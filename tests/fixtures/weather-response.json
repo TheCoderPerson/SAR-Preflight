@@ -1,0 +1,26 @@
+{
+  "current": {
+    "temperature_2m": 72.5,
+    "relative_humidity_2m": 35,
+    "dew_point_2m": 44.2,
+    "apparent_temperature": 70.1,
+    "surface_pressure": 1012.5,
+    "cloud_cover": 25,
+    "visibility": 16093,
+    "wind_speed_10m": 8.5,
+    "wind_direction_10m": 225,
+    "wind_gusts_10m": 14.2,
+    "precipitation_probability": 10,
+    "weather_code": 2,
+    "uv_index": 6.3,
+    "is_day": 1
+  },
+  "hourly": {
+    "wind_speed_80m": [12.0],
+    "wind_speed_120m": [15.0],
+    "wind_speed_180m": [18.0],
+    "wind_direction_80m": [230],
+    "wind_direction_120m": [235],
+    "wind_direction_180m": [240]
+  }
+}

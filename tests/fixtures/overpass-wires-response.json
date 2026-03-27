@@ -1,0 +1,24 @@
+{
+  "elements": [
+    {"type": "node", "id": 100, "lat": 38.685, "lon": -120.99},
+    {"type": "node", "id": 101, "lat": 38.690, "lon": -120.98},
+    {"type": "node", "id": 102, "lat": 38.695, "lon": -120.97},
+    {"type": "node", "id": 200, "lat": 38.680, "lon": -120.99},
+    {"type": "node", "id": 201, "lat": 38.680, "lon": -120.98},
+    {
+      "type": "way", "id": 1001,
+      "tags": {"power": "line", "voltage": "115000", "operator": "PG&E"},
+      "nodes": [100, 101, 102]
+    },
+    {
+      "type": "way", "id": 1002,
+      "tags": {"power": "minor_line", "operator": "PG&E"},
+      "nodes": [200, 201]
+    },
+    {
+      "type": "way", "id": 1003,
+      "tags": {"telecom": "line", "operator": "AT&T"},
+      "nodes": [100, 200]
+    }
+  ]
+}

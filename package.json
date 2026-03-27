@@ -1,0 +1,20 @@
+{
+  "name": "sar-preflight",
+  "private": true,
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run tests/unit",
+    "test:dom": "vitest run tests/dom",
+    "test:integration": "vitest run tests/integration",
+    "test:coverage": "vitest run --coverage",
+    "build": "node build.js",
+    "serve": "npx serve .",
+    "serve:dist": "node build.js && npx serve dist"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0",
+    "jsdom": "^25.0.0",
+    "@vitest/coverage-v8": "^3.0.0"
+  }
+}

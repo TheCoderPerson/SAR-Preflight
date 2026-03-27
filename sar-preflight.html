@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>SAR UAS Pre-Flight Intelligence</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#06b6d4">
+<link rel="icon" type="image/svg+xml" href="icons/icon-192.svg">
+<link rel="apple-touch-icon" href="icons/icon-192.svg">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/geotiff@2.1.3/dist-browser/geotiff.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.12.1/proj4.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg-primary: #0a0e14;
+  --bg-secondary: #111820;
+  --bg-tertiary: #1a2230;
+  --bg-elevated: #1e2a3a;
+  --border: #2a3a4e;
+  --border-active: #3d8bfd;
+  --text-primary: #e2e8f0;
+  --text-secondary: #8899aa;
+  --text-muted: #556677;
+  --accent-blue: #3d8bfd;
+  --accent-green: #22c55e;
+  --accent-amber: #f59e0b;
+  --accent-red: #ef4444;
+  --accent-cyan: #06b6d4;
+  --accent-purple: #a78bfa;
+  --font-mono: 'JetBrains Mono', monospace;
+  --font-sans: 'IBM Plex Sans', -apple-system, sans-serif;
+  --panel-width: 480px;
+  --header-height: 48px;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Header */
+.header {
+  height: var(--header-height);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  gap: 12px;
+  z-index: 1000;
+  position: relative;
+}
+.header-logo {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--accent-cyan);
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.header-logo span { color: var(--text-muted); font-weight: 400; }
+.header-status {
+  display: flex; align-items: center; gap: 6px; margin-left: auto;
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary);
+}
+.status-dot {
+  width: 6px; height: 6px; background: var(--accent-green);
+  border-radius: 50%; animation: pulse 2s infinite;
+}
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+.header-btn {
+  background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text-primary);
+  font-family: var(--font-mono); font-size: 11px; padding: 6px 12px; border-radius: 4px;
+  cursor: pointer; transition: all 0.2s; white-space: nowrap;
+}
+.header-btn:hover { border-color: var(--accent-blue); background: var(--bg-elevated); }
+.header-btn.active { border-color: var(--accent-cyan); color: var(--accent-cyan); }
+
+/* Main Layout */
+.main { display: flex; height: calc(100vh - var(--header-height)); }
+.map-container { flex: 1; position: relative; }
+#map { width: 100%; height: 100%; }
+
+/* Drawing Toolbar */
+.draw-toolbar {
+  position: absolute; top: 12px; left: 12px; z-index: 800;
+  display: flex; flex-direction: column; gap: 4px;
+  background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 6px;
+}
+.draw-btn {
+  width: 36px; height: 36px; background: var(--bg-tertiary); border: 1px solid transparent;
+  border-radius: 4px; color: var(--text-secondary); cursor: pointer;
+  display: flex; align-items: center; justify-content: center; font-size: 16px; transition: all 0.15s;
+}
+.draw-btn:hover { border-color: var(--accent-blue); color: var(--text-primary); }
+.draw-btn.active { background: var(--accent-blue); color: #fff; border-color: var(--accent-blue); }
+.draw-btn svg { width: 18px; height: 18px; }
+
+/* Map Info Overlay */
+.map-info {
+  position: absolute; bottom: 12px; left: 12px; z-index: 800;
+  background: rgba(10,14,20,0.9); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 12px; font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary);
+  backdrop-filter: blur(8px);
+}
+.map-info .coord { color: var(--accent-cyan); }
+
+/* Forecast Timebar */
+.timebar {
+  position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); z-index: 800;
+  display: none; align-items: center; gap: 0;
+  background: rgba(10,14,20,0.92); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 12px; backdrop-filter: blur(8px);
+  width: min(520px, calc(100% - 24px)); flex-direction: column;
+}
+.timebar-row { display: flex; align-items: center; gap: 8px; width: 100%; }
+.timebar-track {
+  flex: 1; height: 18px; position: relative; cursor: crosshair;
+}
+.timebar-bg {
+  position: absolute; top: 8px; left: 0; right: 0; height: 3px;
+  background: var(--border); border-radius: 2px;
+}
+.timebar-fill {
+  position: absolute; top: 8px; left: 0; height: 3px;
+  background: var(--accent-cyan); border-radius: 2px; width: 0;
+}
+.timebar-thumb {
+  position: absolute; top: 4px; width: 3px; height: 12px;
+  background: var(--accent-cyan); border-radius: 2px;
+  transform: translateX(-1px); pointer-events: none;
+}
+.timebar-labels {
+  display: flex; justify-content: space-between; width: 100%;
+  font-family: var(--font-mono); font-size: 7px; color: var(--text-muted);
+  margin-top: 1px; padding: 0 1px; user-select: none;
+}
+.timebar-readout {
+  font-family: var(--font-mono); font-size: 10px; color: var(--accent-cyan);
+  white-space: nowrap; min-width: 52px; text-align: center;
+}
+.timebar-vals {
+  font-family: var(--font-mono); font-size: 9px; color: var(--text-secondary);
+  white-space: nowrap;
+}
+.timebar-vals .tb-wind { color: var(--accent-blue); }
+.timebar-vals .tb-sun { color: var(--accent-amber); }
+
+/* Radar Controls */
+.radar-controls {
+  position: absolute; bottom: 50px; right: 12px; z-index: 800;
+  display: flex; align-items: center; gap: 4px;
+  background: rgba(10,14,20,0.9); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; backdrop-filter: blur(8px);
+}
+
+/* Layer Control */
+.layer-control {
+  position: absolute; top: 12px; right: 12px; z-index: 800;
+  background: rgba(10,14,20,0.92); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px; backdrop-filter: blur(8px); max-height: calc(100vh - 120px);
+  overflow-y: auto; width: 200px;
+}
+.layer-control h4 {
+  font-family: var(--font-mono); font-size: 10px; font-weight: 600; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 8px;
+  padding-bottom: 6px; border-bottom: 1px solid var(--border);
+}
+.layer-item {
+  display: flex; align-items: center; gap: 8px; padding: 4px 0;
+  cursor: pointer; font-size: 12px; color: var(--text-secondary); transition: color 0.15s;
+}
+.layer-item:hover { color: var(--text-primary); }
+.layer-check {
+  width: 14px; height: 14px; border: 1.5px solid var(--border); border-radius: 3px;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all 0.15s;
+}
+.layer-item.active .layer-check { background: var(--accent-blue); border-color: var(--accent-blue); }
+.layer-item.active .layer-check::after { content: '✓'; font-size: 9px; color: #fff; font-weight: 700; }
+.layer-color { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+
+/* Side Panel */
+.side-panel {
+  width: var(--panel-width); background: var(--bg-secondary); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; transition: transform 0.3s ease, width 0.3s ease; overflow: hidden;
+  flex-shrink: 0;
+}
+.side-panel.collapsed { transform: translateX(100%); width: 0; border: none; }
+
+/* ========= TAB NAVIGATION — FIXED ========= */
+.tab-nav-wrapper {
+  display: flex; align-items: stretch; border-bottom: 1px solid var(--border); flex-shrink: 0;
+  position: relative;
+}
+.tab-scroll-btn {
+  width: 28px; flex-shrink: 0; background: var(--bg-secondary); border: none; color: var(--text-muted);
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  font-size: 14px; transition: all 0.15s; border-bottom: 2px solid transparent;
+  z-index: 2;
+}
+.tab-scroll-btn:hover { color: var(--text-primary); background: var(--bg-tertiary); }
+.tab-scroll-btn.hidden { visibility: hidden; pointer-events: none; }
+.tab-nav {
+  display: flex; overflow-x: auto; flex: 1; scrollbar-width: none; scroll-behavior: smooth;
+}
+.tab-nav::-webkit-scrollbar { display: none; }
+.tab-btn {
+  flex-shrink: 0; padding: 10px 14px;
+  font-family: var(--font-mono); font-size: 10px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted);
+  background: none; border: none; border-bottom: 2px solid transparent;
+  cursor: pointer; transition: all 0.15s; white-space: nowrap;
+}
+.tab-btn:hover { color: var(--text-secondary); }
+.tab-btn.active { color: var(--accent-cyan); border-bottom-color: var(--accent-cyan); }
+
+/* Tab Content */
+.tab-content {
+  flex: 1; overflow-y: auto; padding: 0;
+  scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+}
+.tab-content::-webkit-scrollbar { width: 4px; }
+.tab-content::-webkit-scrollbar-track { background: transparent; }
+.tab-content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* Data Section */
+.data-section { border-bottom: 1px solid var(--border); padding: 12px 16px; }
+.data-section-title {
+  font-family: var(--font-mono); font-size: 10px; font-weight: 600; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 10px;
+  display: flex; align-items: center; gap: 6px;
+}
+.data-section-title .indicator { width: 8px; height: 8px; border-radius: 2px; }
+.data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
+.data-grid.three-col { grid-template-columns: 1fr 1fr 1fr; }
+.data-cell { background: var(--bg-tertiary); padding: 8px 10px; border-radius: 4px; }
+.data-cell.full { grid-column: 1 / -1; }
+.data-label {
+  font-size: 10px; color: var(--text-muted); font-family: var(--font-mono);
+  text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 3px;
+}
+.data-value { font-family: var(--font-mono); font-size: 14px; font-weight: 600; color: var(--text-primary); }
+.data-value.green { color: var(--accent-green); }
+.data-value.amber { color: var(--accent-amber); }
+.data-value.red { color: var(--accent-red); }
+.data-value.cyan { color: var(--accent-cyan); }
+.data-value.sm { font-size: 12px; font-weight: 400; }
+
+/* Wind Table */
+.wind-table {
+  width: 100%; border-collapse: separate; border-spacing: 0 2px;
+  font-family: var(--font-mono); font-size: 11px;
+}
+.wind-table th {
+  text-align: left; font-size: 9px; font-weight: 600; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 1px; padding: 4px 8px;
+}
+.wind-table td { background: var(--bg-tertiary); padding: 6px 8px; color: var(--text-primary); }
+.wind-table td:first-child { border-radius: 4px 0 0 4px; color: var(--text-secondary); }
+.wind-table td:last-child { border-radius: 0 4px 4px 0; }
+
+/* NOTAM Cards */
+.notam-card {
+  background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 12px; margin-bottom: 8px;
+}
+.notam-card.tfr { border-left: 3px solid var(--accent-red); }
+.notam-card.notam-style { border-left: 3px solid var(--accent-amber); }
+.notam-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.notam-id { font-family: var(--font-mono); font-size: 11px; font-weight: 600; color: var(--accent-amber); }
+.notam-card.tfr .notam-id { color: var(--accent-red); }
+.notam-type {
+  font-family: var(--font-mono); font-size: 9px; padding: 2px 6px; border-radius: 3px;
+  text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;
+}
+.notam-type.tfr-type { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+.notam-type.notam-type-tag { background: rgba(245,158,11,0.15); color: var(--accent-amber); }
+.notam-body { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+.notam-meta { margin-top: 6px; font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); }
+
+/* Risk Bar */
+.risk-bar { height: 6px; background: var(--bg-primary); border-radius: 3px; margin-top: 8px; overflow: hidden; }
+.risk-fill { height: 100%; border-radius: 3px; transition: width 0.5s ease; }
+
+/* Loading Spinner */
+.loading-overlay {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 40px; gap: 12px;
+}
+.spinner {
+  width: 24px; height: 24px; border: 2px solid var(--border); border-top-color: var(--accent-cyan);
+  border-radius: 50%; animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading-text { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+
+/* Assessment Banner */
+.assessment-banner {
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px; font-family: var(--font-mono); font-size: 12px;
+}
+.assessment-badge {
+  padding: 3px 10px; border-radius: 4px; font-weight: 700; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 1px;
+}
+.assessment-badge.go { background: rgba(34,197,94,0.15); color: var(--accent-green); }
+.assessment-badge.caution { background: rgba(245,158,11,0.15); color: var(--accent-amber); }
+.assessment-badge.nogo { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+
+/* Area Info Bar */
+.area-info-bar {
+  background: var(--bg-tertiary); padding: 8px 16px; border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary);
+  display: flex; gap: 16px; flex-wrap: wrap;
+}
+.area-info-item { display: flex; align-items: center; gap: 4px; }
+.area-info-item strong { color: var(--text-primary); }
+
+/* No Area Overlay */
+.no-area-overlay {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  z-index: 700; background: rgba(10,14,20,0.85); border: 1px solid var(--border);
+  border-radius: 10px; padding: 30px 40px; text-align: center;
+  backdrop-filter: blur(8px); cursor: pointer;
+}
+.no-area-overlay h3 { font-family: var(--font-mono); font-size: 14px; color: var(--accent-cyan); margin-bottom: 8px; }
+.no-area-overlay p { font-size: 13px; color: var(--text-secondary); line-height: 1.6; }
+.no-area-overlay .hotkeys { margin-top: 12px; display: flex; gap: 12px; justify-content: center; }
+.hotkey { display: flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+.hotkey kbd {
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  padding: 2px 6px; border-radius: 3px; font-size: 10px; color: var(--text-secondary);
+}
+
+/* Config */
+.api-config { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.api-input-group { display: flex; gap: 6px; margin-top: 6px; }
+.api-input {
+  flex: 1; background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text-primary);
+  font-family: var(--font-mono); font-size: 11px; padding: 6px 10px; border-radius: 4px; outline: none;
+}
+.api-input:focus { border-color: var(--accent-blue); }
+.api-input::placeholder { color: var(--text-muted); }
+select.api-input { cursor: pointer; }
+
+/* Empty State */
+.empty-state {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 40px 20px; text-align: center;
+}
+.empty-icon { font-size: 36px; margin-bottom: 12px; opacity: 0.3; }
+.empty-title { font-family: var(--font-mono); font-size: 13px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
+.empty-desc { font-size: 12px; color: var(--text-muted); line-height: 1.5; max-width: 260px; }
+
+/* Fetch status badges */
+.fetch-status {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-family: var(--font-mono); font-size: 9px; padding: 2px 8px;
+  border-radius: 3px; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.fetch-status.live { background: rgba(34,197,94,0.12); color: var(--accent-green); }
+.fetch-status.error { background: rgba(239,68,68,0.12); color: var(--accent-red); }
+.fetch-status.loading { background: rgba(6,182,212,0.12); color: var(--accent-cyan); }
+.fetch-status.cached { background: rgba(245,158,11,0.15); color: var(--accent-amber); }
+.fetch-status.expired { background: rgba(239,68,68,0.15); color: var(--accent-red); animation: pulse 1.5s infinite; }
+
+/* Export Modal */
+.modal-overlay {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.7); z-index: 2000; display: none;
+  align-items: center; justify-content: center; backdrop-filter: blur(4px);
+}
+.modal-overlay.active { display: flex; }
+.modal {
+  background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px;
+  padding: 24px; width: 400px; max-height: 80vh; overflow-y: auto;
+}
+.modal h3 { font-family: var(--font-mono); font-size: 14px; font-weight: 600; margin-bottom: 16px; color: var(--accent-cyan); }
+.modal-actions { display: flex; gap: 8px; margin-top: 16px; }
+.btn {
+  padding: 8px 16px; border-radius: 5px; font-family: var(--font-mono); font-size: 12px;
+  font-weight: 500; cursor: pointer; border: 1px solid var(--border); transition: all 0.15s;
+}
+.btn-primary { background: var(--accent-blue); border-color: var(--accent-blue); color: #fff; }
+.btn-primary:hover { background: #2d7bf0; }
+.btn-ghost { background: transparent; color: var(--text-secondary); }
+.btn-ghost:hover { color: var(--text-primary); border-color: var(--text-secondary); }
+
+.export-check-row {
+  display: flex; align-items: center; gap: 8px; padding: 6px 0;
+  cursor: pointer; font-size: 12px; color: var(--text-secondary);
+}
+.export-check-row input { accent-color: var(--accent-blue); }
+
+@media (max-width: 900px) {
+  .side-panel {
+    position: absolute; right: 0; top: var(--header-height);
+    height: calc(100vh - var(--header-height)); z-index: 900;
+  }
+  .layer-control { width: 170px; }
+  :root { --panel-width: 100vw; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-logo">SAR PREFLIGHT<span> // UAS INTEL</span></div>
+  <button class="header-btn" id="btnPanel" onclick="togglePanel()">DATA PANEL</button>
+  <button class="header-btn" id="btnExport" onclick="openExport()">EXPORT KML</button>
+  <button class="header-btn" id="btnCopy" onclick="copyBriefing()">COPY</button>
+  <button class="header-btn" id="btnPDF" onclick="generatePDFBriefing()">PDF</button>
+  <button class="header-btn" id="btnEmail" onclick="shareBriefingEmail()">EMAIL</button>
+  <button class="header-btn" id="btnLog" onclick="logMission()">LOG</button>
+  <button class="header-btn" id="btnViewLogs" onclick="showMissionLogs()">LOGS</button>
+  <button class="header-btn" id="btnSARTopo" onclick="openInSARTopo()">SARTOPO</button>
+  <button class="header-btn" id="btnRefresh" onclick="refreshData()">REFRESH</button>
+  <button class="header-btn" id="btnClearArea" onclick="clearArea()">CLEAR</button>
+  <div class="header-status">
+    <span id="fetchActivity" style="font-size:10px;color:var(--accent-cyan);display:none;"></span>
+    <div class="status-dot" id="statusDot"></div>
+    <span id="clockDisplay">--:--:-- UTC</span>
+    <span id="refreshCountdown" style="color:var(--accent-cyan);font-size:10px;display:none;"></span>
+  </div>
+</div>
+
+<div class="main">
+  <div id="trainingBanner" style="display:none;background:var(--accent-amber);color:#111;padding:6px 16px;font-family:var(--font-mono);font-size:12px;font-weight:700;text-align:center;letter-spacing:2px;z-index:1001;">
+    TRAINING MODE — <span id="trainingScenarioName"></span>
+    <button class="btn btn-ghost" onclick="exitTrainingMode()" style="margin-left:12px;padding:2px 8px;font-size:10px;color:#111;border-color:#111;">EXIT</button>
+  </div>
+  <div class="map-container">
+    <div id="map"></div>
+    <div class="draw-toolbar">
+      <button class="draw-btn" id="drawRect" title="Draw Rectangle" onclick="startDraw('rectangle')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="1"/></svg>
+      </button>
+      <button class="draw-btn" id="drawCircle" title="Draw Circle" onclick="startDraw('circle')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg>
+      </button>
+      <button class="draw-btn" id="drawPolygon" title="Draw Polygon" onclick="startDraw('polygon')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12,2 22,8.5 18,20 6,20 2,8.5"/></svg>
+      </button>
+      <div style="height:1px;background:var(--border);margin:2px 0;"></div>
+      <button class="draw-btn" id="drawCoords" title="Enter Coordinates" onclick="enterCoords()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
+      </button>
+      <button class="draw-btn" id="drawImport" title="Import KML/KMZ" onclick="importKML()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      </button>
+    </div>
+    <div class="map-info">
+      <span>CURSOR </span><span class="coord" id="cursorCoord">--°, --°</span>
+      <span style="margin:0 8px;color:var(--border);">|</span>
+      <span>ELEV </span><span class="coord" id="cursorElev">-- ft</span>
+    </div>
+    <div class="no-area-overlay" id="noAreaOverlay" onclick="this.style.display='none'">
+      <h3>Define Operational Area</h3>
+      <p>Draw a rectangle, circle, or polygon on the map, or click a tool below.</p>
+      <div class="hotkeys">
+        <div class="hotkey" onclick="event.stopPropagation();document.getElementById('noAreaOverlay').style.display='none';startDraw('rectangle')" style="cursor:pointer;padding:4px 8px;border-radius:4px;border:1px solid var(--border);"><kbd>▭</kbd> Rect</div>
+        <div class="hotkey" onclick="event.stopPropagation();document.getElementById('noAreaOverlay').style.display='none';startDraw('circle')" style="cursor:pointer;padding:4px 8px;border-radius:4px;border:1px solid var(--border);"><kbd>○</kbd> Circle</div>
+        <div class="hotkey" onclick="event.stopPropagation();document.getElementById('noAreaOverlay').style.display='none';startDraw('polygon')" style="cursor:pointer;padding:4px 8px;border-radius:4px;border:1px solid var(--border);"><kbd>⬠</kbd> Polygon</div>
+      </div>
+    </div>
+    <div class="layer-control" id="layerControl">
+      <h4>Map Layers</h4>
+      <div id="layerList"></div>
+    </div>
+    <div class="radar-controls" id="radarControls" style="display:none;">
+      <button class="draw-btn" onclick="radarStep(-1)" title="Previous">&laquo;</button>
+      <button class="draw-btn" id="radarPlayBtn" onclick="radarToggle()" title="Play/Pause">&#9654;</button>
+      <button class="draw-btn" onclick="radarStep(1)" title="Next">&raquo;</button>
+      <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);" id="radarTime">--</span>
+    </div>
+    <div class="timebar" id="timeBar">
+      <div class="timebar-row">
+        <div class="timebar-readout" id="tbTime">NOW</div>
+        <div class="timebar-track" id="tbTrack">
+          <div class="timebar-bg"></div>
+          <div class="timebar-fill" id="tbFill"></div>
+          <div class="timebar-thumb" id="tbThumb"></div>
+        </div>
+        <div class="timebar-vals">
+          <span class="tb-wind" id="tbWind">--</span>
+          <span style="color:var(--border);margin:0 3px;">|</span>
+          <span class="tb-sun" id="tbSun">--</span>
+        </div>
+      </div>
+      <div class="timebar-labels" id="tbLabels"></div>
+    </div>
+  </div>
+
+  <!-- Side Panel -->
+  <div class="side-panel" id="sidePanel">
+    <div class="assessment-banner" id="assessmentBanner" style="display:none;">
+      <span class="assessment-badge go" id="assessBadge">GO</span>
+      <span id="assessText">All conditions nominal</span>
+    </div>
+    <div class="area-info-bar" id="areaInfoBar" style="display:none;">
+      <div class="area-info-item">CENTER: <strong id="areaCenter">--</strong></div>
+      <div class="area-info-item">AREA: <strong id="areaSize">--</strong></div>
+      <div class="area-info-item">TYPE: <strong id="areaType">--</strong></div>
+      <div class="area-info-item">PERIM: <strong id="areaPerimeter">--</strong></div>
+      <div class="area-info-item">MAX DIM: <strong id="areaMaxDim">--</strong></div>
+    </div>
+
+    <!-- FIXED TAB NAV with scroll arrows -->
+    <div class="tab-nav-wrapper">
+      <button class="tab-scroll-btn" id="tabScrollLeft" onclick="scrollTabs(-1)">◂</button>
+      <div class="tab-nav" id="tabNav">
+        <button class="tab-btn active" data-tab="wx" onclick="switchTab('wx')">Weather</button>
+        <button class="tab-btn" data-tab="wind" onclick="switchTab('wind')">Wind</button>
+        <button class="tab-btn" data-tab="airspace" onclick="switchTab('airspace')">Airspace</button>
+        <button class="tab-btn" data-tab="terrain" onclick="switchTab('terrain')">Terrain</button>
+        <button class="tab-btn" data-tab="astro" onclick="switchTab('astro')">Sun/Moon</button>
+        <button class="tab-btn" data-tab="sats" onclick="switchTab('sats')">GNSS</button>
+        <button class="tab-btn" data-tab="notams" onclick="switchTab('notams')">NOTAMs</button>
+        <button class="tab-btn" data-tab="ops" onclick="switchTab('ops')">Ops</button>
+        <button class="tab-btn" data-tab="config" onclick="switchTab('config')">Config</button>
+      </div>
+      <button class="tab-scroll-btn" id="tabScrollRight" onclick="scrollTabs(1)">▸</button>
+    </div>
+
+    <div class="tab-content" id="tabContent">
+      <div id="noAreaState" class="empty-state">
+        <div class="empty-icon">🛰️</div>
+        <div class="empty-title">No Area Selected</div>
+        <div class="empty-desc">Draw an operational area on the map to generate pre-flight intelligence data.</div>
+      </div>
+
+      <!-- WX Tab -->
+      <div id="tab-wx" class="tab-panel" style="display:none;">
+        <div class="data-section" id="alertSection" style="display:none;">
+          <div class="data-section-title">
+            <div class="indicator" style="background:var(--accent-red)"></div>Active Weather Alerts
+            <span class="fetch-status" id="alertStatus"></span>
+          </div>
+          <div id="alertList"></div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title">
+            <div class="indicator" style="background:var(--accent-cyan)"></div>Current Conditions
+            <span class="fetch-status" id="wxStatus"></span>
+          </div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Temperature</div><div class="data-value" id="wxTemp">--°F</div></div>
+            <div class="data-cell"><div class="data-label">Feels Like</div><div class="data-value" id="wxFeels">--°F</div></div>
+            <div class="data-cell"><div class="data-label">Dew Point</div><div class="data-value" id="wxDew">--°F</div></div>
+            <div class="data-cell"><div class="data-label">Humidity</div><div class="data-value" id="wxHumidity">--%</div></div>
+            <div class="data-cell"><div class="data-label">Pressure</div><div class="data-value sm" id="wxPressure">-- inHg</div></div>
+            <div class="data-cell"><div class="data-label">Density Alt</div><div class="data-value" id="wxDensity">-- ft</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>Visibility &amp; Clouds</div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Visibility</div><div class="data-value" id="wxVis">-- mi</div></div>
+            <div class="data-cell"><div class="data-label">Cloud Cover</div><div class="data-value" id="wxCloud">--%</div></div>
+            <div class="data-cell"><div class="data-label">Cloud Ceiling</div><div class="data-value sm" id="wxCeiling">-- ft</div></div>
+            <div class="data-cell"><div class="data-label">Conditions</div><div class="data-value sm" id="wxConditions">--</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Precipitation &amp; Hazards</div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Precip Prob</div><div class="data-value" id="wxPrecip">--%</div></div>
+            <div class="data-cell"><div class="data-label">Lightning Risk</div><div class="data-value" id="wxLightning">--</div></div>
+            <div class="data-cell"><div class="data-label">UV Index</div><div class="data-value" id="wxUV">--</div></div>
+            <div class="data-cell"><div class="data-label">Kp Index</div><div class="data-value" id="wxKp">--</div></div>
+            <div class="data-cell"><div class="data-label">Icing Risk</div><div class="data-value" id="wxIcing">--</div></div>
+            <div class="data-cell"><div class="data-label">Fire Danger</div><div class="data-value" id="wxFire">--</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-purple)"></div>Air Quality</div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">AQI (US)</div><div class="data-value" id="wxAQI">--</div></div>
+            <div class="data-cell"><div class="data-label">PM2.5</div><div class="data-value sm" id="wxPM25">--</div></div>
+            <div class="data-cell"><div class="data-label">PM10</div><div class="data-value sm" id="wxPM10">--</div></div>
+            <div class="data-cell"><div class="data-label">Ozone</div><div class="data-value sm" id="wxOzone">--</div></div>
+          </div>
+        </div>
+        <div class="data-section" id="forecastSection" style="display:none;">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-blue)"></div>24-Hour Forecast</div>
+          <div id="forecastChart" style="width:100%;overflow-x:auto;"></div>
+        </div>
+      </div>
+
+      <!-- Wind Tab -->
+      <div id="tab-wind" class="tab-panel" style="display:none;">
+        <div class="data-section">
+          <div class="data-section-title">
+            <div class="indicator" style="background:var(--accent-cyan)"></div>Wind Profile by Altitude
+            <span class="fetch-status" id="windStatus"></span>
+          </div>
+          <table class="wind-table"><thead><tr><th>Altitude</th><th>Speed</th><th>Gusts</th><th>Direction</th></tr></thead>
+            <tbody id="windTableBody">
+              <tr><td>Ground</td><td>--</td><td>--</td><td>--</td></tr>
+              <tr><td>100 ft AGL</td><td>--</td><td>--</td><td>--</td></tr>
+              <tr><td>200 ft AGL</td><td>--</td><td>--</td><td>--</td></tr>
+              <tr><td>300 ft AGL</td><td>--</td><td>--</td><td>--</td></tr>
+              <tr><td>400 ft AGL</td><td>--</td><td>--</td><td>--</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Wind Assessment</div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Max Sustained</div><div class="data-value" id="windMax">--</div></div>
+            <div class="data-cell"><div class="data-label">Max Gust</div><div class="data-value" id="windGustMax">--</div></div>
+            <div class="data-cell"><div class="data-label">Prevailing Dir</div><div class="data-value" id="windDir">--</div></div>
+            <div class="data-cell"><div class="data-label">Battery Impact</div><div class="data-value sm" id="windImpact">--</div></div>
+            <div class="data-cell"><div class="data-label">Gust Factor</div><div class="data-value" id="windGustFactor">--</div></div>
+            <div class="data-cell"><div class="data-label">Wind Shear</div><div class="data-value sm" id="windShear">--</div></div>
+            <div class="data-cell full"><div class="data-label">Terrain Turbulence</div><div class="data-value sm" id="windTurbulence">--</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Airspace Tab -->
+      <div id="tab-airspace" class="tab-panel" style="display:none;">
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-blue)"></div>Airspace Classification <span class="fetch-status" id="faaAirspaceStatus"></span></div>
+          <div class="data-grid">
+            <div class="data-cell full"><div class="data-label">Primary Airspace</div><div class="data-value" id="airClass">--</div></div>
+            <div class="data-cell"><div class="data-label">LAANC Available</div><div class="data-value" id="airLAANC">--</div></div>
+            <div class="data-cell"><div class="data-label">LAANC Max Alt</div><div class="data-value" id="airLAANCAlt">--</div></div>
+            <div class="data-cell"><div class="data-label">Nearest Airport</div><div class="data-value sm" id="airNearAirport">--</div></div>
+            <div class="data-cell"><div class="data-label">Distance</div><div class="data-value" id="airNearDist">--</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>Special Use Airspace</div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">MOA</div><div class="data-value sm" id="airMOA">None</div></div>
+            <div class="data-cell"><div class="data-label">Restricted</div><div class="data-value sm" id="airRestricted">None</div></div>
+            <div class="data-cell"><div class="data-label">Prohibited</div><div class="data-value sm" id="airProhibited">None</div></div>
+            <div class="data-cell full"><div class="data-label">TFRs</div><div class="data-value sm" id="airTFR">None</div></div>
+            <div class="data-cell full"><div class="data-label">NS UAS Restrictions</div><div class="data-value sm" id="airNSRestrict">None</div></div>
+            <div class="data-cell"><div class="data-label">Heliports Nearby</div><div class="data-value sm" id="airHeliports">--</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Terrain Tab -->
+      <div id="tab-terrain" class="tab-panel" style="display:none;">
+        <div class="data-section">
+          <div class="data-section-title">
+            <div class="indicator" style="background:var(--accent-green)"></div>Elevation Profile
+            <span class="fetch-status" id="elevStatus"></span>
+          </div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Min Elevation</div><div class="data-value" id="terrMin">-- ft</div></div>
+            <div class="data-cell"><div class="data-label">Max Elevation</div><div class="data-value" id="terrMax">-- ft</div></div>
+            <div class="data-cell"><div class="data-label">Elev Range</div><div class="data-value" id="terrRange">-- ft</div></div>
+            <div class="data-cell"><div class="data-label">Center Elev</div><div class="data-value" id="terrLaunch">-- ft</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Terrain Variability</div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Terrain Class</div><div class="data-value sm" id="terrClass">--</div></div>
+            <div class="data-cell"><div class="data-label">Elev Change/km</div><div class="data-value" id="terrSlope">--</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>Obstacles &amp; Hazards <span class="fetch-status" id="wireStatus"></span> <span class="fetch-status" id="protectedAreasStatus"></span></div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Power Lines</div><div class="data-value sm" id="terrPower">Check imagery</div></div>
+            <div class="data-cell"><div class="data-label">Cell Towers</div><div class="data-value sm" id="terrTowers">Check FAA OE</div></div>
+            <div class="data-cell"><div class="data-label">Highways</div><div class="data-value sm" id="terrHwy">--</div></div>
+            <div class="data-cell"><div class="data-label">Vegetation</div><div class="data-value sm" id="terrVeg">--</div></div>
+            <div class="data-cell full"><div class="data-label">Emergency LZ</div><div class="data-value sm" id="terrLZ">Identify on satellite before flight</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-purple)"></div>Comms &amp; Connectivity</div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Cell Coverage</div><div class="data-value sm" id="terrCell">--</div></div>
+            <div class="data-cell"><div class="data-label">Remote ID</div><div class="data-value sm" id="terrRID">--</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Sun/Moon Tab -->
+      <div id="tab-astro" class="tab-panel" style="display:none;">
+        <div class="data-section">
+          <div class="data-section-title">
+            <div class="indicator" style="background:var(--accent-amber)"></div>Solar
+            <span class="fetch-status" id="astroStatus"></span>
+          </div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Sunrise</div><div class="data-value" id="astSunrise">--</div></div>
+            <div class="data-cell"><div class="data-label">Sunset</div><div class="data-value" id="astSunset">--</div></div>
+            <div class="data-cell"><div class="data-label">Civil Twilight AM</div><div class="data-value sm" id="astTwilightAM">--</div></div>
+            <div class="data-cell"><div class="data-label">Civil Twilight PM</div><div class="data-value sm" id="astTwilightPM">--</div></div>
+            <div class="data-cell"><div class="data-label">Nautical Twilight AM</div><div class="data-value sm" id="astNauticalAM">--</div></div>
+            <div class="data-cell"><div class="data-label">Nautical Twilight PM</div><div class="data-value sm" id="astNauticalPM">--</div></div>
+            <div class="data-cell"><div class="data-label">Solar Noon</div><div class="data-value sm" id="astSolarNoon">--</div></div>
+            <div class="data-cell"><div class="data-label">Sun Azimuth</div><div class="data-value" id="astSunAz">--</div></div>
+            <div class="data-cell"><div class="data-label">Sun Elevation</div><div class="data-value" id="astSunEl">--</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-purple)"></div>Lunar</div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Moon Phase</div><div class="data-value sm" id="astMoonPhase">--</div></div>
+            <div class="data-cell"><div class="data-label">Illumination</div><div class="data-value" id="astMoonIllum">--</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-cyan)"></div>Flight Window</div>
+          <div class="data-grid">
+            <div class="data-cell full"><div class="data-label">Part 107 Daylight Window</div><div class="data-value sm" id="astDayWindow">--</div></div>
+            <div class="data-cell full"><div class="data-label">Night Ops Assessment</div><div class="data-value sm" id="astNightOps">--</div></div>
+            <div class="data-cell"><div class="data-label">Shadow Factor</div><div class="data-value sm" id="astShadow">--</div></div>
+            <div class="data-cell"><div class="data-label">Mag Declination</div><div class="data-value" id="astMagDec">--</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- GNSS Tab -->
+      <div id="tab-sats" class="tab-panel" style="display:none;">
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>GNSS Satellite Availability</div>
+          <table class="wind-table"><thead><tr><th>Altitude</th><th>Expected Sats</th><th>PDOP</th><th>Quality</th></tr></thead>
+            <tbody id="satTableBody">
+              <tr><td>Below 100 ft</td><td>--</td><td>--</td><td>--</td></tr>
+              <tr><td>Below 200 ft</td><td>--</td><td>--</td><td>--</td></tr>
+              <tr><td>Below 300 ft</td><td>--</td><td>--</td><td>--</td></tr>
+              <tr><td>Below 400 ft</td><td>--</td><td>--</td><td>--</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Space Weather</div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Kp Index</div><div class="data-value" id="satKp">--</div></div>
+            <div class="data-cell"><div class="data-label">GPS Accuracy</div><div class="data-value sm" id="satAccuracy">--</div></div>
+            <div class="data-cell full"><div class="data-label">GNSS Assessment</div><div class="data-value sm" id="satAssessment">--</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>Terrain Masking</div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Sky Visibility</div><div class="data-value" id="satSkyVis">--</div></div>
+            <div class="data-cell"><div class="data-label">Masked Directions</div><div class="data-value sm" id="satMasked">--</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- NOTAMs Tab -->
+      <div id="tab-notams" class="tab-panel" style="display:none;">
+        <div class="data-section">
+          <div class="data-section-title">
+            <div class="indicator" style="background:var(--accent-red)"></div>TFRs &amp; NOTAMs
+            <span class="fetch-status" id="notamStatus"></span>
+          </div>
+          <div id="notamList"><div class="notam-body" style="color:var(--text-muted);font-style:italic;">Draw an area to check NOTAMs</div></div>
+        </div>
+      </div>
+
+      <!-- Ops Tab -->
+      <div id="tab-ops" class="tab-panel" style="display:none;">
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-cyan)"></div>Battery Performance Estimate</div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Temp Factor</div><div class="data-value" id="opsTempFactor">--</div></div>
+            <div class="data-cell"><div class="data-label">Alt Factor</div><div class="data-value" id="opsAltFactor">--</div></div>
+            <div class="data-cell"><div class="data-label">Wind Factor</div><div class="data-value" id="opsWindFactor">--</div></div>
+            <div class="data-cell"><div class="data-label">Est. Flight Time</div><div class="data-value amber" id="opsFlightTime">--</div></div>
+            <div class="data-cell full">
+              <div class="data-label">Effective Capacity</div>
+              <div class="data-value sm" id="opsCapacity">--</div>
+              <div class="risk-bar"><div class="risk-fill" id="opsCapBar" style="width:0;background:var(--accent-green);"></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Other Aircraft</div>
+          <div class="data-grid">
+            <div class="data-cell full"><div class="data-label">Manned SAR Assets</div><div class="data-value sm" id="opsAircraft">Check with IC / dispatch</div></div>
+            <div class="data-cell full"><div class="data-label">Air Ambulance Corridors</div><div class="data-value sm" id="opsAmbulance">Verify with dispatch / AirComm</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>Wildlife Hazards</div>
+          <div class="data-grid">
+            <div class="data-cell full"><div class="data-label">Raptor/Bird Activity</div><div class="data-value sm" id="opsBirds">--</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>Battery Swap</div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Swap At</div><div class="data-value" id="opsSwapTime">--</div></div>
+            <div class="data-cell"><div class="data-label">Max Radius</div><div class="data-value" id="opsSwapRadius">--</div></div>
+            <div class="data-cell full"><div class="data-label">Nearest LZ</div><div class="data-value sm" id="opsSwapLZ">--</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-blue)"></div>Flight Plan Suggestion</div>
+          <div class="data-grid">
+            <div class="data-cell">
+              <div class="data-label">Pattern</div>
+              <select class="api-input" id="cfgSearchPattern" style="font-size:11px;padding:4px;">
+                <option value="parallel">Parallel Track</option>
+                <option value="expanding_square">Expanding Square</option>
+                <option value="sector">Sector Search</option>
+              </select>
+            </div>
+            <div class="data-cell">
+              <div class="data-label">Track Spacing (m)</div>
+              <input class="api-input" id="cfgTrackSpacing" type="number" value="100" style="font-size:11px;padding:4px;">
+            </div>
+            <div class="data-cell full">
+              <button class="btn btn-primary" onclick="generateAndRenderFlightPlan()" style="width:100%;padding:5px;font-size:11px;">Generate Flight Plan</button>
+            </div>
+            <div class="data-cell"><div class="data-label">Distance</div><div class="data-value sm" id="opsPlanDist">--</div></div>
+            <div class="data-cell"><div class="data-label">Legs</div><div class="data-value sm" id="opsPlanLegs">--</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Config Tab -->
+      <div id="tab-config" class="tab-panel" style="display:none;">
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-cyan)"></div>Data Sources</div>
+          <p style="font-size:11px;color:var(--text-muted);margin-bottom:8px;line-height:1.5;">
+            <strong style="color:var(--accent-green);">FREE — No key needed:</strong> Open-Meteo (weather, wind, AQI), Open-Elevation, Sunrise-Sunset.org
+          </p>
+          <p style="font-size:11px;color:var(--text-muted);margin-bottom:12px;line-height:1.5;">
+            <strong style="color:var(--accent-amber);">Optional API keys</strong> for enhanced data:
+          </p>
+          <div class="api-config">
+            <div class="data-label">FAA NOTAM API Key (api.faa.gov)</div>
+            <div class="api-input-group">
+              <input class="api-input" id="apiFAA" type="password" placeholder="client_id:client_secret" />
+              <button class="btn btn-ghost" onclick="saveApiKey('faa')">Save</button>
+            </div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Auto-Refresh Interval</div>
+            <select class="api-input" id="cfgRefreshInterval" onchange="setAutoRefresh()">
+              <option value="0">Off</option>
+              <option value="5">Every 5 min</option>
+              <option value="10" selected>Every 10 min</option>
+              <option value="15">Every 15 min</option>
+              <option value="30">Every 30 min</option>
+              <option value="60">Every 60 min</option>
+            </select>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>Aircraft Profile</div>
+          <div class="api-config">
+            <div class="data-label">RPIC Name (for PDF briefing)</div>
+            <input class="api-input" id="cfgRPIC" type="text" placeholder="Enter RPIC name" onchange="if(typeof saveAppState==='function')saveAppState('cfgRPIC',this.value)" />
+          </div>
+          <div class="api-config">
+            <div class="data-label">Aircraft Type</div>
+            <select class="api-input" id="cfgAircraft" onchange="saveConfig()">
+              <option value="m4t">DJI Matrice 4T</option>
+              <option value="m30t">DJI Matrice 30T</option>
+              <option value="m300">DJI Matrice 300 RTK</option>
+              <option value="m350">DJI Matrice 350 RTK</option>
+              <option value="mavic3t">DJI Mavic 3T</option>
+              <option value="skydio_x10">Skydio X10</option>
+              <option value="custom">Custom</option>
+            </select>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Max Flight Time (min, nominal)</div>
+            <input class="api-input" id="cfgFlightTime" type="number" value="38" onchange="saveConfig()" />
+          </div>
+          <div class="api-config">
+            <div class="data-label">Max Wind Tolerance (mph)</div>
+            <input class="api-input" id="cfgMaxWind" type="number" value="27" onchange="saveConfig()" />
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-purple)"></div>Offline &amp; Map Tiles</div>
+          <div class="api-config">
+            <div class="data-label">Import FAA Sectional Chart (.tif from <a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank" style="color:var(--accent-cyan);">faa.gov</a>)</div>
+            <input type="file" id="chartFileInput" accept=".tif,.tiff" style="font-size:11px;color:var(--text-secondary);margin-top:6px;" onchange="loadFAAChart(this)">
+            <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
+              <label style="font-size:11px;color:var(--text-secondary);white-space:nowrap;">Collar trim:</label>
+              <input type="range" id="chartCollarMargin" min="0" max="10" step="0.5" value="3" style="width:100px;" oninput="document.getElementById('collarPct').textContent=this.value+'%'">
+              <span id="collarPct" style="font-size:10px;color:var(--text-muted);width:30px;">3%</span>
+            </div>
+            <div class="risk-bar" style="margin-top:6px;"><div class="risk-fill" id="chartProgressBar" style="width:0;background:var(--accent-purple);"></div></div>
+            <div id="chartProgressText" style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:4px;"></div>
+            <div id="chartList" style="margin-top:8px;"></div>
+            <button class="btn btn-ghost" id="btnClearCharts" onclick="clearAllCharts()" style="margin-top:6px;padding:4px 10px;font-size:10px;display:none;">Clear All Charts</button>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Download Map Tiles for Current View</div>
+            <div style="display:flex;gap:6px;margin-top:6px;align-items:center;">
+              <select class="api-input" id="cfgTileZooms" style="width:auto;">
+                <option value="10,11,12,13,14">z10-14 (default)</option>
+                <option value="10,11,12">z10-12 (small)</option>
+                <option value="10,11,12,13,14,15,16">z10-16 (large)</option>
+              </select>
+              <button class="btn btn-primary" id="btnDownloadTiles" onclick="downloadTilesForView()" style="padding:5px 12px;font-size:11px;">Download</button>
+            </div>
+            <div style="display:flex;gap:12px;margin-top:6px;font-size:11px;color:var(--text-secondary);">
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileSat"> Satellite</label>
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileTopo"> Topo</label>
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileSectional" checked> FAA Sectional</label>
+            </div>
+            <div class="risk-bar" style="margin-top:8px;"><div class="risk-fill" id="tileProgressBar" style="width:0;background:var(--accent-cyan);"></div></div>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:4px;" id="tileProgressText"></div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Cache Status</div>
+            <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);margin-top:4px;" id="cacheStatus">Checking...</div>
+            <button class="btn btn-ghost" onclick="clearAllCaches()" style="margin-top:6px;padding:4px 10px;font-size:10px;">Clear All Caches</button>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Notifications</div>
+          <div class="api-config">
+            <div class="data-label">Threshold Alert Notifications</div>
+            <div style="display:flex;gap:6px;margin-top:6px;">
+              <button class="btn btn-ghost" id="btnNotifyEnable" onclick="enableNotifications()">Enable Notifications</button>
+              <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);align-self:center;" id="notifyStatus">Not enabled</span>
+            </div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>SOP Risk Profiles</div>
+          <div class="api-config">
+            <div class="data-label">Active Profile</div>
+            <div style="display:flex;gap:6px;margin-top:6px;">
+              <select class="api-input" id="cfgSopProfile" onchange="loadSopProfile(this.value)" style="flex:1;">
+                <option value="">Default</option>
+              </select>
+              <button class="btn btn-ghost" onclick="deleteSopProfileFromUI()" style="padding:4px 8px;font-size:10px;">Delete</button>
+            </div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Thresholds</div>
+            <div class="data-grid" style="margin-top:6px;">
+              <div class="data-cell"><div class="data-label">Vis NO-GO (mi)</div><input class="api-input" id="sopVisNoGo" type="number" value="1" step="0.5" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Vis CAUTION (mi)</div><input class="api-input" id="sopVisCaution" type="number" value="5" step="0.5" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Precip NO-GO (%)</div><input class="api-input" id="sopPrecipNoGo" type="number" value="60" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Precip CAUTION (%)</div><input class="api-input" id="sopPrecipCaution" type="number" value="30" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Wind CAUTION (mph)</div><input class="api-input" id="sopWindCaution" type="number" value="15" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Temp CAUTION (°F)</div><input class="api-input" id="sopTempCaution" type="number" value="35" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Elev CAUTION (ft)</div><input class="api-input" id="sopElevCaution" type="number" value="6000" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Wx Code NO-GO</div><input class="api-input" id="sopWxCodeNoGo" type="number" value="95" style="font-size:11px;padding:3px;"></div>
+            </div>
+          </div>
+          <div class="api-config">
+            <div style="display:flex;gap:6px;">
+              <input class="api-input" id="sopProfileName" placeholder="Profile name" style="flex:1;">
+              <button class="btn btn-primary" onclick="saveSopProfileFromUI()" style="padding:4px 10px;font-size:10px;">Save Profile</button>
+            </div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Training Mode</div>
+          <div class="api-config">
+            <div class="data-label">Load Scenario</div>
+            <div style="display:flex;gap:6px;margin-top:6px;">
+              <select class="api-input" id="cfgTrainingScenario" style="flex:1;"></select>
+              <button class="btn btn-primary" onclick="enterTrainingMode(document.getElementById('cfgTrainingScenario').selectedIndex)" style="padding:4px 10px;font-size:10px;">Load</button>
+            </div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--text-muted)"></div>Audit Trail</div>
+          <div class="api-config">
+            <div style="display:flex;gap:6px;">
+              <button class="btn btn-ghost" onclick="showAuditTrail()">View Trail</button>
+              <button class="btn btn-ghost" onclick="exportAuditTrailAsCSV()">Export CSV</button>
+              <button class="btn btn-ghost" onclick="clearAuditTrailUI()" style="color:var(--accent-red);">Clear</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Export Modal -->
+<div class="modal-overlay" id="exportModal">
+  <div class="modal">
+    <h3>Export KML</h3>
+    <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px;">Select data to include:</p>
+    <label class="export-check-row"><input type="checkbox" id="expOpsArea" checked> Operational Area Polygon</label>
+    <label class="export-check-row"><input type="checkbox" id="expWxData" checked> Weather Data</label>
+    <label class="export-check-row"><input type="checkbox" id="expWindData" checked> Wind Profile</label>
+    <label class="export-check-row"><input type="checkbox" id="expAirspace" checked> Airspace Info</label>
+    <label class="export-check-row"><input type="checkbox" id="expTerrain" checked> Terrain Data</label>
+    <label class="export-check-row"><input type="checkbox" id="expAstro" checked> Sun/Moon/Twilight</label>
+    <label class="export-check-row"><input type="checkbox" id="expNOTAMs" checked> NOTAMs/TFRs</label>
+    <label class="export-check-row"><input type="checkbox" id="expOps" checked> Ops/Battery Assessment</label>
+    <div class="modal-actions">
+      <button class="btn btn-primary" onclick="doExport()">Download KML</button>
+      <button class="btn btn-ghost" onclick="closeExport()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="missionLogModal">
+  <div class="modal" style="width:600px;max-height:85vh;">
+    <h3>Mission Log</h3>
+    <div id="missionLogList" style="overflow-y:auto;max-height:60vh;"></div>
+    <div class="modal-actions">
+      <button class="btn btn-primary" onclick="exportMissionLogsAsCSV()">Export CSV</button>
+      <button class="btn btn-ghost" onclick="closeMissionLogModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="auditTrailModal">
+  <div class="modal" style="width:600px;max-height:85vh;">
+    <h3>Audit Trail</h3>
+    <div id="auditTrailList" style="overflow-y:auto;max-height:60vh;"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeAuditTrailModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="kmlFileInput" accept=".kml,.kmz" style="display:none" onchange="handleKMLFile(this)">
+
+<script src="sar-preflight-offline.js"></script>
+<script src="sar-preflight-core.js"></script>
+<script src="sar-preflight-charts.js"></script>
+<script src="sar-preflight.js"></script>
+<!-- To build a single-file version for field deployment: node build.js -->
+
+<script>/* JS extracted to sar-preflight-core.js and sar-preflight.js — this block intentionally left empty */
+</script>
+</body>
+</html>

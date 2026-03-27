@@ -1,0 +1,13 @@
+{
+  "results": [
+    {"latitude": 38.685, "longitude": -120.99, "elevation": 579},
+    {"latitude": 38.705, "longitude": -120.97, "elevation": 612},
+    {"latitude": 38.705, "longitude": -121.01, "elevation": 548},
+    {"latitude": 38.665, "longitude": -120.97, "elevation": 590},
+    {"latitude": 38.665, "longitude": -121.01, "elevation": 521},
+    {"latitude": 38.685, "longitude": -120.97, "elevation": 601},
+    {"latitude": 38.685, "longitude": -121.01, "elevation": 534},
+    {"latitude": 38.705, "longitude": -120.99, "elevation": 580},
+    {"latitude": 38.665, "longitude": -120.99, "elevation": 556}
+  ]
+}
