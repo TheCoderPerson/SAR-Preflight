@@ -2560,10 +2560,81 @@ function computeOpsData() {
   bar.style.width = `${capacity}%`;
   bar.style.background = capacity > 85 ? 'var(--accent-green)' : capacity > 70 ? 'var(--accent-amber)' : 'var(--accent-red)';
 
-  const month = new Date().getMonth();
-  const birdRisk = (month >= 2 && month <= 6) ? 'Spring/summer nesting \u2014 watch for raptors near ridges and water' :
-                   (month >= 9 && month <= 11) ? 'Fall migration \u2014 moderate bird activity' : 'Winter \u2014 low bird activity';
-  setText('opsBirds', birdRisk);
+  // Multi-factor bird strike risk assessment
+  const now = new Date();
+  const month = now.getMonth();
+  const hour = now.getHours();
+  let birdScore = 0;
+  const factors = [];
+
+  // Season factor (0-3 points)
+  let seasonText, seasonLevel;
+  if (month >= 2 && month <= 6) {
+    birdScore += 3; seasonText = 'Nesting season (Mar-Jul)'; seasonLevel = 'red';
+  } else if (month >= 8 && month <= 10) {
+    birdScore += 2; seasonText = 'Fall migration (Sep-Nov)'; seasonLevel = 'amber';
+  } else if (month === 7) {
+    birdScore += 1; seasonText = 'Late summer — fledglings active'; seasonLevel = 'amber';
+  } else {
+    birdScore += 0; seasonText = 'Winter — low activity'; seasonLevel = 'green';
+  }
+  setText('opsBirdSeason', seasonText);
+  setColor('opsBirdSeason', seasonLevel);
+  if (birdScore >= 2) factors.push(seasonText.split(' \u2014')[0].split(' —')[0]);
+
+  // Time of day factor (0-2 points)
+  let timeText, timeLevel;
+  if ((hour >= 5 && hour <= 8) || (hour >= 16 && hour <= 19)) {
+    birdScore += 2; timeText = 'Dawn/dusk — peak activity'; timeLevel = 'red';
+    factors.push('Peak bird hours');
+  } else if (hour >= 9 && hour <= 15) {
+    birdScore += 1; timeText = 'Midday — moderate soaring'; timeLevel = 'amber';
+  } else {
+    birdScore += 0; timeText = 'Night — minimal risk'; timeLevel = 'green';
+  }
+  setText('opsBirdTime', timeText);
+  setColor('opsBirdTime', timeLevel);
+
+  // Water proximity factor (0-2 points) — check elevation data for low-lying flat areas
+  // Also check if terrain features indicate valleys/water corridors
+  let waterText = 'Unknown', waterLevel = 'amber';
+  const hasLowTerrain = S.elev && S.elev.min != null && S.elev.min < 500;
+  const hasWetlandTerrain = S.elev && S.elev.range != null && S.elev.range < 100 && S.elev.center < 1000;
+  const nearWater = S.protectedAreas && S.protectedAreas.dams && S.protectedAreas.dams.length > 0;
+  if (nearWater || hasWetlandTerrain) {
+    birdScore += 2; waterText = 'Water/wetland nearby — waterfowl likely'; waterLevel = 'red';
+    factors.push('Near water');
+  } else if (hasLowTerrain) {
+    birdScore += 1; waterText = 'Low terrain — possible watercourses'; waterLevel = 'amber';
+  } else {
+    birdScore += 0; waterText = 'No water features detected'; waterLevel = 'green';
+  }
+  setText('opsBirdWater', waterText);
+  setColor('opsBirdWater', waterLevel);
+
+  // Altitude factor (0-2 points) — most bird strikes below 500 ft AGL
+  let altText, altLevel;
+  const opAlt = parseInt(document.getElementById('cfgMaxAlt')?.value) || 400;
+  if (opAlt <= 200) {
+    birdScore += 2; altText = '\u2264200 ft AGL — high strike zone'; altLevel = 'red';
+    factors.push('Low altitude ops');
+  } else if (opAlt <= 400) {
+    birdScore += 1; altText = '200-400 ft AGL — moderate zone'; altLevel = 'amber';
+  } else {
+    birdScore += 0; altText = '>400 ft AGL — above most birds'; altLevel = 'green';
+  }
+  setText('opsBirdAlt', altText);
+  setColor('opsBirdAlt', altLevel);
+
+  // Overall risk rating
+  let riskLabel, riskLevel;
+  if (birdScore >= 7) { riskLabel = 'HIGH — aggressive bird encounters likely'; riskLevel = 'red'; }
+  else if (birdScore >= 4) { riskLabel = 'MODERATE — maintain visual watch'; riskLevel = 'amber'; }
+  else { riskLabel = 'LOW — standard awareness'; riskLevel = 'green'; }
+  setText('opsBirdRisk', riskLabel);
+  setColor('opsBirdRisk', riskLevel);
+  setText('opsBirds', factors.length > 0 ? factors.join(' \u2022 ') : 'No elevated risk factors');
+  setColor('opsBirds', birdScore >= 4 ? 'amber' : 'green');
 
   // Battery swap recommendation
   if (typeof calcSwapRecommendation === 'function') {
