@@ -610,7 +610,15 @@ async function fetchKpIndex() {
   try {
     const res = await fetch('https://services.swpc.noaa.gov/products/noaa-planetary-k-index-forecast.json');
     const data = await res.json();
-    const kp = parseFloat(data[1]?.[1]) || 2;
+    // Find the entry closest to current time (row 0 is headers)
+    const now = Date.now();
+    let kp = 2;
+    let bestDiff = Infinity;
+    for (let i = 1; i < data.length; i++) {
+      const t = new Date(data[i][0] + ' UTC').getTime();
+      const diff = Math.abs(now - t);
+      if (diff < bestDiff) { bestDiff = diff; kp = parseFloat(data[i][1]) || 2; }
+    }
     setText('wxKp', kp.toFixed(1));
     setColor('wxKp', kp <= 3 ? 'green' : kp <= 5 ? 'amber' : 'red');
     setText('satKp', kp.toFixed(1));
