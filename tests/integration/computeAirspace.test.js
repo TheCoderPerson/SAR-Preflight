@@ -158,8 +158,8 @@ describe('computeAirspace(lat, lng)', () => {
       computeAirspace(lat, lng);
       const text = document.getElementById('airNearAirport').textContent;
       expect(text).toBeTruthy();
-      // Should contain an ICAO code (could be airport or heliport)
-      expect(text).toMatch(/[A-Z]{2,4}/);
+      // Should contain an ICAO/FAA code (e.g., KPVF or O61)
+      expect(text).toMatch(/[A-Z0-9]{2,4}/);
     });
 
     it('distance is more than 5 nm (> 9.26 km)', () => {

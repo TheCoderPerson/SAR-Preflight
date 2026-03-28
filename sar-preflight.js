@@ -127,6 +127,15 @@ function initMap() {
   });
   L.control.zoom({ position: 'bottomright' }).addTo(S.map);
 
+  // Center map on device location if available
+  if (navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition(
+      pos => S.map.setView([pos.coords.latitude, pos.coords.longitude], 11),
+      () => { /* denied or unavailable — keep default center */ },
+      { timeout: 5000, maximumAge: 300000 }
+    );
+  }
+
   // Start with panel collapsed on mobile
   if (window.innerWidth <= 900) {
     S.panelOpen = false;

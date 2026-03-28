@@ -211,6 +211,7 @@ const AIRPORTS_CA = [
   { icao: 'KSBP', name: 'San Luis Obispo County Regional', type: 'medium_airport', lat: 35.2368, lng: -120.6424, elevation_ft: 212, municipality: 'San Luis Obispo' },
 
   // Small airports — El Dorado / foothill area
+  { icao: 'O61', name: 'Cameron Airpark', type: 'small_airport', lat: 38.6838, lng: -120.9871, elevation_ft: 1286, municipality: 'Cameron Park' },
   { icao: 'KPVF', name: 'Placerville Airport', type: 'small_airport', lat: 38.7243, lng: -120.7533, elevation_ft: 2585, municipality: 'Placerville' },
   { icao: 'KGOO', name: 'Georgetown Airport', type: 'small_airport', lat: 38.8916, lng: -120.8624, elevation_ft: 2620, municipality: 'Georgetown' },
   { icao: 'KTRK', name: 'Truckee-Tahoe Airport', type: 'small_airport', lat: 39.3200, lng: -120.1396, elevation_ft: 5900, municipality: 'Truckee' },
