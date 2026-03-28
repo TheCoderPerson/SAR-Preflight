@@ -3,10 +3,23 @@ Object.assign(globalThis, core);
 
 globalThis.L = { map: vi.fn(), tileLayer: vi.fn(), control: { zoom: vi.fn() }, Draw: { Event: {} }, FeatureGroup: vi.fn() };
 
-const { computeAirspace } = require('../../sar-preflight.js');
+const { computeAirspace, S } = require('../../sar-preflight.js');
+
+// Inline test airports for dynamic airport system
+const TEST_AIRPORTS = [
+  { icao: 'KSMF', name: 'Sacramento International', type: 'large_airport', lat: 38.6954, lng: -121.5908, elevation_ft: 27, municipality: 'Sacramento' },
+  { icao: 'KSAC', name: 'Sacramento Executive', type: 'medium_airport', lat: 38.5125, lng: -121.4935, elevation_ft: 24, municipality: 'Sacramento' },
+  { icao: 'KMCC', name: 'McClellan Airfield', type: 'medium_airport', lat: 38.6676, lng: -121.4008, elevation_ft: 77, municipality: 'McClellan' },
+  { icao: 'KPVF', name: 'Placerville Airport', type: 'small_airport', lat: 38.7243, lng: -120.7533, elevation_ft: 2585, municipality: 'Placerville' },
+  { icao: 'KTRK', name: 'Truckee-Tahoe Airport', type: 'small_airport', lat: 39.3200, lng: -120.1396, elevation_ft: 5900, municipality: 'Truckee' },
+  { icao: 'O61', name: 'Cameron Airpark', type: 'small_airport', lat: 38.6838, lng: -120.9871, elevation_ft: 1286, municipality: 'Cameron Park' },
+  { icao: 'CA23', name: 'UC Davis Medical Center Heliport', type: 'heliport', lat: 38.5530, lng: -121.4560, elevation_ft: 50, municipality: 'Sacramento' },
+  { icao: 'CA68', name: 'Marshall Medical Center Heliport', type: 'heliport', lat: 38.7340, lng: -120.7890, elevation_ft: 1860, municipality: 'Placerville' },
+];
 
 describe('computeAirspace(lat, lng)', () => {
   beforeEach(() => {
+    S.nearbyAirports = TEST_AIRPORTS;
     document.body.innerHTML = `
       <span id="airClass"></span>
       <span id="airLAANC"></span>

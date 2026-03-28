@@ -180,61 +180,6 @@ function estimateCellCoverage(centerElevFt) {
   return { label: 'Likely available', level: 'green' };
 }
 
-// --- California Airports / Heliports Dataset ---
-
-const AIRPORTS_CA = [
-  // Large airports
-  { icao: 'KSMF', name: 'Sacramento International', type: 'large_airport', lat: 38.6954, lng: -121.5908, elevation_ft: 27, municipality: 'Sacramento' },
-  { icao: 'KSFO', name: 'San Francisco International', type: 'large_airport', lat: 37.6213, lng: -122.3790, elevation_ft: 13, municipality: 'San Francisco' },
-  { icao: 'KOAK', name: 'Oakland International', type: 'large_airport', lat: 37.7213, lng: -122.2208, elevation_ft: 9, municipality: 'Oakland' },
-  { icao: 'KSJC', name: 'San Jose International', type: 'large_airport', lat: 37.3626, lng: -121.9291, elevation_ft: 62, municipality: 'San Jose' },
-  { icao: 'KLAX', name: 'Los Angeles International', type: 'large_airport', lat: 33.9425, lng: -118.4081, elevation_ft: 128, municipality: 'Los Angeles' },
-  { icao: 'KSAN', name: 'San Diego International', type: 'large_airport', lat: 32.7336, lng: -117.1897, elevation_ft: 17, municipality: 'San Diego' },
-  { icao: 'KONT', name: 'Ontario International', type: 'large_airport', lat: 34.0560, lng: -117.6012, elevation_ft: 944, municipality: 'Ontario' },
-  { icao: 'KBUR', name: 'Hollywood Burbank', type: 'large_airport', lat: 34.2007, lng: -118.3585, elevation_ft: 778, municipality: 'Burbank' },
-  { icao: 'KSNA', name: 'John Wayne Airport', type: 'large_airport', lat: 33.6757, lng: -117.8683, elevation_ft: 56, municipality: 'Santa Ana' },
-  { icao: 'KFAT', name: 'Fresno Yosemite International', type: 'large_airport', lat: 36.7762, lng: -119.7181, elevation_ft: 336, municipality: 'Fresno' },
-
-  // Medium airports — Sacramento / El Dorado area
-  { icao: 'KSAC', name: 'Sacramento Executive', type: 'medium_airport', lat: 38.5125, lng: -121.4935, elevation_ft: 24, municipality: 'Sacramento' },
-  { icao: 'KMCC', name: 'McClellan Airfield', type: 'medium_airport', lat: 38.6676, lng: -121.4008, elevation_ft: 77, municipality: 'McClellan' },
-  { icao: 'KMHR', name: 'Mather Airport', type: 'medium_airport', lat: 38.5539, lng: -121.2978, elevation_ft: 98, municipality: 'Mather' },
-  { icao: 'KAUN', name: 'Auburn Municipal', type: 'medium_airport', lat: 38.9548, lng: -121.0822, elevation_ft: 1539, municipality: 'Auburn' },
-  { icao: 'KLHM', name: 'Lincoln Regional', type: 'medium_airport', lat: 38.9092, lng: -121.3513, elevation_ft: 121, municipality: 'Lincoln' },
-  { icao: 'KRNQ', name: 'Rio Linda', type: 'medium_airport', lat: 38.7084, lng: -121.4485, elevation_ft: 38, municipality: 'Rio Linda' },
-
-  // Medium airports — other California
-  { icao: 'KRNO', name: 'Reno-Tahoe International', type: 'medium_airport', lat: 39.4991, lng: -119.7681, elevation_ft: 4415, municipality: 'Reno' },
-  { icao: 'KMOD', name: 'Modesto City-County', type: 'medium_airport', lat: 37.6258, lng: -120.9544, elevation_ft: 97, municipality: 'Modesto' },
-  { icao: 'KSTS', name: 'Charles M. Schulz Sonoma County', type: 'medium_airport', lat: 38.5090, lng: -122.8127, elevation_ft: 128, municipality: 'Santa Rosa' },
-  { icao: 'KRDD', name: 'Redding Municipal', type: 'medium_airport', lat: 40.5090, lng: -122.2934, elevation_ft: 505, municipality: 'Redding' },
-  { icao: 'KSBP', name: 'San Luis Obispo County Regional', type: 'medium_airport', lat: 35.2368, lng: -120.6424, elevation_ft: 212, municipality: 'San Luis Obispo' },
-
-  // Small airports — El Dorado / foothill area
-  { icao: 'O61', name: 'Cameron Airpark', type: 'small_airport', lat: 38.6838, lng: -120.9871, elevation_ft: 1286, municipality: 'Cameron Park' },
-  { icao: 'KPVF', name: 'Placerville Airport', type: 'small_airport', lat: 38.7243, lng: -120.7533, elevation_ft: 2585, municipality: 'Placerville' },
-  { icao: 'KGOO', name: 'Georgetown Airport', type: 'small_airport', lat: 38.8916, lng: -120.8624, elevation_ft: 2620, municipality: 'Georgetown' },
-  { icao: 'KTRK', name: 'Truckee-Tahoe Airport', type: 'small_airport', lat: 39.3200, lng: -120.1396, elevation_ft: 5900, municipality: 'Truckee' },
-  { icao: 'KCPU', name: 'Calaveras County Airport', type: 'small_airport', lat: 38.1462, lng: -120.6480, elevation_ft: 2770, municipality: 'San Andreas' },
-  { icao: 'KJAQ', name: 'Westover Field', type: 'small_airport', lat: 38.1538, lng: -120.5064, elevation_ft: 1698, municipality: 'Jackson' },
-  { icao: 'KCIC', name: 'Chico Municipal', type: 'small_airport', lat: 39.7954, lng: -121.8584, elevation_ft: 240, municipality: 'Chico' },
-  { icao: 'KMYV', name: 'Yuba County Airport', type: 'small_airport', lat: 39.0978, lng: -121.5697, elevation_ft: 64, municipality: 'Marysville' },
-  { icao: 'KOVE', name: 'Oroville Municipal', type: 'small_airport', lat: 39.4878, lng: -121.6219, elevation_ft: 192, municipality: 'Oroville' },
-  { icao: 'KHWD', name: 'Hayward Executive', type: 'small_airport', lat: 37.6592, lng: -122.1217, elevation_ft: 47, municipality: 'Hayward' },
-  { icao: 'KCCR', name: 'Buchanan Field', type: 'small_airport', lat: 37.9897, lng: -122.0569, elevation_ft: 23, municipality: 'Concord' },
-  { icao: 'KLVK', name: 'Livermore Municipal', type: 'small_airport', lat: 37.6934, lng: -121.8204, elevation_ft: 400, municipality: 'Livermore' },
-  { icao: 'KTVL', name: 'Lake Tahoe Airport', type: 'small_airport', lat: 38.8937, lng: -119.9953, elevation_ft: 6264, municipality: 'South Lake Tahoe' },
-
-  // Heliports — Sacramento / El Dorado area hospitals & SAR
-  { icao: 'CA23', name: 'UC Davis Medical Center Heliport', type: 'heliport', lat: 38.5530, lng: -121.4560, elevation_ft: 50, municipality: 'Sacramento' },
-  { icao: 'CA49', name: 'Mercy San Juan Medical Center Heliport', type: 'heliport', lat: 38.6870, lng: -121.3280, elevation_ft: 120, municipality: 'Carmichael' },
-  { icao: 'CA50', name: 'Sutter Medical Center Heliport', type: 'heliport', lat: 38.5680, lng: -121.4620, elevation_ft: 50, municipality: 'Sacramento' },
-  { icao: 'CA68', name: 'Marshall Medical Center Heliport', type: 'heliport', lat: 38.7340, lng: -120.7890, elevation_ft: 1860, municipality: 'Placerville' },
-  { icao: 'CA92', name: 'Barton Memorial Hospital Heliport', type: 'heliport', lat: 38.9127, lng: -119.9984, elevation_ft: 6250, municipality: 'South Lake Tahoe' },
-  { icao: 'CA37', name: 'Kaiser Roseville Heliport', type: 'heliport', lat: 38.7430, lng: -121.2740, elevation_ft: 160, municipality: 'Roseville' },
-  { icao: 'CL02', name: 'Mercy General Hospital Heliport', type: 'heliport', lat: 38.5633, lng: -121.4352, elevation_ft: 40, municipality: 'Sacramento' },
-];
-
 // --- Airport Distance Filter (haversine-based) ---
 
 function filterAirportsByDistance(airports, lat, lng, maxDistKm) {
@@ -939,7 +884,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcDensityAltitude, calcBatteryDerating, assessRisk,
     DEFAULT_THRESHOLDS, TRAINING_SCENARIOS,
     classifyTerrain, estimateVegetation, estimateCellCoverage,
-    AIRPORTS_CA, filterAirportsByDistance, classifyAirspace,
+    filterAirportsByDistance, classifyAirspace,
     calcGustFactor, calcWindShear,
     generateElevationGrid, calcSlopeFromGrid, calcAspect,
     detectTerrainFeatures, scoreLZFitness, findEmergencyLZs,

@@ -14,6 +14,7 @@ const ENDPOINT_TTL = {
   elevation:  7 * 24 * 60 * 60000,  // 7 days
   sunrise:    24 * 60 * 60 * 1000,  // 24 hr
   overpass:   7 * 24 * 60 * 60000,  // 7 days
+  airports:   7 * 24 * 60 * 60000,  // 7 days
   nws:        15 * 60 * 1000,       // 15 min
   radar_meta: 5 * 60 * 1000,        // 5 min
 };

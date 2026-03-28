@@ -302,10 +302,7 @@ async function processArea(layer, type) {
   // Show active tab
   switchTab(S.activeTab);
 
-  // Render airport markers (sync — from local dataset)
-  renderAirportMarkers(center.lat, center.lng);
-
-  // Fetch all data in parallel
+  // Fetch all data in parallel (airports are now dynamic via Overpass)
   await Promise.allSettled([
     fetchWeather(center.lat, center.lng),
     fetchElevation(center, bounds),
@@ -315,6 +312,7 @@ async function processArea(layer, type) {
     fetchNWSAlerts(center.lat, center.lng),
     fetchRadar(),
     fetchFAAairspace(bounds),
+    fetchNearbyAirports(center, bounds),
     fetchProtectedAreas(bounds),
     fetchFireDanger(center.lat, center.lng, bounds),
   ]);
@@ -351,6 +349,7 @@ async function retryFailedSource(source) {
     'FAA Airspace': () => fetchFAAairspace(bounds),
     'Protected Areas': () => fetchProtectedAreas(bounds),
     'Fire Danger': () => fetchFireDanger(lat, lng, bounds),
+    'Airports': () => fetchNearbyAirports(S.areaCenter, bounds),
   };
   const fn = retryMap[source];
   if (fn) {
@@ -1302,8 +1301,8 @@ function renderFireDangerCard(fires, danger, lat, lng) {
 }
 
 function computeAirspace(lat, lng) {
-  // Always compute nearest airport from local dataset (for nearest airport/heliport display)
-  const nearby = filterAirportsByDistance(AIRPORTS_CA, lat, lng, 100);
+  // Compute nearest airport from dynamically fetched data
+  const nearby = filterAirportsByDistance(S.nearbyAirports || [], lat, lng, 100);
   const nearest = nearby.length > 0 ? nearby[0] : null;
   const nearDist = nearest ? nearest.distKm : Infinity;
   const nearNm = (nearDist * 0.539957).toFixed(1);
@@ -1435,6 +1434,132 @@ function computeAirspace(lat, lng) {
 }
 
 // ============================================================
+// DYNAMIC AIRPORT QUERY VIA OVERPASS
+// ============================================================
+async function fetchNearbyAirports(center, bounds) {
+  trackFetchStart('Airports');
+  try {
+    const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+    const pad = 0.8; // ~55nm buffer for airport search
+    const bbox = `${sw.lat - pad},${sw.lng - pad},${ne.lat + pad},${ne.lng + pad}`;
+    const cacheKey = typeof areaKey === 'function' ? areaKey(center.lat, center.lng) : `${center.lat.toFixed(3)}_${center.lng.toFixed(3)}`;
+
+    // Try cached first
+    if (typeof getCachedApiResponse === 'function') {
+      const cached = await getCachedApiResponse('airports', cacheKey);
+      if (cached && cached.data && cached.status !== 'expired') {
+        S.nearbyAirports = _parseOverpassAirports(cached.data);
+        renderAirportMarkers(center.lat, center.lng);
+        computeAirspace(center.lat, center.lng);
+        clearDataSourceError('Airports');
+        trackFetchEnd('Airports');
+        return;
+      }
+    }
+
+    const query = `[out:json][timeout:30];(`
+      + `nwr["aeroway"="aerodrome"](${bbox});`
+      + `nwr["aeroway"="helipad"](${bbox});`
+      + `);out body center;`;
+
+    const overpassServers = [
+      'https://overpass-api.de/api/interpreter',
+      'https://overpass.kumi.systems/api/interpreter',
+      'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+    ];
+    let data = null;
+    for (const server of overpassServers) {
+      try {
+        const res = await fetch(server, {
+          method: 'POST',
+          body: 'data=' + encodeURIComponent(query),
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        data = await res.json();
+        break;
+      } catch (e) {
+        console.warn(`Overpass airport mirror ${server} failed:`, e.message);
+        if (server === overpassServers[overpassServers.length - 1]) throw e;
+      }
+    }
+
+    S.nearbyAirports = _parseOverpassAirports(data);
+
+    // Cache results
+    if (typeof cacheApiResponse === 'function') cacheApiResponse('airports', cacheKey, data);
+
+    renderAirportMarkers(center.lat, center.lng);
+    computeAirspace(center.lat, center.lng);
+    clearDataSourceError('Airports');
+  } catch (err) {
+    console.warn('Airport fetch failed:', err);
+    recordDataSourceError('Airports', err);
+    S.nearbyAirports = [];
+  } finally {
+    trackFetchEnd('Airports');
+  }
+}
+
+function _parseOverpassAirports(data) {
+  if (!data || !data.elements) return [];
+  const airports = [];
+  const seen = new Set();
+
+  data.elements.forEach(el => {
+    const tags = el.tags || {};
+    const isHelipad = tags.aeroway === 'helipad';
+    const isAerodrome = tags.aeroway === 'aerodrome';
+    if (!isHelipad && !isAerodrome) return;
+
+    // Get coordinates (node has lat/lon directly, way/relation uses center)
+    const lat = el.lat || el.center?.lat;
+    const lng = el.lon || el.center?.lon;
+    if (!lat || !lng) return;
+
+    // Deduplicate by coordinate proximity
+    const coordKey = `${lat.toFixed(4)}_${lng.toFixed(4)}`;
+    if (seen.has(coordKey)) return;
+    seen.add(coordKey);
+
+    // Determine identifier
+    const icao = tags.icao || tags.ref || tags.faa || tags['ref:ICAO'] || '';
+    const name = tags.name || tags['name:en'] || (isHelipad ? 'Helipad' : 'Airfield');
+
+    // Determine type
+    let type;
+    if (isHelipad) {
+      type = 'heliport';
+    } else if (tags.iata) {
+      type = 'large_airport';
+    } else if (icao.match(/^K[A-Z]{3}$/) || tags['aerodrome:type'] === 'regional' || tags['aerodrome:type'] === 'international') {
+      type = 'medium_airport';
+    } else {
+      type = 'small_airport';
+    }
+
+    // Elevation
+    let elevation_ft = 0;
+    if (tags.ele) {
+      const m = parseFloat(tags.ele);
+      if (!isNaN(m)) elevation_ft = Math.round(m * 3.28084);
+    }
+
+    airports.push({
+      icao: icao || `OSM${el.id}`,
+      name,
+      type,
+      lat,
+      lng,
+      elevation_ft,
+      municipality: tags['addr:city'] || tags['addr:municipality'] || '',
+    });
+  });
+
+  return airports;
+}
+
+// ============================================================
 // AIRPORT MARKERS ON MAP
 // ============================================================
 function renderAirportMarkers(lat, lng) {
@@ -1444,7 +1569,7 @@ function renderAirportMarkers(lat, lng) {
     S.mapLayers.airports.clearLayers();
   }
 
-  const nearby = filterAirportsByDistance(AIRPORTS_CA, lat, lng, 55);
+  const nearby = filterAirportsByDistance(S.nearbyAirports || [], lat, lng, 55);
 
   nearby.forEach(a => {
     const distNm = (a.distKm * 0.539957).toFixed(1);
@@ -1477,8 +1602,8 @@ function renderAirportMarkers(lat, lng) {
       `<div style="font-family:var(--font-mono,monospace);font-size:12px;">` +
       `<b style="color:${color}">${a.icao}</b> — ${a.name}<br>` +
       `<span style="opacity:0.7">${typeLabel}</span><br>` +
-      `Elev: ${a.elevation_ft.toLocaleString()} ft<br>` +
-      `${a.municipality}<br>` +
+      (a.elevation_ft ? `Elev: ${a.elevation_ft.toLocaleString()} ft<br>` : '') +
+      (a.municipality ? `${a.municipality}<br>` : '') +
       `<b>${distNm} nm</b> from area center</div>`
     );
 
@@ -4486,6 +4611,7 @@ if (typeof module !== 'undefined' && module.exports) {
     recordDataSourceError, clearDataSourceError, retryFailedSource, retryAllFailed, showDataSourceStatus,
     setAutoRefresh, loadFAAChart, removeChart, clearAllCharts, updateChartList, restoreFAACharts,
     fetchFireDanger, renderFirePerimeters, renderFireDangerCard,
+    fetchNearbyAirports,
     initTimeBar, hideTimeBar,
     renderTerrainFeatures, renderLZMarkers, generateAndRenderFlightPlan,
     // Phase 6: SOP Profiles, Mission Logging, Training Mode, Audit Trail
