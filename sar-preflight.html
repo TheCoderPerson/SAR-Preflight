@@ -387,6 +387,18 @@ select.api-input { cursor: pointer; }
 .fetch-status.cached { background: rgba(245,158,11,0.15); color: var(--accent-amber); }
 .fetch-status.expired { background: rgba(239,68,68,0.15); color: var(--accent-red); animation: pulse 1.5s infinite; }
 
+/* ADS-B Traffic */
+.adsb-row { cursor: pointer; transition: background 0.15s; }
+.adsb-row:hover td { background: var(--bg-elevated) !important; }
+.adsb-emergency-card {
+  background: var(--bg-tertiary); border-left: 3px solid var(--accent-red);
+  border-radius: 6px; padding: 8px 12px; margin-bottom: 6px;
+  font-family: var(--font-mono); font-size: 12px;
+}
+.adsb-list-table { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 11px; }
+.adsb-list-table th { text-align: left; padding: 4px 6px; color: var(--text-muted); font-weight: 500; border-bottom: 1px solid var(--border); }
+.adsb-list-table td { padding: 4px 6px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+
 /* Export Modal */
 .modal-overlay {
   position: fixed; top: 0; left: 0; right: 0; bottom: 0;
@@ -556,6 +568,7 @@ select.api-input { cursor: pointer; }
         <button class="tab-btn active" data-tab="wx" onclick="switchTab('wx')">Weather</button>
         <button class="tab-btn" data-tab="wind" onclick="switchTab('wind')">Wind</button>
         <button class="tab-btn" data-tab="airspace" onclick="switchTab('airspace')">Airspace</button>
+        <button class="tab-btn" data-tab="traffic" onclick="switchTab('traffic')">Traffic</button>
         <button class="tab-btn" data-tab="terrain" onclick="switchTab('terrain')">Terrain</button>
         <button class="tab-btn" data-tab="astro" onclick="switchTab('astro')">Sun/Moon</button>
         <button class="tab-btn" data-tab="sats" onclick="switchTab('sats')">GNSS</button>
@@ -684,6 +697,32 @@ select.api-input { cursor: pointer; }
             <div class="data-cell full"><div class="data-label">NS UAS Restrictions</div><div class="data-value sm" id="airNSRestrict">None</div></div>
             <div class="data-cell"><div class="data-label">Heliports Nearby</div><div class="data-value sm" id="airHeliports">--</div></div>
           </div>
+        </div>
+      </div>
+
+      <!-- Traffic Tab -->
+      <div id="tab-traffic" class="tab-panel" style="display:none;">
+        <div class="data-section">
+          <div class="data-section-title">
+            <div class="indicator" style="background:var(--accent-cyan)"></div>Live ADS-B Traffic
+            <span class="fetch-status" id="adsbStatus"></span>
+          </div>
+          <div class="data-grid">
+            <div class="data-cell"><div class="data-label">Aircraft Tracked</div><div class="data-value" id="adsbCount">--</div></div>
+            <div class="data-cell"><div class="data-label">Search Radius</div><div class="data-value sm" id="adsbRadius">-- nm</div></div>
+            <div class="data-cell"><div class="data-label">Nearest Aircraft</div><div class="data-value sm" id="adsbNearest">--</div></div>
+            <div class="data-cell"><div class="data-label">Nearest Alt AGL</div><div class="data-value sm" id="adsbNearestAlt">--</div></div>
+            <div class="data-cell"><div class="data-label">Low Alt &lt;500 AGL</div><div class="data-value" id="adsbLowCount">--</div></div>
+            <div class="data-cell"><div class="data-label">Data Source</div><div class="data-value sm" id="adsbSource">--</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>Emergency Alerts</div>
+          <div id="adsbEmergencyList" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);">No emergency squawks detected</div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-purple)"></div>Aircraft List</div>
+          <div id="adsbAircraftList" style="max-height:400px;overflow-y:auto;font-family:var(--font-mono);font-size:11px;color:var(--text-muted);">Draw an area to track nearby aircraft</div>
         </div>
       </div>
 
@@ -898,6 +937,16 @@ select.api-input { cursor: pointer; }
               <option value="30">Every 30 min</option>
               <option value="60">Every 60 min</option>
             </select>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Live ADS-B Traffic</div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <select class="api-input" id="cfgAdsbEnabled" onchange="toggleAdsbPolling()" style="flex:1;">
+                <option value="1" selected>Enabled (5s poll)</option>
+                <option value="0">Disabled</option>
+              </select>
+              <span id="adsbPollStatus" style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);">Idle</span>
+            </div>
           </div>
         </div>
         <div class="data-section">

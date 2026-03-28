@@ -876,6 +876,77 @@ const TRAINING_SCENARIOS = [
   },
 ];
 
+// ============================================================
+// ADS-B HELPERS
+// ============================================================
+
+/**
+ * Compute search radius (NM) from operational area bounds + 10 NM buffer.
+ * Uses point+radius API format — finds farthest corner from center.
+ */
+function computeAdsbSearchRadius(centerLat, centerLng, ne, sw) {
+  const corners = [
+    [ne.lat, ne.lng],           // NE
+    [ne.lat, sw.lng],           // NW
+    [sw.lat, ne.lng],           // SE
+    [sw.lat, sw.lng],           // SW
+  ];
+  let maxKm = 0;
+  for (const [lat, lng] of corners) {
+    const d = haversine(centerLat, centerLng, lat, lng);
+    if (d > maxKm) maxKm = d;
+  }
+  const nm = maxKm / 1.852;
+  const buffered = nm + 10;   // 10 NM buffer for approaching aircraft
+  return Math.ceil(Math.min(Math.max(buffered, 15), 50));
+}
+
+/**
+ * Parse raw ADS-B API response into normalized, sorted aircraft array.
+ * Filters stale positions, computes distance and AGL.
+ */
+function parseAdsbAircraft(acArray, centerLat, centerLng, groundElevFt) {
+  if (!Array.isArray(acArray)) return [];
+  return acArray
+    .filter(ac => ac.lat != null && ac.lon != null && (ac.seen_pos == null || ac.seen_pos <= 60))
+    .map(ac => {
+      const altBaro = ac.alt_baro === 'ground' ? 0 : (typeof ac.alt_baro === 'number' ? ac.alt_baro : null);
+      const altGeom = typeof ac.alt_geom === 'number' ? ac.alt_geom : null;
+      const alt = altBaro != null ? altBaro : (altGeom != null ? altGeom : 0);
+      const agl = Math.max(0, alt - (groundElevFt || 0));
+      const distKm = haversine(centerLat, centerLng, ac.lat, ac.lon);
+      return {
+        hex: ac.hex || '',
+        flight: (ac.flight || '').trim(),
+        reg: ac.r || '',
+        type: ac.t || '',
+        lat: ac.lat,
+        lon: ac.lon,
+        alt_baro: altBaro,
+        alt_geom: altGeom,
+        agl: Math.round(agl),
+        gs: ac.gs != null ? ac.gs : null,
+        track: ac.track != null ? ac.track : null,
+        baro_rate: ac.baro_rate != null ? ac.baro_rate : null,
+        squawk: ac.squawk || '',
+        emergency: ac.emergency || 'none',
+        seen: ac.seen != null ? ac.seen : null,
+        seen_pos: ac.seen_pos != null ? ac.seen_pos : null,
+        distNm: +(distKm / 1.852).toFixed(1),
+      };
+    })
+    .sort((a, b) => a.distNm - b.distNm);
+}
+
+/**
+ * Format AGL altitude for compact icon labels.
+ */
+function formatAltitudeAgl(aglFt) {
+  if (aglFt <= 0) return 'GND';
+  if (aglFt < 1000) return String(Math.round(aglFt));
+  return (aglFt / 1000).toFixed(1) + 'k';
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -890,5 +961,6 @@ if (typeof module !== 'undefined' && module.exports) {
     detectTerrainFeatures, scoreLZFitness, findEmergencyLZs,
     assessTerrainTurbulence, analyzeGPSMasking,
     calcSwapRecommendation, generateSearchPattern,
+    computeAdsbSearchRadius, parseAdsbAircraft, formatAltitudeAgl,
   };
 }

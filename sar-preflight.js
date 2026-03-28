@@ -23,7 +23,21 @@ const S = {
   activeProfile: null,
   // Training mode flag
   _trainingMode: false,
+  // ADS-B live traffic
+  adsbAircraft: [],
+  adsbTrails: {},
+  adsbSearchRadiusNm: null,
+  _adsbPollTimer: null,
+  _adsbLastFetch: 0,
+  _adsbApiIndex: 0,
+  _adsbEnabled: true,
 };
+
+const ADSB_APIS = [
+  { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
+  { name: 'airplanes.live', url: (lat, lon, dist) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${dist}` },
+  { name: 'adsb.lol',       url: (lat, lon, dist) => `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
+];
 
 // Local timezone helper (avoids hardcoding America/Los_Angeles)
 function _localTZ() {
@@ -190,6 +204,7 @@ function startDraw(type) {
 }
 function clearDrawBtns() { document.querySelectorAll('.draw-btn').forEach(b => b.classList.remove('active')); }
 function clearArea() {
+  stopAdsbPolling();
   S.drawnItems.clearLayers(); S.currentArea = null; S.areaCenter = null;
   Object.keys(WIRE_CATEGORIES).forEach(k => { if (S.mapLayers['wire_' + k]) S.mapLayers['wire_' + k].clearLayers(); });
   if (S.mapLayers.airports) S.mapLayers.airports.clearLayers();
@@ -324,6 +339,10 @@ async function processArea(layer, type) {
     fetchFireDanger(center.lat, center.lng, bounds),
   ]);
 
+  // Start ADS-B polling (needs elevation data for AGL)
+  stopAdsbPolling();
+  startAdsbPolling();
+
   // Compute derived data after fetches complete
   computeOpsData();
   computeAssessment();
@@ -357,6 +376,7 @@ async function retryFailedSource(source) {
     'Protected Areas': () => fetchProtectedAreas(bounds),
     'Fire Danger': () => fetchFireDanger(lat, lng, bounds),
     'Airports': () => fetchNearbyAirports(S.areaCenter, bounds),
+    'ADS-B': () => fetchAdsb(),
   };
   const fn = retryMap[source];
   if (fn) {
@@ -2396,6 +2416,280 @@ function updateRadarTime() {
 }
 
 // ============================================================
+// ADS-B LIVE TRAFFIC
+// ============================================================
+
+async function fetchAdsb() {
+  if (!S.areaCenter || !S.adsbSearchRadiusNm) return;
+  trackFetchStart('ADS-B');
+  setStatus('adsbStatus', 'loading', 'Polling...');
+  try {
+    const lat = S.areaCenter.lat.toFixed(4);
+    const lon = S.areaCenter.lng.toFixed(4);
+    const dist = S.adsbSearchRadiusNm;
+    let json = null;
+    let lastErr = null;
+    let usedApi = null;
+    for (let attempt = 0; attempt < ADSB_APIS.length; attempt++) {
+      const idx = (S._adsbApiIndex + attempt) % ADSB_APIS.length;
+      const api = ADSB_APIS[idx];
+      try {
+        const res = await fetch(api.url(lat, lon, dist));
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        json = await res.json();
+        S._adsbApiIndex = idx;
+        usedApi = api.name;
+        break;
+      } catch (e) {
+        lastErr = e;
+        console.warn(`ADS-B ${api.name} failed:`, e.message);
+      }
+    }
+    if (!json) throw lastErr || new Error('All ADS-B APIs failed');
+    const groundElev = S.elev?.center ?? 0;
+    const aircraft = parseAdsbAircraft(json.ac || [], S.areaCenter.lat, S.areaCenter.lng, groundElev);
+    S.adsbAircraft = aircraft;
+    S._adsbLastFetch = Date.now();
+    updateAdsbTrails(aircraft);
+    renderAdsbMap();
+    renderAdsbTab(usedApi);
+    clearDataSourceError('ADS-B');
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: _localTZ() });
+    setStatus('adsbStatus', 'live', aircraft.length + ' AIRCRAFT \u2022 ' + timeStr);
+    const pollEl = document.getElementById('adsbPollStatus');
+    if (pollEl) pollEl.textContent = 'Updated ' + timeStr;
+  } catch (err) {
+    recordDataSourceError('ADS-B', err);
+    setStatus('adsbStatus', 'error', 'FETCH ERROR');
+  } finally {
+    trackFetchEnd('ADS-B');
+  }
+}
+
+function updateAdsbTrails(aircraft) {
+  const now = Date.now();
+  const cutoff = now - 15 * 60 * 1000;
+  const activeHexes = new Set();
+  for (const ac of aircraft) {
+    if (!ac.hex) continue;
+    activeHexes.add(ac.hex);
+    if (!S.adsbTrails[ac.hex]) S.adsbTrails[ac.hex] = [];
+    const trail = S.adsbTrails[ac.hex];
+    // Only append if position changed from last entry
+    const last = trail[trail.length - 1];
+    if (!last || last.lat !== ac.lat || last.lon !== ac.lon) {
+      trail.push({ lat: ac.lat, lon: ac.lon, alt: ac.alt_baro, time: now });
+    }
+    // Prune entries older than 15 min
+    while (trail.length > 0 && trail[0].time < cutoff) trail.shift();
+  }
+  // Clean up trails for aircraft no longer present
+  for (const hex of Object.keys(S.adsbTrails)) {
+    if (!activeHexes.has(hex)) {
+      const trail = S.adsbTrails[hex];
+      while (trail.length > 0 && trail[0].time < cutoff) trail.shift();
+      if (trail.length === 0) delete S.adsbTrails[hex];
+    }
+  }
+}
+
+function adsbAglColor(agl) {
+  if (agl <= 0) return '#556677';
+  if (agl < 500) return '#ef4444';
+  if (agl < 1500) return '#f59e0b';
+  return '#22c55e';
+}
+
+function renderAdsbMap() {
+  if (!S.map) return;
+  // Ensure layer groups exist — track if first creation for layer control rebuild
+  let needsLayerControlRebuild = false;
+  if (!S.mapLayers.adsb_aircraft) {
+    S.mapLayers.adsb_aircraft = L.layerGroup().addTo(S.map);
+    needsLayerControlRebuild = true;
+  } else {
+    S.mapLayers.adsb_aircraft.clearLayers();
+  }
+  if (!S.mapLayers.adsb_trails) {
+    S.mapLayers.adsb_trails = L.layerGroup().addTo(S.map);
+    needsLayerControlRebuild = true;
+  } else {
+    S.mapLayers.adsb_trails.clearLayers();
+  }
+
+  const activeHexes = new Set(S.adsbAircraft.map(ac => ac.hex));
+
+  // Render trails
+  for (const [hex, trail] of Object.entries(S.adsbTrails)) {
+    if (trail.length < 2) continue;
+    const coords = trail.map(p => [p.lat, p.lon]);
+    const isActive = activeHexes.has(hex);
+    const polyline = L.polyline(coords, {
+      color: isActive ? '#3d8bfd' : '#3d8bfd',
+      weight: 2,
+      opacity: isActive ? 0.5 : 0.2,
+      dashArray: '4,4',
+      interactive: false,
+    });
+    S.mapLayers.adsb_trails.addLayer(polyline);
+  }
+
+  // Render aircraft markers
+  for (const ac of S.adsbAircraft) {
+    const color = adsbAglColor(ac.agl);
+    const aglLabel = formatAltitudeAgl(ac.agl);
+    const rotation = ac.track != null ? ac.track : 0;
+    const callsign = ac.flight || ac.hex.toUpperCase();
+
+    const html = `<div style="position:relative;width:80px;height:56px;text-align:center;">` +
+      `<div style="display:inline-block;transform:rotate(${rotation}deg);width:28px;height:28px;">` +
+        `<svg width="28" height="28" viewBox="0 0 24 24"><path d="M21 16v-2l-8-5V3.5A1.5 1.5 0 0 0 11.5 2 1.5 1.5 0 0 0 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z" fill="${color}" stroke="#000" stroke-width="0.6"/></svg>` +
+      `</div>` +
+      `<div style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;color:${color};text-shadow:0 0 3px #000,0 0 6px #000;line-height:1.2;margin-top:1px;">${aglLabel}</div>` +
+      `<div style="font-family:'JetBrains Mono',monospace;font-size:8px;color:#8899aa;text-shadow:0 0 3px #000,0 0 6px #000;line-height:1.1;">${ac.distNm} nm</div>` +
+    `</div>`;
+
+    const icon = L.divIcon({ html, className: '', iconSize: [80, 56], iconAnchor: [40, 14] });
+    const marker = L.marker([ac.lat, ac.lon], { icon, zIndexOffset: 800 });
+
+    // Build popup
+    const altMsl = ac.alt_baro != null ? ac.alt_baro.toLocaleString() + ' ft MSL' : 'N/A';
+    const altAgl = ac.agl + ' ft AGL';
+    const speed = ac.gs != null ? Math.round(ac.gs) + ' kts' : 'N/A';
+    const track = ac.track != null ? Math.round(ac.track) + '\u00B0' : 'N/A';
+    const vrate = ac.baro_rate != null ? (ac.baro_rate > 0 ? '+' : '') + ac.baro_rate + ' ft/min' : 'N/A';
+    const sqk = ac.squawk || 'N/A';
+    const isEmergency = ac.squawk === '7500' || ac.squawk === '7600' || ac.squawk === '7700' || (ac.emergency && ac.emergency !== 'none');
+    const sqkStyle = isEmergency ? 'color:#ef4444;font-weight:bold;' : '';
+
+    const popup = `<div style="font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;">` +
+      `<b style="color:#06b6d4;font-size:13px;">${callsign}</b><br>` +
+      (ac.reg ? `Reg: ${ac.reg}<br>` : '') +
+      (ac.type ? `Type: ${ac.type}<br>` : '') +
+      `Alt: ${altMsl} / ${altAgl}<br>` +
+      `GS: ${speed} | Trk: ${track}<br>` +
+      `VS: ${vrate}<br>` +
+      `<span style="${sqkStyle}">Squawk: ${sqk}</span>` +
+      (isEmergency ? ' <b style="color:#ef4444;">EMERGENCY</b>' : '') + `<br>` +
+      `Dist: ${ac.distNm} nm<br>` +
+      `<span style="opacity:0.5;">ICAO: ${ac.hex.toUpperCase()}</span>` +
+    `</div>`;
+    marker.bindPopup(popup);
+
+    S.mapLayers.adsb_aircraft.addLayer(marker);
+  }
+
+  if (needsLayerControlRebuild) buildLayerControl();
+}
+
+function renderAdsbTab(usedApi) {
+  const aircraft = S.adsbAircraft;
+  setText('adsbCount', aircraft.length > 0 ? String(aircraft.length) : '--');
+  setText('adsbRadius', S.adsbSearchRadiusNm ? S.adsbSearchRadiusNm + ' nm' : '-- nm');
+  if (usedApi) setText('adsbSource', usedApi);
+
+  // Nearest aircraft
+  if (aircraft.length > 0) {
+    const nearest = aircraft[0];
+    const label = nearest.flight || nearest.hex.toUpperCase();
+    setText('adsbNearest', label + ' (' + nearest.distNm + ' nm)');
+    setText('adsbNearestAlt', nearest.agl + ' ft AGL');
+    setColor('adsbNearestAlt', nearest.agl < 500 ? 'red' : nearest.agl < 1500 ? 'amber' : 'green');
+  } else {
+    setText('adsbNearest', 'None');
+    setText('adsbNearestAlt', '--');
+  }
+
+  // Low altitude count
+  const lowAlt = aircraft.filter(ac => ac.agl > 0 && ac.agl < 500);
+  setText('adsbLowCount', String(lowAlt.length));
+  setColor('adsbLowCount', lowAlt.length > 0 ? 'red' : 'green');
+
+  // Emergency alerts
+  const emergencyEl = document.getElementById('adsbEmergencyList');
+  if (emergencyEl) {
+    const emergencies = aircraft.filter(ac =>
+      ac.squawk === '7500' || ac.squawk === '7600' || ac.squawk === '7700' ||
+      (ac.emergency && ac.emergency !== 'none')
+    );
+    if (emergencies.length === 0) {
+      emergencyEl.innerHTML = '<span style="color:var(--text-muted);">No emergency squawks detected</span>';
+    } else {
+      emergencyEl.innerHTML = emergencies.map(ac => {
+        const label = ac.flight || ac.hex.toUpperCase();
+        const sqkLabel = ac.squawk === '7500' ? '7500 HIJACK' : ac.squawk === '7600' ? '7600 COMMS' : ac.squawk === '7700' ? '7700 EMERG' : ac.emergency.toUpperCase();
+        return `<div class="adsb-emergency-card"><b style="color:var(--accent-red);">${sqkLabel}</b> &mdash; ${label} @ ${ac.agl} ft AGL, ${ac.distNm} nm</div>`;
+      }).join('');
+    }
+  }
+
+  // Aircraft list
+  const listEl = document.getElementById('adsbAircraftList');
+  if (listEl) {
+    if (aircraft.length === 0) {
+      listEl.innerHTML = '<span style="color:var(--text-muted);">No aircraft detected in search area</span>';
+    } else {
+      let html = '<table class="adsb-list-table"><thead><tr>' +
+        '<th>Callsign</th><th>Alt AGL</th><th>Dist</th><th>GS</th><th>Squawk</th>' +
+        '</tr></thead><tbody>';
+      for (const ac of aircraft) {
+        const label = ac.flight || ac.hex.toUpperCase();
+        const color = adsbAglColor(ac.agl);
+        const aglStr = formatAltitudeAgl(ac.agl);
+        const gs = ac.gs != null ? Math.round(ac.gs) + 'kt' : '--';
+        const sqk = ac.squawk || '--';
+        const isEmergency = ac.squawk === '7500' || ac.squawk === '7600' || ac.squawk === '7700';
+        const sqkStyle = isEmergency ? 'color:#ef4444;font-weight:bold;' : '';
+        html += `<tr class="adsb-row" onclick="if(S.map)S.map.panTo([${ac.lat},${ac.lon}])">` +
+          `<td style="color:var(--accent-cyan);">${label}</td>` +
+          `<td style="color:${color};font-weight:600;">${aglStr}</td>` +
+          `<td>${ac.distNm} nm</td>` +
+          `<td>${gs}</td>` +
+          `<td style="${sqkStyle}">${sqk}</td>` +
+          `</tr>`;
+      }
+      html += '</tbody></table>';
+      listEl.innerHTML = html;
+    }
+  }
+}
+
+function startAdsbPolling() {
+  if (S._adsbPollTimer || !S._adsbEnabled || !S.areaCenter || !S.areaBounds) return;
+  const ne = S.areaBounds.getNorthEast();
+  const sw = S.areaBounds.getSouthWest();
+  S.adsbSearchRadiusNm = computeAdsbSearchRadius(S.areaCenter.lat, S.areaCenter.lng, ne, sw);
+  setText('adsbRadius', S.adsbSearchRadiusNm + ' nm');
+  const statusEl = document.getElementById('adsbPollStatus');
+  if (statusEl) statusEl.textContent = 'Polling';
+  fetchAdsb();
+  S._adsbPollTimer = setInterval(fetchAdsb, 5000);
+}
+
+function stopAdsbPolling() {
+  if (S._adsbPollTimer) { clearInterval(S._adsbPollTimer); S._adsbPollTimer = null; }
+  S.adsbAircraft = [];
+  S.adsbTrails = {};
+  S.adsbSearchRadiusNm = null;
+  if (S.mapLayers.adsb_aircraft) S.mapLayers.adsb_aircraft.clearLayers();
+  if (S.mapLayers.adsb_trails) S.mapLayers.adsb_trails.clearLayers();
+  const statusEl = document.getElementById('adsbPollStatus');
+  if (statusEl) statusEl.textContent = S._adsbEnabled ? 'Idle' : 'Disabled';
+}
+
+function toggleAdsbPolling() {
+  const sel = document.getElementById('cfgAdsbEnabled');
+  S._adsbEnabled = sel && sel.value === '1';
+  if (typeof saveAppState === 'function') saveAppState('cfgAdsbEnabled', S._adsbEnabled ? '1' : '0');
+  if (S._adsbEnabled && S.areaCenter) {
+    startAdsbPolling();
+  } else {
+    stopAdsbPolling();
+  }
+}
+
+// ============================================================
 // FORECAST TIMEBAR + WIND/SUN ARROWS
 // ============================================================
 
@@ -2944,6 +3238,27 @@ function computeAssessment() {
     if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
   }
 
+  // Integrate ADS-B traffic into assessment (CAUTION only, never NO-GO)
+  if (S.adsbAircraft && S.adsbAircraft.length > 0 && result.level !== 'NO-GO') {
+    const emergencyAc = S.adsbAircraft.filter(ac =>
+      ac.squawk === '7500' || ac.squawk === '7600' || ac.squawk === '7700' ||
+      (ac.emergency && ac.emergency !== 'none')
+    );
+    if (emergencyAc.length > 0) {
+      if (result.level === 'GO') result.level = 'CAUTION';
+      result.cautions = result.cautions || [];
+      result.cautions.push('Emergency aircraft nearby (squawk ' + emergencyAc.map(a => a.squawk).join(', ') + ')');
+      if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+    }
+    const lowClose = S.adsbAircraft.filter(ac => ac.agl > 0 && ac.agl < 500 && ac.distNm < 3);
+    if (lowClose.length > 0) {
+      if (result.level === 'GO') result.level = 'CAUTION';
+      result.cautions = result.cautions || [];
+      result.cautions.push(lowClose.length + ' aircraft below 500ft AGL within 3nm');
+      if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+    }
+  }
+
   // Append staleness warning if data is older than 30 minutes
   if (typeof _lastDataTimestamp !== 'undefined' && _lastDataTimestamp) {
     const dataAge = Date.now() - _lastDataTimestamp;
@@ -3123,6 +3438,26 @@ function buildLayerControl() {
     // Terrain tab shows suitability assessment instead.
   }
 
+  // ADS-B Traffic
+  const hasAdsbAc = S.mapLayers.adsb_aircraft && S.mapLayers.adsb_aircraft.getLayers().length > 0;
+  const hasAdsbTrails = S.mapLayers.adsb_trails && S.mapLayers.adsb_trails.getLayers().length > 0;
+  if (hasAdsbAc || hasAdsbTrails) {
+    html += `<h4 style="margin-top:10px">Traffic</h4>`;
+    if (hasAdsbAc) {
+      const acCount = S.mapLayers.adsb_aircraft.getLayers().length;
+      const on = S.map.hasLayer(S.mapLayers.adsb_aircraft);
+      html += `<div class="layer-item${on ? ' active' : ''}" data-layer="adsb_aircraft" onclick="toggleLayer('adsb_aircraft',this)">
+        <div class="layer-check"></div><div class="layer-color" style="background:#a78bfa"></div><span>Aircraft (${acCount})</span>
+      </div>`;
+    }
+    if (hasAdsbTrails) {
+      const on = S.map.hasLayer(S.mapLayers.adsb_trails);
+      html += `<div class="layer-item${on ? ' active' : ''}" data-layer="adsb_trails" onclick="toggleLayer('adsb_trails',this)">
+        <div class="layer-check"></div><div class="layer-color" style="background:#3d8bfd"></div><span>Position Trails</span>
+      </div>`;
+    }
+  }
+
   // Ops overlays: swap radius, flight plan
   const hasSwap = S.mapLayers.swap_radius && S.mapLayers.swap_radius.getLayers().length > 0;
   const hasPlan = S.mapLayers.flight_plan && S.mapLayers.flight_plan.getLayers().length > 0;
@@ -3274,9 +3609,16 @@ function toggleLayer(id, el) {
       if (on) { if (!S.map.hasLayer(layer)) layer.addTo(S.map); layer.setOpacity(0.5); }
       else { if (S.map.hasLayer(layer)) layer.setOpacity(0); }
     }
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'flight_plan' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_')) && S.mapLayers[id]) {
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'flight_plan' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_')) && S.mapLayers[id]) {
     if (on) S.map.addLayer(S.mapLayers[id]);
     else S.map.removeLayer(S.mapLayers[id]);
+    // Toggling aircraft also toggles trails
+    if (id === 'adsb_aircraft' && S.mapLayers.adsb_trails) {
+      if (on) S.map.addLayer(S.mapLayers.adsb_trails);
+      else S.map.removeLayer(S.mapLayers.adsb_trails);
+      const trailEl = document.querySelector('[data-layer="adsb_trails"]');
+      if (trailEl) { if (on) trailEl.classList.add('active'); else trailEl.classList.remove('active'); }
+    }
   }
 }
 
@@ -4647,5 +4989,8 @@ if (typeof module !== 'undefined' && module.exports) {
     logMission, showMissionLogs, closeMissionLogModal, deleteMissionLogEntry, exportMissionLogsAsCSV,
     enterTrainingMode, exitTrainingMode, populateTrainingScenarios,
     showAuditTrail, closeAuditTrailModal, exportAuditTrailAsCSV, clearAuditTrailUI,
+    // ADS-B
+    ADSB_APIS, fetchAdsb, updateAdsbTrails, renderAdsbMap, renderAdsbTab,
+    startAdsbPolling, stopAdsbPolling, toggleAdsbPolling, adsbAglColor,
   };
 }

@@ -9,11 +9,11 @@ A browser-based pre-flight intelligence tool for UAS (drone) operators conductin
 3. **Draw an operational area** on the map using the rectangle, circle, or polygon tools (left toolbar), or enter coordinates manually
 4. All data tabs auto-populate with conditions for your area
 5. The **GO / CAUTION / NO-GO** assessment banner appears based on current conditions
-6. Use the **Data Panel** tabs (Weather, Wind, Airspace, Terrain, Sun/Moon, GNSS, NOTAMs, Ops) to review detailed information
+6. Use the **Data Panel** tabs (Weather, Wind, Airspace, Traffic, Terrain, Sun/Moon, GNSS, NOTAMs, Ops) to review detailed information
 7. **Export** a pre-flight briefing as PDF, email, clipboard text, or KML
 
 ### Map Features
-- Toggle map layers (satellite, topo, FAA sectional, weather radar, airspace, towers, wire hazards, fire perimeters) via the **Map Layers** control
+- Toggle map layers (satellite, topo, FAA sectional, weather radar, airspace, towers, wire hazards, fire perimeters, live aircraft traffic) via the **Map Layers** control
 - Import FAA sectional chart GeoTIFFs for offline chart overlay
 - Use the **timebar** at the bottom to scrub through 24-hour wind and sun direction forecasts
 - **Wind arrow** (blue) and **sun arrow** (yellow) on the map update as you scrub
@@ -50,6 +50,7 @@ All data is fetched from free, public APIs. No API keys are required.
 | Dams | [HIFLD](https://hifld-geoplatform.opendata.arcgis.com/) via ArcGIS | Static |
 | Wilderness areas | [USFS](https://services1.arcgis.com/) via ArcGIS | Static |
 | National parks | [NPS](https://services1.arcgis.com/) via ArcGIS | Static |
+| Live ADS-B aircraft traffic (with 15-min trails) | [adsb.fi](https://adsb.fi/), [airplanes.live](https://airplanes.live/), [adsb.lol](https://www.adsb.lol/) (fallback chain) | 5 sec polling |
 | Magnetic declination | Approximate WMM 2025 model | Static |
 | Density altitude | Calculated from station pressure and temperature | Real-time |
 | Battery derating | Calculated from temperature, altitude, wind | Real-time |
