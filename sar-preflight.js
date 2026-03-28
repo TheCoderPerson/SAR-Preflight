@@ -181,6 +181,7 @@ function clearArea() {
   if (S.mapLayers.airports) S.mapLayers.airports.clearLayers();
   if (S.mapLayers.nws_alerts) S.mapLayers.nws_alerts.clearLayers();
   if (S.mapLayers.cell_towers) S.mapLayers.cell_towers.clearLayers();
+  if (S.mapLayers.fire_perimeters) S.mapLayers.fire_perimeters.clearLayers();
   // Clear radar layers and stop animation
   if (S.radarAnim) {
     if (S.radarAnim.interval) clearInterval(S.radarAnim.interval);
@@ -306,6 +307,7 @@ async function processArea(layer, type) {
     fetchRadar(),
     fetchFAAairspace(bounds),
     fetchProtectedAreas(bounds),
+    fetchFireDanger(center.lat, center.lng, bounds),
   ]);
 
   // Compute derived data after fetches complete
@@ -339,6 +341,7 @@ async function retryFailedSource(source) {
     'Radar': () => fetchRadar(),
     'FAA Airspace': () => fetchFAAairspace(bounds),
     'Protected Areas': () => fetchProtectedAreas(bounds),
+    'Fire Danger': () => fetchFireDanger(lat, lng, bounds),
   };
   const fn = retryMap[source];
   if (fn) {
@@ -1108,21 +1111,184 @@ async function fetchNOTAMs(lat, lng) {
         </div>
         <div class="notam-meta">Radius: 25 nm from center \u2022 Check \u2264 1 hr before launch</div>
       </div>
-      <div class="notam-card tfr">
-        <div class="notam-header">
-          <span class="notam-id">WILDFIRE TFR ALERT</span>
-          <span class="notam-type tfr-type">Seasonal</span>
-        </div>
-        <div class="notam-body">
-          El Dorado County is in a high fire-risk zone. Wildfire TFRs can activate with &lt;30 min notice.
-          Always verify no active wildfire TFRs before and during operations.
-        </div>
-      </div>
+      <div id="fireDangerCards"></div>
     `;
     computeAirspace(lat, lng);
     setStatus('notamStatus', 'error', 'MANUAL');
   } finally {
     trackFetchEnd('NOTAMs');
+  }
+}
+
+// ============================================================
+// API: NIFC ACTIVE FIRES + CA NFDRS FIRE DANGER
+// ============================================================
+async function fetchFireDanger(lat, lng, bounds) {
+  trackFetchStart('Fire Danger');
+  try {
+    const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+    const pad = 0.5; // ~30nm buffer
+    const geom = `${sw.lng - pad},${sw.lat - pad},${ne.lng + pad},${ne.lat + pad}`;
+
+    // Fetch active fire perimeters and NFDRS fire danger in parallel
+    const [firesRes, nfdrsRes] = await Promise.allSettled([
+      fetch(`https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/Current_WildlandFire_Perimeters/FeatureServer/0/query`
+        + `?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326`
+        + `&outFields=poly_IncidentName,poly_GISAcres,poly_PercentContained,poly_CreateDate`
+        + `&outSR=4326&f=geojson&resultRecordCount=50`),
+      fetch(`https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/CA_NFDRS/FeatureServer/1/query`
+        + `?where=1=1&geometry=${lng},${lat}&geometryType=esriGeometryPoint&inSR=4326`
+        + `&outFields=PSAName,Avg_BI,Avg_BI_Pct,Avg_ERC,Avg_ERC_Pct,Avg_FM100Hr,Avg_FM1000Hr`
+        + `&outSR=4326&f=geojson&resultRecordCount=1`),
+    ]);
+
+    // Process active fires
+    let fires = [];
+    if (firesRes.status === 'fulfilled' && firesRes.value.ok) {
+      const data = await firesRes.value.json();
+      fires = (data.features || []).map(f => {
+        const p = f.properties;
+        const coords = f.geometry?.coordinates;
+        let fireLat = lat, fireLng = lng;
+        if (coords) {
+          // Get centroid from first coordinate of polygon
+          const ring = Array.isArray(coords[0]?.[0]?.[0]) ? coords[0][0] : (Array.isArray(coords[0]?.[0]) ? coords[0] : coords);
+          if (ring.length > 0) { fireLng = ring[0][0]; fireLat = ring[0][1]; }
+        }
+        const distKm = typeof haversine === 'function' ? haversine(lat, lng, fireLat, fireLng) : 0;
+        return {
+          name: p.poly_IncidentName || 'Unknown Fire',
+          acres: Math.round(p.poly_GISAcres || 0),
+          contained: p.poly_PercentContained,
+          date: p.poly_CreateDate,
+          distNm: (distKm * 0.539957).toFixed(1),
+          geometry: f.geometry,
+        };
+      });
+      fires.sort((a, b) => parseFloat(a.distNm) - parseFloat(b.distNm));
+    }
+
+    // Process NFDRS fire danger
+    let fireDanger = null;
+    if (nfdrsRes.status === 'fulfilled' && nfdrsRes.value.ok) {
+      const data = await nfdrsRes.value.json();
+      const f = data.features?.[0]?.properties;
+      if (f) {
+        fireDanger = {
+          psa: f.PSAName || 'Unknown',
+          bi: f.Avg_BI, biPct: f.Avg_BI_Pct,
+          erc: f.Avg_ERC, ercPct: f.Avg_ERC_Pct,
+          fm100: f.Avg_FM100Hr, fm1000: f.Avg_FM1000Hr,
+        };
+      }
+    }
+
+    S.fireDanger = fireDanger;
+    S.activeFires = fires;
+
+    // Render fire perimeters on map
+    renderFirePerimeters(fires);
+
+    // Render fire info in NOTAMs tab
+    renderFireDangerCard(fires, fireDanger, lat, lng);
+
+    clearDataSourceError('Fire Danger');
+  } catch (err) {
+    console.warn('Fire danger fetch failed:', err);
+    recordDataSourceError('Fire Danger', err);
+  } finally {
+    trackFetchEnd('Fire Danger');
+  }
+}
+
+function renderFirePerimeters(fires) {
+  if (!S.mapLayers.fire_perimeters) S.mapLayers.fire_perimeters = L.layerGroup().addTo(S.map);
+  else S.mapLayers.fire_perimeters.clearLayers();
+
+  fires.forEach(fire => {
+    if (!fire.geometry) return;
+    try {
+      const layer = L.geoJSON(fire.geometry, {
+        style: { color: '#ef4444', fillColor: '#f97316', fillOpacity: 0.25, weight: 2 },
+      });
+      layer.bindPopup(
+        `<b style="color:#ef4444">${fire.name}</b><br>` +
+        `${fire.acres.toLocaleString()} acres<br>` +
+        (fire.contained != null ? `${fire.contained}% contained<br>` : '') +
+        `${fire.distNm} nm from area`
+      );
+      S.mapLayers.fire_perimeters.addLayer(layer);
+    } catch (_) { /* invalid geometry */ }
+  });
+  buildLayerControl();
+}
+
+function renderFireDangerCard(fires, danger, lat, lng) {
+  const notamDiv = document.getElementById('notamList');
+  if (!notamDiv) return;
+
+  // Find the existing wildfire card or append after the TFR card
+  let html = '';
+
+  // Fire danger rating card
+  if (danger) {
+    const biLevel = danger.biPct >= 90 ? 'red' : danger.biPct >= 70 ? 'amber' : 'green';
+    const ercLevel = danger.ercPct >= 90 ? 'red' : danger.ercPct >= 70 ? 'amber' : 'green';
+    const biColor = biLevel === 'red' ? '#ef4444' : biLevel === 'amber' ? '#f59e0b' : '#22c55e';
+    const ercColor = ercLevel === 'red' ? '#ef4444' : ercLevel === 'amber' ? '#f59e0b' : '#22c55e';
+    const adjective = danger.ercPct >= 97 ? 'EXTREME' : danger.ercPct >= 90 ? 'VERY HIGH' : danger.ercPct >= 70 ? 'HIGH' : danger.ercPct >= 50 ? 'MODERATE' : 'LOW';
+    const cardClass = danger.ercPct >= 90 ? 'tfr' : danger.ercPct >= 70 ? 'notam-style' : '';
+
+    html += `<div class="notam-card ${cardClass}">
+      <div class="notam-header">
+        <span class="notam-id">FIRE DANGER: ${adjective}</span>
+        <span class="notam-type ${danger.ercPct >= 90 ? 'tfr-type' : 'notam-type-tag'}">${danger.psa}</span>
+      </div>
+      <div class="notam-body" style="font-family:var(--font-mono);font-size:11px;">
+        <div style="display:flex;gap:16px;flex-wrap:wrap;">
+          <div>Burning Index: <b style="color:${biColor}">${danger.bi != null ? Math.round(danger.bi) : '--'}</b> (${danger.biPct != null ? Math.round(danger.biPct) : '--'}th %ile)</div>
+          <div>Energy Release: <b style="color:${ercColor}">${danger.erc != null ? Math.round(danger.erc) : '--'}</b> (${danger.ercPct != null ? Math.round(danger.ercPct) : '--'}th %ile)</div>
+        </div>
+        <div style="margin-top:4px;">100hr Fuel Moisture: ${danger.fm100 != null ? Math.round(danger.fm100) + '%' : '--'} &bull; 1000hr: ${danger.fm1000 != null ? Math.round(danger.fm1000) + '%' : '--'}</div>
+      </div>
+      <div class="notam-meta">NFDRS data via NIFC &bull; Percentiles relative to historical range</div>
+    </div>`;
+  }
+
+  // Active fires card
+  if (fires.length > 0) {
+    html += `<div class="notam-card tfr">
+      <div class="notam-header">
+        <span class="notam-id">ACTIVE FIRES: ${fires.length}</span>
+        <span class="notam-type tfr-type">Live</span>
+      </div>
+      <div class="notam-body" style="font-family:var(--font-mono);font-size:11px;">
+        ${fires.slice(0, 10).map(f =>
+          `<div style="padding:2px 0;">${f.name} &mdash; ${f.acres.toLocaleString()} ac, ${f.distNm} nm` +
+          (f.contained != null ? ` (${f.contained}% cont.)` : '') + `</div>`
+        ).join('')}
+        ${fires.length > 10 ? `<div style="color:var(--text-muted);">+ ${fires.length - 10} more</div>` : ''}
+      </div>
+      <div class="notam-meta">Wildfire TFRs activate with &lt;30 min notice &bull; NIFC perimeter data</div>
+    </div>`;
+  } else {
+    html += `<div class="notam-card" style="border-color:var(--accent-green);">
+      <div class="notam-header">
+        <span class="notam-id" style="color:var(--accent-green);">NO ACTIVE FIRES NEARBY</span>
+      </div>
+      <div class="notam-body">No wildland fire perimeters detected within ~30 nm of search area.</div>
+    </div>`;
+  }
+
+  // Append to notamList after existing TFR content
+  const fireDiv = document.getElementById('fireDangerCards');
+  if (fireDiv) {
+    fireDiv.innerHTML = html;
+  } else {
+    const container = document.createElement('div');
+    container.id = 'fireDangerCards';
+    container.innerHTML = html;
+    notamDiv.appendChild(container);
   }
 }
 
@@ -2538,6 +2704,28 @@ function computeAssessment() {
     }
   }
 
+  // Integrate fire danger into assessment
+  if (S.activeFires && S.activeFires.length > 0) {
+    const nearFires = S.activeFires.filter(f => parseFloat(f.distNm) < 10);
+    if (nearFires.length > 0) {
+      result.level = 'NO-GO';
+      result.issues = result.issues || [];
+      result.issues.push('Active fire within 10nm: ' + nearFires.map(f => f.name).join(', '));
+      result.text = result.issues.join(' \u2022 ');
+    } else if (result.level !== 'NO-GO') {
+      if (result.level === 'GO') result.level = 'CAUTION';
+      result.cautions = result.cautions || [];
+      result.cautions.push('Active fire within 30nm \u2014 monitor for TFRs');
+      if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+    }
+  }
+  if (S.fireDanger && S.fireDanger.ercPct >= 90 && result.level !== 'NO-GO') {
+    if (result.level === 'GO') result.level = 'CAUTION';
+    result.cautions = result.cautions || [];
+    result.cautions.push('Very high/extreme fire danger \u2014 wildfire TFR risk');
+    if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+  }
+
   // Append staleness warning if data is older than 30 minutes
   if (typeof _lastDataTimestamp !== 'undefined' && _lastDataTimestamp) {
     const dataAge = Date.now() - _lastDataTimestamp;
@@ -2745,6 +2933,16 @@ function buildLayerControl() {
     </div>`;
   }
 
+  // Active Fires section
+  const hasFirePerimeters = S.mapLayers.fire_perimeters && S.mapLayers.fire_perimeters.getLayers && S.mapLayers.fire_perimeters.getLayers().length > 0;
+  if (hasFirePerimeters) {
+    html += `<h4 style="margin-top:10px">Fire</h4>`;
+    const on = S.map.hasLayer(S.mapLayers.fire_perimeters);
+    html += `<div class="layer-item${on ? ' active' : ''}" data-layer="fire_perimeters" onclick="toggleLayer('fire_perimeters',this)">
+      <div class="layer-check"></div><div class="layer-color" style="background:#f97316"></div><span>Fire Perimeters (${S.mapLayers.fire_perimeters.getLayers().length})</span>
+    </div>`;
+  }
+
   // FAA Airspace section
   const hasFAAclass = S.mapLayers.faa_class_airspace && S.mapLayers.faa_class_airspace.getLayers && S.mapLayers.faa_class_airspace.getLayers().length > 0;
   const hasFAAsua = S.mapLayers.faa_sua && S.mapLayers.faa_sua.getLayers && S.mapLayers.faa_sua.getLayers().length > 0;
@@ -2858,7 +3056,7 @@ function toggleLayer(id, el) {
       if (on) { if (!S.map.hasLayer(layer)) layer.addTo(S.map); layer.setOpacity(0.5); }
       else { if (S.map.hasLayer(layer)) layer.setOpacity(0); }
     }
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'emergency_lz' || id === 'swap_radius' || id === 'flight_plan' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_')) && S.mapLayers[id]) {
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'flight_plan' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_')) && S.mapLayers[id]) {
     if (on) S.map.addLayer(S.mapLayers[id]);
     else S.map.removeLayer(S.mapLayers[id]);
   }
@@ -4207,6 +4405,7 @@ if (typeof module !== 'undefined' && module.exports) {
     generatePDFBriefing, shareBriefingEmail, openInSARTopo,
     recordDataSourceError, clearDataSourceError, retryFailedSource, retryAllFailed, showDataSourceStatus,
     setAutoRefresh, loadFAAChart, removeChart, clearAllCharts, updateChartList, restoreFAACharts,
+    fetchFireDanger, renderFirePerimeters, renderFireDangerCard,
     initTimeBar, hideTimeBar,
     renderTerrainFeatures, renderLZMarkers, generateAndRenderFlightPlan,
     // Phase 6: SOP Profiles, Mission Logging, Training Mode, Audit Trail
