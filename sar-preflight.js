@@ -2631,6 +2631,13 @@ function updateScrollBtns() {
 // ============================================================
 // UI CONTROLS
 // ============================================================
+function toggleHeaderMenu() {
+  document.getElementById('headerActions')?.classList.toggle('open');
+}
+function toggleLayerControl() {
+  const el = document.getElementById('layerControl');
+  if (el) el.classList.toggle('collapsed');
+}
 function togglePanel() {
   S.panelOpen = !S.panelOpen;
   document.getElementById('sidePanel').classList.toggle('collapsed');

@@ -112,10 +112,10 @@ const DEFAULT_THRESHOLDS = {
 
 // --- Density Altitude ---
 
-function calcDensityAltitude(tempF, surfacePressureHPa, elevFt) {
+function calcDensityAltitude(tempF, surfacePressureHPa) {
   const tempC = (tempF - 32) * 5/9;
-  const pressAlt = (1013.25 - surfacePressureHPa) * 30 + elevFt;
-  return Math.round(pressAlt + (120 * (tempC - (15 - 2 * elevFt / 1000))));
+  const pressAlt = (1013.25 - surfacePressureHPa) * 30;
+  return Math.round(pressAlt + (120 * (tempC - (15 - 2 * pressAlt / 1000))));
 }
 
 // --- Battery Derating ---

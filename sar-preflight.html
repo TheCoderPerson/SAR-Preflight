@@ -86,6 +86,13 @@ body {
 }
 .header-btn:hover { border-color: var(--accent-blue); background: var(--bg-elevated); }
 .header-btn.active { border-color: var(--accent-cyan); color: var(--accent-cyan); }
+.header-hamburger { display: none; font-size: 18px; padding: 6px 10px; }
+.header-actions { display: flex; align-items: center; gap: 6px; }
+.mobile-panel-close {
+  display: none; width: 100%; padding: 10px; background: var(--bg-tertiary);
+  border: none; border-bottom: 1px solid var(--border); color: var(--text-secondary);
+  font-family: var(--font-mono); font-size: 12px; cursor: pointer; text-align: center;
+}
 
 /* Main Layout */
 .main { display: flex; height: calc(100vh - var(--header-height)); }
@@ -176,7 +183,13 @@ body {
   font-family: var(--font-mono); font-size: 10px; font-weight: 600; color: var(--text-muted);
   text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 8px;
   padding-bottom: 6px; border-bottom: 1px solid var(--border);
+  cursor: pointer; display: flex; align-items: center; justify-content: space-between;
+  user-select: none;
 }
+.layer-control h4::after { content: '▾'; font-size: 10px; }
+.layer-control.collapsed h4 { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
+.layer-control.collapsed h4::after { content: '▸'; }
+.layer-control.collapsed #layerList { display: none; }
 .layer-item {
   display: flex; align-items: center; gap: 8px; padding: 4px 0;
   cursor: pointer; font-size: 12px; color: var(--text-secondary); transition: color 0.15s;
@@ -404,11 +417,23 @@ select.api-input { cursor: pointer; }
 .export-check-row input { accent-color: var(--accent-blue); }
 
 @media (max-width: 900px) {
+  .header-hamburger { display: flex; }
+  .header-actions {
+    display: none; position: absolute; top: var(--header-height); left: 0; right: 0;
+    background: var(--bg-secondary); border-bottom: 1px solid var(--border);
+    padding: 8px 12px; flex-wrap: wrap; gap: 6px; z-index: 999;
+  }
+  .header-actions.open { display: flex; }
+  .header-status { font-size: 9px; }
   .side-panel {
     position: absolute; right: 0; top: var(--header-height);
     height: calc(100vh - var(--header-height)); z-index: 900;
   }
+  .side-panel .tab-bar { overflow-x: auto; flex-wrap: nowrap; }
+  .side-panel .tab-btn { flex-shrink: 0; }
+  .mobile-panel-close { display: block; }
   .layer-control { width: 170px; }
+  .layer-control.collapsed h4 { margin-bottom: 0; }
   :root { --panel-width: 100vw; }
 }
 </style>
@@ -417,16 +442,19 @@ select.api-input { cursor: pointer; }
 
 <div class="header">
   <div class="header-logo">SAR PREFLIGHT<span> // UAS INTEL</span></div>
-  <button class="header-btn" id="btnPanel" onclick="togglePanel()">DATA PANEL</button>
-  <button class="header-btn" id="btnExport" onclick="openExport()">EXPORT KML</button>
-  <button class="header-btn" id="btnCopy" onclick="copyBriefing()">COPY</button>
-  <button class="header-btn" id="btnPDF" onclick="generatePDFBriefing()">PDF</button>
-  <button class="header-btn" id="btnEmail" onclick="shareBriefingEmail()">EMAIL</button>
-  <button class="header-btn" id="btnLog" onclick="logMission()">LOG</button>
-  <button class="header-btn" id="btnViewLogs" onclick="showMissionLogs()">LOGS</button>
-  <button class="header-btn" id="btnSARTopo" onclick="openInSARTopo()">SARTOPO</button>
-  <button class="header-btn" id="btnRefresh" onclick="refreshData()">REFRESH</button>
-  <button class="header-btn" id="btnClearArea" onclick="clearArea()">CLEAR</button>
+  <button class="header-btn header-hamburger" onclick="toggleHeaderMenu()">&#9776;</button>
+  <div class="header-actions" id="headerActions">
+    <button class="header-btn" id="btnPanel" onclick="togglePanel()">DATA PANEL</button>
+    <button class="header-btn" id="btnExport" onclick="openExport()">EXPORT KML</button>
+    <button class="header-btn" id="btnCopy" onclick="copyBriefing()">COPY</button>
+    <button class="header-btn" id="btnPDF" onclick="generatePDFBriefing()">PDF</button>
+    <button class="header-btn" id="btnEmail" onclick="shareBriefingEmail()">EMAIL</button>
+    <button class="header-btn" id="btnLog" onclick="logMission()">LOG</button>
+    <button class="header-btn" id="btnViewLogs" onclick="showMissionLogs()">LOGS</button>
+    <button class="header-btn" id="btnSARTopo" onclick="openInSARTopo()">SARTOPO</button>
+    <button class="header-btn" id="btnRefresh" onclick="refreshData()">REFRESH</button>
+    <button class="header-btn" id="btnClearArea" onclick="clearArea()">CLEAR</button>
+  </div>
   <div class="header-status">
     <span id="fetchActivity" style="font-size:10px;color:var(--accent-cyan);display:none;"></span>
     <div class="status-dot" id="statusDot"></div>
@@ -475,7 +503,7 @@ select.api-input { cursor: pointer; }
       </div>
     </div>
     <div class="layer-control" id="layerControl">
-      <h4>Map Layers</h4>
+      <h4 onclick="toggleLayerControl()">Map Layers</h4>
       <div id="layerList"></div>
     </div>
     <div class="radar-controls" id="radarControls" style="display:none;">
@@ -504,6 +532,7 @@ select.api-input { cursor: pointer; }
 
   <!-- Side Panel -->
   <div class="side-panel" id="sidePanel">
+    <button class="mobile-panel-close" onclick="togglePanel()">&#10005; Close Panel</button>
     <div class="assessment-banner" id="assessmentBanner" style="display:none;">
       <span class="assessment-badge go" id="assessBadge">GO</span>
       <span id="assessText">All conditions nominal</span>
