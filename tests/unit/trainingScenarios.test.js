@@ -44,7 +44,7 @@ describe('TRAINING_SCENARIOS', () => {
   describe('risk assessment with default thresholds', () => {
     const maxWindTol = 27; // standard Part 107 tolerance
 
-    it('Georgetown (High Wind) scenario produces CAUTION or NO-GO', () => {
+    it('High Wind scenario produces CAUTION or NO-GO', () => {
       const s = TRAINING_SCENARIOS[0];
       const result = assessRisk(s.wx, s.wind, s.elev, maxWindTol);
       expect(['CAUTION', 'NO-GO']).toContain(result.level);

@@ -25,6 +25,11 @@ const S = {
   _trainingMode: false,
 };
 
+// Local timezone helper (avoids hardcoding America/Los_Angeles)
+function _localTZ() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (_) { return 'America/New_York'; }
+}
+
 function trackFetchStart(source) {
   S._activeFetches[source] = true;
   _updateFetchActivity();
@@ -230,7 +235,9 @@ function clearArea() {
   if (forecastSection) forecastSection.style.display = 'none';
 }
 function enterCoords() {
-  const input = prompt('Enter center lat, lng, radius_meters:\nExample: 38.685, -120.99, 2000');
+  const defaultLat = S.map.getCenter().lat.toFixed(3);
+  const defaultLng = S.map.getCenter().lng.toFixed(3);
+  const input = prompt(`Enter center lat, lng, radius_meters:\nExample: ${defaultLat}, ${defaultLng}, 2000`);
   if (!input) return;
   const p = input.split(',').map(s => parseFloat(s.trim()));
   if (p.length === 3 && !p.some(isNaN)) {
@@ -422,11 +429,11 @@ async function fetchWeather(lat, lng) {
       `weather_code,uv_index,is_day` +
       `&hourly=wind_speed_80m,wind_speed_120m,wind_speed_180m,wind_direction_80m,wind_direction_120m,wind_direction_180m` +
       `,temperature_2m,precipitation_probability,wind_speed_10m,wind_direction_10m,wind_gusts_10m,cloud_cover,weather_code` +
-      `&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=America/Los_Angeles` +
+      `&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto` +
       `&forecast_hours=24`;
 
     const aqiUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lng}` +
-      `&current=us_aqi,pm2_5,pm10,ozone&timezone=America/Los_Angeles`;
+      `&current=us_aqi,pm2_5,pm10,ozone&timezone=auto`;
 
     const [wxRes, aqiRes] = await Promise.all([fetch(wxUrl), fetch(aqiUrl)]);
     const wx = await wxRes.json();
@@ -747,7 +754,7 @@ function renderForecastChart(hourlyData) {
   for (let i = 0; i < n; i += 3) {
     const x = xPos(i);
     const dt = new Date(times[i]);
-    const label = dt.toLocaleTimeString('en-US', { hour: 'numeric', hour12: true, timeZone: 'America/Los_Angeles' }).replace(' ', '');
+    const label = dt.toLocaleTimeString('en-US', { hour: 'numeric', hour12: true, timeZone: _localTZ() }).replace(' ', '');
     svg += `<text x="${x}" y="${H - 4}" text-anchor="middle" fill="var(--text-muted)" font-family="var(--font-mono)" font-size="8">${label}</text>`;
   }
 
@@ -825,7 +832,7 @@ function _fcTooltipMove(e, svg, d) {
 
   // Values
   const dt = new Date(d.times[idx]);
-  const timeStr = dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/Los_Angeles' });
+  const timeStr = dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: _localTZ() });
   const temp = d.temps[idx] != null ? Math.round(d.temps[idx]) + '\u00b0F' : '--';
   const wind = d.winds[idx] != null ? Math.round(d.winds[idx]) + ' mph' : '--';
   const prec = d.precips[idx] != null ? d.precips[idx] + '%' : '--';
@@ -1011,7 +1018,7 @@ async function fetchSunMoon(lat, lng) {
 
     if (data.status === 'OK') {
       const r = data.results;
-      const fmt = iso => new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Los_Angeles' });
+      const fmt = iso => new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: _localTZ() });
 
       setText('astSunrise', fmt(r.sunrise));
       setText('astSunset', fmt(r.sunset));
@@ -1023,7 +1030,7 @@ async function fetchSunMoon(lat, lng) {
 
       const twAM = fmt(r.civil_twilight_begin);
       const twPM = fmt(r.civil_twilight_end);
-      setText('astDayWindow', `${twAM} — ${twPM} PDT`);
+      setText('astDayWindow', `${twAM} — ${twPM} ${new Date().toLocaleTimeString('en-US',{timeZoneName:'short'}).split(' ').pop()}`);
 
       const sunPos = calcSunPosition(lat, lng);
       setText('astSunAz', `${sunPos.azimuth.toFixed(1)}°`);
@@ -1045,7 +1052,9 @@ async function fetchSunMoon(lat, lng) {
                           'Low illumination — ensure adequate anti-collision lighting';
       setText('astNightOps', nightAssess);
 
-      setText('astMagDec', `${(13.2 + (lng + 121) * 0.3).toFixed(1)}° E`);
+      // Simplified WMM 2025 magnetic declination approximation for CONUS
+      const magDec = -5.24 + 0.12 * (lat - 39) + 0.19 * (lng + 98);
+      setText('astMagDec', `${Math.abs(magDec).toFixed(1)}° ${magDec >= 0 ? 'E' : 'W'} (approx)`);
 
       S.astro = { sunrise: r.sunrise, sunset: r.sunset, twAM: r.civil_twilight_begin, twPM: r.civil_twilight_end, moonPhase };
 
@@ -1066,12 +1075,12 @@ async function fetchSunMoon(lat, lng) {
         const cached = await getCachedApiResponse('sunrise', k);
         if (cached && cached.data && cached.data.status === 'OK') {
           const r = cached.data.results;
-          const fmt = iso => new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Los_Angeles' });
+          const fmt = iso => new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: _localTZ() });
           setText('astSunrise', fmt(r.sunrise));
           setText('astSunset', fmt(r.sunset));
           setText('astTwilightAM', fmt(r.civil_twilight_begin));
           setText('astTwilightPM', fmt(r.civil_twilight_end));
-          setText('astDayWindow', `${fmt(r.civil_twilight_begin)} — ${fmt(r.civil_twilight_end)} PDT`);
+          setText('astDayWindow', `${fmt(r.civil_twilight_begin)} — ${fmt(r.civil_twilight_end)} ${new Date().toLocaleTimeString('en-US',{timeZoneName:'short'}).split(' ').pop()}`);
           S.astro = { sunrise: r.sunrise, sunset: r.sunset, twAM: r.civil_twilight_begin, twPM: r.civil_twilight_end };
           const age = Date.now() - cached.timestamp;
           const badge = cached.status === 'stale' ? 'cached' : 'expired';
@@ -1138,17 +1147,21 @@ async function fetchFireDanger(lat, lng, bounds) {
     const pad = 0.5; // ~30nm buffer
     const geom = `${sw.lng - pad},${sw.lat - pad},${ne.lng + pad},${ne.lat + pad}`;
 
-    // Fetch active fire perimeters and NFDRS fire danger in parallel
-    const [firesRes, nfdrsRes] = await Promise.allSettled([
+    // Fetch active fire perimeters (US-wide) and NFDRS fire danger (CA only) in parallel
+    const isCA = lat >= 32.5 && lat <= 42.0 && lng >= -124.5 && lng <= -114.0;
+    const fetches = [
       fetch(`https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/Current_WildlandFire_Perimeters/FeatureServer/0/query`
         + `?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326`
         + `&outFields=poly_IncidentName,poly_GISAcres,poly_PercentContained,poly_CreateDate`
         + `&outSR=4326&f=geojson&resultRecordCount=50`),
-      fetch(`https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/CA_NFDRS/FeatureServer/1/query`
+    ];
+    if (isCA) {
+      fetches.push(fetch(`https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/CA_NFDRS/FeatureServer/1/query`
         + `?where=1=1&geometry=${lng},${lat}&geometryType=esriGeometryPoint&inSR=4326`
         + `&outFields=PSAName,Avg_BI,Avg_BI_Pct,Avg_ERC,Avg_ERC_Pct,Avg_FM100Hr,Avg_FM1000Hr`
-        + `&outSR=4326&f=geojson&resultRecordCount=1`),
-    ]);
+        + `&outSR=4326&f=geojson&resultRecordCount=1`));
+    }
+    const [firesRes, nfdrsRes] = await Promise.allSettled(fetches);
 
     // Process active fires
     let fires = [];
@@ -1723,8 +1736,8 @@ function renderNWSAlertCards() {
     const sevBg = a.severity === 'Extreme' || a.severity === 'Severe'
       ? 'rgba(239,68,68,0.15)' : a.severity === 'Moderate'
       ? 'rgba(245,158,11,0.15)' : 'rgba(6,182,212,0.15)';
-    const onset = a.onset ? new Date(a.onset).toLocaleString('en-US', { timeZone: 'America/Los_Angeles', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
-    const expires = a.expires ? new Date(a.expires).toLocaleString('en-US', { timeZone: 'America/Los_Angeles', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+    const onset = a.onset ? new Date(a.onset).toLocaleString('en-US', { timeZone: _localTZ(), month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+    const expires = a.expires ? new Date(a.expires).toLocaleString('en-US', { timeZone: _localTZ(), month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
     const desc = (a.description || '').substring(0, 300) + ((a.description || '').length > 300 ? '...' : '');
 
     return `<div class="notam-card" style="border-left:3px solid ${sevColor};">
@@ -2376,7 +2389,7 @@ function updateRadarTime() {
   const frame = S.radarAnim.frames[S.radarAnim.index];
   if (frame && frame.time) {
     const d = new Date(frame.time * 1000);
-    el.textContent = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Los_Angeles' });
+    el.textContent = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: _localTZ() });
   } else {
     el.textContent = '--';
   }
@@ -2401,7 +2414,7 @@ function initTimeBar() {
     let lhtml = '';
     for (let i = 0; i < n; i += 3) {
       const dt = new Date(times[i]);
-      lhtml += `<span>${dt.toLocaleTimeString('en-US', { hour: 'numeric', hour12: true, timeZone: 'America/Los_Angeles' }).replace(' ', '')}</span>`;
+      lhtml += `<span>${dt.toLocaleTimeString('en-US', { hour: 'numeric', hour12: true, timeZone: _localTZ() }).replace(' ', '')}</span>`;
     }
     labelsEl.innerHTML = lhtml;
   }
@@ -2453,7 +2466,7 @@ function _updateTimeBar(frac) {
   // Time readout
   const dt = new Date(hourly.time[idx]);
   const timeEl = document.getElementById('tbTime');
-  if (timeEl) timeEl.textContent = idx === 0 ? 'NOW' : dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/Los_Angeles' });
+  if (timeEl) timeEl.textContent = idx === 0 ? 'NOW' : dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: _localTZ() });
 
   // Wind values
   const windSpd = hourly.wind_speed_10m?.[idx];
@@ -3283,7 +3296,7 @@ function saveConfig() {
 
 function updateClock() {
   const now = new Date();
-  const local = now.toLocaleTimeString('en-US', { hour12: false, timeZone: 'America/Los_Angeles' });
+  const local = now.toLocaleTimeString('en-US', { hour12: false, timeZone: _localTZ() });
   const utc = now.toISOString().substr(11, 8);
   document.getElementById('clockDisplay').textContent = `${local} L / ${utc} Z`;
 }
@@ -3682,7 +3695,7 @@ function generatePDFBriefing() {
   const assessText = document.getElementById('assessText')?.textContent || '';
   const now = new Date();
   const dateStr = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
-  const timeLocal = now.toLocaleTimeString('en-US', { hour12: false, timeZone: 'America/Los_Angeles' });
+  const timeLocal = now.toLocaleTimeString('en-US', { hour12: false, timeZone: _localTZ() });
   const timeUTC = now.toISOString().substr(11, 8);
 
   const briefingText = buildBriefingText();
@@ -3827,7 +3840,7 @@ function _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic
     <table style="width:100%;font-size:11px;margin-bottom:12px;border-collapse:collapse;">
       <tr>
         <td style="padding:3px 0;"><b>Date:</b> ${dateStr}</td>
-        <td style="padding:3px 0;"><b>Local:</b> ${timeLocal} PDT</td>
+        <td style="padding:3px 0;"><b>Local:</b> ${timeLocal} ${new Date().toLocaleTimeString('en-US',{timeZoneName:'short'}).split(' ').pop()}</td>
         <td style="padding:3px 0;"><b>UTC:</b> ${timeUTC}Z</td>
       </tr>
       <tr>
@@ -3928,7 +3941,7 @@ function _openEmailBriefingWindow(mapDataUrl) {
   const aircraft = document.getElementById('cfgAircraft')?.value?.toUpperCase() || '--';
   const now = new Date();
   const dateStr = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
-  const timeStr = now.toLocaleTimeString('en-US', { hour12: false, timeZone: 'America/Los_Angeles' });
+  const timeStr = now.toLocaleTimeString('en-US', { hour12: false, timeZone: _localTZ() });
   const briefingText = buildBriefingText();
   const sections = briefingText.split('\n\n');
   const mapHtml = mapDataUrl ? `<img src="${mapDataUrl}" style="width:100%;max-width:700px;border:1px solid #ccc;margin:10px 0;" />` : '';

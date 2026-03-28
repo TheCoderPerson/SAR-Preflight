@@ -779,7 +779,7 @@ function generateSearchPattern(bounds, windDirDeg, patternType, trackSpacingM) {
 
 const TRAINING_SCENARIOS = [
   {
-    name: 'High Wind SAR - Georgetown',
+    name: 'High Wind SAR',
     description: 'Gusty conditions in foothill terrain with elevated winds at altitude. Tests wind tolerance decisions.',
     center: { lat: 38.8916, lng: -120.8624 },
     wx: {
@@ -803,7 +803,7 @@ const TRAINING_SCENARIOS = [
     astro: { sunrise: '06:15 AM', sunset: '07:45 PM', twilightAM: '05:48 AM', twilightPM: '08:12 PM' },
   },
   {
-    name: 'Winter Storm - South Lake Tahoe',
+    name: 'Winter Storm - Mountain',
     description: 'Low visibility, icing risk, high elevation, active precipitation. Should be NO-GO.',
     center: { lat: 38.9396, lng: -119.9772 },
     wx: {
@@ -827,7 +827,7 @@ const TRAINING_SCENARIOS = [
     astro: { sunrise: '07:00 AM', sunset: '04:55 PM', twilightAM: '06:32 AM', twilightPM: '05:23 PM' },
   },
   {
-    name: 'Perfect Conditions - Sacramento Valley',
+    name: 'Perfect Conditions',
     description: 'Ideal flying weather with light winds and clear skies. Should be GO.',
     center: { lat: 38.58, lng: -121.49 },
     wx: {
@@ -851,7 +851,7 @@ const TRAINING_SCENARIOS = [
     astro: { sunrise: '06:30 AM', sunset: '07:30 PM', twilightAM: '06:03 AM', twilightPM: '07:57 PM' },
   },
   {
-    name: 'Wildfire Smoke - Placerville',
+    name: 'Wildfire Smoke - High AQI',
     description: 'Poor AQI from nearby wildfire, reduced visibility, moderate winds. Tests CAUTION thresholds.',
     center: { lat: 38.7296, lng: -120.7985 },
     wx: {
