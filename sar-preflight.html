@@ -1073,6 +1073,21 @@ select.api-input { cursor: pointer; }
   </div>
 </div>
 
+<div class="modal-overlay" id="disclaimerModal">
+  <div class="modal" style="width:500px;max-height:85vh;">
+    <h3 style="color:var(--accent-amber);">Disclaimer</h3>
+    <div style="overflow-y:auto;max-height:55vh;font-size:12px;line-height:1.6;color:var(--text-secondary);">
+      <p><b>This tool is provided for informational and planning purposes only.</b></p>
+      <p style="margin-top:10px;">The data displayed in this application may be incomplete, inaccurate, outdated, or incorrect. Data is sourced from third-party APIs and open data services that may experience outages, delays, or errors. Calculated values (density altitude, airspace classification, risk assessments, etc.) are approximations and may not reflect actual conditions.</p>
+      <p style="margin-top:10px;"><b>Users must independently verify all data before flight operations.</b> Always cross-check critical information (airspace, TFRs, NOTAMs, weather) against official FAA sources, certified weather briefings, and current aeronautical publications. The GO/CAUTION/NO-GO assessment is advisory only and does not replace the Remote Pilot In Command's responsibility to evaluate flight safety.</p>
+      <p style="margin-top:10px;">This software is not certified by the FAA or any aviation authority. Use at your own risk. The developers assume no liability for decisions made based on information provided by this tool.</p>
+    </div>
+    <div class="modal-actions" style="margin-top:16px;">
+      <button class="btn btn-primary" onclick="acceptDisclaimer()">I Understand</button>
+    </div>
+  </div>
+</div>
+
 <input type="file" id="kmlFileInput" accept=".kml,.kmz" style="display:none" onchange="handleKMLFile(this)">
 
 <script src="sar-preflight-offline.js"></script>

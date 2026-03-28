@@ -3311,7 +3311,22 @@ window.addEventListener('load', () => {
   }
   startApp();
 });
+const APP_VERSION = '2026.03.27';
+
+function checkDisclaimer() {
+  const accepted = localStorage.getItem('sar_disclaimer_version');
+  if (accepted !== APP_VERSION) {
+    document.getElementById('disclaimerModal')?.classList.add('active');
+  }
+}
+
+function acceptDisclaimer() {
+  localStorage.setItem('sar_disclaimer_version', APP_VERSION);
+  document.getElementById('disclaimerModal')?.classList.remove('active');
+}
+
 function startApp() {
+  checkDisclaimer();
   initMap();
   updateClock();
   setInterval(updateClock, 1000);
