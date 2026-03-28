@@ -416,6 +416,10 @@ select.api-input { cursor: pointer; }
 .export-check-row input { accent-color: var(--accent-blue); }
 
 @media (max-width: 900px) {
+  html, body { overflow-x: hidden; width: 100%; }
+  .header { overflow: hidden; }
+  .header-logo { font-size: 12px; letter-spacing: 1px; min-width: 0; }
+  .main { overflow: hidden; }
   .header-hamburger { display: flex; }
   .header-actions {
     display: none; position: absolute; top: var(--header-height); left: 0; right: 0;
