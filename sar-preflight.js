@@ -127,6 +127,12 @@ function initMap() {
   });
   L.control.zoom({ position: 'bottomright' }).addTo(S.map);
 
+  // Start with panel collapsed on mobile
+  if (window.innerWidth <= 900) {
+    S.panelOpen = false;
+    document.getElementById('sidePanel')?.classList.add('collapsed');
+  }
+
   // Middle-mouse button panning (allows map drag while drawing tools are active)
   // Use capture phase to intercept before Leaflet.Draw sees the events
   let _mmDragging = false, _mmStart = null;
@@ -2642,6 +2648,8 @@ function togglePanel() {
   S.panelOpen = !S.panelOpen;
   document.getElementById('sidePanel').classList.toggle('collapsed');
   document.getElementById('btnPanel').classList.toggle('active');
+  // Close hamburger menu when toggling panel
+  document.getElementById('headerActions')?.classList.remove('open');
   setTimeout(() => S.map.invalidateSize(), 350);
 }
 function switchTab(tab) {

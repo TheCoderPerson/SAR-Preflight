@@ -153,16 +153,15 @@ body {
   font-family: var(--font-mono); font-size: 7px; color: var(--text-muted);
   margin-top: 1px; padding: 0 1px; user-select: none;
 }
+.timebar-info {
+  display: flex; justify-content: space-between; align-items: center; width: 100%;
+  font-family: var(--font-mono); font-size: 9px; margin-bottom: 2px;
+}
 .timebar-readout {
-  font-family: var(--font-mono); font-size: 10px; color: var(--accent-cyan);
-  white-space: nowrap; min-width: 52px; text-align: center;
+  font-size: 10px; color: var(--accent-cyan); text-align: center;
 }
-.timebar-vals {
-  font-family: var(--font-mono); font-size: 9px; color: var(--text-secondary);
-  white-space: nowrap;
-}
-.timebar-vals .tb-wind { color: var(--accent-blue); }
-.timebar-vals .tb-sun { color: var(--accent-amber); }
+.tb-wind { color: var(--accent-blue); }
+.tb-sun { color: var(--accent-amber); }
 
 /* Radar Controls */
 .radar-controls {
@@ -427,11 +426,13 @@ select.api-input { cursor: pointer; }
   .header-status { font-size: 9px; }
   .side-panel {
     position: absolute; right: 0; top: var(--header-height);
-    height: calc(100vh - var(--header-height)); z-index: 900;
+    width: 100vw; height: calc(100vh - var(--header-height)); z-index: 900;
   }
   .side-panel .tab-bar { overflow-x: auto; flex-wrap: nowrap; }
   .side-panel .tab-btn { flex-shrink: 0; }
   .mobile-panel-close { display: block; }
+  .map-info { bottom: auto; top: 12px; left: 50%; transform: translateX(-50%); font-size: 9px; padding: 4px 8px; }
+  .timebar { bottom: 4px; padding: 4px 8px; }
   .layer-control { width: 170px; }
   .layer-control.collapsed h4 { margin-bottom: 0; }
   :root { --panel-width: 100vw; }
@@ -513,17 +514,16 @@ select.api-input { cursor: pointer; }
       <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);" id="radarTime">--</span>
     </div>
     <div class="timebar" id="timeBar">
+      <div class="timebar-info">
+        <span class="tb-wind" id="tbWind">--</span>
+        <span class="timebar-readout" id="tbTime">NOW</span>
+        <span class="tb-sun" id="tbSun">--</span>
+      </div>
       <div class="timebar-row">
-        <div class="timebar-readout" id="tbTime">NOW</div>
         <div class="timebar-track" id="tbTrack">
           <div class="timebar-bg"></div>
           <div class="timebar-fill" id="tbFill"></div>
           <div class="timebar-thumb" id="tbThumb"></div>
-        </div>
-        <div class="timebar-vals">
-          <span class="tb-wind" id="tbWind">--</span>
-          <span style="color:var(--border);margin:0 3px;">|</span>
-          <span class="tb-sun" id="tbSun">--</span>
         </div>
       </div>
       <div class="timebar-labels" id="tbLabels"></div>
