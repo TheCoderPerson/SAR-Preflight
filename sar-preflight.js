@@ -3698,16 +3698,44 @@ function startApp() {
   window.addEventListener('resize', updateScrollBtns);
 
   // PWA: register service worker
+  // updateViaCache:'none' forces the browser to bypass the HTTP cache when
+  // fetching sw.js and its importScripts (version.js), so iOS PWAs reliably
+  // discover new versions instead of serving stale cached scripts.
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('./sw.js').then(reg => {
-      // Listen for SW updates
+    const trackInstallingSW = (sw) => {
+      sw.addEventListener('statechange', () => {
+        // Fire the banner once the new SW is installed (before activation).
+        // On an update, navigator.serviceWorker.controller is already set by
+        // the old SW, so this distinguishes "update" from "first install".
+        if (sw.state === 'installed' && navigator.serviceWorker.controller) {
+          showUpdateBanner();
+        }
+      });
+    };
+
+    navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' }).then(reg => {
+      S._swReg = reg;
+
+      // Cover three cases missed by a naked updatefound listener:
+      // 1. An update is already waiting from a previous session
+      if (reg.waiting && navigator.serviceWorker.controller) {
+        showUpdateBanner();
+      }
+      // 2. An update is currently installing (race: install may start before listener attaches)
+      if (reg.installing) {
+        trackInstallingSW(reg.installing);
+      }
+      // 3. Future updates discovered after registration
       reg.addEventListener('updatefound', () => {
-        const newSW = reg.installing;
-        newSW.addEventListener('statechange', () => {
-          if (newSW.state === 'activated' && navigator.serviceWorker.controller) {
-            showUpdateBanner();
-          }
-        });
+        if (reg.installing) trackInstallingSW(reg.installing);
+      });
+
+      // Proactively re-check for updates whenever the PWA regains focus —
+      // critical for iOS where tabs may live for days between launches.
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && S._swReg) {
+          S._swReg.update().catch(() => {});
+        }
       });
     }).catch(err => console.warn('SW registration failed:', err));
 
@@ -3757,15 +3785,61 @@ function startApp() {
     const el = document.getElementById('notifyStatus');
     if (el) el.textContent = 'Enabled';
   }
+
+  // Populate app version labels
+  if (typeof SAR_VERSION !== 'undefined') {
+    const headerLabel = document.getElementById('appVersionLabel');
+    if (headerLabel) headerLabel.textContent = 'v' + SAR_VERSION;
+    const configDisplay = document.getElementById('appVersionDisplay');
+    if (configDisplay) configDisplay.textContent = 'v' + SAR_VERSION;
+  }
 }
 
 function showUpdateBanner() {
+  if (document.getElementById('swUpdateBanner')) return;
   const banner = document.getElementById('assessmentBanner');
   if (!banner) return;
   const div = document.createElement('div');
+  div.id = 'swUpdateBanner';
   div.style.cssText = 'padding:8px 16px;background:var(--bg-tertiary);border-bottom:1px solid var(--accent-cyan);font-family:var(--font-mono);font-size:11px;color:var(--accent-cyan);display:flex;align-items:center;gap:8px;';
   div.innerHTML = 'Update available <button class="btn btn-primary" style="padding:3px 10px;font-size:10px;" onclick="location.reload()">Reload</button>';
   banner.parentElement.insertBefore(div, banner);
+}
+
+async function checkForUpdates() {
+  const btn = document.getElementById('btnCheckUpdates');
+  const status = document.getElementById('updateCheckStatus');
+  if (!status) return;
+
+  if (!('serviceWorker' in navigator) || !S._swReg) {
+    status.textContent = 'Service worker not available';
+    status.style.color = 'var(--accent-amber)';
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  status.textContent = 'Checking…';
+  status.style.color = 'var(--text-muted)';
+
+  try {
+    await S._swReg.update();
+    // Give the browser a moment to start installing if there's an update
+    await new Promise(r => setTimeout(r, 1500));
+
+    if (S._swReg.installing || S._swReg.waiting) {
+      status.textContent = 'Update found — installing. Reload banner will appear.';
+      status.style.color = 'var(--accent-cyan)';
+    } else {
+      const ver = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : 'unknown';
+      status.textContent = `Up to date (v${ver})`;
+      status.style.color = 'var(--accent-green)';
+    }
+  } catch (err) {
+    status.textContent = 'Check failed: ' + (err.message || 'unknown error');
+    status.style.color = 'var(--accent-amber)';
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function downloadTilesForView() {

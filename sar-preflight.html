@@ -458,7 +458,7 @@ select.api-input { cursor: pointer; }
 <body>
 
 <div class="header">
-  <div class="header-logo">SAR PREFLIGHT<span> // UAS INTEL</span></div>
+  <div class="header-logo">SAR PREFLIGHT<span> // UAS INTEL</span><span id="appVersionLabel" style="font-size:9px;color:var(--text-muted);margin-left:6px;letter-spacing:0;">—</span></div>
   <button class="header-btn header-hamburger" onclick="toggleHeaderMenu()">&#9776;</button>
   <div class="header-actions" id="headerActions">
     <button class="header-btn" id="btnPanel" onclick="togglePanel()">DATA PANEL</button>
@@ -913,6 +913,17 @@ select.api-input { cursor: pointer; }
       <!-- Config Tab -->
       <div id="tab-config" class="tab-panel" style="display:none;">
         <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>App Version</div>
+          <div class="api-config">
+            <div class="data-label">Installed Version</div>
+            <div id="appVersionDisplay" style="font-family:var(--font-mono);font-size:13px;color:var(--accent-cyan);margin-top:4px;">—</div>
+          </div>
+          <div class="api-config">
+            <button class="btn btn-primary" id="btnCheckUpdates" onclick="checkForUpdates()" style="padding:5px 12px;font-size:11px;">Check for Updates</button>
+            <div id="updateCheckStatus" style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:6px;min-height:12px;">—</div>
+          </div>
+        </div>
+        <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-cyan)"></div>Data Sources</div>
           <p style="font-size:11px;color:var(--text-muted);margin-bottom:8px;line-height:1.5;">
             <strong style="color:var(--accent-green);">FREE — No key needed:</strong> Open-Meteo (weather, wind, AQI), Open-Elevation, Sunrise-Sunset.org
@@ -1139,6 +1150,7 @@ select.api-input { cursor: pointer; }
 
 <input type="file" id="kmlFileInput" accept=".kml,.kmz" style="display:none" onchange="handleKMLFile(this)">
 
+<script src="version.js"></script>
 <script src="sar-preflight-offline.js"></script>
 <script src="sar-preflight-core.js"></script>
 <script src="sar-preflight-charts.js"></script>

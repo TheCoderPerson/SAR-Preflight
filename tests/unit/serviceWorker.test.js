@@ -1,4 +1,4 @@
-const { routeStrategy, latlngToTile, getCacheName } = require('../../sw.js');
+const { routeStrategy, latlngToTile, getCacheName, CACHE_STATIC, CACHE_CDN, CACHE_TILES, SAR_VERSION } = require('../../sw.js');
 
 describe('routeStrategy(url)', () => {
   it('routes map tiles to cache-first', () => {
@@ -73,14 +73,19 @@ describe('latlngToTile(lat, lng, zoom)', () => {
 
 describe('getCacheName(url)', () => {
   it('returns CACHE_TILES for tile URLs', () => {
-    expect(getCacheName('https://a.basemaps.cartocdn.com/dark_all/11/335/785.png')).toBe('sar-tiles-v1');
+    expect(getCacheName('https://a.basemaps.cartocdn.com/dark_all/11/335/785.png')).toBe(CACHE_TILES);
   });
 
   it('returns CACHE_CDN for CDN URLs', () => {
-    expect(getCacheName('https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js')).toBe('sar-cdn-v1');
+    expect(getCacheName('https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js')).toBe(CACHE_CDN);
   });
 
   it('returns CACHE_STATIC for other URLs', () => {
-    expect(getCacheName('http://localhost:3000/sar-preflight.html')).toBe('sar-static-v1');
+    expect(getCacheName('http://localhost:3000/sar-preflight.html')).toBe(CACHE_STATIC);
+  });
+
+  it('CACHE_STATIC is keyed by SAR_VERSION so bumping the version invalidates it', () => {
+    expect(CACHE_STATIC).toBe('sar-static-' + SAR_VERSION);
+    expect(SAR_VERSION).toMatch(/^\d{4}\.\d{2}\.\d{2}(-[a-z])?$/);
   });
 });

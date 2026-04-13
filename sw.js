@@ -3,9 +3,17 @@
 // Cache management, offline fetch, tile pre-download
 // ============================================================
 
-const BUILD_VERSION = '__BUILD_VERSION__';
+// Import version constant — changes to version.js are part of the SW
+// update-check byte comparison, so bumping SAR_VERSION automatically causes
+// browsers to detect a new SW and run install/activate again.
+if (typeof importScripts === 'function') {
+  importScripts('./version.js');
+} else if (typeof require !== 'undefined') {
+  // Node/Vitest test environment: require the module and expose as a global
+  globalThis.SAR_VERSION = require('./version.js').SAR_VERSION;
+}
 
-const CACHE_STATIC = 'sar-static-v2';
+const CACHE_STATIC = 'sar-static-' + SAR_VERSION;
 const CACHE_CDN    = 'sar-cdn-v1';
 const CACHE_TILES  = 'sar-tiles-v1';
 const CACHE_API    = 'sar-api-v1';
@@ -16,6 +24,7 @@ const CURRENT_CACHES = [CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_API];
 const APP_SHELL = [
   './',
   './sar-preflight.html',
+  './version.js',
   './sar-preflight-core.js',
   './sar-preflight.js',
   './sar-preflight-offline.js',
@@ -258,5 +267,10 @@ async function getCacheSize() {
 
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { routeStrategy, latlngToTile, getCacheName, CURRENT_CACHES, APP_SHELL, CDN_ASSETS };
+  module.exports = {
+    routeStrategy, latlngToTile, getCacheName,
+    CURRENT_CACHES, APP_SHELL, CDN_ASSETS,
+    CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_API,
+    SAR_VERSION,
+  };
 }
