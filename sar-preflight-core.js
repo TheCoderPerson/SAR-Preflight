@@ -129,6 +129,27 @@ function calcBatteryDerating(tempF, elevFt, maxWindMph) {
   return { tempFactor, altFactor, windFactor, combined };
 }
 
+// --- Prop Icing Risk ---
+// Quadcopter props can accrete ice even above freezing when air is near saturation —
+// venturi/evaporative cooling on blade surfaces drops temperatures below ambient.
+function assessPropIcing(tempF, dewF) {
+  if (tempF == null) return { risk: 'No data', level: 'green', severity: 'none', reason: null };
+  const t = Math.round(tempF);
+  const hasDew = dewF != null && !Number.isNaN(dewF);
+  const spread = hasDew ? Math.round(tempF - dewF) : null;
+
+  if (hasDew && tempF <= 32 && spread <= 5) {
+    return { risk: 'Likely', level: 'red', severity: 'nogo', reason: `${t}°F / ${spread}°F spread (freezing + saturated)` };
+  }
+  if (hasDew && tempF < 41 && spread <= 5) {
+    return { risk: 'Possible', level: 'amber', severity: 'caution', reason: `${t}°F / ${spread}°F spread` };
+  }
+  if (tempF < 32) {
+    return { risk: 'Possible', level: 'amber', severity: 'caution', reason: `${t}°F sub-freezing` };
+  }
+  return { risk: 'None', level: 'green', severity: 'none', reason: null };
+}
+
 // --- Risk Assessment ---
 
 function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
@@ -153,6 +174,10 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
   if (precip > t.precipCaution && precip <= t.precipNoGo) { cautions.push(`Precip ${precip}%`); }
   if (temp < t.tempCaution) { cautions.push('Cold — battery impact'); }
   if (centerElev > t.elevCaution) { cautions.push('High elevation'); }
+
+  const icing = assessPropIcing(wx.temperature_2m, wx.dew_point_2m);
+  if (icing.severity === 'nogo') { issues.push(`Prop icing — ${icing.reason}`); }
+  else if (icing.severity === 'caution') { cautions.push(`Prop icing — ${icing.reason}`); }
 
   let level = 'GO', text = 'All conditions nominal for UAS operations';
   if (issues.length > 0) { level = 'NO-GO'; text = issues.join(' • '); }
@@ -952,7 +977,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     WIRE_CATEGORIES, lerp, degToCompass, haversine, wmoCodeToText,
     calcSunPosition, calcMoonPhase, wireHazardName,
-    calcDensityAltitude, calcBatteryDerating, assessRisk,
+    calcDensityAltitude, calcBatteryDerating, assessPropIcing, assessRisk,
     DEFAULT_THRESHOLDS, TRAINING_SCENARIOS,
     classifyTerrain, estimateVegetation, estimateCellCoverage,
     filterAirportsByDistance, classifyAirspace,

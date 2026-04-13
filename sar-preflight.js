@@ -448,7 +448,7 @@ async function fetchWeather(lat, lng) {
       `cloud_cover,visibility,wind_speed_10m,wind_direction_10m,wind_gusts_10m,precipitation_probability,` +
       `weather_code,uv_index,is_day` +
       `&hourly=wind_speed_80m,wind_speed_120m,wind_speed_180m,wind_direction_80m,wind_direction_120m,wind_direction_180m` +
-      `,temperature_2m,precipitation_probability,wind_speed_10m,wind_direction_10m,wind_gusts_10m,cloud_cover,weather_code` +
+      `,temperature_2m,dew_point_2m,precipitation_probability,wind_speed_10m,wind_direction_10m,wind_gusts_10m,cloud_cover,weather_code` +
       `&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto` +
       `&forecast_hours=24`;
 
@@ -493,9 +493,9 @@ async function fetchWeather(lat, lng) {
       setColor('wxLightning', c.weather_code >= 95 ? 'red' : precip > 40 ? 'amber' : 'green');
       setText('wxUV', c.uv_index?.toFixed(1) ?? '--');
 
-      const tempC = (c.temperature_2m - 32) * 5/9;
-      setText('wxIcing', tempC < 0 ? 'Possible' : 'None');
-      setColor('wxIcing', tempC < 0 ? 'amber' : 'green');
+      const icing = assessPropIcing(c.temperature_2m, c.dew_point_2m);
+      setText('wxIcing', icing.reason ? `${icing.risk} — ${icing.reason}` : icing.risk);
+      setColor('wxIcing', icing.level);
 
       const fireDanger = c.relative_humidity_2m < 20 ? 'Very High' : c.relative_humidity_2m < 30 ? 'High' : c.relative_humidity_2m < 45 ? 'Moderate' : 'Low';
       setText('wxFire', fireDanger);
@@ -563,6 +563,7 @@ async function fetchWeather(lat, lng) {
       S.wx.hourly = {
         time: wx.hourly.time,
         temperature_2m: wx.hourly.temperature_2m,
+        dew_point_2m: wx.hourly.dew_point_2m,
         precipitation_probability: wx.hourly.precipitation_probability,
         wind_speed_10m: wx.hourly.wind_speed_10m,
         wind_direction_10m: wx.hourly.wind_direction_10m,
@@ -723,6 +724,7 @@ function renderForecastChart(hourlyData) {
 
   const times = hourlyData.time;
   const temps = hourlyData.temperature_2m || [];
+  const dews = hourlyData.dew_point_2m || [];
   const winds = hourlyData.wind_speed_10m || [];
   const precips = hourlyData.precipitation_probability || [];
   const n = Math.min(times.length, 24);
@@ -733,9 +735,12 @@ function renderForecastChart(hourlyData) {
 
   // Auto-scale temp & wind
   const tSlice = temps.slice(0, n), wSlice = winds.slice(0, n), pSlice = precips.slice(0, n);
+  const dSlice = dews.slice(0, n);
   const tMin = Math.min(...tSlice.filter(v => v != null)), tMax = Math.max(...tSlice.filter(v => v != null));
   const wMin = 0, wMax = Math.max(Math.max(...wSlice.filter(v => v != null)), 5);
   const tRange = Math.max(tMax - tMin, 1), wRange = Math.max(wMax - wMin, 1);
+
+  const icingByHour = tSlice.map((t, i) => assessPropIcing(t, dSlice[i]));
 
   function xPos(i) { return padL + (i / (n - 1)) * plotW; }
   function yTemp(v) { return padT + plotH - ((v - tMin) / tRange) * plotH; }
@@ -747,6 +752,17 @@ function renderForecastChart(hourlyData) {
   for (let i = 0; i < n; i += 3) {
     const x = xPos(i);
     svg += `<line x1="${x}" y1="${padT}" x2="${x}" y2="${padT + plotH}" stroke="var(--border)" stroke-width="0.5"/>`;
+  }
+
+  // Icing risk bands (drawn under precip/temp/wind so they appear in background)
+  for (let i = 0; i < n; i++) {
+    const sev = icingByHour[i].severity;
+    if (sev === 'none') continue;
+    const bandColor = sev === 'nogo' ? '#ff4d4d' : '#4db8ff';
+    const bandOpacity = sev === 'nogo' ? 0.22 : 0.15;
+    const x0 = i === 0 ? padL : (xPos(i - 1) + xPos(i)) / 2;
+    const x1 = i === n - 1 ? padL + plotW : (xPos(i) + xPos(i + 1)) / 2;
+    svg += `<rect x="${x0.toFixed(1)}" y="${padT}" width="${(x1 - x0).toFixed(1)}" height="${plotH}" fill="${bandColor}" opacity="${bandOpacity}" pointer-events="none"/>`;
   }
 
   // Precip bars (bottom, blue fill)
@@ -799,17 +815,19 @@ function renderForecastChart(hourlyData) {
   svg += `<circle cx="${padL}" cy="${H - 16}" r="3" fill="var(--accent-cyan)"/><text x="${padL + 6}" y="${H - 13}" fill="var(--accent-cyan)" font-family="var(--font-mono)" font-size="7">Temp</text>`;
   svg += `<circle cx="${padL + 40}" cy="${H - 16}" r="3" fill="var(--accent-amber)"/><text x="${padL + 46}" y="${H - 13}" fill="var(--accent-amber)" font-family="var(--font-mono)" font-size="7">Wind</text>`;
   svg += `<rect x="${padL + 80}" y="${H - 19}" width="6" height="6" fill="var(--accent-blue)" opacity="0.5" rx="1"/><text x="${padL + 90}" y="${H - 13}" fill="var(--accent-blue)" font-family="var(--font-mono)" font-size="7">Precip%</text>`;
+  svg += `<rect x="${padL + 130}" y="${H - 19}" width="6" height="6" fill="#4db8ff" opacity="0.4" rx="1"/><text x="${padL + 140}" y="${H - 13}" fill="#4db8ff" font-family="var(--font-mono)" font-size="7">Icing</text>`;
 
   // Interactive crosshair + tooltip (hidden until hover)
   svg += `<line id="fc-cross" x1="0" y1="${padT}" x2="0" y2="${padT + plotH}" stroke="var(--text-secondary)" stroke-width="1" stroke-dasharray="2,2" style="display:none"/>`;
   svg += `<circle id="fc-dot-t" r="3" fill="var(--accent-cyan)" style="display:none"/>`;
   svg += `<circle id="fc-dot-w" r="3" fill="var(--accent-amber)" style="display:none"/>`;
   svg += `<g id="fc-tip" style="display:none">`;
-  svg += `<rect id="fc-tip-bg" rx="3" fill="var(--bg-card)" stroke="var(--border)" stroke-width="0.5" opacity="0.95" x="0" y="0" width="74" height="52"/>`;
+  svg += `<rect id="fc-tip-bg" rx="3" fill="var(--bg-card)" stroke="var(--border)" stroke-width="0.5" opacity="0.95" x="0" y="0" width="96" height="64"/>`;
   svg += `<text id="fc-tip-time" font-family="var(--font-mono)" font-size="8" fill="var(--text-secondary)" x="0" y="0"></text>`;
   svg += `<text id="fc-tip-temp" font-family="var(--font-mono)" font-size="8" fill="var(--accent-cyan)" x="0" y="0"></text>`;
   svg += `<text id="fc-tip-wind" font-family="var(--font-mono)" font-size="8" fill="var(--accent-amber)" x="0" y="0"></text>`;
   svg += `<text id="fc-tip-prec" font-family="var(--font-mono)" font-size="8" fill="var(--accent-blue)" x="0" y="0"></text>`;
+  svg += `<text id="fc-tip-ice" font-family="var(--font-mono)" font-size="8" fill="#4db8ff" x="0" y="0"></text>`;
   svg += `</g>`;
   svg += `<rect x="${padL}" y="${padT}" width="${plotW}" height="${plotH}" fill="transparent" style="cursor:crosshair" id="fc-overlay"/>`;
 
@@ -819,7 +837,7 @@ function renderForecastChart(hourlyData) {
   // Attach tooltip interaction
   const svgEl = container.querySelector('svg');
   if (svgEl) {
-    const cd = { times: times.slice(0, n), temps: tSlice, winds: wSlice, precips: pSlice, n, W, padL, plotW, plotH, padT, xPos, yTemp, yWind };
+    const cd = { times: times.slice(0, n), temps: tSlice, winds: wSlice, precips: pSlice, icing: icingByHour, n, W, padL, plotW, plotH, padT, xPos, yTemp, yWind };
     const overlay = svgEl.querySelector('#fc-overlay');
     if (overlay) {
       overlay.addEventListener('mousemove', function(ev) { _fcTooltipMove(ev, svgEl, cd); });
@@ -856,9 +874,10 @@ function _fcTooltipMove(e, svg, d) {
   const temp = d.temps[idx] != null ? Math.round(d.temps[idx]) + '\u00b0F' : '--';
   const wind = d.winds[idx] != null ? Math.round(d.winds[idx]) + ' mph' : '--';
   const prec = d.precips[idx] != null ? d.precips[idx] + '%' : '--';
+  const ice = d.icing?.[idx]?.risk ?? '--';
 
   // Position tooltip (flip side near right edge)
-  const tipX = cx < d.padL + d.plotW * 0.7 ? cx + 8 : cx - 82;
+  const tipX = cx < d.padL + d.plotW * 0.7 ? cx + 8 : cx - 104;
   const tipY = d.padT + 4;
 
   svg.querySelector('#fc-tip-bg').setAttribute('x', tipX);
@@ -866,9 +885,10 @@ function _fcTooltipMove(e, svg, d) {
   const tx = tipX + 5;
   const el = (id, text, y) => { const t = svg.querySelector(id); t.textContent = text; t.setAttribute('x', tx); t.setAttribute('y', y); };
   el('#fc-tip-time', timeStr, tipY + 11);
-  el('#fc-tip-temp', temp, tipY + 23);
-  el('#fc-tip-wind', wind, tipY + 35);
-  el('#fc-tip-prec', prec, tipY + 47);
+  el('#fc-tip-temp', temp, tipY + 22);
+  el('#fc-tip-wind', wind, tipY + 33);
+  el('#fc-tip-prec', prec, tipY + 44);
+  el('#fc-tip-ice', `Ice: ${ice}`, tipY + 55);
   svg.querySelector('#fc-tip').style.display = '';
 }
 

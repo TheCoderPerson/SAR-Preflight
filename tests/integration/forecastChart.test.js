@@ -153,4 +153,75 @@ describe('renderForecastChart(hourlyData)', () => {
     renderForecastChart(makeHourlyData(24));
     // Should not throw and no side effects
   });
+
+  describe('prop icing bands', () => {
+    function makeHourlyWithIcing(tempSeq, dewSeq) {
+      const now = new Date();
+      const n = tempSeq.length;
+      const times = [], winds = [], precips = [], gusts = [], clouds = [], codes = [];
+      for (let i = 0; i < n; i++) {
+        times.push(new Date(now.getTime() + i * 3600000).toISOString());
+        winds.push(5); precips.push(0); gusts.push(8); clouds.push(20); codes.push(0);
+      }
+      return {
+        time: times, temperature_2m: tempSeq, dew_point_2m: dewSeq,
+        wind_speed_10m: winds, precipitation_probability: precips,
+        wind_gusts_10m: gusts, cloud_cover: clouds, weather_code: codes,
+      };
+    }
+
+    // Band rects are disambiguated from the legend swatch by their opacity
+    // (bands use 0.15 / 0.22; the legend swatch uses 0.4).
+    const CAUTION_BAND = 'fill="#4db8ff" opacity="0.15"';
+    const NOGO_BAND = 'fill="#ff4d4d" opacity="0.22"';
+
+    it('no icing bands when dew_point_2m field is absent (backwards compat)', () => {
+      const data = makeHourlyData(24);
+      renderForecastChart(data);
+      expect(forecastChart.innerHTML).not.toContain(CAUTION_BAND);
+      expect(forecastChart.innerHTML).not.toContain(NOGO_BAND);
+    });
+
+    it('draws blue CAUTION bands for cold+saturated hours', () => {
+      // 24 hours: first 6 warm/dry, middle 6 cold+saturated, rest warm
+      const temps = [], dews = [];
+      for (let i = 0; i < 24; i++) {
+        if (i >= 6 && i < 12) { temps.push(38); dews.push(35); }
+        else { temps.push(65); dews.push(45); }
+      }
+      renderForecastChart(makeHourlyWithIcing(temps, dews));
+      expect(forecastChart.innerHTML).toContain(CAUTION_BAND);
+      expect(forecastChart.innerHTML).toContain('pointer-events="none"');
+    });
+
+    it('draws red NO-GO bands for freezing+saturated hours', () => {
+      const temps = [], dews = [];
+      for (let i = 0; i < 24; i++) {
+        if (i >= 4 && i < 10) { temps.push(28); dews.push(26); }
+        else { temps.push(55); dews.push(40); }
+      }
+      renderForecastChart(makeHourlyWithIcing(temps, dews));
+      expect(forecastChart.innerHTML).toContain(NOGO_BAND);
+    });
+
+    it('legend includes Icing entry', () => {
+      const data = makeHourlyData(24);
+      renderForecastChart(data);
+      expect(forecastChart.innerHTML).toContain('>Icing<');
+    });
+
+    it('tooltip has fc-tip-ice element', () => {
+      const data = makeHourlyData(24);
+      renderForecastChart(data);
+      expect(forecastChart.innerHTML).toContain('id="fc-tip-ice"');
+    });
+
+    it('all-clear forecast produces zero band rects', () => {
+      const temps = new Array(24).fill(65);
+      const dews = new Array(24).fill(45);
+      renderForecastChart(makeHourlyWithIcing(temps, dews));
+      expect(forecastChart.innerHTML).not.toContain(CAUTION_BAND);
+      expect(forecastChart.innerHTML).not.toContain(NOGO_BAND);
+    });
+  });
 });

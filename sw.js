@@ -5,7 +5,7 @@
 
 const BUILD_VERSION = '__BUILD_VERSION__';
 
-const CACHE_STATIC = 'sar-static-v1';
+const CACHE_STATIC = 'sar-static-v2';
 const CACHE_CDN    = 'sar-cdn-v1';
 const CACHE_TILES  = 'sar-tiles-v1';
 const CACHE_API    = 'sar-api-v1';

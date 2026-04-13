@@ -284,4 +284,74 @@ describe('assessRisk(wx, wind, elev, maxWindTol)', () => {
       expect(result.cautions.some(c => c.includes('Elevated winds'))).toBe(true);
     });
   });
+
+  describe('prop icing integration', () => {
+    it('warm and dry conditions produce no icing caution or issue', () => {
+      const wx = { ...defaultWx(), temperature_2m: 65, dew_point_2m: 45 };
+      const result = assessRisk(wx, defaultWind(), defaultElev(), defaultMaxWindTol);
+      expect(result.cautions.some(c => c.includes('Prop icing'))).toBe(false);
+      expect(result.issues.some(i => i.includes('Prop icing'))).toBe(false);
+      expect(result.level).toBe('GO');
+    });
+
+    it('38F / 35F (3F spread) adds Prop icing CAUTION', () => {
+      const wx = { ...defaultWx(), temperature_2m: 38, dew_point_2m: 35 };
+      const result = assessRisk(wx, defaultWind(), defaultElev(), defaultMaxWindTol);
+      expect(result.level).toBe('CAUTION');
+      expect(result.cautions.some(c => c.includes('Prop icing'))).toBe(true);
+      expect(result.cautions.some(c => c.includes('3') && c.includes('spread'))).toBe(true);
+    });
+
+    it('30F / 28F (freezing + 2F spread) adds Prop icing NO-GO issue', () => {
+      const wx = { ...defaultWx(), temperature_2m: 30, dew_point_2m: 28 };
+      const result = assessRisk(wx, defaultWind(), defaultElev(), defaultMaxWindTol);
+      expect(result.level).toBe('NO-GO');
+      expect(result.issues.some(i => i.includes('Prop icing'))).toBe(true);
+      expect(result.issues.some(i => i.includes('freezing'))).toBe(true);
+    });
+
+    it('icing NO-GO combined with wind NO-GO — both issues present', () => {
+      const wx = { ...defaultWx(), temperature_2m: 28, dew_point_2m: 26 };
+      const wind = { maxWind: 35, maxGust: 40 };
+      const result = assessRisk(wx, wind, defaultElev(), defaultMaxWindTol);
+      expect(result.level).toBe('NO-GO');
+      expect(result.issues.some(i => i.includes('Prop icing'))).toBe(true);
+      expect(result.issues.some(i => i.includes('exceeds limits'))).toBe(true);
+    });
+
+    it('icing CAUTION under existing NO-GO — level stays NO-GO', () => {
+      const wx = { ...defaultWx(), temperature_2m: 38, dew_point_2m: 35, visibility: 500 };
+      const result = assessRisk(wx, defaultWind(), defaultElev(), defaultMaxWindTol);
+      expect(result.level).toBe('NO-GO');
+      expect(result.cautions.some(c => c.includes('Prop icing'))).toBe(true);
+      expect(result.issues.some(i => i.includes('Visibility'))).toBe(true);
+    });
+
+    it('no dew_point_2m with warm temp — no icing caution', () => {
+      const wx = { ...defaultWx(), temperature_2m: 65 };
+      const result = assessRisk(wx, defaultWind(), defaultElev(), defaultMaxWindTol);
+      expect(result.cautions.some(c => c.includes('Prop icing'))).toBe(false);
+      expect(result.issues.some(i => i.includes('Prop icing'))).toBe(false);
+    });
+
+    it('sub-freezing with no dew data — fallback Prop icing CAUTION', () => {
+      const wx = { ...defaultWx(), temperature_2m: 25 };
+      const result = assessRisk(wx, defaultWind(), defaultElev(), defaultMaxWindTol);
+      expect(result.level).toBe('CAUTION');
+      expect(result.cautions.some(c => c.includes('Prop icing') && c.includes('sub-freezing'))).toBe(true);
+    });
+
+    it('boundary: exactly 41F / 36F — no icing trigger', () => {
+      const wx = { ...defaultWx(), temperature_2m: 41, dew_point_2m: 36 };
+      const result = assessRisk(wx, defaultWind(), defaultElev(), defaultMaxWindTol);
+      expect(result.cautions.some(c => c.includes('Prop icing'))).toBe(false);
+      expect(result.issues.some(i => i.includes('Prop icing'))).toBe(false);
+    });
+
+    it('boundary: 40F / 35F (5F spread inclusive) — Prop icing CAUTION', () => {
+      const wx = { ...defaultWx(), temperature_2m: 40, dew_point_2m: 35 };
+      const result = assessRisk(wx, defaultWind(), defaultElev(), defaultMaxWindTol);
+      expect(result.cautions.some(c => c.includes('Prop icing'))).toBe(true);
+    });
+  });
 });
