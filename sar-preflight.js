@@ -3785,14 +3785,8 @@ function startApp() {
     const el = document.getElementById('notifyStatus');
     if (el) el.textContent = 'Enabled';
   }
-
-  // Populate app version labels
-  if (typeof SAR_VERSION !== 'undefined') {
-    const headerLabel = document.getElementById('appVersionLabel');
-    if (headerLabel) headerLabel.textContent = 'v' + SAR_VERSION;
-    const configDisplay = document.getElementById('appVersionDisplay');
-    if (configDisplay) configDisplay.textContent = 'v' + SAR_VERSION;
-  }
+  // App version labels are populated by version.js directly on DOMContentLoaded
+  // so the display survives any earlier failure in startApp.
 }
 
 function showUpdateBanner() {
