@@ -2,6 +2,8 @@
 
 A browser-based pre-flight intelligence tool for UAS (drone) operators conducting Search and Rescue missions. Consolidates weather, airspace, terrain, fire danger, and operational data into a single map-based interface for Part 107 compliance.
 
+https://thecoderperson.github.io/SAR-Preflight/sar-preflight.html
+
 ## How to Use
 
 1. **Open the app** in a browser (desktop or mobile)
