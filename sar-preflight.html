@@ -1060,8 +1060,9 @@ select.api-input { cursor: pointer; }
         </div>
         <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-purple)"></div>Offline &amp; Map Tiles</div>
+          <div id="sectionalEditionStatus" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-bottom:8px;">FAA Sectional — checking edition…</div>
           <div class="api-config">
-            <div class="data-label">Import FAA Sectional Chart (.tif from <a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank" style="color:var(--accent-cyan);">faa.gov</a>)</div>
+            <div class="data-label">Import FAA Sectional Chart (.tif from <a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank" style="color:var(--accent-cyan);">faa.gov</a>) — full-resolution offline backup</div>
             <input type="file" id="chartFileInput" accept=".tif,.tiff" style="font-size:11px;color:var(--text-secondary);margin-top:6px;" onchange="loadFAAChart(this)">
             <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
               <label style="font-size:11px;color:var(--text-secondary);white-space:nowrap;">Collar trim:</label>

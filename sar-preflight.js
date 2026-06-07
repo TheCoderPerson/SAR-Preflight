@@ -89,6 +89,95 @@ function setStatus(id, type, text) {
 }
 
 // ============================================================
+// FAA VFR SECTIONAL — current chart source + edition/offline handling
+// ============================================================
+// Official FAA-hosted cached tile service (same ArcGIS org used for FAA
+// airspace data). Native zoom 8-12, refreshed every 56 days. The edition is
+// appended as a `?ed=` query param so a newer online edition naturally
+// invalidates the Service Worker cache while offline falls back to the last
+// cached edition.
+const VFR_SECTIONAL_BASE = 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer';
+
+function sectionalTileUrl(edition) {
+  return VFR_SECTIONAL_BASE + '/tile/{z}/{y}/{x}?ed=' + encodeURIComponent(edition);
+}
+
+// Last-known edition, persisted so the first paint works offline. Falls back to
+// the deterministic 56-day cycle if the device has never been online.
+function getStoredSectionalEdition() {
+  let ed = null;
+  try { ed = localStorage.getItem('sar_sectional_edition'); } catch (e) { /* private mode */ }
+  if (!ed && typeof currentSectionalCycle === 'function') {
+    ed = currentSectionalCycle(new Date().toISOString().slice(0, 10));
+  }
+  return ed || '2026-05-13';
+}
+
+// When online, ask the service for its current edition and, if newer, repoint
+// the tile layer (fresh tiles fetch via the SW; the prior edition stays cached
+// as an offline fallback). When offline or on any failure, keep the cached
+// edition. Safe to call repeatedly (init + on reconnect).
+async function resolveSectionalEdition() {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    updateSectionalEditionUI(getStoredSectionalEdition(), { online: false });
+    return;
+  }
+  try {
+    const res = await fetch(VFR_SECTIONAL_BASE + '?f=json', { cache: 'no-cache' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const meta = await res.json();
+    // The edition stamp lives in documentInfo.subject for this service
+    // (e.g. "Updated with the latest charts on 2026-05-13 ..."); fall back
+    // across the other text fields in case the service layout changes.
+    const di = (meta && meta.documentInfo) || {};
+    const candidate = [di.subject, di.comments, meta && meta.serviceDescription, meta && meta.description]
+      .filter(Boolean).join(' ');
+    const ed = (typeof parseSectionalEdition === 'function') ? parseSectionalEdition(candidate) : null;
+    if (!ed) throw new Error('no edition in service metadata');
+    const prev = getStoredSectionalEdition();
+    try { localStorage.setItem('sar_sectional_edition', ed); } catch (e) { /* private mode */ }
+    if (ed !== prev && S.mapLayers && S.mapLayers.sectional) {
+      S.mapLayers.sectional.setUrl(sectionalTileUrl(ed));
+    }
+    updateSectionalEditionUI(ed, { online: true });
+  } catch (e) {
+    updateSectionalEditionUI(getStoredSectionalEdition(), { online: false });
+  }
+}
+
+function updateSectionalEditionUI(edition, opts) {
+  const el = document.getElementById('sectionalEditionStatus');
+  if (!el) return;
+  if (opts && opts.online) {
+    el.textContent = 'FAA Sectional — current (' + edition + ')';
+    el.style.color = 'var(--accent-green)';
+  } else {
+    el.textContent = 'FAA Sectional — cached edition ' + edition + ' (offline)';
+    el.style.color = 'var(--accent-amber)';
+  }
+}
+
+// Background-cache the FAA sectional covering a drawn operating area (z8-12) so
+// it is fully available offline. No-op when offline or the SW isn't controlling.
+function cacheSectionalForArea(bounds) {
+  if (typeof navigator === 'undefined' || !navigator.onLine) return;
+  if (!navigator.serviceWorker || !navigator.serviceWorker.controller) return;
+  if (!bounds) return;
+  navigator.serviceWorker.controller.postMessage({
+    type: 'DOWNLOAD_TILES',
+    bounds: {
+      south: bounds.getSouth(), west: bounds.getWest(),
+      north: bounds.getNorth(), east: bounds.getEast(),
+    },
+    zooms: [8, 9, 10, 11, 12],
+    providers: ['sectional'],
+    sectionalEdition: getStoredSectionalEdition(),
+  });
+  const text = document.getElementById('tileProgressText');
+  if (text && !text.textContent) text.textContent = 'Caching sectional for area…';
+}
+
+// ============================================================
 // MAP INIT
 // ============================================================
 function initMap() {
@@ -96,7 +185,7 @@ function initMap() {
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '&copy; CARTO' }).addTo(S.map);
   S.mapLayers.satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19 });
   S.mapLayers.topo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { maxZoom: 17 });
-  S.mapLayers.sectional = L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Specialty/World_Navigation_Charts/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 10, maxZoom: 18, opacity: 0.85, attribution: 'Esri World Navigation Charts' });
+  S.mapLayers.sectional = L.tileLayer(sectionalTileUrl(getStoredSectionalEdition()), { maxNativeZoom: 12, maxZoom: 18, opacity: 1.0, attribution: 'FAA Aeronautical Information Services' });
   S.drawnItems = new L.FeatureGroup();
   S.map.addLayer(S.drawnItems);
   // Cursor coordinate + elevation display
@@ -349,6 +438,9 @@ async function processArea(layer, type) {
   computeOpsData();
   computeAssessment();
   showDataSourceStatus();
+
+  // Background-cache the current FAA sectional for this area so it's available offline
+  cacheSectionalForArea(bounds);
 }
 
 function recordDataSourceError(source, error) {
@@ -4137,6 +4229,7 @@ function acceptDisclaimer() {
 function startApp() {
   checkDisclaimer();
   initMap();
+  resolveSectionalEdition();
   updateClock();
   setInterval(updateClock, 1000);
   const tabNav = document.getElementById('tabNav');

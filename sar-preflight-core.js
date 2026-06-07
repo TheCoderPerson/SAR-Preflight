@@ -1511,10 +1511,41 @@ function artccsForArea(areaPoly) {
   return Object.values(found);
 }
 
+// --- FAA VFR Sectional chart edition helpers ---
+// The FAA VFR Sectional tile service publishes a new edition every 56 days.
+// parseSectionalEdition() extracts the YYYY-MM-DD edition stamp from the
+// ArcGIS MapServer `description` field, e.g.:
+//   "Updated with the latest charts on 2026-05-13 16:18:39.073216"
+// Returns the date string, or null if none is present.
+function parseSectionalEdition(description) {
+  if (typeof description !== 'string') return null;
+  const m = description.match(/(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : null;
+}
+
+// Deterministic 56-day cycle used ONLY as a cold-start fallback edition when
+// the device has never reached the service. Anchored to the verified
+// 2026-05-13 edition; the live `?f=json` description is authoritative whenever
+// the device is online. Returns the latest cycle date <= todayISO.
+const SECTIONAL_CYCLE_ANCHOR = '2026-05-13';
+const SECTIONAL_CYCLE_DAYS = 56;
+function currentSectionalCycle(todayISO) {
+  const MS_DAY = 86400000;
+  const anchor = Date.parse(SECTIONAL_CYCLE_ANCHOR + 'T00:00:00Z');
+  const t = todayISO
+    ? Date.parse(/T/.test(todayISO) ? todayISO : todayISO + 'T00:00:00Z')
+    : anchor;
+  if (isNaN(t)) return SECTIONAL_CYCLE_ANCHOR;
+  const cycleMs = SECTIONAL_CYCLE_DAYS * MS_DAY;
+  const k = Math.floor((t - anchor) / cycleMs);
+  return new Date(anchor + k * cycleMs).toISOString().slice(0, 10);
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     WIRE_CATEGORIES, lerp, degToCompass, haversine, wmoCodeToText,
+    parseSectionalEdition, currentSectionalCycle,
     calcSunPosition, calcMoonPhase, wireHazardName,
     calcDensityAltitude, calcBatteryDerating, assessPropIcing, assessRisk,
     DEFAULT_THRESHOLDS, TRAINING_SCENARIOS,

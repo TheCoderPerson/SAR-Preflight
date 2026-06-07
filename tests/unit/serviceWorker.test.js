@@ -1,10 +1,21 @@
-const { routeStrategy, latlngToTile, getCacheName, CACHE_STATIC, CACHE_CDN, CACHE_TILES, SAR_VERSION } = require('../../sw.js');
+const { routeStrategy, latlngToTile, getCacheName, CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_SECTIONAL, SAR_VERSION } = require('../../sw.js');
+
+const SECTIONAL_TILE = 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/10/396/164?ed=2026-05-13';
+const SECTIONAL_META = 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer?f=json';
 
 describe('routeStrategy(url)', () => {
   it('routes map tiles to cache-first', () => {
     expect(routeStrategy('https://a.basemaps.cartocdn.com/dark_all/11/335/785.png')).toBe('cache-first');
     expect(routeStrategy('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/11/785/335')).toBe('cache-first');
     expect(routeStrategy('https://a.tile.opentopomap.org/11/335/785.png')).toBe('cache-first');
+  });
+
+  it('routes FAA VFR sectional tiles to cache-first', () => {
+    expect(routeStrategy(SECTIONAL_TILE)).toBe('cache-first');
+  });
+
+  it('routes FAA VFR sectional service metadata to network-first', () => {
+    expect(routeStrategy(SECTIONAL_META)).toBe('network-first');
   });
 
   it('routes CDN assets to cache-first', () => {
@@ -74,6 +85,10 @@ describe('latlngToTile(lat, lng, zoom)', () => {
 describe('getCacheName(url)', () => {
   it('returns CACHE_TILES for tile URLs', () => {
     expect(getCacheName('https://a.basemaps.cartocdn.com/dark_all/11/335/785.png')).toBe(CACHE_TILES);
+  });
+
+  it('returns CACHE_SECTIONAL for FAA VFR sectional tiles', () => {
+    expect(getCacheName(SECTIONAL_TILE)).toBe(CACHE_SECTIONAL);
   });
 
   it('returns CACHE_CDN for CDN URLs', () => {

@@ -13,12 +13,13 @@ if (typeof importScripts === 'function') {
   globalThis.SAR_VERSION = require('./version.js').SAR_VERSION;
 }
 
-const CACHE_STATIC = 'sar-static-' + SAR_VERSION;
-const CACHE_CDN    = 'sar-cdn-v1';
-const CACHE_TILES  = 'sar-tiles-v1';
-const CACHE_API    = 'sar-api-v1';
+const CACHE_STATIC    = 'sar-static-' + SAR_VERSION;
+const CACHE_CDN       = 'sar-cdn-v1';
+const CACHE_TILES     = 'sar-tiles-v1';
+const CACHE_API       = 'sar-api-v1';
+const CACHE_SECTIONAL = 'sar-sectional-v1'; // FAA VFR sectional tiles (edition-tagged)
 
-const CURRENT_CACHES = [CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_API];
+const CURRENT_CACHES = [CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_API, CACHE_SECTIONAL];
 
 // App shell files to pre-cache on install
 const APP_SHELL = [
@@ -89,6 +90,12 @@ self.addEventListener('fetch', event => {
     return;
   }
 
+  // FAA VFR Sectional tiles — cache-first with cross-edition offline fallback
+  if (url.includes('/VFR_Sectional/MapServer/tile/')) {
+    event.respondWith(sectionalTileStrategy(event.request));
+    return;
+  }
+
   const strategy = routeStrategy(url);
 
   if (strategy === 'cache-first') {
@@ -100,11 +107,14 @@ self.addEventListener('fetch', event => {
 });
 
 function routeStrategy(url) {
+  // FAA VFR Sectional service metadata (edition check) — network-first
+  if (url.includes('/VFR_Sectional/MapServer') && !url.includes('/tile/')) return 'network-first';
+
   // Map tiles — cache-first (opportunistic + pre-downloaded)
   if (url.includes('basemaps.cartocdn.com') ||
       url.includes('arcgisonline.com') ||
       url.includes('opentopomap.org') ||
-      url.includes('services.arcgisonline.com/ArcGIS/rest/services/Specialty'))             return 'cache-first';
+      url.includes('/VFR_Sectional/MapServer/tile/'))             return 'cache-first';
 
   // CDN assets — cache-first
   if (url.includes('cdnjs.cloudflare.com') ||
@@ -165,14 +175,34 @@ async function networkFirst(request) {
 }
 
 function getCacheName(url) {
+  if (url.includes('/VFR_Sectional/MapServer/tile/')) return CACHE_SECTIONAL;
   if (url.includes('basemaps.cartocdn.com') ||
       url.includes('arcgisonline.com') ||
-      url.includes('opentopomap.org') ||
-      url.includes('services.arcgisonline.com/ArcGIS/rest/services/Specialty'))         return CACHE_TILES;
+      url.includes('opentopomap.org'))         return CACHE_TILES;
   if (url.includes('cdnjs.cloudflare.com') ||
       url.includes('fonts.googleapis.com') ||
       url.includes('fonts.gstatic.com'))   return CACHE_CDN;
   return CACHE_STATIC;
+}
+
+// --- FAA VFR Sectional: cache-first, with offline fallback to any cached
+// edition of the same tile (so a 56-day edition rollover doesn't blank the
+// chart when offline; the URL's ?ed= query is ignored for the fallback) ---
+async function sectionalTileStrategy(request) {
+  const cached = await caches.match(request);
+  if (cached) return cached;
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const cache = await caches.open(CACHE_SECTIONAL);
+      cache.put(request, response.clone());
+    }
+    return response;
+  } catch (err) {
+    const fallback = await caches.match(request, { ignoreSearch: true });
+    if (fallback) return fallback;
+    return new Response('', { status: 404 });
+  }
 }
 
 // --- Tile pre-download via postMessage ---
@@ -181,8 +211,9 @@ self.addEventListener('message', event => {
     downloadTiles(event.data, event.source || event.ports?.[0]);
   }
   if (event.data?.type === 'CLEAR_TILE_CACHE') {
-    caches.delete(CACHE_TILES).then(() => {
-      caches.open(CACHE_TILES); // re-create empty
+    Promise.all([caches.delete(CACHE_TILES), caches.delete(CACHE_SECTIONAL)]).then(() => {
+      caches.open(CACHE_TILES);     // re-create empty
+      caches.open(CACHE_SECTIONAL);
       event.source?.postMessage({ type: 'TILE_CACHE_CLEARED' });
     });
   }
@@ -195,14 +226,15 @@ self.addEventListener('message', event => {
 
 async function downloadTiles(config, client) {
   const { bounds, zooms, providers } = config;
-  const cache = await caches.open(CACHE_TILES);
 
   const providerUrls = {
     carto: 'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
     satellite: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     topo: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
-    sectional: 'https://services.arcgisonline.com/ArcGIS/rest/services/Specialty/World_Navigation_Charts/MapServer/tile/{z}/{y}/{x}',
+    sectional: 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}',
   };
+  // Native zoom limits per provider — out-of-range tiles don't exist (skip them)
+  const providerZoom = { sectional: { min: 8, max: 12 } };
 
   const selectedProviders = providers || ['carto'];
   const tiles = [];
@@ -215,7 +247,12 @@ async function downloadTiles(config, client) {
         for (const prov of selectedProviders) {
           const template = providerUrls[prov];
           if (!template) continue;
-          const url = template.replace('{z}', z).replace('{x}', x).replace('{y}', y).replace('{s}', 'a');
+          const zr = providerZoom[prov];
+          if (zr && (z < zr.min || z > zr.max)) continue;
+          let url = template.replace('{z}', z).replace('{x}', x).replace('{y}', y).replace('{s}', 'a');
+          if (prov === 'sectional' && config.sectionalEdition) {
+            url += '?ed=' + encodeURIComponent(config.sectionalEdition);
+          }
           tiles.push(url);
         }
       }
@@ -232,7 +269,10 @@ async function downloadTiles(config, client) {
       batch.map(async url => {
         try {
           const resp = await fetch(url);
-          if (resp.ok) await cache.put(url, resp);
+          if (resp.ok) {
+            const cache = await caches.open(getCacheName(url));
+            await cache.put(url, resp);
+          }
         } catch (e) { /* skip failed tiles */ }
       })
     );
@@ -270,7 +310,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     routeStrategy, latlngToTile, getCacheName,
     CURRENT_CACHES, APP_SHELL, CDN_ASSETS,
-    CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_API,
+    CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_API, CACHE_SECTIONAL,
     SAR_VERSION,
   };
 }
