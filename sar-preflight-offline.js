@@ -219,6 +219,8 @@ function initConnectivity() {
 function _onConnectivityChange() {
   _isOnline = navigator.onLine;
   updateConnectivityUI();
+  // Re-check the FAA sectional edition (refreshes the chart if a newer one exists)
+  if (typeof resolveSectionalEdition === 'function') resolveSectionalEdition();
   // On reconnect, offer to refresh stale data
   if (_isOnline && typeof S !== 'undefined' && S.currentArea && _lastDataTimestamp) {
     const age = Date.now() - _lastDataTimestamp;

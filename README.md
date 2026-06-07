@@ -16,7 +16,8 @@ https://thecoderperson.github.io/SAR-Preflight/sar-preflight.html
 
 ### Map Features
 - Toggle map layers (satellite, topo, FAA sectional, weather radar, airspace, towers, wire hazards, fire perimeters, live aircraft traffic) via the **Map Layers** control
-- Import FAA sectional chart GeoTIFFs for offline chart overlay
+- The **FAA Sectional** layer streams the current official FAA VFR sectional (56-day cycle); drawing an operational area auto-caches its tiles for offline use, and the cached edition is shown / refreshed when a newer one is published
+- Import FAA sectional chart GeoTIFFs for full-resolution offline chart overlay (backup to the live sectional)
 - Use the **timebar** at the bottom to scrub through 24-hour wind and sun direction forecasts
 - **Wind arrow** (blue) and **sun arrow** (yellow) on the map update as you scrub
 
