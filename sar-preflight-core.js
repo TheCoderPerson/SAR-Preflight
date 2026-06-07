@@ -972,6 +972,545 @@ function formatAltitudeAgl(aglFt) {
   return (aglFt / 1000).toFixed(1) + 'k';
 }
 
+// ============================================================
+// TFR / NOTAM IMPORT — pure helpers (no DOM/Leaflet except DOMParser-guarded)
+// Polygons use [lat, lng] vertex order to match the KML parser convention.
+// ============================================================
+
+// --- Geometry ---
+
+function pointInPolygon(lat, lng, poly) {
+  if (!poly || poly.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const yi = poly[i][0], xi = poly[i][1];
+    const yj = poly[j][0], xj = poly[j][1];
+    const intersect = ((yi > lat) !== (yj > lat)) &&
+      (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function polygonBBox(poly) {
+  let minLat = Infinity, minLng = Infinity, maxLat = -Infinity, maxLng = -Infinity;
+  for (const p of poly) {
+    if (p[0] < minLat) minLat = p[0];
+    if (p[0] > maxLat) maxLat = p[0];
+    if (p[1] < minLng) minLng = p[1];
+    if (p[1] > maxLng) maxLng = p[1];
+  }
+  return { minLat, minLng, maxLat, maxLng };
+}
+
+function bboxesOverlap(a, b) {
+  return a.minLat <= b.maxLat && a.maxLat >= b.minLat &&
+         a.minLng <= b.maxLng && a.maxLng >= b.minLng;
+}
+
+// Segment intersection via orientation tests. Points are [lat, lng] = [y, x].
+function segmentsIntersect(p1, p2, p3, p4) {
+  function ccw(a, b, c) {
+    return (c[0] - a[0]) * (b[1] - a[1]) - (b[0] - a[0]) * (c[1] - a[1]);
+  }
+  const d1 = ccw(p3, p4, p1), d2 = ccw(p3, p4, p2);
+  const d3 = ccw(p1, p2, p3), d4 = ccw(p1, p2, p4);
+  return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+         ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+}
+
+// True if two rings overlap: bbox prefilter, then vertex-containment (both
+// directions, catches full containment), then edge crossing (partial overlap).
+function polygonsIntersect(a, b) {
+  if (!a || !b || a.length < 3 || b.length < 3) return false;
+  if (!bboxesOverlap(polygonBBox(a), polygonBBox(b))) return false;
+  for (const p of a) if (pointInPolygon(p[0], p[1], b)) return true;
+  for (const p of b) if (pointInPolygon(p[0], p[1], a)) return true;
+  for (let i = 0; i < a.length; i++) {
+    const a1 = a[i], a2 = a[(i + 1) % a.length];
+    for (let j = 0; j < b.length; j++) {
+      const b1 = b[j], b2 = b[(j + 1) % b.length];
+      if (segmentsIntersect(a1, a2, b1, b2)) return true;
+    }
+  }
+  return false;
+}
+
+// Approximate a circle (meters) as a closed ring of [lat,lng] vertices.
+function circleToPolygon(lat, lng, radiusM, segments) {
+  segments = segments || 24;
+  const R = 6371000;
+  const latR = lat * Math.PI / 180, lngR = lng * Math.PI / 180;
+  const dByR = radiusM / R;
+  const pts = [];
+  for (let i = 0; i < segments; i++) {
+    const brng = 2 * Math.PI * i / segments;
+    const lat2 = Math.asin(Math.sin(latR) * Math.cos(dByR) +
+      Math.cos(latR) * Math.sin(dByR) * Math.cos(brng));
+    const lng2 = lngR + Math.atan2(
+      Math.sin(brng) * Math.sin(dByR) * Math.cos(latR),
+      Math.cos(dByR) - Math.sin(latR) * Math.sin(lat2));
+    pts.push([lat2 * 180 / Math.PI, lng2 * 180 / Math.PI]);
+  }
+  pts.push(pts[0]);
+  return pts;
+}
+
+// --- Coordinate parsing ---
+
+// Parse an FAA coordinate. Handles two FAA encodings:
+//  - decimal degrees with trailing hemisphere: "120.01666667W" -> -120.0166...
+//  - packed DMS with trailing hemisphere:      "1200100W" (DDDMMSS) -> -120.0166...
+// A leading "-" is also honored. Returns NaN on failure.
+function parseFaaCoord(raw) {
+  if (raw == null) return NaN;
+  let s = String(raw).trim();
+  if (!s) return NaN;
+  let sign = 1;
+  const last = s.charAt(s.length - 1).toUpperCase();
+  if (last === 'N' || last === 'S' || last === 'E' || last === 'W') {
+    if (last === 'S' || last === 'W') sign = -1;
+    s = s.slice(0, -1).trim();
+  } else if (s.charAt(0) === '-') {
+    sign = -1; s = s.slice(1);
+  }
+  s = s.replace(/[^0-9.]/g, '');
+  if (!s) return NaN;
+  const dotIdx = s.indexOf('.');
+  const intLen = (dotIdx === -1 ? s.length : dotIdx);
+  // Decimal degrees: 2-3 integer digits (lat <=90, lon <=180)
+  if (dotIdx !== -1 && intLen <= 3) {
+    const v = parseFloat(s);
+    return isNaN(v) ? NaN : sign * v;
+  }
+  if (dotIdx === -1 && intLen <= 3) {
+    const v = parseFloat(s);
+    return isNaN(v) ? NaN : sign * v;
+  }
+  // Packed DMS: trailing 2 digits = seconds, next 2 = minutes, rest = degrees
+  const intPart = dotIdx === -1 ? s : s.slice(0, dotIdx);
+  const fracPart = dotIdx === -1 ? '' : s.slice(dotIdx);
+  let deg, min, sec;
+  if (intPart.length >= 5) {
+    sec = parseInt(intPart.slice(-2), 10) + (fracPart ? parseFloat('0' + fracPart) : 0);
+    min = parseInt(intPart.slice(-4, -2), 10);
+    deg = parseInt(intPart.slice(0, -4), 10);
+  } else {
+    sec = 0;
+    min = parseInt(intPart.slice(-2), 10);
+    deg = parseInt(intPart.slice(0, -2), 10);
+  }
+  if (isNaN(deg) || isNaN(min) || isNaN(sec)) return NaN;
+  return sign * (deg + min / 60 + sec / 3600);
+}
+
+// Normalize an FAA date string to an ISO-8601 instant. Detail-XML times are
+// emitted without an offset but flagged UTC, so assume Z when none is present.
+function normalizeFaaDate(s) {
+  if (!s) return null;
+  s = String(s).trim();
+  if (!s) return null;
+  if (/[Zz]$|[+\-]\d{2}:?\d{2}$/.test(s)) return s;
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s)) return s + 'Z';
+  return s;
+}
+
+// --- TFR ingest ---
+
+// Outer rings of a GeoJSON geometry, as [lat,lng] (GeoJSON stores [lng,lat]).
+function geoJsonOuterRings(geom) {
+  if (!geom) return [];
+  const swap = ring => ring.map(c => [c[1], c[0]]);
+  if (geom.type === 'Polygon') {
+    return (geom.coordinates && geom.coordinates[0]) ? [swap(geom.coordinates[0])] : [];
+  }
+  if (geom.type === 'MultiPolygon') {
+    return (geom.coordinates || [])
+      .map(poly => (poly && poly[0]) ? swap(poly[0]) : null)
+      .filter(Boolean);
+  }
+  return [];
+}
+
+// Normalized TFR shape produced by every parser:
+// { id, name, type, artcc, state, lowerAlt, upperAlt, altUom,
+//   effectiveStart, effectiveEnd, reason, source, polygons:[[ [lat,lng], ... ]] }
+
+// Parse the GeoServer GeoJSON (TFR:V_TFR_LOC) — primary, geometry-bearing path.
+// Also accepts the exportTfrList array shape (delegates to parseTfrList).
+function parseTfrGeoJson(input) {
+  const errors = [], tfrs = [];
+  let obj;
+  try { obj = (typeof input === 'string') ? JSON.parse(input) : input; }
+  catch (e) { return { tfrs, errors: ['Invalid JSON: ' + (e.message || e)] }; }
+  if (!obj) return { tfrs, errors: ['Empty input'] };
+  if (Array.isArray(obj)) return parseTfrList(obj);
+  let features = null;
+  if (obj.type === 'FeatureCollection') features = obj.features || [];
+  else if (obj.type === 'Feature') features = [obj];
+  else if (Array.isArray(obj.features)) features = obj.features;
+  if (!features) return { tfrs, errors: ['Not a GeoJSON FeatureCollection or TFR list'] };
+  features.forEach((f, idx) => {
+    try {
+      const p = f.properties || {};
+      const polygons = geoJsonOuterRings(f.geometry);
+      if (!polygons.length) return;
+      const key = p.NOTAM_KEY || p.notam_id || p.NOTAM || '';
+      const id = key ? String(key).split('-')[0] : ('TFR-' + (idx + 1));
+      tfrs.push({
+        id,
+        name: p.TITLE || p.NAME || p.description || id,
+        type: p.LEGAL || p.type || p.TYPE_CODE || '',
+        artcc: p.CNS_LOCATION_ID || p.facility || '',
+        state: p.STATE || p.state || '',
+        lowerAlt: null, upperAlt: null, altUom: null,
+        effectiveStart: null, effectiveEnd: null,
+        reason: p.TITLE || '',
+        source: 'geojson',
+        polygons,
+      });
+    } catch (e) { errors.push('Feature ' + idx + ': ' + (e.message || e)); }
+  });
+  return { tfrs, errors };
+}
+
+// Parse the exportTfrList JSON (no geometry — informational list only).
+function parseTfrList(input) {
+  const errors = [], tfrs = [];
+  let arr;
+  try { arr = (typeof input === 'string') ? JSON.parse(input) : input; }
+  catch (e) { return { tfrs, errors: ['Invalid JSON: ' + (e.message || e)] }; }
+  if (!Array.isArray(arr)) return { tfrs, errors: ['Expected a TFR list array'] };
+  arr.forEach((e, idx) => {
+    const id = e.notam_id || e.NOTAM_ID || ('TFR-' + (idx + 1));
+    tfrs.push({
+      id: String(id),
+      name: e.description || e.TITLE || String(id),
+      type: e.type || e.TYPE || '',
+      artcc: e.facility || e.FACILITY || '',
+      state: e.state || e.STATE || '',
+      lowerAlt: null, upperAlt: null, altUom: null,
+      effectiveStart: null, effectiveEnd: null,
+      reason: e.description || '',
+      source: 'list',
+      polygons: [],
+    });
+  });
+  return { tfrs, errors };
+}
+
+function _tagText(el, tag) {
+  if (!el) return null;
+  const n = el.getElementsByTagName(tag);
+  return n.length ? (n[0].textContent || '').trim() : null;
+}
+
+function _avxRing(parent) {
+  const ring = [];
+  const avxs = parent.getElementsByTagName('Avx');
+  for (let v = 0; v < avxs.length; v++) {
+    const lat = parseFaaCoord(_tagText(avxs[v], 'geoLat'));
+    const lng = parseFaaCoord(_tagText(avxs[v], 'geoLong'));
+    if (!isNaN(lat) && !isNaN(lng)) ring.push([lat, lng]);
+  }
+  return ring;
+}
+
+function _extractDetailPolygons(not) {
+  const polys = [];
+  const areas = not.getElementsByTagName('abdMergedArea');
+  for (let a = 0; a < areas.length; a++) {
+    const ring = _avxRing(areas[a]);
+    if (ring.length >= 3) polys.push(ring);
+  }
+  const abds = not.getElementsByTagName('Abd');
+  for (let a = 0; a < abds.length; a++) {
+    const avxs = abds[a].getElementsByTagName('Avx');
+    for (let v = 0; v < avxs.length; v++) {
+      const ctNode = avxs[v].getElementsByTagName('codeType')[0];
+      const ct = ctNode ? (ctNode.textContent || '').trim() : '';
+      if (ct === 'CIR') {
+        const lat = parseFaaCoord(_tagText(avxs[v], 'geoLat'));
+        const lng = parseFaaCoord(_tagText(avxs[v], 'geoLong'));
+        const rad = parseFloat(_tagText(avxs[v], 'valRadiusArc'));
+        const uom = (_tagText(avxs[v], 'uomRadiusArc') || 'NM').toUpperCase();
+        if (!isNaN(lat) && !isNaN(lng) && !isNaN(rad)) {
+          const radM = uom === 'KM' ? rad * 1000 : rad * 1852;
+          polys.push(circleToPolygon(lat, lng, radM, 36));
+        }
+      }
+    }
+  }
+  if (polys.length === 0) {
+    for (let a = 0; a < abds.length; a++) {
+      const ring = _avxRing(abds[a]);
+      if (ring.length >= 3) polys.push(ring);
+    }
+  }
+  return polys;
+}
+
+// Normalize a parsed FAA "XNOTAM-Update" detail document (altitudes + times).
+function normalizeTfrDetailDoc(doc) {
+  const errors = [], tfrs = [];
+  if (!doc) return { tfrs, errors: ['No document'] };
+  const nots = doc.getElementsByTagName('Not');
+  for (let i = 0; i < nots.length; i++) {
+    try {
+      const not = nots[i];
+      const id = _tagText(not, 'txtLocalName') || _tagText(not, 'noSeqNo') || ('TFR-' + (i + 1));
+      const upper = _tagText(not, 'valDistVerUpper');
+      const lower = _tagText(not, 'valDistVerLower');
+      const uom = _tagText(not, 'uomDistVerUpper') || _tagText(not, 'uomDistVerLower');
+      const reason = _tagText(not, 'txtDescrPurpose') || _tagText(not, 'codeType') || '';
+      tfrs.push({
+        id: String(id),
+        name: _tagText(not, 'txtNameTitle') || _tagText(not, 'txtNameCity') || reason || String(id),
+        type: _tagText(not, 'codeType') || '',
+        artcc: _tagText(not, 'codeFacility') || '',
+        state: _tagText(not, 'txtNameUSState') || '',
+        lowerAlt: lower != null ? Number(lower) : null,
+        upperAlt: upper != null ? Number(upper) : null,
+        altUom: uom || null,
+        effectiveStart: normalizeFaaDate(_tagText(not, 'dateEffective')),
+        effectiveEnd: normalizeFaaDate(_tagText(not, 'dateExpire')),
+        reason,
+        source: 'detail-xml',
+        polygons: _extractDetailPolygons(not),
+      });
+    } catch (e) { errors.push('Not ' + i + ': ' + (e.message || e)); }
+  }
+  return { tfrs, errors };
+}
+
+// DOMParser-guarded wrapper around normalizeTfrDetailDoc.
+function parseTfrDetailXml(str) {
+  if (typeof str !== 'string') return { tfrs: [], errors: ['Expected XML string'] };
+  if (typeof DOMParser === 'undefined') return { tfrs: [], errors: ['DOMParser unavailable'] };
+  let doc;
+  try { doc = new DOMParser().parseFromString(str, 'text/xml'); }
+  catch (e) { return { tfrs: [], errors: ['XML parse error: ' + (e.message || e)] }; }
+  if (doc.getElementsByTagName('parsererror').length) return { tfrs: [], errors: ['Malformed XML'] };
+  return normalizeTfrDetailDoc(doc);
+}
+
+// TFRs whose geometry intersects the drawn area polygon.
+function filterTfrsIntersectingArea(tfrs, areaPoly) {
+  if (!Array.isArray(tfrs) || !areaPoly || areaPoly.length < 3) return [];
+  return tfrs.filter(t => Array.isArray(t.polygons) &&
+    t.polygons.some(ring => polygonsIntersect(ring, areaPoly)));
+}
+
+// Whether a TFR is active at the given instant. Null times => treat active
+// (a missing window must never silently suppress a NO-GO).
+function isTfrActiveNow(tfr, nowMs) {
+  const now = (nowMs == null) ? Date.now() : nowMs;
+  const start = tfr.effectiveStart ? Date.parse(tfr.effectiveStart) : NaN;
+  const end = tfr.effectiveEnd ? Date.parse(tfr.effectiveEnd) : NaN;
+  if (!isNaN(start) && now < start) return false;
+  if (!isNaN(end) && now > end) return false;
+  return true;
+}
+
+// --- NOTAM ingest (best-effort) ---
+
+function _icaoDate(s) {
+  if (!/^\d{10}$/.test(s)) return null;
+  return `${2000 + +s.slice(0, 2)}-${s.slice(2, 4)}-${s.slice(4, 6)}T${s.slice(6, 8)}:${s.slice(8, 10)}:00Z`;
+}
+
+function _parseOneNotam(block) {
+  const obj = {
+    id: '', location: '', type: '', body: block.trim(),
+    effectiveStart: null, effectiveEnd: null,
+    lowerAlt: null, upperAlt: null, lat: null, lng: null, polygons: [], source: 'text',
+  };
+  let m = block.match(/!\s*([A-Z]{3,4})\s+([A-Z0-9]+\/[A-Z0-9]+)/);
+  if (m) { obj.location = m[1]; obj.id = m[2]; obj.type = 'FDC/domestic'; }
+  const paren = block.match(/\(([A-Z]\d{4}\/\d{2})\b/); if (paren && !obj.id) obj.id = paren[1];
+  const ntype = block.match(/\bNOTAM([NRC])\b/); if (ntype && !obj.type) obj.type = 'NOTAM' + ntype[1];
+  const a = block.match(/\bA\)\s*([A-Z]{4})/); if (a) obj.location = obj.location || a[1];
+  const q = block.match(/\bQ\)\s*([A-Z]{4})/); if (q && !obj.location) obj.location = q[1];
+  const b1 = block.match(/\bB\)\s*(\d{10})/); if (b1) obj.effectiveStart = _icaoDate(b1[1]);
+  const c1 = block.match(/\bC\)\s*(\d{10})/); if (c1) obj.effectiveEnd = _icaoDate(c1[1]);
+  const idm = block.match(/\b([A-Z]\d{4}\/\d{2})\b/); if (idm && !obj.id) obj.id = idm[1];
+  // ICAO F)/G) altitude fields
+  const f1 = block.match(/\bF\)\s*([^\n]*?)(?=\s+[A-GQ]\)|$)/m); if (f1) obj.lowerAlt = f1[1].trim();
+  const g1 = block.match(/\bG\)\s*([^\n]*?)(?=\s+[A-GQ]\)|$)/m); if (g1) obj.upperAlt = g1[1].trim();
+  // Domestic altitude band, e.g. "SFC-2000FT AGL", "1000FT-FL180 MSL"
+  if (obj.lowerAlt == null && obj.upperAlt == null) {
+    const alt = block.match(/\b(SFC|GND|UNL|FL\d{2,3}|\d{3,5}\s?FT)\s?-\s?(SFC|GND|UNL|FL\d{2,3}|\d{3,5}\s?FT)(?:\s*(AGL|MSL))?/i);
+    if (alt) {
+      const ref = alt[3] ? ' ' + alt[3].toUpperCase() : '';
+      obj.lowerAlt = alt[1].toUpperCase().replace(/\s+/g, '') + ref;
+      obj.upperAlt = alt[2].toUpperCase().replace(/\s+/g, '') + ref;
+    }
+  }
+  // Coordinates. Domestic NOTAMs express areas as a list of DMS vertices OR a
+  // radius around a center point. DMS may carry decimal seconds (e.g. 382948.90N).
+  const coordRe = /(\d{6}(?:\.\d+)?)([NS])\s*(\d{7}(?:\.\d+)?)([EW])/g;
+  const verts = [];
+  let cm;
+  while ((cm = coordRe.exec(block)) !== null) {
+    const lat = parseFaaCoord(cm[1] + cm[2]);
+    const lng = parseFaaCoord(cm[3] + cm[4]);
+    if (!isNaN(lat) && !isNaN(lng)) verts.push([lat, lng]);
+  }
+  // Circle: "5NM RADIUS OF <coord>" or "WI 5NM OF <coord>"
+  const circ = block.match(/(\d+(?:\.\d+)?)\s*NM\s+RADIUS\s+OF\s+(\d{6}(?:\.\d+)?)([NS])\s*(\d{7}(?:\.\d+)?)([EW])/i)
+            || block.match(/\bWI\s+(\d+(?:\.\d+)?)\s*NM\s+OF\s+(\d{6}(?:\.\d+)?)([NS])\s*(\d{7}(?:\.\d+)?)([EW])/i);
+  if (circ) {
+    const radNm = parseFloat(circ[1]);
+    const clat = parseFaaCoord(circ[2] + circ[3]);
+    const clng = parseFaaCoord(circ[4] + circ[5]);
+    if (!isNaN(radNm) && !isNaN(clat) && !isNaN(clng)) {
+      obj.polygons = [circleToPolygon(clat, clng, radNm * 1852, 32)];
+      obj.lat = clat; obj.lng = clng;
+    }
+  }
+  if (!obj.polygons.length && verts.length >= 3) {
+    const ring = verts.slice();
+    const first = ring[0], last = ring[ring.length - 1];
+    if (first[0] !== last[0] || first[1] !== last[1]) ring.push([first[0], first[1]]);
+    obj.polygons = [ring];
+    obj.lat = verts.reduce((s, v) => s + v[0], 0) / verts.length;
+    obj.lng = verts.reduce((s, v) => s + v[1], 0) / verts.length;
+  } else if (!obj.polygons.length && verts.length >= 1) {
+    obj.lat = verts[0][0];
+    obj.lng = verts[0][1];
+  }
+  // Domestic time window, e.g. "2601121600-2608220400" (YYMMDDHHMM-YYMMDDHHMM, UTC)
+  if (!obj.effectiveStart && !obj.effectiveEnd) {
+    const tr = block.match(/\b(\d{10})-(\d{10})\b/);
+    if (tr) { obj.effectiveStart = _icaoDate(tr[1]); obj.effectiveEnd = _icaoDate(tr[2]); }
+  }
+  if (!obj.id) obj.id = '(unparsed)';
+  return obj;
+}
+
+// Parse NOTAM text pasted/copied from the FAA NOTAM Search results page, or
+// from an opened PDF/Excel, into normalized records. Tolerant of copied-page
+// furniture and of records that are not blank-line separated.
+// Parse a US "MM/DD/YYYY HHMM" date (optional trailing EST=estimated) to ISO UTC.
+function _usDate(s) {
+  if (!s) return null;
+  s = String(s).trim();
+  if (/^PERM/i.test(s)) return null;
+  const m = s.match(/(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2})(\d{2})/);
+  return m ? `${m[3]}-${m[1]}-${m[2]}T${m[4]}:${m[5]}:00Z` : null;
+}
+
+function parseNotamText(text) {
+  const errors = [], notams = [];
+  if (typeof text !== 'string' || !text.trim()) return { notams, errors };
+  let raw = text.replace(/\r\n?/g, '\n');
+  // Strip common copied-page furniture: page numbers, bare URLs, print timestamps.
+  raw = raw.replace(/^[ \t]*Page \d+ of \d+.*$/gim, '')
+           .replace(/^[ \t]*https?:\/\/\S+[ \t]*$/gim, '')
+           .replace(/^[ \t]*\d{1,2}\/\d{1,2}\/\d{2,4},?[ \t]+\d{1,2}:\d{2}.*$/gim, '');
+
+  // FAA NOTAM Search WEB-DISPLAY format: records delimited by a metadata header
+  // like "<FAC>Number: 6/9738 Class: ProcedureStart Date UTC: 04/08/2026 1836End Date UTC: PERM".
+  const headerRe = /([A-Z]{2,4})Number:\s*(\S+)\s+Class:\s*([A-Za-z]+?)Start Date UTC:\s*([\d/]+\s+\d{3,4})\s*End Date UTC:\s*([^\n]*)/g;
+  const heads = [];
+  let hm;
+  while ((hm = headerRe.exec(raw)) !== null) {
+    heads.push({ start: hm.index, end: headerRe.lastIndex, fac: hm[1], num: hm[2], cls: hm[3], sd: hm[4], ed: hm[5] });
+  }
+  if (heads.length) {
+    // Any text before the first header is the tail of an un-captured NOTAM
+    // (minus the "Digital NOTAM"/"Letter to Airmen" prefix that labels the first header).
+    const lead = raw.slice(0, heads[0].start)
+      .replace(/(?:Digital NOTAM|Letter to Airmen)\s*$/i, '').trim();
+    if (lead && /[A-Z]{2,}/.test(lead)) { try { notams.push(_parseOneNotam(lead)); } catch (_) {} }
+    heads.forEach((h, i) => {
+      try {
+        const bodyEnd = (i + 1 < heads.length) ? heads[i + 1].start : raw.length;
+        let body = raw.slice(h.end, bodyEnd)
+          .replace(/(?:Digital NOTAM|Letter to Airmen)\s*$/i, '').trim();
+        const rec = _parseOneNotam(body || h.num);
+        rec.id = h.num;
+        rec.location = h.fac;
+        rec.type = h.cls;
+        if (!rec.effectiveStart) rec.effectiveStart = _usDate(h.sd);
+        if (!rec.effectiveEnd) rec.effectiveEnd = _usDate(h.ed);
+        notams.push(rec);
+      } catch (e) { errors.push('Record ' + i + ': ' + (e.message || e)); }
+    });
+    return { notams, errors };
+  }
+
+  // RAW/ICAO format: blank-line separated blocks.
+  let blocks = raw.split(/\n[ \t]*\n/).map(b => b.trim()).filter(Boolean);
+  // Fallback: if it did not segment, split before NOTAM start markers.
+  if (blocks.length <= 1) {
+    const parts = raw.split(/\n(?=!\s*[A-Z]{3,4}\b|\([A-Z]\d{4}\/\d{2}\b|FDC\s+\d|[A-Z]{4}\s+[A-Z]\d{4}\/\d{2}\b)/)
+      .map(b => b.trim()).filter(Boolean);
+    if (parts.length > 1) blocks = parts;
+  }
+  blocks.forEach((b, idx) => {
+    try { notams.push(_parseOneNotam(b)); }
+    catch (e) { errors.push('Block ' + idx + ': ' + (e.message || e)); }
+  });
+  return { notams, errors };
+}
+
+// Minimal static identifier->coord fallback for offline NOTAM geolocation.
+const ARTCC_REF = {
+  KSMF: [38.6954, -121.5908], KSAC: [38.5125, -121.4935], KMCC: [38.6676, -121.4008],
+  KPVF: [38.7243, -120.7533], KTRK: [39.3200, -120.1396], KOAK: [37.7213, -122.2207],
+  KSFO: [37.6213, -122.3790], KRNO: [39.4991, -119.7681], ZOA: [38.5, -121.5],
+};
+
+// Best-effort: set notam.lat/lng from embedded coords, live airports, or fallback.
+function geolocateNotam(notam, airports) {
+  if (!notam) return notam;
+  if (notam.lat != null && notam.lng != null && !isNaN(notam.lat) && !isNaN(notam.lng)) return notam;
+  const loc = (notam.location || '').toUpperCase();
+  if (loc && Array.isArray(airports)) {
+    const hit = airports.find(a => (a.icao || '').toUpperCase() === loc);
+    if (hit) { notam.lat = hit.lat; notam.lng = hit.lng; return notam; }
+  }
+  if (loc && ARTCC_REF[loc]) { notam.lat = ARTCC_REF[loc][0]; notam.lng = ARTCC_REF[loc][1]; }
+  return notam;
+}
+
+// --- ARTCC scoping for deep-links (approximate; for human-readable labels) ---
+
+const ARTCC_BOUNDS = [
+  { id: 'ZOA', name: 'Oakland Center',     bbox: { minLat: 36.4, maxLat: 42.1, minLng: -124.6, maxLng: -119.4 } },
+  { id: 'ZLA', name: 'Los Angeles Center', bbox: { minLat: 32.0, maxLat: 37.2, minLng: -121.6, maxLng: -114.0 } },
+  { id: 'ZSE', name: 'Seattle Center',     bbox: { minLat: 42.0, maxLat: 49.1, minLng: -125.0, maxLng: -116.0 } },
+  { id: 'ZLC', name: 'Salt Lake Center',   bbox: { minLat: 37.0, maxLat: 44.5, minLng: -119.3, maxLng: -109.0 } },
+  { id: 'ZDV', name: 'Denver Center',      bbox: { minLat: 36.9, maxLat: 45.2, minLng: -111.1, maxLng: -102.0 } },
+];
+
+function artccForPoint(lat, lng) {
+  for (const a of ARTCC_BOUNDS) {
+    const b = a.bbox;
+    if (lat >= b.minLat && lat <= b.maxLat && lng >= b.minLng && lng <= b.maxLng) {
+      return { id: a.id, name: a.name };
+    }
+  }
+  return null;
+}
+
+function artccsForArea(areaPoly) {
+  if (!Array.isArray(areaPoly) || !areaPoly.length) return [];
+  const bb = polygonBBox(areaPoly);
+  const probes = [
+    [bb.minLat, bb.minLng], [bb.minLat, bb.maxLng],
+    [bb.maxLat, bb.minLng], [bb.maxLat, bb.maxLng],
+    [(bb.minLat + bb.maxLat) / 2, (bb.minLng + bb.maxLng) / 2],
+  ];
+  const found = {};
+  for (const p of probes) {
+    const a = artccForPoint(p[0], p[1]);
+    if (a) found[a.id] = a;
+  }
+  return Object.values(found);
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -987,5 +1526,10 @@ if (typeof module !== 'undefined' && module.exports) {
     assessTerrainTurbulence, analyzeGPSMasking,
     calcSwapRecommendation, generateSearchPattern,
     computeAdsbSearchRadius, parseAdsbAircraft, formatAltitudeAgl,
+    pointInPolygon, polygonBBox, bboxesOverlap, segmentsIntersect, polygonsIntersect,
+    circleToPolygon, parseFaaCoord, normalizeFaaDate, geoJsonOuterRings,
+    parseTfrGeoJson, parseTfrList, normalizeTfrDetailDoc, parseTfrDetailXml,
+    filterTfrsIntersectingArea, isTfrActiveNow, parseNotamText, geolocateNotam,
+    ARTCC_REF, ARTCC_BOUNDS, artccForPoint, artccsForArea,
   };
 }

@@ -287,6 +287,8 @@ body {
   background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 6px;
   padding: 10px 12px; margin-bottom: 8px;
 }
+.notam-card.clickable { cursor: pointer; }
+.notam-card.clickable:hover { border-color: var(--accent-cyan); }
 .notam-card.tfr { border-left: 3px solid var(--accent-red); }
 .notam-card.notam-style { border-left: 3px solid var(--accent-amber); }
 .notam-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
@@ -300,6 +302,34 @@ body {
 .notam-type.notam-type-tag { background: rgba(245,158,11,0.15); color: var(--accent-amber); }
 .notam-body { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
 .notam-meta { margin-top: 6px; font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); }
+
+/* FAA TFR/NOTAM import controls */
+.dropzone {
+  border: 1px dashed var(--accent-cyan); border-radius: 6px; padding: 14px;
+  text-align: center; color: var(--text-muted); font-size: 12px; cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.dropzone.dragover { border-color: var(--accent-green); background: rgba(34,197,94,0.08); color: var(--text-secondary); }
+.fetch-status.manual { color: var(--accent-amber); }
+.deeplink-btn {
+  display: block; padding: 7px 10px; margin-bottom: 5px; border-radius: 5px;
+  background: var(--bg-tertiary); border: 1px solid var(--border);
+  color: var(--accent-cyan); text-decoration: none; font-size: 12px;
+  font-family: var(--font-mono);
+}
+.deeplink-btn:hover { border-color: var(--accent-cyan); }
+.deeplink-btn.primary { border-color: var(--accent-red); color: var(--accent-red); font-weight: 600; }
+.tfr-stale-banner {
+  padding: 8px 12px; margin-bottom: 8px; border: 1px solid var(--border);
+  border-left-width: 3px; border-radius: 4px; background: var(--bg-tertiary);
+  font-family: var(--font-mono); font-size: 11px;
+}
+.notam-paste {
+  width: 100%; min-height: 70px; resize: vertical; box-sizing: border-box;
+  background: var(--bg-primary); border: 1px solid var(--border); border-radius: 5px;
+  color: var(--text-secondary); font-family: var(--font-mono); font-size: 11px; padding: 8px;
+}
+.notam-paste:focus { outline: none; border-color: var(--accent-cyan); }
 
 /* Risk Bar */
 .risk-bar { height: 6px; background: var(--bg-primary); border-radius: 3px; margin-top: 8px; overflow: hidden; }
@@ -835,13 +865,54 @@ select.api-input { cursor: pointer; }
 
       <!-- NOTAMs Tab -->
       <div id="tab-notams" class="tab-panel" style="display:none;">
+
+        <div id="tfrStaleBanner" class="tfr-stale-banner" style="display:none;"></div>
+
+        <!-- Import controls -->
         <div class="data-section">
           <div class="data-section-title">
-            <div class="indicator" style="background:var(--accent-red)"></div>TFRs &amp; NOTAMs
+            <div class="indicator" style="background:var(--accent-red)"></div>Import FAA TFR / NOTAM
             <span class="fetch-status" id="notamStatus"></span>
           </div>
-          <div id="notamList"><div class="notam-body" style="color:var(--text-muted);font-style:italic;">Draw an area to check NOTAMs</div></div>
+          <input type="file" id="faaFileInput" accept=".geojson,.json,.xml,.aixm,.txt,.notam" multiple style="display:none" onchange="handleFaaFiles(this)">
+          <button class="btn btn-primary" style="width:100%;margin-bottom:6px;" onclick="importFaaFile()">Import file…</button>
+          <div id="tfrDropzone" class="dropzone">Drag &amp; drop FAA TFR (GeoJSON/XML) or NOTAM (text) here</div>
         </div>
+
+        <!-- Pre-filled FAA links scoped to the drawn area -->
+        <div class="data-section">
+          <div class="data-section-title">
+            <div class="indicator" style="background:var(--accent-cyan)"></div>Get the data (opens FAA)
+          </div>
+          <div id="notamDeepLinks"><div class="notam-body" style="color:var(--text-muted);font-style:italic;">Draw an area to generate FAA links.</div></div>
+        </div>
+
+        <!-- Active TFRs over / near the area -->
+        <div class="data-section">
+          <div class="data-section-title">
+            <div class="indicator" style="background:var(--accent-red)"></div>TFRs
+            <span class="fetch-status" id="tfrCount"></span>
+          </div>
+          <div id="tfrList"><div class="notam-body" style="color:var(--text-muted);font-style:italic;">No TFR file imported.</div></div>
+        </div>
+
+        <!-- NOTAMs -->
+        <div class="data-section">
+          <div class="data-section-title">
+            <div class="indicator" style="background:var(--accent-amber)"></div>NOTAMs
+          </div>
+          <div class="notam-meta" style="margin-bottom:6px;">FAA NOTAM Search only downloads PDF/Excel. Copy the results (or text from the opened PDF/Excel) and paste below.</div>
+          <textarea id="notamPasteBox" class="notam-paste" placeholder="Paste NOTAM text here (ICAO or plain text)…"></textarea>
+          <div style="display:flex;gap:6px;margin:6px 0;">
+            <button class="btn btn-primary" style="flex:1;" onclick="parsePastedNotams()">Parse pasted NOTAMs</button>
+            <button class="btn" onclick="clearImportedNotams()">Clear</button>
+          </div>
+          <div id="notamParseMsg" class="notam-meta" style="display:none;"></div>
+          <div id="notamList"><div class="notam-body" style="color:var(--text-muted);font-style:italic;">No NOTAMs parsed yet.</div></div>
+        </div>
+
+        <!-- Fire danger cards render here (populated by fetchFireDanger) -->
+        <div id="fireDangerCards"></div>
       </div>
 
       <!-- Ops Tab -->

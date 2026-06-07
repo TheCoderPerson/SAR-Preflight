@@ -17,6 +17,7 @@ const ENDPOINT_TTL = {
   airports:   7 * 24 * 60 * 60000,  // 7 days
   nws:        15 * 60 * 1000,       // 15 min
   radar_meta: 5 * 60 * 1000,        // 5 min
+  tfr_import: 60 * 60 * 1000,       // 1 hr — matches "verify <=1hr before launch"
 };
 
 // --- IndexedDB Helpers ---
