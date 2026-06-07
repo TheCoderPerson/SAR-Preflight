@@ -335,4 +335,60 @@ describe('computeAssessment()', () => {
       expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
     });
   });
+
+  describe('imported FAA TFR assessment', () => {
+    // Drawn area: a box around El Dorado County center
+    const areaRing = [{ lat: 38.6, lng: -121.0 }, { lat: 38.6, lng: -120.9 }, { lat: 38.7, lng: -120.9 }, { lat: 38.7, lng: -121.0 }];
+    const overlapRing = [[38.64, -120.96], [38.64, -120.94], [38.66, -120.94], [38.66, -120.96], [38.64, -120.96]];
+    const farRing = [[10.0, 10.0], [10.0, 10.1], [10.1, 10.1], [10.1, 10.0], [10.0, 10.0]];
+
+    beforeEach(() => {
+      // Nominal weather so the base assessment is GO
+      S.wx = { visibility: 16000, temperature_2m: 65, precipitation_probability: 0, weather_code: 0 };
+      S.wind = { maxWind: 5, maxGust: 8 };
+      S.elev = { center: 2000 };
+      S.areaType = 'POLYGON';
+      S.currentArea = { getLatLngs: () => [areaRing] };
+    });
+
+    afterEach(() => {
+      S.tfrs = [];
+      S.currentArea = null;
+      S.areaType = null;
+    });
+
+    it('active TFR overlapping the area forces NO-GO', () => {
+      S.tfrs = [{ id: '6/1234', name: 'Fire TFR', polygons: [overlapRing], effectiveStart: null, effectiveEnd: null }];
+      computeAssessment();
+      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+      expect(document.getElementById('assessText').textContent).toContain('Active TFR over area');
+      expect(document.getElementById('assessText').textContent).toContain('6/1234');
+    });
+
+    it('a future (inactive) TFR over the area is CAUTION, not NO-GO', () => {
+      S.tfrs = [{ id: '6/5678', name: 'Scheduled', polygons: [overlapRing], effectiveStart: '2099-01-01T00:00:00Z', effectiveEnd: '2099-01-02T00:00:00Z' }];
+      computeAssessment();
+      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessText').textContent).toContain('not currently active');
+    });
+
+    it('a TFR that does not overlap the area does not change GO', () => {
+      S.tfrs = [{ id: '6/9999', name: 'Elsewhere', polygons: [farRing], effectiveStart: null, effectiveEnd: null }];
+      computeAssessment();
+      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+    });
+
+    it('an active TFR NO-GO cannot be downgraded by a weather CAUTION', () => {
+      S.wx = { visibility: 16000, temperature_2m: 30, precipitation_probability: 0, weather_code: 0 }; // cold -> CAUTION base
+      S.tfrs = [{ id: '6/1111', name: 'Fire TFR', polygons: [overlapRing], effectiveStart: null, effectiveEnd: null }];
+      computeAssessment();
+      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+    });
+
+    it('list-only TFRs (no geometry) do not trigger NO-GO', () => {
+      S.tfrs = [{ id: '6/2222', name: 'list only', polygons: [], source: 'list', effectiveStart: null, effectiveEnd: null }];
+      computeAssessment();
+      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+    });
+  });
 });

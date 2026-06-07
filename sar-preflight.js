@@ -15,6 +15,8 @@ const S = {
   wx: {}, wind: {}, elev: {}, astro: {}, notams: [],
   nwsAlerts: [],
   faaAirspace: null,
+  // Imported FAA TFR/NOTAM data (no-server file import)
+  tfrs: [], importedNotams: [], tfrImportMeta: null,
   // Track data source errors for retry/display
   dataSourceErrors: {},
   // Track active fetches for header status
@@ -329,7 +331,7 @@ async function processArea(layer, type) {
     fetchWeather(center.lat, center.lng),
     fetchElevation(center, bounds),
     fetchSunMoon(center.lat, center.lng),
-    fetchNOTAMs(center.lat, center.lng),
+    renderNotamsTab(center.lat, center.lng),
     fetchWireHazards(bounds),
     fetchNWSAlerts(center.lat, center.lng),
     fetchRadar(),
@@ -1142,40 +1144,429 @@ async function fetchSunMoon(lat, lng) {
 }
 
 // ============================================================
-// API: FAA TFRs
+// FAA TFR / NOTAM — in-app import + smart deep-links (NO SERVER)
 // ============================================================
-async function fetchNOTAMs(lat, lng) {
-  trackFetchStart('NOTAMs');
-  setStatus('notamStatus', 'loading', 'Checking...');
+// The browser cannot fetch FAA endpoints directly (they send no CORS headers),
+// so the user downloads files from FAA via the pre-filled links below and
+// imports them here; the app parses + plots them. Works offline once loaded.
+
+const TFR_GEOSERVER_BASE = 'https://tfr.faa.gov/geoserver/TFR/ows';
+
+// Build the GeoServer WFS URL returning active TFR polygons (GeoJSON) for the
+// drawn area's bbox. Verified order: minLng,minLat,maxLng,maxLat,EPSG:4326.
+function tfrGeoJsonUrlForBounds(bounds) {
+  if (!bounds) return TFR_GEOSERVER_BASE;
+  const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  const bbox = `${sw.lng.toFixed(4)},${sw.lat.toFixed(4)},${ne.lng.toFixed(4)},${ne.lat.toFixed(4)},EPSG:4326`;
+  return `${TFR_GEOSERVER_BASE}?service=WFS&version=1.1.0&request=GetFeature&typeName=TFR:V_TFR_LOC` +
+         `&outputFormat=application/json&srsname=EPSG:4326&bbox=${encodeURIComponent(bbox)}`;
+}
+
+function _esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+// Decimal degrees -> DMS string for the FAA NOTAM Search Lat/Long query.
+function toDMS(lat, lng) {
+  function fmt(v, posC, negC) {
+    const hemi = v >= 0 ? posC : negC;
+    v = Math.abs(v);
+    const d = Math.floor(v);
+    const mf = (v - d) * 60;
+    const m = Math.floor(mf);
+    const s = Math.round((mf - m) * 60);
+    return `${d}°${String(m).padStart(2, '0')}'${String(s).padStart(2, '0')}"${hemi}`;
+  }
+  return `${fmt(lat, 'N', 'S')} ${fmt(lng, 'E', 'W')}`;
+}
+
+function fmtTfrTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
   try {
-    const res = await fetch('https://tfr.faa.gov/tfr2/list.html');
-    throw new Error('CORS restricted — use FAA API key');
-  } catch (err) {
-    const notamDiv = document.getElementById('notamList');
-    notamDiv.innerHTML = `
-      <div class="notam-card notam-style">
-        <div class="notam-header">
-          <span class="notam-id">TFR CHECK REQUIRED</span>
-          <span class="notam-type notam-type-tag">Manual</span>
-        </div>
-        <div class="notam-body">
-          FAA TFR/NOTAM APIs require CORS proxy or backend. Check these sources before flight:
-          <br><br>
-          <strong>\u2022 <a href="https://tfr.faa.gov/tfr2/list.html" target="_blank" style="color:var(--accent-cyan);">FAA TFR List</a></strong><br>
-          <strong>\u2022 <a href="https://notams.aim.faa.gov/notamSearch/" target="_blank" style="color:var(--accent-cyan);">FAA NOTAM Search</a></strong><br>
-          <strong>\u2022 <a href="https://skyvector.com/?ll=${lat},${lng}&chart=301" target="_blank" style="color:var(--accent-cyan);">SkyVector (Airspace)</a></strong><br>
-          <strong>\u2022 B4UFLY App</strong> or <strong>Aloft (AirMap)</strong>
-        </div>
-        <div class="notam-meta">Radius: 25 nm from center \u2022 Check \u2264 1 hr before launch</div>
+    return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: _localTZ() });
+  } catch (_) { return iso; }
+}
+
+// Drawn area as a [lat,lng] ring (circle approximated to a polygon).
+function currentAreaPolygon() {
+  if (!S.currentArea) return null;
+  try {
+    if (S.areaType === 'CIRCLE') {
+      const c = S.currentArea.getLatLng ? S.currentArea.getLatLng() : S.areaCenter;
+      const r = S.currentArea.getRadius ? S.currentArea.getRadius() : 0;
+      if (c && r) return circleToPolygon(c.lat, c.lng, r, 32);
+    } else if (S.currentArea.getLatLngs) {
+      const ll = S.currentArea.getLatLngs()[0];
+      if (ll && ll.length) return ll.map(p => [p.lat, p.lng]);
+    }
+  } catch (_) { /* fall through to bounds */ }
+  if (S.areaBounds) {
+    const sw = S.areaBounds.getSouthWest(), ne = S.areaBounds.getNorthEast();
+    return [[sw.lat, sw.lng], [sw.lat, ne.lng], [ne.lat, ne.lng], [ne.lat, sw.lng], [sw.lat, sw.lng]];
+  }
+  return null;
+}
+
+// Called from processArea (no network). Hydrates cached data + renders tab.
+async function renderNotamsTab(lat, lng) {
+  if ((!S.tfrs || !S.tfrs.length) && (!S.importedNotams || !S.importedNotams.length) &&
+      typeof getCachedApiResponse === 'function' && S.areaCenter) {
+    try {
+      const rec = await getCachedApiResponse('tfr_import', areaKey(S.areaCenter.lat, S.areaCenter.lng));
+      if (rec && rec.data) {
+        S.tfrs = rec.data.tfrs || [];
+        S.importedNotams = rec.data.notams || [];
+        S.tfrImportMeta = rec.data.meta || null;
+        if (S.tfrImportMeta) S.tfrImportMeta.cached = true;
+        renderImportedTfrLayer();
+        renderImportedNotamLayer();
+      }
+    } catch (_) { /* ignore cache errors */ }
+  }
+  renderDeepLinks(lat, lng);
+  renderTfrCards();
+  renderNotamCards();
+  renderImportStatus();
+  setStatus('notamStatus', (S.tfrs && S.tfrs.length) ? 'live' : 'manual',
+    (S.tfrs && S.tfrs.length) ? `${S.tfrs.length} TFR${S.tfrs.length > 1 ? 'S' : ''}` : 'IMPORT');
+  computeAirspace(lat, lng);
+}
+
+function renderDeepLinks(lat, lng) {
+  const el = document.getElementById('notamDeepLinks');
+  if (!el) return;
+  const areaPoly = currentAreaPolygon();
+  let artccs = areaPoly ? artccsForArea(areaPoly) : [];
+  if (!artccs.length) { const a = artccForPoint(lat, lng); if (a) artccs = [a]; }
+  const dms = toDMS(lat, lng);
+  const tfrDownload = S.areaBounds
+    ? `<a href="${tfrGeoJsonUrlForBounds(S.areaBounds)}" target="_blank" rel="noopener" class="deeplink-btn primary">⬇ Download active TFRs for this area (GeoJSON)</a>`
+    : '';
+  const artccNote = artccs.length
+    ? `<div class="notam-meta">Area ARTCC: ${_esc(artccs.map(a => `${a.name} (${a.id})`).join(', '))}${artccs.length > 1 ? ' — spans multiple centers, check each' : ''}</div>`
+    : '';
+  el.innerHTML = `
+    ${tfrDownload}
+    <a href="https://tfr.faa.gov/tfr3/?page=map" target="_blank" rel="noopener" class="deeplink-btn">FAA TFR Map (visual)</a>
+    <a href="https://skyvector.com/?ll=${lat},${lng}&chart=301&zoom=10" target="_blank" rel="noopener" class="deeplink-btn">SkyVector Sectional</a>
+    <a href="https://notams.aim.faa.gov/notamSearch/" target="_blank" rel="noopener" class="deeplink-btn">FAA NOTAM Search</a>
+    ${artccNote}
+    <div class="notam-meta">NOTAM Search → Lat/Long query <b>${_esc(dms)}</b>, radius 20 NM → select the results and copy, then paste into the NOTAMs box below.</div>
+    <div class="notam-meta" style="color:var(--accent-amber)">Download a file, then "Import file" to plot it. Re-verify ≤ 1 hr before launch.</div>
+  `;
+}
+
+function renderTfrCards() {
+  const el = document.getElementById('tfrList');
+  const countEl = document.getElementById('tfrCount');
+  if (!el) return;
+  if (!S.tfrs || !S.tfrs.length) {
+    el.innerHTML = `<div class="notam-body" style="color:var(--text-muted);font-style:italic;">No TFR file imported. Download via the links above, then import.</div>`;
+    if (countEl) countEl.textContent = '';
+    return;
+  }
+  const areaPoly = currentAreaPolygon();
+  const now = Date.now();
+  const hitIds = new Set((areaPoly ? filterTfrsIntersectingArea(S.tfrs, areaPoly) : []).map(t => t.id));
+  if (countEl) countEl.textContent = `${S.tfrs.length} loaded${hitIds.size ? ` • ${hitIds.size} over area` : ''}`;
+  const sorted = S.tfrs.slice().sort((a, b) => (hitIds.has(b.id) ? 1 : 0) - (hitIds.has(a.id) ? 1 : 0));
+  el.innerHTML = sorted.map(t => {
+    const intersects = hitIds.has(t.id);
+    const active = isTfrActiveNow(t, now);
+    const danger = intersects && active;
+    const tag = danger ? 'OVER AREA' : (intersects ? 'OVER AREA (inactive)' : (t.polygons && t.polygons.length ? 'elsewhere' : 'no map geom'));
+    const alt = (t.lowerAlt != null || t.upperAlt != null)
+      ? `${t.lowerAlt != null ? t.lowerAlt : 'SFC'}–${t.upperAlt != null ? t.upperAlt : '?'} ${t.altUom || ''}` : '';
+    const times = (t.effectiveStart || t.effectiveEnd)
+      ? `${fmtTfrTime(t.effectiveStart)} → ${fmtTfrTime(t.effectiveEnd)}` : 'Schedule: see NOTAM text';
+    return `<div class="notam-card clickable ${danger ? 'tfr' : 'notam-style'}" onclick="focusTfr('${(t.id || '').replace(/['"\\]/g, '')}')" title="Click to center the map on this TFR">
+      <div class="notam-header">
+        <span class="notam-id">TFR ${_esc(t.id)}${t.type ? ` • ${_esc(t.type)}` : ''}</span>
+        <span class="notam-type ${danger ? 'tfr-type' : 'notam-type-tag'}">${tag}</span>
       </div>
-      <div id="fireDangerCards"></div>
-    `;
-    computeAirspace(lat, lng);
-    setStatus('notamStatus', 'error', 'MANUAL');
-  } finally {
-    trackFetchEnd('NOTAMs');
+      <div class="notam-body">${_esc(t.name || '')}${t.state ? ` (${_esc(t.state)})` : ''}</div>
+      <div class="notam-meta">${alt ? `Alt: ${_esc(alt)} • ` : ''}${_esc(times)}${t.artcc ? ` • ${_esc(t.artcc)}` : ''}${t.source === 'list' ? ' • list-only (no map geometry)' : ''}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderNotamCards() {
+  const el = document.getElementById('notamList');
+  if (!el) return;
+  if (!S.importedNotams || !S.importedNotams.length) {
+    el.innerHTML = `<div class="notam-body" style="color:var(--text-muted);font-style:italic;">No NOTAMs parsed yet.</div>`;
+    return;
+  }
+  const areaPoly = currentAreaPolygon();
+  const now = Date.now();
+  el.innerHTML = S.importedNotams.map(n => {
+    const hasPoly = n.polygons && n.polygons.length;
+    const overArea = hasPoly && areaPoly && n.polygons.some(r => polygonsIntersect(r, areaPoly));
+    const active = isTfrActiveNow(n, now);
+    const danger = overArea && active;
+    const times = (n.effectiveStart || n.effectiveEnd) ? `${fmtTfrTime(n.effectiveStart)} → ${fmtTfrTime(n.effectiveEnd)}` : '';
+    const alt = (n.lowerAlt || n.upperAlt) ? `${n.lowerAlt || '?'}–${n.upperAlt || '?'}` : '';
+    const geo = hasPoly ? (overArea ? 'AREA OVER SEARCH' : 'area plotted') : (n.lat != null && n.lng != null ? 'point plotted' : 'no map geom');
+    return `<div class="notam-card clickable ${danger ? 'tfr' : 'notam-style'}" onclick="focusNotam('${(n.id || '').replace(/['"\\]/g, '')}')" title="Click to center the map on this NOTAM">
+      <div class="notam-header">
+        <span class="notam-id">${_esc(n.id || 'NOTAM')}${n.type ? ` • ${_esc(n.type)}` : ''}</span>
+        <span class="notam-type ${danger ? 'tfr-type' : 'notam-type-tag'}">${_esc(n.location || geo)}</span>
+      </div>
+      <div class="notam-body" style="font-family:var(--font-mono);font-size:11px;white-space:pre-wrap;">${_esc((n.body || '').slice(0, 500))}</div>
+      <div class="notam-meta">${alt ? `Alt: ${_esc(alt)} • ` : ''}${times ? `${_esc(times)} • ` : ''}${geo}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderImportStatus() {
+  const el = document.getElementById('tfrStaleBanner');
+  if (!el) return;
+  const meta = S.tfrImportMeta;
+  if (!meta) { el.style.display = 'none'; el.textContent = ''; return; }
+  const age = Date.now() - (meta.importedAtMs || Date.now());
+  const ageStr = typeof formatAge === 'function' ? formatAge(age) : Math.round(age / 60000) + 'm';
+  const stale = age > 60 * 60 * 1000;
+  el.style.display = '';
+  el.style.color = stale ? 'var(--accent-red)' : 'var(--text-muted)';
+  el.style.borderColor = stale ? 'var(--accent-red)' : 'var(--border)';
+  el.textContent = `Imported ${meta.fileName || 'data'} • ${ageStr} ago${meta.cached ? ' (cached)' : ''}` +
+    (stale ? ' — re-verify ≤ 1 hr before launch' : '');
+}
+
+function renderImportedTfrLayer() {
+  if (typeof L === 'undefined' || !S.map) return;
+  if (S.mapLayers.tfr_imported) S.mapLayers.tfr_imported.clearLayers();
+  else S.mapLayers.tfr_imported = L.layerGroup();
+  const now = Date.now();
+  const areaPoly = currentAreaPolygon();
+  const hitIds = new Set((areaPoly ? filterTfrsIntersectingArea(S.tfrs || [], areaPoly) : []).map(t => t.id));
+  (S.tfrs || []).forEach(t => {
+    const active = isTfrActiveNow(t, now);
+    const color = active ? '#ef4444' : '#f59e0b';
+    (t.polygons || []).forEach(ring => {
+      if (!ring || ring.length < 3) return;
+      const poly = L.polygon(ring, { color, weight: 3, fillColor: color, fillOpacity: hitIds.has(t.id) ? 0.25 : 0.12, dashArray: '4,4' });
+      const alt = (t.lowerAlt != null || t.upperAlt != null)
+        ? `${t.lowerAlt != null ? t.lowerAlt : 'SFC'}-${t.upperAlt != null ? t.upperAlt : '?'} ${t.altUom || ''}` : '';
+      poly.bindPopup(`<b>TFR ${_esc(t.id)}</b><br>${_esc(t.name || '')}${alt ? '<br>' + _esc(alt) : ''}<br>${active ? '<span style="color:#ef4444">ACTIVE</span>' : 'inactive / scheduled'}`);
+      S.mapLayers.tfr_imported.addLayer(poly);
+    });
+  });
+  if (S.mapLayers.tfr_imported.getLayers().length) S.map.addLayer(S.mapLayers.tfr_imported); // default ON -- never hide a NO-GO
+  buildLayerControl();
+}
+
+function renderImportedNotamLayer() {
+  if (typeof L === 'undefined' || !S.map) return;
+  if (S.mapLayers.notam_imported) S.mapLayers.notam_imported.clearLayers();
+  else S.mapLayers.notam_imported = L.layerGroup();
+  const areaPoly = currentAreaPolygon();
+  (S.importedNotams || []).forEach(n => {
+    if (n.polygons && n.polygons.length) {
+      const overArea = areaPoly ? n.polygons.some(r => polygonsIntersect(r, areaPoly)) : false;
+      const color = overArea ? '#ef4444' : '#f59e0b';
+      n.polygons.forEach(ring => {
+        if (!ring || ring.length < 3) return;
+        const poly = L.polygon(ring, { color, weight: 2, fillColor: color, fillOpacity: overArea ? 0.20 : 0.10, dashArray: '2,4' });
+        poly.bindPopup(`<b>${_esc(n.id || 'NOTAM')}</b> ${_esc(n.location || '')}<br>${_esc((n.body || '').slice(0, 240))}`);
+        S.mapLayers.notam_imported.addLayer(poly);
+      });
+    } else if (n.lat != null && n.lng != null && !isNaN(n.lat) && !isNaN(n.lng)) {
+      const m = L.circleMarker([n.lat, n.lng], { radius: 6, color: '#f59e0b', fillColor: '#f59e0b', fillOpacity: 0.7, weight: 2 });
+      m.bindPopup(`<b>${_esc(n.id || 'NOTAM')}</b> ${_esc(n.location || '')}<br>${_esc((n.body || '').slice(0, 200))}`);
+      S.mapLayers.notam_imported.addLayer(m);
+    }
+  });
+  if (S.mapLayers.notam_imported.getLayers().length) S.map.addLayer(S.mapLayers.notam_imported);
+  buildLayerControl();
+}
+
+// Center/zoom the map on a clicked TFR/NOTAM card.
+function focusTfr(id) { _focusFeature((S.tfrs || []).find(x => String(x.id) === String(id))); }
+function focusNotam(id) { _focusFeature((S.importedNotams || []).find(x => String(x.id) === String(id))); }
+function _focusFeature(f) {
+  if (!f || !S.map) return;
+  if (f.polygons && f.polygons.length) {
+    let pts = [];
+    f.polygons.forEach(r => { pts = pts.concat(r); });
+    if (pts.length) { try { S.map.fitBounds(pts, { padding: [40, 40], maxZoom: 12 }); } catch (_) {} return; }
+  }
+  if (f.lat != null && f.lng != null && !isNaN(f.lat) && !isNaN(f.lng)) {
+    try { S.map.setView([f.lat, f.lng], 11); } catch (_) {}
   }
 }
+
+// --- Import handling ---
+
+function importFaaFile() {
+  if (typeof logAudit === 'function') logAudit('tfr_imported');
+  const input = document.getElementById('faaFileInput');
+  if (input) { input.value = ''; input.click(); }
+}
+
+function handleFaaFiles(input) {
+  const files = input.files;
+  if (!files || !files.length) return;
+  let pending = files.length;
+  const done = () => { if (--pending === 0) afterFaaImport(); };
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    const reader = new FileReader();
+    reader.onload = function () {
+      try { ingestFaaFileText(reader.result, file.name); }
+      catch (e) { console.error('FAA import error:', e); }
+      done();
+    };
+    reader.onerror = done;
+    reader.readAsText(file);
+  }
+}
+
+function ingestFaaFileText(text, fileName) {
+  const name = (fileName || '').toLowerCase();
+  if (/\.(xlsx|xls|zip|shp|kmz)$/.test(name)) {
+    alert('Binary files (Excel / Shapefile / KMZ) are not supported. From FAA NOTAM Search export as Text/ICAO; from tfr.faa.gov download GeoJSON or the XML detail.');
+    return;
+  }
+  const trimmed = (text || '').trim();
+  if (!trimmed) { alert('Empty file.'); return; }
+
+  if (trimmed[0] === '{' || trimmed[0] === '[') {
+    const r = parseTfrGeoJson(trimmed);
+    if (r.errors.length && !r.tfrs.length) { alert('Could not parse JSON: ' + r.errors[0]); return; }
+    applyTfrImport(r.tfrs, fileName, r.tfrs[0] ? r.tfrs[0].source : 'geojson');
+    return;
+  }
+  if (/<XNOTAM|<geoLat|<abdMergedArea|<Not[\s>]/.test(trimmed)) {
+    const r = parseTfrDetailXml(trimmed);
+    if (r.errors.length && !r.tfrs.length) { alert('Could not parse XML: ' + r.errors[0]); return; }
+    applyTfrImport(r.tfrs, fileName, 'detail-xml');
+    return;
+  }
+  if (/aixm:|gml:posList/.test(trimmed)) {
+    alert('AIXM/GML files are not supported. From tfr.faa.gov download the GeoJSON (the per-TFR XML detail also works).');
+    return;
+  }
+  const r = parseNotamText(trimmed);
+  if (r.notams.length) {
+    r.notams.forEach(n => geolocateNotam(n, S.nearbyAirports || []));
+    mergeNotams(r.notams);
+    S.tfrImportMeta = { fileName, importedAtMs: Date.now(), source: 'notam-text' };
+    return;
+  }
+  alert('Unrecognized file. Expected FAA TFR GeoJSON/XML or a NOTAM text export.');
+}
+
+function applyTfrImport(tfrs, fileName, source) {
+  if (!tfrs || !tfrs.length) { alert('No TFRs found in this file.'); return; }
+  mergeTfrs(tfrs);
+  S.tfrImportMeta = { fileName, importedAtMs: Date.now(), source };
+}
+
+// Merge incoming TFRs by id; prefer the geometry-bearing record and enrich it
+// with altitude/time fields from a matching list/detail import.
+function mergeTfrs(incoming) {
+  const byId = {};
+  (S.tfrs || []).forEach(t => { byId[t.id] = t; });
+  incoming.forEach(t => {
+    const ex = byId[t.id];
+    if (!ex) { byId[t.id] = t; return; }
+    const exGeo = ex.polygons && ex.polygons.length;
+    const tGeo = t.polygons && t.polygons.length;
+    const base = (tGeo || !exGeo) ? t : ex;
+    const other = base === t ? ex : t;
+    ['lowerAlt', 'upperAlt', 'altUom', 'effectiveStart', 'effectiveEnd', 'reason', 'artcc', 'state', 'type', 'name'].forEach(k => {
+      if ((base[k] == null || base[k] === '') && other[k] != null && other[k] !== '') base[k] = other[k];
+    });
+    if ((!base.polygons || !base.polygons.length) && other.polygons && other.polygons.length) base.polygons = other.polygons;
+    byId[t.id] = base;
+  });
+  S.tfrs = Object.values(byId);
+}
+
+function mergeNotams(incoming) {
+  const byId = {};
+  (S.importedNotams || []).forEach(n => { byId[n.id + '|' + (n.location || '')] = n; });
+  incoming.forEach(n => { byId[n.id + '|' + (n.location || '')] = n; });
+  S.importedNotams = Object.values(byId);
+}
+
+function afterFaaImport() {
+  renderImportedTfrLayer();
+  renderImportedNotamLayer();
+  renderTfrCards();
+  renderNotamCards();
+  renderImportStatus();
+  setStatus('notamStatus', (S.tfrs && S.tfrs.length) ? 'live' : 'manual',
+    (S.tfrs && S.tfrs.length) ? `${S.tfrs.length} TFR${S.tfrs.length > 1 ? 'S' : ''}` : 'IMPORT');
+  if (typeof cacheApiResponse === 'function' && S.areaCenter) {
+    cacheApiResponse('tfr_import', areaKey(S.areaCenter.lat, S.areaCenter.lng), {
+      tfrs: S.tfrs, notams: S.importedNotams, meta: S.tfrImportMeta,
+    });
+  }
+  if (S.currentArea) computeAssessment();
+}
+
+function setupTfrDropzone() {
+  const dz = document.getElementById('tfrDropzone');
+  if (!dz) return;
+  ['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation(); dz.classList.add('dragover');
+  }));
+  ['dragleave', 'drop'].forEach(ev => dz.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation(); dz.classList.remove('dragover');
+  }));
+  dz.addEventListener('drop', e => {
+    const files = e.dataTransfer && e.dataTransfer.files;
+    if (files && files.length) handleFaaFiles({ files });
+  });
+  dz.addEventListener('click', () => importFaaFile());
+}
+
+// FAA NOTAM Search only downloads PDF/Excel (no text file), but its results are
+// copyable — paste them here and parse. Also works for text copied from a PDF/Excel.
+function parsePastedNotams() {
+  const ta = document.getElementById('notamPasteBox');
+  if (!ta) return;
+  const text = ta.value || '';
+  if (!text.trim()) { alert('Paste NOTAM text first (copy it from the FAA NOTAM Search results, or from the opened PDF/Excel).'); return; }
+  const r = parseNotamText(text);
+  const msgEl = document.getElementById('notamParseMsg');
+  if (!r.notams.length) {
+    if (msgEl) { msgEl.style.display = ''; msgEl.style.color = 'var(--accent-amber)'; msgEl.textContent = 'No NOTAMs recognized in the pasted text. Paste the domestic or ICAO NOTAM text from the FAA results.'; }
+    else alert('No NOTAMs recognized in the pasted text.');
+    return;
+  }
+  r.notams.forEach(n => geolocateNotam(n, S.nearbyAirports || []));
+  mergeNotams(r.notams);
+  S.tfrImportMeta = { fileName: r.notams.length + ' pasted NOTAM(s)', importedAtMs: Date.now(), source: 'notam-paste' };
+  afterFaaImport();
+  // Clear feedback so the user can see it worked
+  const withArea = r.notams.filter(n => n.polygons && n.polygons.length).length;
+  const areaPoly = currentAreaPolygon();
+  const overArea = areaPoly ? r.notams.filter(n => n.polygons && n.polygons.some(rg => polygonsIntersect(rg, areaPoly))).length : 0;
+  if (msgEl) {
+    msgEl.style.display = '';
+    msgEl.style.color = overArea ? 'var(--accent-red)' : 'var(--accent-green)';
+    msgEl.textContent = `✓ Parsed ${r.notams.length} NOTAM(s)` +
+      (withArea ? `, ${withArea} with an area drawn on the map` : '') +
+      (overArea ? ` — ${overArea} OVER your search area (see red on map + CAUTION banner)` : '') + '.';
+  }
+  ta.value = '';
+}
+
+function clearImportedNotams() {
+  S.importedNotams = [];
+  const ta = document.getElementById('notamPasteBox');
+  if (ta) ta.value = '';
+  renderImportedNotamLayer();
+  renderNotamCards();
+}
+
+// Fire danger renders into #fireDangerCards (a static element in the NOTAMs tab).
 
 // ============================================================
 // API: NIFC ACTIVE FIRES + CA NFDRS FIRE DANGER
@@ -3150,6 +3541,43 @@ function computeAssessment() {
     }
   }
 
+  // Imported FAA TFRs (manual file import) — authoritative, take precedence.
+  // An active TFR whose geometry overlaps the drawn area is a hard NO-GO.
+  if (S.tfrs && S.tfrs.length && S.currentArea) {
+    const areaPoly = currentAreaPolygon();
+    if (areaPoly) {
+      const intersecting = filterTfrsIntersectingArea(S.tfrs, areaPoly);
+      const activeHits = intersecting.filter(t => isTfrActiveNow(t, Date.now()));
+      if (activeHits.length) {
+        result.level = 'NO-GO';
+        result.issues = result.issues || [];
+        result.issues.push('Active TFR over area: ' + activeHits.map(t => t.id).join(', '));
+        result.text = result.issues.join(' • ');
+      } else if (intersecting.length && result.level !== 'NO-GO') {
+        if (result.level === 'GO') result.level = 'CAUTION';
+        result.cautions = result.cautions || [];
+        result.cautions.push('TFR over area not currently active — verify times: ' + intersecting.map(t => t.id).join(', '));
+        if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
+      }
+    }
+  }
+
+  // Imported NOTAMs with an area (polygon) overlapping the drawn area -> CAUTION.
+  // NOTAM semantics vary too much to auto-NO-GO; flag for pilot review instead.
+  if (S.importedNotams && S.importedNotams.length && S.currentArea) {
+    const areaPoly = currentAreaPolygon();
+    if (areaPoly) {
+      const hits = S.importedNotams.filter(n => n.polygons && n.polygons.length &&
+        n.polygons.some(r => polygonsIntersect(r, areaPoly)) && isTfrActiveNow(n, Date.now()));
+      if (hits.length && result.level !== 'NO-GO') {
+        if (result.level === 'GO') result.level = 'CAUTION';
+        result.cautions = result.cautions || [];
+        result.cautions.push('NOTAM over area — review: ' + hits.map(n => n.id).join(', '));
+        if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
+      }
+    }
+  }
+
   // Integrate FAA airspace data into assessment
   if (S.faaAirspace) {
     // NO-GO: active TFR
@@ -3549,6 +3977,25 @@ function buildLayerControl() {
     }
   }
 
+  // Imported TFR / NOTAM section
+  const hasImpTfr = S.mapLayers.tfr_imported && S.mapLayers.tfr_imported.getLayers && S.mapLayers.tfr_imported.getLayers().length > 0;
+  const hasImpNotam = S.mapLayers.notam_imported && S.mapLayers.notam_imported.getLayers && S.mapLayers.notam_imported.getLayers().length > 0;
+  if (hasImpTfr || hasImpNotam) {
+    html += `<h4 style="margin-top:10px">Imported TFR/NOTAM</h4>`;
+    if (hasImpTfr) {
+      const on = S.map.hasLayer(S.mapLayers.tfr_imported);
+      html += `<div class="layer-item${on ? ' active' : ''}" data-layer="tfr_imported" onclick="toggleLayer('tfr_imported',this)">
+        <div class="layer-check"></div><div class="layer-color" style="background:#ef4444"></div><span>TFRs (${S.mapLayers.tfr_imported.getLayers().length})</span>
+      </div>`;
+    }
+    if (hasImpNotam) {
+      const on = S.map.hasLayer(S.mapLayers.notam_imported);
+      html += `<div class="layer-item${on ? ' active' : ''}" data-layer="notam_imported" onclick="toggleLayer('notam_imported',this)">
+        <div class="layer-check"></div><div class="layer-color" style="background:#f59e0b"></div><span>NOTAMs (${S.mapLayers.notam_imported.getLayers().length})</span>
+      </div>`;
+    }
+  }
+
   // Protected Areas section
   const hasDams = S.mapLayers.dams && S.mapLayers.dams.getLayers && S.mapLayers.dams.getLayers().length > 0;
   const hasWilderness = S.mapLayers.wilderness && S.mapLayers.wilderness.getLayers && S.mapLayers.wilderness.getLayers().length > 0;
@@ -3629,7 +4076,7 @@ function toggleLayer(id, el) {
       if (on) { if (!S.map.hasLayer(layer)) layer.addTo(S.map); layer.setOpacity(0.5); }
       else { if (S.map.hasLayer(layer)) layer.setOpacity(0); }
     }
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'flight_plan' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_')) && S.mapLayers[id]) {
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'flight_plan' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_')) && S.mapLayers[id]) {
     if (on) S.map.addLayer(S.mapLayers[id]);
     else S.map.removeLayer(S.mapLayers[id]);
     // Toggling aircraft also toggles trails
@@ -3776,6 +4223,7 @@ function startApp() {
   // Restore last config from IndexedDB
   restoreConfig();
   restoreFAACharts();
+  setupTfrDropzone();
 
   // Populate training scenarios dropdown
   populateTrainingScenarios();
@@ -5054,7 +5502,13 @@ if (typeof module !== 'undefined' && module.exports) {
     buildLayerControl, toggleLayer, updateWireDisplay,
     computeAirspace, computeOpsData, computeAssessment,
     fetchWeather, fetchKpIndex, fetchElevation, fetchSunMoon,
-    fetchNOTAMs, fetchWireHazards, processArea,
+    renderNotamsTab, fetchWireHazards, processArea,
+    tfrGeoJsonUrlForBounds, toDMS, fmtTfrTime, currentAreaPolygon,
+    renderDeepLinks, renderTfrCards, renderNotamCards, renderImportStatus,
+    renderImportedTfrLayer, renderImportedNotamLayer,
+    importFaaFile, handleFaaFiles, ingestFaaFileText, applyTfrImport,
+    mergeTfrs, mergeNotams, afterFaaImport, setupTfrDropzone,
+    parsePastedNotams, clearImportedNotams, focusTfr, focusNotam,
     fetchFAAairspace, renderFAAairspaceLayers, fetchProtectedAreas, renderProtectedAreaLayers,
     renderAirportMarkers, fetchNWSAlerts, renderNWSAlertCards, renderNWSAlertPolygons,
     renderForecastChart, fetchRadar,
