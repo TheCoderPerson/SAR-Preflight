@@ -15,6 +15,9 @@ const S = {
   wx: {}, wind: {}, elev: {}, astro: {}, notams: [],
   nwsAlerts: [],
   faaAirspace: null,
+  faaObstacles: null,
+  // Aggregated multi-feature popup (cycle through all features under a click)
+  _aggPopup: { items: [], index: 0, popup: null },
   // Imported FAA TFR/NOTAM data (no-server file import)
   tfrs: [], importedNotams: [], tfrImportMeta: null,
   // Track data source errors for retry/display
@@ -285,6 +288,12 @@ function initMap() {
   });
   L.control.zoom({ position: 'bottomright' }).addTo(S.map);
 
+  // Aggregated popup: a click on the map gathers ALL overlapping features (across
+  // every visible overlay) and shows them in one paginated popup. Feature clicks
+  // are routed here too (see wirePopupAggregation), so this catches clicks that
+  // land between features but still inside a polygon.
+  S.map.on('click', e => openAggregatePopup(e.latlng, e));
+
   // Center map on device location if available
   if (navigator.geolocation) {
     navigator.geolocation.getCurrentPosition(
@@ -368,10 +377,12 @@ function clearArea() {
   if (S.mapLayers.faa_laanc) S.mapLayers.faa_laanc.clearLayers();
   if (S.mapLayers.faa_ns_restrictions) S.mapLayers.faa_ns_restrictions.clearLayers();
   if (S.mapLayers.faa_prohibited) S.mapLayers.faa_prohibited.clearLayers();
+  if (S.mapLayers.faa_obstacles) S.mapLayers.faa_obstacles.clearLayers();
   if (S.mapLayers.dams) S.mapLayers.dams.clearLayers();
   if (S.mapLayers.wilderness) S.mapLayers.wilderness.clearLayers();
   if (S.mapLayers.national_parks) S.mapLayers.national_parks.clearLayers();
   S.faaAirspace = null;
+  S.faaObstacles = null;
   S.protectedAreas = null;
   S.lzs = [];
   S.wireHazardCounts = {};
@@ -475,6 +486,7 @@ async function processArea(layer, type) {
     fetchNWSAlerts(center.lat, center.lng),
     fetchRadar(),
     fetchFAAairspace(bounds),
+    fetchFaaObstacles(bounds),
     fetchNearbyAirports(center, bounds),
     fetchProtectedAreas(bounds),
     fetchFireDanger(center.lat, center.lng, bounds),
@@ -517,6 +529,7 @@ async function retryFailedSource(source) {
     'NWS Alerts': () => fetchNWSAlerts(lat, lng),
     'Radar': () => fetchRadar(),
     'FAA Airspace': () => fetchFAAairspace(bounds),
+    'FAA Obstacles': () => fetchFaaObstacles(bounds),
     'Protected Areas': () => fetchProtectedAreas(bounds),
     'Fire Danger': () => fetchFireDanger(lat, lng, bounds),
     'Airports': () => fetchNearbyAirports(S.areaCenter, bounds),
@@ -2540,6 +2553,123 @@ function renderFAAairspaceLayers() {
 }
 
 // ============================================================
+// API: FAA DIGITAL OBSTACLE FILE (DOF) — verified man-made obstacles (FREE)
+// Authoritative FAA AIS obstacle data (verified AGL/AMSL heights, lighting &
+// marking status, type code) on the SAME ArcGIS org as the airspace layers, so
+// it is CORS-enabled and always reflects the current 56-day cycle. CAUTION: the
+// DOF is NOT a complete low-altitude inventory — below ~200' AGL away from
+// airports it is intentionally sparse, so absence is not proof of clear air.
+// ============================================================
+const UAS_CEILING_FT = 400; // Part 107 max AGL — the drone's operating band ceiling
+
+async function fetchFaaObstacles(bounds) {
+  trackFetchStart('FAA Obstacles');
+  setStatus('obstacleStatus', 'loading', 'Fetching...');
+  const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  // Pad ~0.01 deg (~1km) so obstacles just outside the drawn box are caught.
+  const pad = 0.01;
+  const geom = `${sw.lng - pad},${sw.lat - pad},${ne.lng + pad},${ne.lat + pad}`;
+  const base = 'https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/arcgis/rest/services';
+  const url = `${base}/Digital_Obstacle_File/FeatureServer/0/query`
+    + `?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326`
+    + `&spatialRel=esriSpatialRelIntersects`
+    + `&outFields=OAS_Number,Type_Code,AGL,AMSL,Lighting,Marking,Verified`
+    + `&outSR=4326&f=geojson&resultRecordCount=2000`;
+  const cacheKey = `${sw.lat.toFixed(3)}_${sw.lng.toFixed(3)}_${ne.lat.toFixed(3)}_${ne.lng.toFixed(3)}`;
+
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    S.faaObstacles = data;
+    renderObstacleLayer();
+    updateObstacleDisplay(summarizeObstacles(data.features, UAS_CEILING_FT));
+    computeAssessment();
+
+    if (typeof cacheApiResponse === 'function') cacheApiResponse('faa_obstacles', cacheKey, data);
+    if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+
+    clearDataSourceError('FAA Obstacles');
+    const n = (data.features || []).length;
+    // maxRecordCount on the service is 2000; flag if a large AO was clipped.
+    setStatus('obstacleStatus', 'live', n >= 2000 ? '2000+ (clipped)' : `${n}`);
+    buildLayerControl();
+  } catch (err) {
+    console.error('FAA Obstacles fetch error:', err);
+    recordDataSourceError('FAA Obstacles', err);
+    if (typeof getCachedApiResponse === 'function') {
+      try {
+        const cached = await getCachedApiResponse('faa_obstacles', cacheKey);
+        if (cached && cached.data) {
+          S.faaObstacles = cached.data;
+          renderObstacleLayer();
+          updateObstacleDisplay(summarizeObstacles(cached.data.features, UAS_CEILING_FT));
+          computeAssessment();
+          buildLayerControl();
+          const age = Date.now() - cached.timestamp;
+          const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
+          setStatus('obstacleStatus', 'cached', label);
+        } else {
+          setStatus('obstacleStatus', 'error', 'ERROR');
+        }
+      } catch (cacheErr) {
+        console.warn('FAA obstacles cache fallback failed:', cacheErr);
+        setStatus('obstacleStatus', 'error', 'ERROR');
+      }
+    } else {
+      setStatus('obstacleStatus', 'error', 'ERROR');
+    }
+  } finally {
+    trackFetchEnd('FAA Obstacles');
+  }
+}
+
+function renderObstacleLayer() {
+  if (typeof L === 'undefined') return;
+  if (S.mapLayers.faa_obstacles) S.mapLayers.faa_obstacles.clearLayers();
+  else S.mapLayers.faa_obstacles = typeof L.layerGroup === 'function' ? L.layerGroup() : null;
+  if (!S.mapLayers.faa_obstacles || !S.faaObstacles || !S.faaObstacles.features) return;
+
+  S.faaObstacles.features.forEach(f => {
+    const g = f.geometry;
+    if (!g || !g.coordinates) return;
+    const lng = g.coordinates[0], lat = g.coordinates[1];
+    if (lat == null || lng == null) return;
+    const p = f.properties || {};
+    const agl = Number(p.AGL);
+    const color = obstacleMarkerColor(agl);
+    const marker = L.circleMarker([lat, lng], {
+      radius: 5, color: '#000', weight: 1, fillColor: color, fillOpacity: 0.9,
+    });
+    const lines = [`<b style="color:${color}">${obstacleLabel(p)}</b>`];
+    const h = [];
+    if (isFinite(agl)) h.push(`${agl} ft AGL`);
+    if (isFinite(Number(p.AMSL))) h.push(`${Number(p.AMSL)} ft MSL`);
+    if (h.length) lines.push(h.join(' / '));
+    lines.push(`Lighting: ${obstacleLighting(p.Lighting)}`);
+    if ((p.Verified || '').toString().trim().toUpperCase() === 'U') {
+      lines.push('<span style="color:#f59e0b">UNVERIFIED position/height</span>');
+    }
+    lines.push(`<span style="font-size:10px;opacity:0.6">FAA DOF ${p.OAS_Number || ''}</span>`);
+    marker.bindPopup(lines.join('<br>'));
+    S.mapLayers.faa_obstacles.addLayer(marker);
+  });
+}
+
+function updateObstacleDisplay(summary) {
+  const s = summary || { total: 0 };
+  if (!s.total) {
+    setText('terrObstacles', 'None in DOF (not a complete low-alt inventory)');
+    setColor('terrObstacles', 'green');
+    return;
+  }
+  const tallest = s.maxAgl > 0 ? `, tallest ${s.maxAgl} ft AGL` : '';
+  const unv = s.unverified > 0 ? `, ${s.unverified} unverified` : '';
+  setText('terrObstacles', `${s.total} obstacle${s.total === 1 ? '' : 's'}${tallest}${unv} — see map`);
+  setColor('terrObstacles', obstacleHazardLevel(s));
+}
+
+// ============================================================
 // API: CRITICAL INFRASTRUCTURE & PROTECTED AREAS (FREE, no key)
 // Dams (49 USC § 46307), Wilderness (USFS), National Parks (NPS)
 // ============================================================
@@ -3849,6 +3979,19 @@ function computeAssessment() {
     }
   }
 
+  // Integrate FAA DOF obstacles into assessment. CAUTION-only and never an auto
+  // NO-GO: this is advisory hazard data and the DOF is not a complete
+  // low-altitude inventory, so it must not give false confidence either way.
+  if (S.faaObstacles && S.faaObstacles.features && S.faaObstacles.features.length > 0) {
+    const obs = summarizeObstacles(S.faaObstacles.features, UAS_CEILING_FT);
+    if (obs.tallCount > 0 && result.level !== 'NO-GO') {
+      if (result.level === 'GO') result.level = 'CAUTION';
+      result.cautions = result.cautions || [];
+      result.cautions.push(`${obs.tallCount} tall obstacle${obs.tallCount === 1 ? '' : 's'} in area (tallest ${obs.maxAgl} ft AGL) — verify clearance`);
+      if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
+    }
+  }
+
   // Integrate fire danger into assessment
   if (S.activeFires && S.activeFires.length > 0) {
     const nearFires = S.activeFires.filter(f => parseFloat(f.distNm) < 10);
@@ -4224,6 +4367,17 @@ function buildLayerControl() {
     }
   }
 
+  // FAA Obstacles (Digital Obstacle File) section
+  const hasObstacles = S.mapLayers.faa_obstacles && S.mapLayers.faa_obstacles.getLayers && S.mapLayers.faa_obstacles.getLayers().length > 0;
+  if (hasObstacles) {
+    const count = S.mapLayers.faa_obstacles.getLayers().length;
+    const on = S.map.hasLayer(S.mapLayers.faa_obstacles);
+    html += `<h4 style="margin-top:10px">FAA Obstacles (DOF)</h4>`;
+    html += `<div class="layer-item${on ? ' active' : ''}" data-layer="faa_obstacles" onclick="toggleLayer('faa_obstacles',this)">
+      <div class="layer-check"></div><div class="layer-color" style="background:#ef4444"></div><span>Obstacles (${count})</span>
+    </div>`;
+  }
+
   const totalWires = Object.values(S.wireHazardCounts).reduce((a, b) => a + b, 0);
   if (totalWires > 0) {
     html += `<h4 style="margin-top:10px">Wire Hazards</h4>`;
@@ -4252,6 +4406,9 @@ function buildLayerControl() {
   }
 
   document.getElementById('layerList').innerHTML = html;
+  // buildLayerControl runs after virtually every layer (re)render, so use it as
+  // the chokepoint to (re)wire feature clicks into the aggregated popup system.
+  wirePopupAggregation();
 }
 function toggleLayer(id, el) {
   el.classList.toggle('active');
@@ -4285,6 +4442,227 @@ function toggleLayer(id, el) {
       const trailEl = document.querySelector('[data-layer="adsb_trails"]');
       if (trailEl) { if (on) trailEl.classList.add('active'); else trailEl.classList.remove('active'); }
     }
+  }
+}
+
+// ============================================================
+// AGGREGATED MULTI-FEATURE POPUP
+// A single click can land on many overlapping features (e.g. Class airspace +
+// LAANC grid + an obstacle + a NOTAM). Leaflet only opens the topmost feature's
+// popup, so instead we hit-test every visible overlay at the click point and
+// show all matches in one popup with "<- n/N ->" pagination.
+// ============================================================
+const AGG_HIT_PX = 8; // pixel tolerance for line / point hit-testing
+const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails']);
+// Per-layer display label + cycle priority (lower = shown first). Safety-relevant
+// restrictions sort ahead of advisory/terrain features.
+const AGG_LAYER_META = {
+  faa_tfr: { label: 'TFR', pri: 0 }, faa_prohibited: { label: 'Prohibited Area', pri: 0 },
+  faa_ns_restrictions: { label: 'Nat. Security', pri: 0 }, tfr_imported: { label: 'TFR (imported)', pri: 0 },
+  notam_imported: { label: 'NOTAM', pri: 1 }, faa_sua: { label: 'Special Use', pri: 1 },
+  nws_alerts: { label: 'NWS Alert', pri: 1 }, fire_perimeters: { label: 'Fire Perimeter', pri: 1 },
+  faa_class_airspace: { label: 'Class Airspace', pri: 2 }, adsb_aircraft: { label: 'Aircraft', pri: 2 },
+  faa_laanc: { label: 'LAANC Grid', pri: 3 }, airports: { label: 'Airport', pri: 3 },
+  faa_obstacles: { label: 'Obstacle', pri: 4 }, dams: { label: 'Dam', pri: 4 },
+  cell_towers: { label: 'Tower', pri: 5 }, wilderness: { label: 'Wilderness', pri: 6 },
+  national_parks: { label: 'National Park', pri: 6 }, swap_radius: { label: 'Swap Radius', pri: 8 },
+  flight_plan: { label: 'Flight Plan', pri: 8 },
+};
+
+function _aggMeta(key) {
+  if (AGG_LAYER_META[key]) return AGG_LAYER_META[key];
+  if (key.indexOf('wire_') === 0) {
+    const info = typeof WIRE_CATEGORIES !== 'undefined' && WIRE_CATEGORIES[key.slice(5)];
+    return { label: info ? info.label : 'Wire', pri: 5 };
+  }
+  if (key.indexOf('chart_') === 0) return { label: 'Chart', pri: 9 };
+  return { label: '', pri: 7 };
+}
+
+// Walk a layer tree, invoking cb on each layer that carries its OWN popup
+// (stops descending once found — a GeoJSON wrapper holds the popup, not its child).
+function eachPopupLayer(root, cb) {
+  if (!root) return;
+  if (root.getPopup && root.getPopup()) { cb(root); return; }
+  if (root.getLayers) root.getLayers().forEach(c => eachPopupLayer(c, cb));
+}
+
+function _aggContentToHtml(c) {
+  if (!c) return '';
+  if (typeof c === 'string') return c;
+  if (typeof c === 'function') { try { return _aggContentToHtml(c()); } catch (e) { return ''; } }
+  if (c.outerHTML) return c.outerHTML;
+  return String(c);
+}
+
+// Flatten Leaflet getLatLngs() (which nests for holes / multi-geometries) into
+// an array of rings, each ring an array of [lat, lng].
+function _aggRings(latlngs, out) {
+  out = out || [];
+  if (!Array.isArray(latlngs)) return out;
+  if (latlngs.length && latlngs[0] && typeof latlngs[0].lat === 'number') {
+    out.push(latlngs.map(p => [p.lat, p.lng]));
+  } else {
+    latlngs.forEach(s => _aggRings(s, out));
+  }
+  return out;
+}
+
+function _aggPolygonHit(lyr, latlng) {
+  try { if (lyr.getBounds && !lyr.getBounds().contains(latlng)) return false; } catch (e) { /* no bounds */ }
+  return pointInRings(latlng.lat, latlng.lng, _aggRings(lyr.getLatLngs()));
+}
+
+function _aggPolylineHit(lyr, clickPt) {
+  const segs = [];
+  const collect = a => {
+    if (!Array.isArray(a)) return;
+    if (a.length && a[0] && typeof a[0].lat === 'number') segs.push(a);
+    else a.forEach(collect);
+  };
+  collect(lyr.getLatLngs());
+  for (const seg of segs) {
+    for (let i = 1; i < seg.length; i++) {
+      const a = S.map.latLngToLayerPoint(seg[i - 1]);
+      const b = S.map.latLngToLayerPoint(seg[i]);
+      if (distPointToSegment(clickPt.x, clickPt.y, a.x, a.y, b.x, b.y) <= AGG_HIT_PX) return true;
+    }
+  }
+  return false;
+}
+
+function _aggPointHit(lyr, latlng, clickPt) {
+  if (typeof L !== 'undefined' && L.Circle && lyr instanceof L.Circle) {
+    return S.map.distance(latlng, lyr.getLatLng()) <= lyr.getRadius(); // radius in metres
+  }
+  const mp = S.map.latLngToLayerPoint(lyr.getLatLng());
+  let pad = AGG_HIT_PX;
+  if (typeof L !== 'undefined' && L.CircleMarker && lyr instanceof L.CircleMarker) {
+    pad = (lyr.getRadius ? lyr.getRadius() : 5) + 6;
+  } else {
+    const sz = lyr.options && lyr.options.icon && lyr.options.icon.options && lyr.options.icon.options.iconSize;
+    pad = (Array.isArray(sz) ? Math.max(sz[0], sz[1]) / 2 : 14) + 2;
+  }
+  return clickPt.distanceTo(mp) <= pad;
+}
+
+// Does this geometry (descending into groups) contain / sit under the click?
+function _aggLayerHit(lyr, latlng, clickPt) {
+  try {
+    if (typeof L !== 'undefined' && L.Polygon && lyr instanceof L.Polygon) return _aggPolygonHit(lyr, latlng);
+    if (typeof L !== 'undefined' && L.Polyline && lyr instanceof L.Polyline) return _aggPolylineHit(lyr, clickPt);
+    if (lyr.getLatLng) return _aggPointHit(lyr, latlng, clickPt);
+    if (lyr.getLayers) return lyr.getLayers().some(c => _aggLayerHit(c, latlng, clickPt));
+    if (lyr.getBounds) return lyr.getBounds().contains(latlng);
+  } catch (e) { /* malformed geometry — treat as miss */ }
+  return false;
+}
+
+function collectFeaturesAt(latlng) {
+  const hits = [];
+  const seen = new Set(); // collapse exact-duplicate popups (e.g. tiered airspace split into segments)
+  if (!S.map || !S.mapLayers) return hits;
+  const clickPt = S.map.latLngToLayerPoint(latlng);
+  for (const key of Object.keys(S.mapLayers)) {
+    if (AGG_SKIP_LAYERS.has(key)) continue;
+    const group = S.mapLayers[key];
+    if (!group || !S.map.hasLayer(group)) continue;
+    const meta = _aggMeta(key);
+    eachPopupLayer(group, pl => {
+      if (!_aggLayerHit(pl, latlng, clickPt)) return;
+      const content = _aggContentToHtml(pl.getPopup().getContent());
+      if (!content || seen.has(content)) return;
+      seen.add(content);
+      hits.push({ content, label: meta.label, pri: meta.pri });
+    });
+  }
+  hits.sort((a, b) => a.pri - b.pri);
+  return hits;
+}
+
+let _aggLastEvent = null;
+function openAggregatePopup(latlng, ev) {
+  if (!S.map || !latlng) return;
+  // Don't hijack clicks while a draw tool is placing points.
+  if (typeof document !== 'undefined' && document.querySelector('.draw-btn.active')) return;
+  const oe = ev && ev.originalEvent;
+  // Ignore clicks that originate INSIDE the popup (e.g. the pager arrows) — those
+  // must page the popup, not be treated as a fresh map click that re-aggregates.
+  if (oe && oe.target && oe.target.closest && oe.target.closest('.leaflet-popup')) return;
+  // A feature click and the map click both fire for one user click — they share
+  // the same underlying DOM event, so dedupe on its identity (distinct user
+  // clicks get a fresh event; programmatic calls pass none and never dedupe).
+  if (oe) { if (oe === _aggLastEvent) return; _aggLastEvent = oe; }
+
+  const hits = collectFeaturesAt(latlng);
+  if (!hits.length) return;
+  S._aggPopup.items = hits;
+  S._aggPopup.index = 0;
+  if (!S._aggPopup.popup) S._aggPopup.popup = L.popup({ maxWidth: 340, minWidth: 180, autoPan: true, className: 'agg-popup' });
+  S._aggPopup.popup.setLatLng(latlng);
+  renderAggregatePopup();
+  S._aggPopup.popup.openOn(S.map);
+  // Stop clicks inside the popup from bubbling to the map (which would re-open the
+  // aggregate or close the popup via closePopupOnClick). Re-applied each open
+  // because Leaflet recreates the popup container when it is re-added to the map.
+  const el = S._aggPopup.popup.getElement && S._aggPopup.popup.getElement();
+  if (el && !el._aggStop && typeof L !== 'undefined' && L.DomEvent) {
+    el._aggStop = true;
+    L.DomEvent.disableClickPropagation(el);
+    L.DomEvent.on(el, 'click', L.DomEvent.stopPropagation);
+  }
+}
+
+function renderAggregatePopup() {
+  const st = S._aggPopup;
+  if (!st.popup || !st.items.length) return;
+  const n = st.items.length, i = ((st.index % n) + n) % n;
+  st.index = i;
+  const item = st.items[i];
+  const btn = 'background:rgba(128,128,128,0.16);border:1px solid rgba(128,128,128,0.5);color:inherit;border-radius:4px;cursor:pointer;font:600 14px/1 monospace;padding:1px 9px';
+  let html = '';
+  if (n > 1) {
+    html += `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 6px;padding-bottom:5px;border-bottom:1px solid rgba(128,128,128,0.3)">`
+      + `<button type="button" title="Previous" onclick="aggPopupStep(-1)" style="${btn}">&#8592;</button>`
+      + `<span style="font:600 11px/1.25 monospace;opacity:0.8;text-align:center">${i + 1} / ${n}`
+      + (item.label ? `<br><span style="opacity:0.6;font-weight:400">${item.label}</span>` : '')
+      + `</span>`
+      + `<button type="button" title="Next" onclick="aggPopupStep(1)" style="${btn}">&#8594;</button>`
+      + `</div>`;
+  } else if (item.label) {
+    html += `<div style="font:600 10px/1.2 monospace;opacity:0.55;margin-bottom:4px">${item.label}</div>`;
+  }
+  html += `<div class="agg-popup-body">${item.content}</div>`;
+  st.popup.setContent(html);
+}
+
+function aggPopupStep(dir) {
+  const st = S._aggPopup;
+  if (!st.items.length) return;
+  st.index += dir;
+  renderAggregatePopup();
+  if (st.popup && st.popup.update) st.popup.update();
+}
+
+function _aggFeatureClick(e) {
+  if (e && e.originalEvent && typeof L !== 'undefined' && L.DomEvent) L.DomEvent.stopPropagation(e);
+  openAggregatePopup(e.latlng, e);
+}
+
+// Route every popup-bearing feature's click into the aggregated popup, replacing
+// Leaflet's default "open just my popup" behavior. Idempotent via _aggWired.
+function wirePopupAggregation() {
+  if (!S.map || !S.mapLayers) return;
+  for (const key of Object.keys(S.mapLayers)) {
+    if (AGG_SKIP_LAYERS.has(key)) continue;
+    const group = S.mapLayers[key];
+    if (!group) continue;
+    eachPopupLayer(group, pl => {
+      if (pl._aggWired || typeof pl.on !== 'function') return;
+      if (pl._openPopup) pl.off('click', pl._openPopup, pl); // suppress native single-popup open
+      pl.on('click', _aggFeatureClick);
+      pl._aggWired = true;
+    });
   }
 }
 
@@ -5700,6 +6078,8 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, setText, setColor, setStatus, switchTab, togglePanel,
     buildLayerControl, toggleLayer, updateWireDisplay,
+    openAggregatePopup, aggPopupStep, renderAggregatePopup, collectFeaturesAt,
+    wirePopupAggregation, eachPopupLayer,
     computeAirspace, computeOpsData, computeAssessment,
     fetchWeather, fetchKpIndex, fetchElevation, fetchSunMoon,
     renderNotamsTab, fetchWireHazards, processArea,
@@ -5710,6 +6090,7 @@ if (typeof module !== 'undefined' && module.exports) {
     mergeTfrs, mergeNotams, afterFaaImport, setupTfrDropzone,
     parsePastedNotams, clearImportedNotams, focusTfr, focusNotam,
     fetchFAAairspace, renderFAAairspaceLayers, fetchProtectedAreas, renderProtectedAreaLayers,
+    fetchFaaObstacles, renderObstacleLayer, updateObstacleDisplay,
     renderAirportMarkers, fetchNWSAlerts, renderNWSAlertCards, renderNWSAlertPolygons,
     renderForecastChart, fetchRadar,
     radarToggle, radarStep, updateRadarTime,

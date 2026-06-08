@@ -96,6 +96,81 @@ function wireHazardName(tags, cat) {
   return '';
 }
 
+// --- FAA Digital Obstacle File (DOF) helpers ---
+// The DOF is the FAA's authoritative man-made obstacle database. Each record
+// carries a verified height (AGL/AMSL), a structure type code, lighting and
+// marking status, and a verified/unverified flag. CAUTION: the DOF is NOT a
+// complete low-altitude inventory — below ~200' AGL away from airports it is
+// intentionally sparse, so absence of an obstacle is not proof of clear air.
+
+// DOF lighting codes -> short description (per DOF_README).
+const DOF_LIGHTING = {
+  R: 'Red', D: 'Med strobe + red', H: 'High strobe + red', M: 'Med strobe',
+  S: 'High strobe', F: 'Flood', C: 'Dual med catenary', W: 'Synced red',
+  L: 'Lighted (type unknown)', N: 'None', U: 'Unknown',
+};
+function obstacleLighting(code) {
+  const c = (code || '').toString().trim().toUpperCase();
+  return DOF_LIGHTING[c] || 'Unknown';
+}
+
+// Marker color by height above ground (ft AGL), relative to the drone band:
+// tall structures that reach well into the band are red, mid-height amber,
+// low yellow, unknown gray.
+function obstacleMarkerColor(aglFt) {
+  const agl = Number(aglFt);
+  if (!isFinite(agl) || agl <= 0) return '#9ca3af';
+  if (agl >= 200) return '#ef4444';
+  if (agl >= 100) return '#f59e0b';
+  return '#facc15';
+}
+
+// Title-case the all-caps DOF type code, preserving separators and short
+// acronym segments (e.g. "T-L TOWER" -> "T-L Tower", "SOLAR PANELS" ->
+// "Solar Panels"). Only alphabetic runs are recased so hyphens/spaces survive.
+function obstacleLabel(props) {
+  const p = props || {};
+  const type = (p.Type_Code || p.TYPE_CODE || 'Obstacle').toString().trim() || 'Obstacle';
+  return type.replace(/[A-Za-z]+/g, w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+}
+
+// Summarize an array of DOF features (GeoJSON Features or raw property objects)
+// for the panel + assessment. aglCeiling = drone max AGL (default 400').
+function summarizeObstacles(features, aglCeiling) {
+  const ceiling = Number(aglCeiling) > 0 ? Number(aglCeiling) : 400;
+  const list = (features || [])
+    .map(f => (f && f.properties) ? f.properties : f)
+    .filter(Boolean);
+  let total = 0, maxAgl = 0, maxAmsl = 0, tallCount = 0, unverified = 0, unlit = 0;
+  let tallestType = null;
+  const byType = {};
+  for (const p of list) {
+    total++;
+    const agl = Number(p.AGL);
+    const amsl = Number(p.AMSL);
+    if (isFinite(agl)) {
+      if (agl > maxAgl) { maxAgl = agl; tallestType = p.Type_Code || p.TYPE_CODE || null; }
+      if (agl >= 200) tallCount++;
+    }
+    if (isFinite(amsl) && amsl > maxAmsl) maxAmsl = amsl;
+    if ((p.Verified || p.VERIFIED || '').toString().trim().toUpperCase() === 'U') unverified++;
+    const lt = (p.Lighting || p.LIGHTING || '').toString().trim().toUpperCase();
+    if (lt === '' || lt === 'N' || lt === 'U') unlit++;
+    const type = (p.Type_Code || p.TYPE_CODE || 'UNKNOWN').toString().trim().toUpperCase();
+    byType[type] = (byType[type] || 0) + 1;
+  }
+  return { total, maxAgl, maxAmsl, tallCount, unverified, unlit, byType, tallestType, ceiling };
+}
+
+// Panel/assessment hazard level from an obstacle summary. Red when any tall
+// (>=200' AGL) structure is present, amber for shorter obstacles, green when
+// the DOF returned none (NOT a guarantee of clear airspace — see caveat above).
+function obstacleHazardLevel(summary) {
+  if (!summary || !summary.total) return 'green';
+  if (summary.tallCount > 0) return 'red';
+  return 'amber';
+}
+
 // --- Default Risk Thresholds ---
 
 const DEFAULT_THRESHOLDS = {
@@ -1056,6 +1131,29 @@ function circleToPolygon(lat, lng, radiusM, segments) {
   return pts;
 }
 
+// Even-odd point-in-rings test — handles polygons with holes and multipolygons.
+// `rings` is an array of rings, each ring an array of [lat, lng] points. A point
+// inside an odd number of rings is inside the polygon (so holes subtract).
+function pointInRings(lat, lng, rings) {
+  if (!rings || !rings.length) return false;
+  let count = 0;
+  for (const ring of rings) {
+    if (pointInPolygon(lat, lng, ring)) count++;
+  }
+  return (count % 2) === 1;
+}
+
+// Shortest distance from point P to segment AB in a flat (e.g. pixel) plane.
+// Used for hit-testing clicks against polylines.
+function distPointToSegment(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const l2 = dx * dx + dy * dy;
+  if (l2 === 0) return Math.hypot(px - ax, py - ay);
+  let t = ((px - ax) * dx + (py - ay) * dy) / l2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
 // --- Coordinate parsing ---
 
 // Parse an FAA coordinate. Handles two FAA encodings:
@@ -1547,6 +1645,8 @@ if (typeof module !== 'undefined' && module.exports) {
     WIRE_CATEGORIES, lerp, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,
     calcSunPosition, calcMoonPhase, wireHazardName,
+    DOF_LIGHTING, obstacleLighting, obstacleMarkerColor, obstacleLabel,
+    summarizeObstacles, obstacleHazardLevel,
     calcDensityAltitude, calcBatteryDerating, assessPropIcing, assessRisk,
     DEFAULT_THRESHOLDS, TRAINING_SCENARIOS,
     classifyTerrain, estimateVegetation, estimateCellCoverage,
@@ -1557,7 +1657,7 @@ if (typeof module !== 'undefined' && module.exports) {
     assessTerrainTurbulence, analyzeGPSMasking,
     calcSwapRecommendation, generateSearchPattern,
     computeAdsbSearchRadius, parseAdsbAircraft, formatAltitudeAgl,
-    pointInPolygon, polygonBBox, bboxesOverlap, segmentsIntersect, polygonsIntersect,
+    pointInPolygon, pointInRings, distPointToSegment, polygonBBox, bboxesOverlap, segmentsIntersect, polygonsIntersect,
     circleToPolygon, parseFaaCoord, normalizeFaaDate, geoJsonOuterRings,
     parseTfrGeoJson, parseTfrList, normalizeTfrDetailDoc, parseTfrDetailXml,
     filterTfrsIntersectingArea, isTfrActiveNow, parseNotamText, geolocateNotam,

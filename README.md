@@ -15,9 +15,12 @@ https://thecoderperson.github.io/SAR-Preflight/sar-preflight.html
 7. **Export** a pre-flight briefing as PDF, email, clipboard text, or KML
 
 ### Map Features
-- Toggle map layers (satellite, topo, FAA sectional, weather radar, airspace, towers, wire hazards, fire perimeters, live aircraft traffic) via the **Map Layers** control
+- Toggle map layers (satellite, topo, FAA sectional, weather radar, airspace, LAANC grid, FAA obstacles, towers, wire hazards, dams, fire perimeters, live aircraft traffic) via the **Map Layers** control
+- **Click any point to inspect overlapping features.** A single click hit-tests every visible layer and shows all matches in one popup with `← n/N →` pagination, so overlapping airspace, an obstacle, a LAANC cell, and a NOTAM at the same spot can all be read without toggling layers off
+- The **FAA Obstacles (DOF)** layer plots verified man-made obstacles color-coded by height (red ≥ 200 ft AGL, amber 100–199, yellow < 100); popups show AGL/AMSL height, lighting, and marking status
 - The **FAA Sectional** layer streams the current official FAA VFR sectional (56-day cycle); drawing an operational area auto-caches its tiles for offline use, and the cached edition is shown / refreshed when a newer one is published
 - Import FAA sectional chart GeoTIFFs for full-resolution offline chart overlay (backup to the live sectional)
+- Import active **TFRs and NOTAMs** in-app via area-scoped deep-links (no server) — see the NOTAMs tab
 - Use the **timebar** at the bottom to scrub through 24-hour wind and sun direction forecasts
 - **Wind arrow** (blue) and **sun arrow** (yellow) on the map update as you scrub
 
@@ -44,10 +47,12 @@ All data is fetched from free, public APIs. No API keys are required.
 | TFR areas (national defense) | [FAA UDDS](https://udds.faa.gov/) via ArcGIS | Static |
 | LAANC grid ceilings | [FAA UDDS](https://udds.faa.gov/) via ArcGIS | Static |
 | National security UAS restrictions | [FAA UDDS](https://udds.faa.gov/) via ArcGIS | Static |
+| Man-made obstacles — verified AGL/AMSL height, lighting, marking, type (towers, antennas, stacks, cranes, met towers, etc.) | [FAA Digital Obstacle File](https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/dof/) via ArcGIS | 56-day cycle |
+| Current FAA VFR sectional chart tiles | [FAA Aeronautical Information Services](https://www.faa.gov/air_traffic/flight_info/aeronav/) via ArcGIS | 56-day cycle |
+| Active TFRs (in-app import + area-scoped deep-link) | [FAA TFR GeoServer](https://tfr.faa.gov/) | On import |
 | Airports, heliports, seaplane bases | [OpenStreetMap](https://www.openstreetmap.org/) via Overpass API | Cached 7 days |
 | Towers (comm, water, wind turbine, chimney, etc.) | [OpenStreetMap](https://www.openstreetmap.org/) via Overpass API | Cached 7 days |
-| Wire/cable hazards (power, telecom, aerialway) | [OpenStreetMap](https://www.openstreetmap.org/) via Overpass API | Cached 7 days |
-| Power transmission lines with voltage | [HIFLD](https://hifld-geoplatform.opendata.arcgis.com/) via ArcGIS | Static |
+| Wire/cable hazards & power transmission lines (with voltage where tagged) | [OpenStreetMap](https://www.openstreetmap.org/) via Overpass API | Cached 7 days |
 | Active wildfire perimeters | [NIFC](https://data-nifc.opendata.arcgis.com/) via ArcGIS | ~5 min |
 | Fire danger rating (CA only: BI, ERC, fuel moisture) | [NIFC CA NFDRS](https://data-nifc.opendata.arcgis.com/) via ArcGIS | Daily |
 | Dams | [HIFLD](https://hifld-geoplatform.opendata.arcgis.com/) via ArcGIS | Static |
@@ -59,7 +64,9 @@ All data is fetched from free, public APIs. No API keys are required.
 | Battery derating | Calculated from temperature, altitude, wind | Real-time |
 | Bird strike risk | Calculated from season, time of day, terrain, altitude | Real-time |
 
-**Note:** FAA NOTAM and TFR data requires a CORS proxy or backend and is not available directly in the browser. The app provides links to FAA sources for manual verification.
+**Notes:**
+- **FAA NOTAM/TFR:** the official FAA NOTAM/TFR endpoints are CORS-restricted, so the app cannot poll them live. Instead it provides area-scoped deep-links to download active TFRs (GeoJSON) and NOTAMs, plus an in-app file/paste importer (no server) that parses and plots them on the map and folds an active TFR over your area into the assessment.
+- **FAA Digital Obstacle File:** the DOF catalogs verified obstacles but is **not a complete low-altitude inventory** — below ~200 ft AGL away from airports it is intentionally sparse, so the absence of an obstacle is not proof of clear airspace. It complements (does not replace) the OpenStreetMap wire/tower hazard layers and visual reconnaissance.
 
 ## Offline Use
 
