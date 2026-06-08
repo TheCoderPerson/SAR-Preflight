@@ -979,12 +979,12 @@ function renderForecastChart(hourlyData) {
   svg += `<circle id="fc-dot-t" r="3" fill="var(--accent-cyan)" style="display:none"/>`;
   svg += `<circle id="fc-dot-w" r="3" fill="var(--accent-amber)" style="display:none"/>`;
   svg += `<g id="fc-tip" style="display:none">`;
-  svg += `<rect id="fc-tip-bg" rx="3" fill="var(--bg-card)" stroke="var(--border)" stroke-width="0.5" opacity="0.95" x="0" y="0" width="96" height="64"/>`;
-  svg += `<text id="fc-tip-time" font-family="var(--font-mono)" font-size="8" fill="var(--text-secondary)" x="0" y="0"></text>`;
-  svg += `<text id="fc-tip-temp" font-family="var(--font-mono)" font-size="8" fill="var(--accent-cyan)" x="0" y="0"></text>`;
-  svg += `<text id="fc-tip-wind" font-family="var(--font-mono)" font-size="8" fill="var(--accent-amber)" x="0" y="0"></text>`;
-  svg += `<text id="fc-tip-prec" font-family="var(--font-mono)" font-size="8" fill="var(--accent-blue)" x="0" y="0"></text>`;
-  svg += `<text id="fc-tip-ice" font-family="var(--font-mono)" font-size="8" fill="#4db8ff" x="0" y="0"></text>`;
+  svg += `<rect id="fc-tip-bg" rx="6" fill="var(--bg-elevated)" stroke="var(--border)" stroke-width="0.5" opacity="0.95" x="0" y="0" width="192" height="128"/>`;
+  svg += `<text id="fc-tip-time" font-family="var(--font-mono)" font-size="16" fill="var(--text-secondary)" x="0" y="0"></text>`;
+  svg += `<text id="fc-tip-temp" font-family="var(--font-mono)" font-size="16" fill="var(--accent-cyan)" x="0" y="0"></text>`;
+  svg += `<text id="fc-tip-wind" font-family="var(--font-mono)" font-size="16" fill="var(--accent-amber)" x="0" y="0"></text>`;
+  svg += `<text id="fc-tip-prec" font-family="var(--font-mono)" font-size="16" fill="var(--accent-blue)" x="0" y="0"></text>`;
+  svg += `<text id="fc-tip-ice" font-family="var(--font-mono)" font-size="16" fill="#4db8ff" x="0" y="0"></text>`;
   svg += `</g>`;
   svg += `<rect x="${padL}" y="${padT}" width="${plotW}" height="${plotH}" fill="transparent" style="cursor:crosshair" id="fc-overlay"/>`;
 
@@ -997,15 +997,24 @@ function renderForecastChart(hourlyData) {
     const cd = { times: times.slice(0, n), temps: tSlice, winds: wSlice, precips: pSlice, icing: icingByHour, n, W, padL, plotW, plotH, padT, xPos, yTemp, yWind };
     const overlay = svgEl.querySelector('#fc-overlay');
     if (overlay) {
-      overlay.addEventListener('mousemove', function(ev) { _fcTooltipMove(ev, svgEl, cd); });
+      overlay.addEventListener('mousemove', function(ev) { _fcTooltipMove(ev.clientX, svgEl, cd); });
       overlay.addEventListener('mouseleave', function() { _fcTooltipHide(svgEl); });
+      // Touch: tap/drag to scrub. preventDefault stops the panel scrolling while scrubbing.
+      // Box stays visible after lift (no hover on touch to fall back to).
+      const onTouch = function(ev) {
+        if (!ev.touches || ev.touches.length === 0) return;
+        ev.preventDefault();
+        _fcTooltipMove(ev.touches[0].clientX, svgEl, cd);
+      };
+      overlay.addEventListener('touchstart', onTouch, { passive: false });
+      overlay.addEventListener('touchmove', onTouch, { passive: false });
     }
   }
 }
 
-function _fcTooltipMove(e, svg, d) {
+function _fcTooltipMove(clientX, svg, d) {
   const rect = svg.getBoundingClientRect();
-  const mx = (e.clientX - rect.left) / rect.width * d.W;
+  const mx = (clientX - rect.left) / rect.width * d.W;
   const frac = (mx - d.padL) / d.plotW;
   if (frac < 0 || frac > 1) { _fcTooltipHide(svg); return; }
 
@@ -1033,19 +1042,21 @@ function _fcTooltipMove(e, svg, d) {
   const prec = d.precips[idx] != null ? d.precips[idx] + '%' : '--';
   const ice = d.icing?.[idx]?.risk ?? '--';
 
-  // Position tooltip (flip side near right edge)
-  const tipX = cx < d.padL + d.plotW * 0.7 ? cx + 8 : cx - 104;
+  // Position tooltip (192x128 box; flip + clamp to stay inside the 440-wide viewBox)
+  const BOX_W = 192, GAP = 8;
+  let tipX = (cx + GAP + BOX_W <= d.W) ? cx + GAP : cx - GAP - BOX_W;
+  tipX = Math.max(0, Math.min(tipX, d.W - BOX_W));
   const tipY = d.padT + 4;
 
   svg.querySelector('#fc-tip-bg').setAttribute('x', tipX);
   svg.querySelector('#fc-tip-bg').setAttribute('y', tipY);
-  const tx = tipX + 5;
+  const tx = tipX + 10;
   const el = (id, text, y) => { const t = svg.querySelector(id); t.textContent = text; t.setAttribute('x', tx); t.setAttribute('y', y); };
-  el('#fc-tip-time', timeStr, tipY + 11);
-  el('#fc-tip-temp', temp, tipY + 22);
-  el('#fc-tip-wind', wind, tipY + 33);
-  el('#fc-tip-prec', prec, tipY + 44);
-  el('#fc-tip-ice', `Ice: ${ice}`, tipY + 55);
+  el('#fc-tip-time', timeStr, tipY + 22);
+  el('#fc-tip-temp', temp, tipY + 44);
+  el('#fc-tip-wind', wind, tipY + 66);
+  el('#fc-tip-prec', prec, tipY + 88);
+  el('#fc-tip-ice', `Ice: ${ice}`, tipY + 110);
   svg.querySelector('#fc-tip').style.display = '';
 }
 
@@ -3135,7 +3146,7 @@ function updateRadarTime() {
   const frame = S.radarAnim.frames[S.radarAnim.index];
   if (frame && frame.time) {
     const d = new Date(frame.time * 1000);
-    el.textContent = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: _localTZ() });
+    el.textContent = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: _localTZ() });
   } else {
     el.textContent = '--';
   }
@@ -4149,6 +4160,10 @@ function toggleLayerControl() {
   const el = document.getElementById('layerControl');
   if (el) el.classList.toggle('collapsed');
 }
+function toggleDrawToolbar() {
+  const el = document.getElementById('drawToolbar');
+  if (el) el.classList.toggle('collapsed');
+}
 function togglePanel() {
   S.panelOpen = !S.panelOpen;
   document.getElementById('sidePanel').classList.toggle('collapsed');
@@ -4426,12 +4441,25 @@ function toggleLayer(id, el) {
       S.map.removeLayer(S.mapLayers[id]);
     }
   } else if (id === 'radar') {
-    // Toggle radar: show/hide current frame
+    // Toggle radar frame + its play panel together
     if (S.radarAnim && S.radarAnim.layers) {
       const layer = S.radarAnim.layers[S.radarAnim.index];
       if (on) { if (!S.map.hasLayer(layer)) layer.addTo(S.map); layer.setOpacity(0.5); }
-      else { if (S.map.hasLayer(layer)) layer.setOpacity(0); }
+      else {
+        if (S.map.hasLayer(layer)) layer.setOpacity(0);
+        // Stop playback so hidden frames don't cycle back into view
+        if (S.radarAnim.playing) {
+          clearInterval(S.radarAnim.interval);
+          S.radarAnim.interval = null;
+          S.radarAnim.playing = false;
+          const btn = document.getElementById('radarPlayBtn');
+          if (btn) btn.innerHTML = '&#9654;';
+        }
+      }
     }
+    // Play panel is visible only while the radar layer is checked on
+    const controls = document.getElementById('radarControls');
+    if (controls) controls.style.display = on ? 'flex' : 'none';
   } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'flight_plan' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_')) && S.mapLayers[id]) {
     if (on) S.map.addLayer(S.mapLayers[id]);
     else S.map.removeLayer(S.mapLayers[id]);
