@@ -812,10 +812,12 @@ select.api-input { cursor: pointer; }
           </div>
         </div>
         <div class="data-section">
-          <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>Obstacles &amp; Hazards <span class="fetch-status" id="wireStatus"></span> <span class="fetch-status" id="protectedAreasStatus"></span></div>
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>Obstacles &amp; Hazards <span class="fetch-status" id="wireStatus"></span> <span class="fetch-status" id="obstacleStatus"></span> <span class="fetch-status" id="protectedAreasStatus"></span></div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">Power Lines</div><div class="data-value sm" id="terrPower">Check imagery</div></div>
             <div class="data-cell"><div class="data-label">Cell Towers</div><div class="data-value sm" id="terrTowers">Check FAA OE</div></div>
+            <div class="data-cell full"><div class="data-label">FAA Obstacles (DOF)</div><div class="data-value sm" id="terrObstacles">Draw area to load</div></div>
+            <div class="data-cell full" style="padding-top:2px"><div class="data-value sm" style="font-size:10px;opacity:0.6;line-height:1.3">FAA Digital Obstacle File — verified heights/lighting. NOT a complete low-altitude inventory; absence ≠ clear. Scan imagery &amp; verify wires visually.</div></div>
             <div class="data-cell"><div class="data-label">Highways</div><div class="data-value sm" id="terrHwy">--</div></div>
             <div class="data-cell"><div class="data-label">Vegetation</div><div class="data-value sm" id="terrVeg">--</div></div>
             <div class="data-cell full"><div class="data-label">Emergency LZ</div><div class="data-value sm" id="terrLZ">Identify on satellite before flight</div></div>
