@@ -225,4 +225,21 @@ describe('buildLayerControl includes Phase 2 layers', () => {
     const html = document.getElementById('layerList').innerHTML;
     expect(html).not.toContain('Weather Radar');
   });
+
+  it('renders FAA National Security layer when it has features', () => {
+    S.mapLayers.faa_ns_restrictions = { getLayers: vi.fn(() => [1, 2]) };
+    buildLayerControl();
+    const html = document.getElementById('layerList').innerHTML;
+    expect(html).toContain('FAA Airspace');
+    expect(html).toContain('National Security');
+    expect(html).toContain('faa_ns_restrictions');
+  });
+
+  it('renders FAA Prohibited Areas layer when it has features', () => {
+    S.mapLayers.faa_prohibited = { getLayers: vi.fn(() => [1]) };
+    buildLayerControl();
+    const html = document.getElementById('layerList').innerHTML;
+    expect(html).toContain('Prohibited Areas');
+    expect(html).toContain('faa_prohibited');
+  });
 });

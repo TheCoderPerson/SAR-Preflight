@@ -157,6 +157,51 @@ function updateSectionalEditionUI(edition, opts) {
   }
 }
 
+// --- Map theme (dark / light-map / full-light) ---
+// Three modes, cycled by a manual button and persisted to localStorage:
+//   dark      — CARTO dark basemap + dark HUD palette (default)
+//   light-map — CARTO light basemap, dark HUD palette (bright-day map, HUD intact)
+//   light     — CARTO light basemap + full light UI palette
+// The data-theme attribute drives the CSS palette ([data-theme="light"] only);
+// the basemap swap is done here in JS.
+const THEME_MODES = ['dark', 'light-map', 'light'];
+const THEME_LABELS = { dark: '☾ DARK', 'light-map': '◐ LIGHT MAP', light: '☀ LIGHT' };
+
+function getStoredTheme() {
+  let t = null;
+  try { t = localStorage.getItem('sar_theme'); } catch (e) { /* private mode */ }
+  return THEME_MODES.indexOf(t) !== -1 ? t : 'dark';
+}
+
+function applyTheme(theme) {
+  if (THEME_MODES.indexOf(theme) === -1) theme = 'dark';
+  if (typeof document !== 'undefined' && document.documentElement) {
+    document.documentElement.setAttribute('data-theme', theme);
+  }
+  // Swap the basemap (light for light-map/light, dark otherwise).
+  if (S.map && S.mapLayers && S.mapLayers.basemap_dark && S.mapLayers.basemap_light) {
+    const wantLight = (theme === 'light' || theme === 'light-map');
+    const want = wantLight ? S.mapLayers.basemap_light : S.mapLayers.basemap_dark;
+    const other = wantLight ? S.mapLayers.basemap_dark : S.mapLayers.basemap_light;
+    if (S.map.hasLayer(other)) S.map.removeLayer(other);
+    if (!S.map.hasLayer(want)) S.map.addLayer(want);
+    // Pin the basemap beneath every other tile layer (satellite/topo/sectional,
+    // radar). bringToBack() relies on Leaflet's auto z-index, which drifts across
+    // repeated theme switches and can leave the basemap ABOVE the base overlays —
+    // hiding them when toggled on. A fixed negative z-index is deterministic.
+    if (typeof want.setZIndex === 'function') want.setZIndex(-1);
+  }
+  try { localStorage.setItem('sar_theme', theme); } catch (e) { /* private mode */ }
+  const btn = (typeof document !== 'undefined') ? document.getElementById('themeToggle') : null;
+  if (btn) btn.textContent = THEME_LABELS[theme];
+  S.theme = theme;
+}
+
+function cycleTheme() {
+  const next = THEME_MODES[(THEME_MODES.indexOf(getStoredTheme()) + 1) % THEME_MODES.length];
+  applyTheme(next);
+}
+
 // Background-cache the FAA sectional covering a drawn operating area (z8-12) so
 // it is fully available offline. No-op when offline or the SW isn't controlling.
 function cacheSectionalForArea(bounds) {
@@ -182,7 +227,10 @@ function cacheSectionalForArea(bounds) {
 // ============================================================
 function initMap() {
   S.map = L.map('map', { center: [38.685, -120.99], zoom: 11, zoomControl: false, attributionControl: false });
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '&copy; CARTO' }).addTo(S.map);
+  // Tracked basemaps so the theme toggle can swap between them (dark default).
+  S.mapLayers.basemap_dark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
+  S.mapLayers.basemap_light = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
+  applyTheme(getStoredTheme());
   S.mapLayers.satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19 });
   S.mapLayers.topo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { maxZoom: 17 });
   S.mapLayers.sectional = L.tileLayer(sectionalTileUrl(getStoredSectionalEdition()), { maxNativeZoom: 12, maxZoom: 18, opacity: 1.0, attribution: 'FAA Aeronautical Information Services' });
@@ -318,6 +366,8 @@ function clearArea() {
   if (S.mapLayers.faa_sua) S.mapLayers.faa_sua.clearLayers();
   if (S.mapLayers.faa_tfr) S.mapLayers.faa_tfr.clearLayers();
   if (S.mapLayers.faa_laanc) S.mapLayers.faa_laanc.clearLayers();
+  if (S.mapLayers.faa_ns_restrictions) S.mapLayers.faa_ns_restrictions.clearLayers();
+  if (S.mapLayers.faa_prohibited) S.mapLayers.faa_prohibited.clearLayers();
   if (S.mapLayers.dams) S.mapLayers.dams.clearLayers();
   if (S.mapLayers.wilderness) S.mapLayers.wilderness.clearLayers();
   if (S.mapLayers.national_parks) S.mapLayers.national_parks.clearLayers();
@@ -2114,9 +2164,12 @@ function renderAirportMarkers(lat, lng) {
     const sz = isHeli ? 22 : (a.type === 'large_airport' ? 26 : a.type === 'medium_airport' ? 22 : 18);
     const color = isHeli ? '#a78bfa' : '#f59e0b';
 
+    // Airports use the plane silhouette inside a black-outlined circular badge so
+    // they read distinctly from bare ADS-B traffic planes (which share the same
+    // silhouette). Heliports keep their lettered disc.
     const svgIcon = isHeli
       ? `<svg width="${sz}" height="${sz}" viewBox="0 0 24 24"><circle cx="12" cy="12" r="11" fill="${color}" fill-opacity="0.85" stroke="#fff" stroke-width="1.5"/><text x="12" y="17" text-anchor="middle" fill="#fff" font-size="14" font-weight="bold" font-family="sans-serif">H</text></svg>`
-      : `<svg width="${sz}" height="${sz}" viewBox="0 0 24 24"><path d="M21 16v-2l-8-5V3.5A1.5 1.5 0 0 0 11.5 2 1.5 1.5 0 0 0 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z" fill="${color}" stroke="#fff" stroke-width="0.8"/></svg>`;
+      : `<svg width="${sz}" height="${sz}" viewBox="0 0 24 24"><circle cx="12" cy="12" r="11" fill="#fff" fill-opacity="0.85" stroke="#000" stroke-width="1.5"/><g transform="translate(12 12) scale(0.6) translate(-12 -12)"><path d="M21 16v-2l-8-5V3.5A1.5 1.5 0 0 0 11.5 2 1.5 1.5 0 0 0 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z" fill="${color}" stroke="#000" stroke-width="1"/></g></svg>`;
 
     const icon = L.divIcon({
       html: svgIcon,
@@ -2308,7 +2361,8 @@ async function fetchFAAairspace(bounds) {
     sua: `${base}/Special_Use_Airspace/FeatureServer/0/query?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=NAME,TYPE_CODE,LOCAL_TYPE,UPPER_VAL,LOWER_VAL&outSR=4326&f=geojson&resultRecordCount=500`,
     tfrs: `${base}/National_Defense_Airspace_TFR_Areas/FeatureServer/0/query?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=NAME,TYPE_CODE,LOCAL_TYPE,CITY,STATE&outSR=4326&f=geojson&resultRecordCount=200`,
     laanc: `${base}/FAA_UAS_FacilityMap_Data_V5/FeatureServer/0/query?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=CEILING,APT1_FAAID,APT1_NAME&outSR=4326&f=geojson&resultRecordCount=2000`,
-    nsRestrictions: `${base}/Part_Time_National_Security_UAS_Flight_Restrictions/FeatureServer/0/query?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=NAME,TYPE_CODE,LOCAL_TYPE&outSR=4326&f=geojson&resultRecordCount=200`,
+    nsRestrictions: `${base}/Part_Time_National_Security_UAS_Flight_Restrictions/FeatureServer/0/query?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=*&outSR=4326&f=geojson&resultRecordCount=200`,
+    prohibited: `${base}/Prohibited_Areas/FeatureServer/0/query?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=*&outSR=4326&f=geojson&resultRecordCount=200`,
   };
 
   try {
@@ -2442,6 +2496,45 @@ function renderFAAairspaceLayers() {
       const aptName = f.properties.APT1_NAME || f.properties.APT1_FAAID || '';
       layer.bindPopup(`<b>LAANC Grid</b><br>Ceiling: ${ceil} ft AGL<br>${aptName}`);
       S.mapLayers.faa_laanc.addLayer(layer);
+    });
+  }
+
+  // National Security UAS Flight Restrictions layer. Already fetched into
+  // S.faaAirspace.nsRestrictions and drives NO-GO in computeAssessment(); this
+  // makes it visible on the map. Fields per the FAA Part-Time NSFR schema
+  // (Facility/Base/Reason/POC) — there is no NAME field.
+  if (S.mapLayers.faa_ns_restrictions) S.mapLayers.faa_ns_restrictions.clearLayers();
+  else S.mapLayers.faa_ns_restrictions = typeof L.layerGroup === 'function' ? L.layerGroup() : null;
+  if (S.mapLayers.faa_ns_restrictions && S.faaAirspace.nsRestrictions && S.faaAirspace.nsRestrictions.features) {
+    S.faaAirspace.nsRestrictions.features.forEach(f => {
+      const p = f.properties || {};
+      const layer = L.geoJSON(f, {
+        style: { color: '#dd1133', weight: 2, fillColor: '#dd1133', fillOpacity: 0.18, dashArray: '6,3' },
+      });
+      const title = p.Facility || p.Base || p.NAME || 'National Security UAS Restriction';
+      const lines = [`<b>${title}</b>`];
+      if (p.Reason) lines.push(p.Reason);
+      const alt = [p.Floor, p.Ceiling].filter(Boolean).join(' to ');
+      if (alt) lines.push(alt);
+      if (p.POC) lines.push(`POC: ${p.POC}`);
+      layer.bindPopup(lines.join('<br>'));
+      S.mapLayers.faa_ns_restrictions.addLayer(layer);
+    });
+  }
+
+  // Prohibited Areas (dedicated FAA Prohibited_Areas service). May overlap the
+  // SUA "P" type areas above; rendered separately for completeness.
+  if (S.mapLayers.faa_prohibited) S.mapLayers.faa_prohibited.clearLayers();
+  else S.mapLayers.faa_prohibited = typeof L.layerGroup === 'function' ? L.layerGroup() : null;
+  if (S.mapLayers.faa_prohibited && S.faaAirspace.prohibited && S.faaAirspace.prohibited.features) {
+    S.faaAirspace.prohibited.features.forEach(f => {
+      const p = f.properties || {};
+      const layer = L.geoJSON(f, {
+        style: { color: '#991b1b', weight: 2, fillColor: '#991b1b', fillOpacity: 0.20 },
+      });
+      const nm = p.NAME || p.LOCAL_TYPE || p.TYPE_CODE || 'Prohibited Area';
+      layer.bindPopup(`<b>Prohibited Area</b><br>${nm}`);
+      S.mapLayers.faa_prohibited.addLayer(layer);
     });
   }
 }
@@ -2717,7 +2810,7 @@ async function fetchWireHazards(bounds) {
       // FAA sectional-style tower icon: solid inverted triangle with dot on top
       const color = '#00CCFF';
       const sz = 28;
-      const svgIcon = `<svg width="${sz}" height="${sz}" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">`
+      const svgIcon = `<svg width="${sz}" height="${sz}" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg" style="filter:drop-shadow(0 0 1px #000) drop-shadow(0 0 1px #000);">`
         + `<line x1="14" y1="4" x2="14" y2="22" stroke="${color}" stroke-width="1.5"/>`
         + `<circle cx="14" cy="4" r="2.5" fill="${color}"/>`
         + `<line x1="8" y1="12" x2="14" y2="8" stroke="${color}" stroke-width="1"/>`
@@ -3293,7 +3386,7 @@ function _updateWindArrow(dir, speed) {
   }
 
   const len = Math.min(30, 14 + speed * 0.6); // arrow length scales with speed
-  const svgHtml = `<svg width="60" height="60" viewBox="0 0 60 60" style="overflow:visible;">
+  const svgHtml = `<svg width="60" height="60" viewBox="0 0 60 60" style="overflow:visible;filter:drop-shadow(0 0 1px #000) drop-shadow(0 0 1px #000);">
     <defs><marker id="wah" markerWidth="6" markerHeight="5" refX="3" refY="2.5" orient="auto"><polygon points="0 0,6 2.5,0 5" fill="#3d8bfd"/></marker></defs>
     <line x1="30" y1="30" x2="30" y2="${30 - len}" stroke="#3d8bfd" stroke-width="2.5" marker-end="url(#wah)"
           transform="rotate(${dir}, 30, 30)"/>
@@ -3322,7 +3415,7 @@ function _updateSunArrow(sunPos) {
 
   const az = sunPos.azimuth;
   const len = 24;
-  const svgHtml = `<svg width="60" height="60" viewBox="0 0 60 60" style="overflow:visible;">
+  const svgHtml = `<svg width="60" height="60" viewBox="0 0 60 60" style="overflow:visible;filter:drop-shadow(0 0 1px #000) drop-shadow(0 0 1px #000);">
     <defs><marker id="sah" markerWidth="6" markerHeight="5" refX="3" refY="2.5" orient="auto"><polygon points="0 0,6 2.5,0 5" fill="#f59e0b"/></marker></defs>
     <line x1="30" y1="30" x2="30" y2="${30 - len}" stroke="#f59e0b" stroke-width="2" stroke-dasharray="4,2" marker-end="url(#sah)"
           transform="rotate(${az}, 30, 30)"/>
@@ -4041,7 +4134,9 @@ function buildLayerControl() {
   const hasFAAsua = S.mapLayers.faa_sua && S.mapLayers.faa_sua.getLayers && S.mapLayers.faa_sua.getLayers().length > 0;
   const hasFAAtfr = S.mapLayers.faa_tfr && S.mapLayers.faa_tfr.getLayers && S.mapLayers.faa_tfr.getLayers().length > 0;
   const hasFAAlaanc = S.mapLayers.faa_laanc && S.mapLayers.faa_laanc.getLayers && S.mapLayers.faa_laanc.getLayers().length > 0;
-  if (hasFAAclass || hasFAAsua || hasFAAtfr || hasFAAlaanc) {
+  const hasFAAns = S.mapLayers.faa_ns_restrictions && S.mapLayers.faa_ns_restrictions.getLayers && S.mapLayers.faa_ns_restrictions.getLayers().length > 0;
+  const hasFAAprohibited = S.mapLayers.faa_prohibited && S.mapLayers.faa_prohibited.getLayers && S.mapLayers.faa_prohibited.getLayers().length > 0;
+  if (hasFAAclass || hasFAAsua || hasFAAtfr || hasFAAlaanc || hasFAAns || hasFAAprohibited) {
     html += `<h4 style="margin-top:10px">FAA Airspace</h4>`;
     if (hasFAAclass) {
       const on = S.map.hasLayer(S.mapLayers.faa_class_airspace);
@@ -4065,6 +4160,18 @@ function buildLayerControl() {
       const on = S.map.hasLayer(S.mapLayers.faa_laanc);
       html += `<div class="layer-item${on ? ' active' : ''}" data-layer="faa_laanc" onclick="toggleLayer('faa_laanc',this)">
         <div class="layer-check"></div><div class="layer-color" style="background:#22c55e"></div><span>LAANC Grid</span>
+      </div>`;
+    }
+    if (hasFAAns) {
+      const on = S.map.hasLayer(S.mapLayers.faa_ns_restrictions);
+      html += `<div class="layer-item${on ? ' active' : ''}" data-layer="faa_ns_restrictions" onclick="toggleLayer('faa_ns_restrictions',this)">
+        <div class="layer-check"></div><div class="layer-color" style="background:#dd1133"></div><span>National Security</span>
+      </div>`;
+    }
+    if (hasFAAprohibited) {
+      const on = S.map.hasLayer(S.mapLayers.faa_prohibited);
+      html += `<div class="layer-item${on ? ' active' : ''}" data-layer="faa_prohibited" onclick="toggleLayer('faa_prohibited',this)">
+        <div class="layer-check"></div><div class="layer-color" style="background:#991b1b"></div><span>Prohibited Areas</span>
       </div>`;
     }
   }
@@ -5609,6 +5716,7 @@ if (typeof module !== 'undefined' && module.exports) {
     openExport, closeExport, doExport, getKMLCoords,
     saveApiKey, saveConfig, updateClock, refreshData,
     initMap, startDraw, clearDrawBtns, clearArea, enterCoords,
+    getStoredTheme, applyTheme, cycleTheme,
     scrollTabs, updateScrollBtns,
     importKML, handleKMLFile, parseKML,
     copyBriefing, buildBriefingText,

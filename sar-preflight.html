@@ -39,6 +39,39 @@
   --panel-width: 480px;
   --header-height: 48px;
 }
+/* Full light theme (mode "light"). Mode "light-map" keeps this dark palette and
+   only swaps the basemap, so it does NOT match this selector. */
+[data-theme="light"] {
+  --bg-primary: #eef1f5;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #e3e9f0;
+  --bg-elevated: #d6deea;
+  --border: #c2ccd8;
+  --border-active: #2563eb;
+  --text-primary: #1a2230;
+  --text-secondary: #46586c;
+  --text-muted: #6b7d92;
+  --accent-blue: #2563eb;
+  --accent-green: #16a34a;
+  --accent-amber: #b45309;
+  --accent-red: #dc2626;
+  --accent-cyan: #0e7490;
+  --accent-purple: #7c3aed;
+}
+/* The glassy map overlays use a hardcoded dark wash; flip them in full light. */
+[data-theme="light"] .map-info,
+[data-theme="light"] .layer-control,
+[data-theme="light"] .timebar,
+[data-theme="light"] .radar-controls { background: rgba(255,255,255,0.92); }
+/* Theme toggle button (cycles dark / light-map / light) */
+.theme-toggle {
+  position: absolute; top: 12px; left: 72px; z-index: 800;
+  background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px;
+  padding: 9px 11px; color: var(--text-secondary); cursor: pointer;
+  font-family: var(--font-mono); font-size: 10px; font-weight: 600; letter-spacing: 1px;
+  text-transform: uppercase; white-space: nowrap; transition: all 0.15s;
+}
+.theme-toggle:hover { border-color: var(--accent-blue); color: var(--text-primary); }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
   font-family: var(--font-sans);
@@ -535,6 +568,7 @@ select.api-input { cursor: pointer; }
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
       </button>
     </div>
+    <button class="theme-toggle" id="themeToggle" onclick="cycleTheme()" title="Cycle map theme: Dark → Light Map → Light">☾ DARK</button>
     <div class="map-info">
       <span>CURSOR </span><span class="coord" id="cursorCoord">--°, --°</span>
       <span style="margin:0 8px;color:var(--border);">|</span>
