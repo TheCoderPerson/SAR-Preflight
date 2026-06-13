@@ -27,6 +27,7 @@ const APP_SHELL = [
   './sar-preflight.html',
   './version.js',
   './sar-preflight-core.js',
+  './sar-preflight-raster.js',
   './sar-preflight.js',
   './sar-preflight-offline.js',
   './manifest.json',

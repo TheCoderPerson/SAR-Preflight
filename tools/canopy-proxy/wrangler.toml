@@ -1,0 +1,7 @@
+name = "sar-canopy-proxy"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Free-tier Cloudflare Worker. After `wrangler deploy`, the deploy output prints
+# the URL (https://sar-canopy-proxy.<your-subdomain>.workers.dev). Paste that URL
+# into the SAR Preflight app: Config tab → "Canopy proxy URL".

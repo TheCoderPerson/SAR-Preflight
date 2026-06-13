@@ -21,6 +21,8 @@ https://thecoderperson.github.io/SAR-Preflight/sar-preflight.html
 - The **FAA Sectional** layer streams the current official FAA VFR sectional (56-day cycle); drawing an operational area auto-caches its tiles for offline use, and the cached edition is shown / refreshed when a newer one is published
 - Import FAA sectional chart GeoTIFFs for full-resolution offline chart overlay (backup to the live sectional)
 - Import active **TFRs and NOTAMs** in-app via area-scoped deep-links (no server) — see the NOTAMs tab
+- Toggle a **vegetation height overlay** (Meta/WRI 1 m canopy) over the current view with an opacity slider (Terrain tab → *Canopy & Visibility*)
+- Run a **viewshed**: tap an observer location and the tool shades every spot where a drone at your entered AGL would be visible to a 5.5 ft-eye observer, factoring terrain *and* vegetation into line-of-sight (Terrain tab, or the eye icon on the draw toolbar)
 - Use the **timebar** at the bottom to scrub through 24-hour wind and sun direction forecasts
 - **Wind arrow** (blue) and **sun arrow** (yellow) on the map update as you scrub
 
@@ -36,6 +38,8 @@ All data is fetched from free, public APIs. No API keys are required.
 | Air quality (AQI, PM2.5, PM10, ozone) | [Open-Meteo Air Quality](https://open-meteo.com/) | ~30 min |
 | Cursor elevation | [Open-Meteo Elevation](https://open-meteo.com/) | Static |
 | Terrain elevation grid | [Open-Elevation](https://open-elevation.com/) | Static |
+| Viewshed terrain DEM (best-available, ~3 m effective) | [USGS 3DEP](https://www.usgs.gov/3d-elevation-program) Elevation ImageServer (CORS-enabled) | Static |
+| Vegetation (canopy) height — 1 m, for the overlay & viewshed | [Meta/WRI Global Canopy Height](https://registry.opendata.aws/dataforgood-fb-forests/) via a self-hosted Cloudflare Worker proxy (see [`tools/canopy-proxy`](tools/canopy-proxy)) | Static |
 | Sunrise, sunset, civil/nautical twilight | [Sunrise-Sunset.org](https://sunrise-sunset.org/) | Daily |
 | Sun azimuth and elevation | Calculated (solar position algorithm) | Real-time |
 | Moon phase and illumination | Calculated (lunar phase algorithm) | Real-time |
@@ -67,6 +71,7 @@ All data is fetched from free, public APIs. No API keys are required.
 **Notes:**
 - **FAA NOTAM/TFR:** the official FAA NOTAM/TFR endpoints are CORS-restricted, so the app cannot poll them live. Instead it provides area-scoped deep-links to download active TFRs (GeoJSON) and NOTAMs, plus an in-app file/paste importer (no server) that parses and plots them on the map and folds an active TFR over your area into the assessment.
 - **FAA Digital Obstacle File:** the DOF catalogs verified obstacles but is **not a complete low-altitude inventory** — below ~200 ft AGL away from airports it is intentionally sparse, so the absence of an obstacle is not proof of clear airspace. It complements (does not replace) the OpenStreetMap wire/tower hazard layers and visual reconnaissance.
+- **Vegetation / viewshed:** the USGS 3DEP terrain DEM is read directly in-browser (CORS-enabled), so the viewshed works "bare-earth" with no setup. The Meta 1 m canopy tiles, however, are served from an AWS bucket that sends no CORS headers, so the canopy overlay and vegetation-aware viewshed require a small **self-hosted Cloudflare Worker** proxy (free tier; one-time setup — see [`tools/canopy-proxy/README.md`](tools/canopy-proxy/README.md)) whose URL is set in the Config tab. Viewed areas are cached in IndexedDB for offline use. The viewshed is a **modeled** line-of-sight from terrain + canopy and is not a substitute for legal VLOS or on-scene judgment.
 
 ## Offline Use
 

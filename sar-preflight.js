@@ -36,6 +36,10 @@ const S = {
   _adsbLastFetch: 0,
   _adsbApiIndex: 0,
   _adsbEnabled: true,
+  // Vegetation overlay + viewshed
+  canopy: {},
+  viewshed: { marker: null, observer: null, grid: null, running: false },
+  _viewshedPicking: false,
 };
 
 const ADSB_APIS = [
@@ -292,7 +296,10 @@ function initMap() {
   // every visible overlay) and shows them in one paginated popup. Feature clicks
   // are routed here too (see wirePopupAggregation), so this catches clicks that
   // land between features but still inside a polygon.
-  S.map.on('click', e => openAggregatePopup(e.latlng, e));
+  S.map.on('click', e => {
+    if (S._viewshedPicking) { onViewshedMapClick(e.latlng); return; }
+    openAggregatePopup(e.latlng, e);
+  });
 
   // Center map on device location if available
   if (navigator.geolocation) {
@@ -342,6 +349,7 @@ function initMap() {
 // DRAW
 // ============================================================
 function startDraw(type) {
+  if (typeof cancelViewshedPick === 'function') cancelViewshedPick(); // draw + viewshed-pick are mutually exclusive
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
   clearDrawBtns();
   const opts = { shapeOptions: { color: '#3d8bfd', weight: 2, fillOpacity: 0.08, dashArray: '6,4' } };
@@ -381,6 +389,14 @@ function clearArea() {
   if (S.mapLayers.dams) S.mapLayers.dams.clearLayers();
   if (S.mapLayers.wilderness) S.mapLayers.wilderness.clearLayers();
   if (S.mapLayers.national_parks) S.mapLayers.national_parks.clearLayers();
+  // Vegetation overlay + viewshed (analysis overlays) — teardown without rebuilding
+  // the layer control (clearArea intentionally leaves that to the next processArea).
+  if (S.viewshed && S.viewshed.marker && S.map && S.map.hasLayer(S.viewshed.marker)) S.map.removeLayer(S.viewshed.marker);
+  if (S.viewshed) { S.viewshed.marker = null; S.viewshed.observer = null; S.viewshed.grid = null; }
+  if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
+  if (S.mapLayers.canopy && S.map && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
+  const _canopyCb = document.getElementById('canopyToggle'); if (_canopyCb) _canopyCb.checked = false;
+  const _vsRes = document.getElementById('vsResult'); if (_vsRes) _vsRes.textContent = '';
   S.faaAirspace = null;
   S.faaObstacles = null;
   S.protectedAreas = null;
@@ -4420,6 +4436,33 @@ function buildLayerControl() {
     }
   }
 
+  // Analysis overlays: vegetation height + viewshed (each with an opacity slider)
+  const hasCanopy = S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy);
+  const hasViewshed = S.mapLayers.viewshed && S.map.hasLayer(S.mapLayers.viewshed);
+  if (hasCanopy || hasViewshed) {
+    html += `<h4 style="margin-top:10px">Analysis</h4>`;
+    if (hasCanopy) {
+      const op = S.mapLayers.canopy.options.opacity != null ? S.mapLayers.canopy.options.opacity : CANOPY_OVERLAY_OPACITY;
+      html += `<div class="layer-item active" data-layer="canopy" onclick="toggleLayer('canopy',this)">
+        <div class="layer-check"></div><div class="layer-color" style="background:#0d5e28"></div><span>Vegetation Height</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin:2px 0 4px 22px;">
+        <input type="range" min="0" max="1" step="0.05" value="${op}" style="width:90px;" oninput="setCanopyOpacity(this.value)" onclick="event.stopPropagation()">
+        <span style="font-size:9px;color:var(--text-muted);">opacity</span>
+      </div>`;
+    }
+    if (hasViewshed) {
+      const op = S.mapLayers.viewshed.options.opacity != null ? S.mapLayers.viewshed.options.opacity : VIEWSHED_OVERLAY_OPACITY;
+      html += `<div class="layer-item active" data-layer="viewshed" onclick="toggleLayer('viewshed',this)">
+        <div class="layer-check"></div><div class="layer-color" style="background:#22c55e"></div><span>Viewshed</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin:2px 0 4px 22px;">
+        <input type="range" min="0" max="1" step="0.05" value="${op}" style="width:90px;" oninput="setViewshedOpacity(this.value)" onclick="event.stopPropagation()">
+        <span style="font-size:9px;color:var(--text-muted);">opacity</span>
+      </div>`;
+    }
+  }
+
   document.getElementById('layerList').innerHTML = html;
   // buildLayerControl runs after virtually every layer (re)render, so use it as
   // the chokepoint to (re)wire feature clicks into the aggregated popup system.
@@ -4460,7 +4503,8 @@ function toggleLayer(id, el) {
     // Play panel is visible only while the radar layer is checked on
     const controls = document.getElementById('radarControls');
     if (controls) controls.style.display = on ? 'flex' : 'none';
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'flight_plan' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_')) && S.mapLayers[id]) {
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'flight_plan' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_')) && S.mapLayers[id]) {
+    if (id === 'canopy') { const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = on; }
     if (on) S.map.addLayer(S.mapLayers[id]);
     else S.map.removeLayer(S.mapLayers[id]);
     // Toggling aircraft also toggles trails
@@ -4481,7 +4525,7 @@ function toggleLayer(id, el) {
 // show all matches in one popup with "<- n/N ->" pagination.
 // ============================================================
 const AGG_HIT_PX = 8; // pixel tolerance for line / point hit-testing
-const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails']);
+const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed']);
 // Per-layer display label + cycle priority (lower = shown first). Safety-relevant
 // restrictions sort ahead of advisory/terrain features.
 const AGG_LAYER_META = {
@@ -4967,6 +5011,10 @@ async function restoreConfig() {
   if (profileName) loadSopProfile(profileName);
   // Populate SOP dropdown
   populateSopDropdown();
+  // Restore canopy proxy URL (localStorage) + hint
+  const proxyEl = document.getElementById('cfgCanopyProxy');
+  if (proxyEl) proxyEl.value = getCanopyProxyBase() || '';
+  if (typeof saveCanopyProxy === 'function') saveCanopyProxy(getCanopyProxyBase() || '');
 }
 
 // ============================================================
@@ -6101,10 +6149,398 @@ async function clearAuditTrailUI() {
   }
 }
 
+// ============================================================
+// VEGETATION (CANOPY) OVERLAY + VIEWSHED
+// Canopy: Meta/WRI 1 m COG tiles via a user-configured CORS proxy (Cloudflare
+// Worker — see tools/canopy-proxy). DEM: USGS 3DEP exportImage (CORS-enabled).
+// Line-of-sight math lives in sar-preflight-raster.js. Processed rasters are
+// cached in IndexedDB so previously-viewed areas work offline.
+// ============================================================
+
+const CANOPY_OVERLAY_OPACITY = 0.6;
+const VIEWSHED_OVERLAY_OPACITY = 0.5;
+const CANOPY_MAX_M = 60;        // clamp canopy heights (guards COG fill/nodata artifacts)
+const COG_MAX_READ_PX = 2048;   // cap per-tile window read; pick a coarser overview if larger
+
+function getCanopyProxyBase() {
+  try {
+    const v = localStorage.getItem('sar_canopy_proxy');
+    return v && v.trim() ? v.trim().replace(/\/+$/, '') : null;
+  } catch (_) { return null; }
+}
+
+function saveCanopyProxy(url) {
+  try {
+    const v = (url || '').trim().replace(/\/+$/, '');
+    if (v) localStorage.setItem('sar_canopy_proxy', v);
+    else localStorage.removeItem('sar_canopy_proxy');
+  } catch (_) {}
+  const hint = document.getElementById('canopyProxyHint');
+  if (hint) hint.textContent = getCanopyProxyBase() ? 'Canopy proxy configured ✓' : 'No canopy proxy set — set one in Config to enable vegetation.';
+}
+
+// Quantized AOI key for the processed-raster cache (~100 m).
+function _aoiKey(b) {
+  return [b.west, b.south, b.east, b.north].map(v => v.toFixed(3)).join('_');
+}
+
+// --- DEM: USGS 3DEP exportImage (CORS-enabled, direct) ---
+async function fetch3DEPDEM(grid) {
+  const b = grid.bounds;
+  const cacheKey = 'dem_' + _aoiKey(b) + '_' + grid.cols + 'x' + grid.rows;
+  const url = 'https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage'
+    + '?bbox=' + [b.west, b.south, b.east, b.north].join(',')
+    + '&bboxSR=4326&imageSR=4326&size=' + grid.cols + ',' + grid.rows
+    + '&format=tiff&pixelType=F32&interpolation=RSP_BilinearInterpolation&f=image';
+  let buf = null;
+  try {
+    if (typeof isOnline !== 'function' || isOnline()) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('3DEP HTTP ' + res.status);
+      buf = await res.arrayBuffer();
+      if (typeof cacheRaster === 'function') cacheRaster('dem', cacheKey, { buf });
+    }
+  } catch (e) {
+    recordDataSourceError('DEM (3DEP)', e);
+  }
+  if (!buf && typeof getCachedRaster === 'function') {
+    const c = await getCachedRaster('dem', cacheKey);
+    if (c && c.data && c.data.buf) buf = c.data.buf;
+  }
+  if (!buf) return { demFlat: null, source: 'unavailable' };
+  const tiff = await GeoTIFF.fromArrayBuffer(buf);
+  const image = await tiff.getImage();
+  const w = image.getWidth(), h = image.getHeight();
+  const rasters = await image.readRasters();
+  const demFlat = resampleToGrid(grid, {
+    data: rasters[0], srcCols: w, srcRows: h,
+    srcBounds: { west: b.west, south: b.south, east: b.east, north: b.north },
+    srcIsMercator: false, nodata: null,
+  });
+  // 3DEP nodata is a very-negative sentinel → NaN.
+  for (let i = 0; i < demFlat.length; i++) if (demFlat[i] <= -1e30) demFlat[i] = NaN;
+  clearDataSourceError('DEM (3DEP)');
+  return { demFlat, source: '3DEP ~' + Math.round(grid.resM) + ' m' };
+}
+
+// --- Canopy: Meta 1 m COG tiles via the proxy (online), else IndexedDB cache ---
+async function fetchCanopyRaster(grid) {
+  const base = getCanopyProxyBase();
+  const b = grid.bounds;
+  const cacheKey = 'canopy_' + _aoiKey(b) + '_' + grid.cols + 'x' + grid.rows;
+  if (base && (typeof isOnline !== 'function' || isOnline())) {
+    try {
+      const canopy = await _fetchCanopyFromProxy(base, grid);
+      if (canopy) {
+        if (typeof cacheRaster === 'function') cacheRaster('canopy', cacheKey, { canopyArr: canopy });
+        clearDataSourceError('Canopy');
+        return { canopyFlat: canopy, source: 'Meta 1 m' };
+      }
+    } catch (e) {
+      recordDataSourceError('Canopy', e);
+    }
+  }
+  if (typeof getCachedRaster === 'function') {
+    const c = await getCachedRaster('canopy', cacheKey);
+    if (c && c.data && c.data.canopyArr) return { canopyFlat: c.data.canopyArr, source: 'Meta 1 m (cached)' };
+  }
+  return { canopyFlat: null, source: base ? 'unavailable' : 'no proxy' };
+}
+
+async function _fetchCanopyFromProxy(base, grid) {
+  const b = grid.bounds;
+  const qks = metaQuadkeysForBBox(b.west, b.south, b.east, b.north);
+  const canopy = new Float32Array(grid.rows * grid.cols).fill(NaN);
+  let any = false;
+  for (const qk of qks) {
+    let tiff;
+    try { tiff = await GeoTIFF.fromUrl(base + '/chm/' + qk + '.tif'); }
+    catch (_) { continue; } // tile missing / CORS — skip
+    const tileGrid = await _cogTileToGrid(tiff, grid);
+    if (!tileGrid) continue;
+    for (let i = 0; i < canopy.length; i++) {
+      if (Number.isNaN(canopy[i]) && Number.isFinite(tileGrid[i])) { canopy[i] = tileGrid[i]; any = true; }
+    }
+  }
+  return any ? canopy : null;
+}
+
+// Read the AOI window from a (Web-Mercator) COG, choosing an overview so the read
+// stays under COG_MAX_READ_PX per side, and resample onto the grid.
+async function _cogTileToGrid(tiff, grid) {
+  const b = grid.bounds;
+  const count = await tiff.getImageCount();
+  const base = await tiff.getImage(0);
+  const bbox = base.getBoundingBox(); // [minX,minY,maxX,maxY] mercator metres
+  const axMin = lngToMercX(b.west), axMax = lngToMercX(b.east);
+  const ayMin = latToMercY(b.south), ayMax = latToMercY(b.north);
+  if (axMax <= bbox[0] || axMin >= bbox[2] || ayMax <= bbox[1] || ayMin >= bbox[3]) return null; // no overlap
+  const ovX = Math.max(axMin, bbox[0]), ovX2 = Math.min(axMax, bbox[2]);
+  const ovY = Math.max(ayMin, bbox[1]), ovY2 = Math.min(ayMax, bbox[3]);
+  // COG IFDs are ordered full-res first, then progressively coarser overviews.
+  let img = base;
+  for (let i = 0; i < count; i++) {
+    const cand = await tiff.getImage(i);
+    img = cand;
+    const w = cand.getWidth(), h = cand.getHeight();
+    const winW = (ovX2 - ovX) / (bbox[2] - bbox[0]) * w;
+    const winH = (ovY2 - ovY) / (bbox[3] - bbox[1]) * h;
+    if (Math.max(winW, winH) <= COG_MAX_READ_PX) break;
+  }
+  const w = img.getWidth(), h = img.getHeight();
+  const resX = (bbox[2] - bbox[0]) / w, resY = (bbox[3] - bbox[1]) / h;
+  let px0 = Math.max(0, Math.min(w, Math.floor((axMin - bbox[0]) / resX)));
+  let px1 = Math.max(0, Math.min(w, Math.ceil((axMax - bbox[0]) / resX)));
+  let py0 = Math.max(0, Math.min(h, Math.floor((bbox[3] - ayMax) / resY)));
+  let py1 = Math.max(0, Math.min(h, Math.ceil((bbox[3] - ayMin) / resY)));
+  if (px1 <= px0 || py1 <= py0) return null;
+  const outW = Math.min(grid.cols, px1 - px0);
+  const outH = Math.min(grid.rows, py1 - py0);
+  const rasters = await img.readRasters({ window: [px0, py0, px1, py1], width: outW, height: outH, resampleMethod: 'nearest', samples: [0] });
+  const data = rasters[0];
+  // Clamp to a sane canopy range (guards COG fill/nodata artifacts).
+  for (let i = 0; i < data.length; i++) {
+    const v = data[i];
+    if (!Number.isFinite(v) || v < 0) data[i] = 0;
+    else if (v > CANOPY_MAX_M) data[i] = CANOPY_MAX_M;
+  }
+  const wMinX = bbox[0] + px0 * resX, wMaxX = bbox[0] + px1 * resX;
+  const wMaxY = bbox[3] - py0 * resY, wMinY = bbox[3] - py1 * resY;
+  const srcBounds = { west: mercXToLng(wMinX), east: mercXToLng(wMaxX), north: mercYToLat(wMaxY), south: mercYToLat(wMinY) };
+  return resampleToGrid(grid, { data, srcCols: outW, srcRows: outH, srcBounds, srcIsMercator: true, nodata: null });
+}
+
+// --- Render a computed raster as a semi-transparent image overlay ---
+function renderRasterOverlay(layerId, rgba, grid, opacity) {
+  const canvas = document.createElement('canvas');
+  canvas.width = grid.cols; canvas.height = grid.rows;
+  const ctx = canvas.getContext('2d');
+  ctx.putImageData(new ImageData(rgba, grid.cols, grid.rows), 0, 0);
+  const url = canvas.toDataURL('image/png');
+  const bounds = L.latLngBounds([grid.bounds.south, grid.bounds.west], [grid.bounds.north, grid.bounds.east]);
+  let layer = S.mapLayers[layerId];
+  if (layer && layer.setUrl) {
+    layer.setUrl(url); layer.setBounds(bounds); layer.setOpacity(opacity);
+  } else {
+    layer = L.imageOverlay(url, bounds, { opacity, interactive: false, className: 'raster-overlay-' + layerId });
+    S.mapLayers[layerId] = layer;
+  }
+  if (!S.map.hasLayer(layer)) layer.addTo(S.map);
+  return layer;
+}
+
+function setCanopyOpacity(v) {
+  const o = parseFloat(v);
+  if (S.mapLayers.canopy && S.mapLayers.canopy.setOpacity) S.mapLayers.canopy.setOpacity(o);
+  const span = document.getElementById('canopyOpacityVal');
+  if (span) span.textContent = Math.round(o * 100) + '%';
+}
+function setViewshedOpacity(v) {
+  const o = parseFloat(v);
+  if (S.mapLayers.viewshed && S.mapLayers.viewshed.setOpacity) S.mapLayers.viewshed.setOpacity(o);
+  const span = document.getElementById('viewshedOpacityVal');
+  if (span) span.textContent = Math.round(o * 100) + '%';
+}
+
+async function toggleCanopyOverlay() {
+  const cb = document.getElementById('canopyToggle');
+  const on = cb ? cb.checked : !(S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy));
+  if (!on) {
+    if (S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
+    buildLayerControl();
+    return;
+  }
+  if (!getCanopyProxyBase()) {
+    setStatus('canopyStatus', 'error', 'NO PROXY');
+    if (cb) cb.checked = false;
+    if (typeof alert === 'function') alert('Set a Canopy proxy URL in the Config tab first (see tools/canopy-proxy/README.md).');
+    return;
+  }
+  await loadCanopyForView();
+}
+
+async function loadCanopyForView() {
+  if (!S.map) return;
+  trackFetchStart('Canopy');
+  setStatus('canopyStatus', 'loading', 'Fetching...');
+  try {
+    const vb = S.map.getBounds();
+    const center = vb.getCenter();
+    const halfWidthM = Math.max(
+      center.distanceTo(L.latLng(center.lat, vb.getWest())),
+      center.distanceTo(L.latLng(vb.getNorth(), center.lng))
+    );
+    const resM = Math.max(WORK_RES_M, (2 * halfWidthM) / MAX_GRID);
+    const grid = makeGrid(center.lat, center.lng, halfWidthM, resM);
+    const { canopyFlat, source } = await fetchCanopyRaster(grid);
+    if (!canopyFlat) {
+      setStatus('canopyStatus', 'error', source === 'no proxy' ? 'NO PROXY' : 'NO DATA');
+      const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = false;
+      return;
+    }
+    const op = parseFloat((document.getElementById('canopyOpacity') || {}).value) || CANOPY_OVERLAY_OPACITY;
+    renderRasterOverlay('canopy', canopyGridToRGBA(grid, canopyFlat), grid, op);
+    S.canopy = { grid, source };
+    const cached = source.includes('cached');
+    setStatus('canopyStatus', cached ? 'cached' : 'live', cached ? 'CACHED' : 'LIVE');
+    const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = true;
+    buildLayerControl();
+  } catch (e) {
+    console.error('Canopy overlay error:', e);
+    recordDataSourceError('Canopy', e);
+    setStatus('canopyStatus', 'error', 'ERROR');
+  } finally {
+    trackFetchEnd('Canopy');
+  }
+}
+
+// --- Viewshed: tap-to-pick observer + compute ---
+function _readVsInputs() {
+  const aglFt = parseFloat((document.getElementById('vsAgl') || {}).value) || 200;
+  const vlosFt = parseFloat((document.getElementById('vsVlos') || {}).value) || 2500;
+  return { aglFt, vlosFt };
+}
+
+function startViewshedPick() {
+  // Mutually exclusive with the draw tools.
+  if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
+  clearDrawBtns();
+  S._viewshedPicking = true;
+  document.getElementById('vsPickBtnMap')?.classList.add('active');
+  document.getElementById('vsPickBtn')?.classList.add('active');
+  if (S.map) S.map.getContainer().style.cursor = 'crosshair';
+  setStatus('viewshedStatus', 'loading', 'TAP MAP');
+}
+
+function cancelViewshedPick() {
+  S._viewshedPicking = false;
+  document.getElementById('vsPickBtnMap')?.classList.remove('active');
+  document.getElementById('vsPickBtn')?.classList.remove('active');
+  if (S.map) S.map.getContainer().style.cursor = '';
+}
+
+function onViewshedMapClick(latlng) {
+  cancelViewshedPick();
+  if (!S.viewshed) S.viewshed = {};
+  S.viewshed.observer = { lat: latlng.lat, lng: latlng.lng };
+  if (S.viewshed.marker && S.map.hasLayer(S.viewshed.marker)) S.map.removeLayer(S.viewshed.marker);
+  const m = L.marker(latlng, { draggable: true, title: 'Viewshed observer (drag to move)' });
+  m.on('dragend', () => {
+    const p = m.getLatLng();
+    S.viewshed.observer = { lat: p.lat, lng: p.lng };
+    runViewshed();
+  });
+  m.addTo(S.map);
+  S.viewshed.marker = m;
+  runViewshed();
+}
+
+function clearViewshed() {
+  if (S.viewshed) {
+    if (S.viewshed.marker && S.map.hasLayer(S.viewshed.marker)) S.map.removeLayer(S.viewshed.marker);
+    S.viewshed.marker = null; S.viewshed.observer = null; S.viewshed.grid = null;
+  }
+  if (S.mapLayers.viewshed && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
+  setStatus('viewshedStatus', '', '');
+  const r = document.getElementById('vsResult'); if (r) r.textContent = '';
+  const pb = document.getElementById('vsProgressBar'); if (pb) pb.style.width = '0';
+  buildLayerControl();
+}
+
+function _vsProgress(frac) {
+  const pb = document.getElementById('vsProgressBar');
+  if (pb) pb.style.width = Math.round(frac * 100) + '%';
+}
+
+async function runViewshed() {
+  if (!S.viewshed || !S.viewshed.observer || S.viewshed.running) return;
+  S.viewshed.running = true;
+  trackFetchStart('Viewshed');
+  setStatus('viewshedStatus', 'loading', 'Computing...');
+  const { aglFt, vlosFt } = _readVsInputs();
+  const obs = S.viewshed.observer;
+  try {
+    const vlosM = ftToM(vlosFt), aglM = ftToM(aglFt);
+    const halfWidthM = vlosM + 50;
+    const resM = Math.max(WORK_RES_M, (2 * halfWidthM) / MAX_GRID);
+    const grid = makeGrid(obs.lat, obs.lng, halfWidthM, resM);
+    _vsProgress(0.05);
+    const [demRes, canRes] = await Promise.allSettled([fetch3DEPDEM(grid), fetchCanopyRaster(grid)]);
+    const dem = demRes.status === 'fulfilled' ? demRes.value : { demFlat: null, source: 'unavailable' };
+    const can = canRes.status === 'fulfilled' ? canRes.value : { canopyFlat: null, source: 'unavailable' };
+    if (!dem.demFlat) {
+      setStatus('viewshedStatus', 'error', 'NO DEM');
+      const r = document.getElementById('vsResult'); if (r) r.textContent = 'Terrain (3DEP) unavailable — cannot compute viewshed.';
+      return;
+    }
+    _vsProgress(0.2);
+    const n = grid.rows * grid.cols;
+    const dsm = sanitizeForKernel(buildDSM(dem.demFlat, can.canopyFlat, n), n);
+    const { col: obsCol, row: obsRow } = latLngToCell(grid, obs.lat, obs.lng);
+    const mask = await _runViewshedKernel({ grid, dem: dem.demFlat, dsm, obsCol, obsRow, aglM, vlosRangeM: vlosM });
+    const op = parseFloat((document.getElementById('vsOpacity') || {}).value) || VIEWSHED_OVERLAY_OPACITY;
+    renderRasterOverlay('viewshed', viewshedMaskToRGBA(grid, mask), grid, op);
+    S.viewshed.grid = grid;
+    const cov = viewshedCoverage(grid, mask, obsCol, obsRow, vlosM);
+    const canLabel = can.canopyFlat ? ('canopy ' + can.source) : 'bare earth (no canopy)';
+    const r = document.getElementById('vsResult');
+    if (r) r.textContent = `${Math.round(cov * 100)}% of ${vlosFt} ft VLOS visible @ ${aglFt} ft AGL · DEM ${dem.source} · ${canLabel}`;
+    setStatus('viewshedStatus', 'live', 'DONE');
+    _vsProgress(1);
+    buildLayerControl();
+  } catch (e) {
+    console.error('Viewshed error:', e);
+    recordDataSourceError('Viewshed', e);
+    setStatus('viewshedStatus', 'error', 'ERROR');
+  } finally {
+    S.viewshed.running = false;
+    trackFetchEnd('Viewshed');
+  }
+}
+
+// Cooperative (UI-yielding) viewshed kernel — reuses the pure isVisible math so
+// it stays in sync with the unit-tested computeViewshed in sar-preflight-raster.js.
+async function _runViewshedKernel(opts) {
+  const { grid, dem, dsm, obsCol, obsRow, aglM, vlosRangeM } = opts;
+  const cols = grid.cols, rows = grid.rows, cellSizeM = grid.resM;
+  const out = new Uint8Array(rows * cols);
+  const obsIdx = obsRow * cols + obsCol;
+  const obsGround = dem[obsIdx];
+  if (!Number.isFinite(obsGround)) return out;
+  const pilotZ = obsGround + PILOT_EYE_M;
+  const vlosCells = vlosRangeM / cellSizeM;
+  const vlosCells2 = vlosCells * vlosCells;
+  const rMin = Math.max(0, Math.floor(obsRow - vlosCells));
+  const rMax = Math.min(rows - 1, Math.ceil(obsRow + vlosCells));
+  const cMin = Math.max(0, Math.floor(obsCol - vlosCells));
+  const cMax = Math.min(cols - 1, Math.ceil(obsCol + vlosCells));
+  out[obsIdx] = 1;
+  for (let row = rMin; row <= rMax; row++) {
+    for (let col = cMin; col <= cMax; col++) {
+      const dc = col - obsCol, dr = row - obsRow;
+      if (dc * dc + dr * dr > vlosCells2) continue;
+      const idx = row * cols + col;
+      if (idx === obsIdx) continue;
+      const g = dem[idx];
+      if (!Number.isFinite(g)) continue;
+      if (isVisible(obsCol, obsRow, pilotZ, col, row, g + aglM, dsm, cols, rows, cellSizeM)) out[idx] = 1;
+    }
+    if ((row - rMin) % 16 === 0) {
+      _vsProgress(0.2 + 0.78 * (row - rMin) / Math.max(1, rMax - rMin));
+      await new Promise(requestAnimationFrame);
+    }
+  }
+  return out;
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, setText, setColor, setStatus, switchTab, togglePanel,
+    getCanopyProxyBase, saveCanopyProxy, fetch3DEPDEM, fetchCanopyRaster,
+    renderRasterOverlay, setCanopyOpacity, setViewshedOpacity,
+    toggleCanopyOverlay, loadCanopyForView,
+    startViewshedPick, cancelViewshedPick, onViewshedMapClick, runViewshed, clearViewshed,
     buildLayerControl, toggleLayer, updateWireDisplay,
     openAggregatePopup, aggPopupStep, renderAggregatePopup, collectFeaturesAt,
     wirePopupAggregation, eachPopupLayer,

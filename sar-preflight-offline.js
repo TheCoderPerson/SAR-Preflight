@@ -18,7 +18,21 @@ const ENDPOINT_TTL = {
   nws:        15 * 60 * 1000,       // 15 min
   radar_meta: 5 * 60 * 1000,        // 5 min
   tfr_import: 60 * 60 * 1000,       // 1 hr — matches "verify <=1hr before launch"
+  canopytile: 90 * 24 * 60 * 60000, // 90 days — Meta canopy COG byte-range blocks (offline tile cache)
+  canopy:     90 * 24 * 60 * 60000, // 90 days — resampled canopy grids per AOI
+  dem:        90 * 24 * 60 * 60000, // 90 days — 3DEP DEM rasters per AOI
 };
+
+// --- Raster cache (ArrayBuffers / typed arrays — structured-cloneable) ---
+// Thin wrappers over the apiCache store so fetched DEM/canopy rasters survive
+// offline. `kind` is one of the raster ENDPOINT_TTL keys above.
+async function cacheRaster(kind, key, payload) {
+  return cacheApiResponse(kind, key, payload);
+}
+
+async function getCachedRaster(kind, key) {
+  return getCachedApiResponse(kind, key);
+}
 
 // --- IndexedDB Helpers ---
 
@@ -468,6 +482,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     SAR_DB_NAME, SAR_DB_VERSION, ENDPOINT_TTL,
     openDB, areaKey, cacheApiResponse, getCachedApiResponse, clearApiCache,
+    cacheRaster, getCachedRaster,
     saveAppState, getAppState,
     saveTileRegion, getTileRegions, deleteTileRegion,
     classifyStaleness, formatAge,

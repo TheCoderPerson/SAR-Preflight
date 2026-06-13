@@ -13,6 +13,7 @@ const html = fs.readFileSync(path.join(dir, 'sar-preflight.html'), 'utf8');
 const versionJs = fs.readFileSync(path.join(dir, 'version.js'), 'utf8');
 const offlineJs = fs.readFileSync(path.join(dir, 'sar-preflight-offline.js'), 'utf8');
 const coreJs = fs.readFileSync(path.join(dir, 'sar-preflight-core.js'), 'utf8');
+const rasterJs = fs.readFileSync(path.join(dir, 'sar-preflight-raster.js'), 'utf8');
 const chartsJs = fs.readFileSync(path.join(dir, 'sar-preflight-charts.js'), 'utf8');
 const appJs = fs.readFileSync(path.join(dir, 'sar-preflight.js'), 'utf8');
 
@@ -20,9 +21,9 @@ const appJs = fs.readFileSync(path.join(dir, 'sar-preflight.js'), 'utf8');
 const stripCJS = code => code.replace(/\/\/\s*---\s*CJS export[\s\S]*?^}/m, '').trimEnd();
 
 // Replace all local <script src> tags + the empty placeholder with a single inline <script>
-const pattern = /<script src="version\.js"><\/script>\s*<script src="sar-preflight-offline\.js"><\/script>\s*<script src="sar-preflight-core\.js"><\/script>\s*<script src="sar-preflight-charts\.js"><\/script>[\s\S]*?<script>\/\*.*?intentionally left empty.*?\*\/\s*<\/script>/;
+const pattern = /<script src="version\.js"><\/script>\s*<script src="sar-preflight-offline\.js"><\/script>\s*<script src="sar-preflight-core\.js"><\/script>\s*<script src="sar-preflight-raster\.js"><\/script>\s*<script src="sar-preflight-charts\.js"><\/script>[\s\S]*?<script>\/\*.*?intentionally left empty.*?\*\/\s*<\/script>/;
 
-const inlinedJs = `<script>\n${versionJs.trimEnd()}\n\n${stripCJS(offlineJs)}\n\n${stripCJS(coreJs)}\n\n${stripCJS(chartsJs)}\n\n${stripCJS(appJs)}\n</script>`;
+const inlinedJs = `<script>\n${versionJs.trimEnd()}\n\n${stripCJS(offlineJs)}\n\n${stripCJS(coreJs)}\n\n${stripCJS(rasterJs)}\n\n${stripCJS(chartsJs)}\n\n${stripCJS(appJs)}\n</script>`;
 let output = html.replace(pattern, inlinedJs);
 
 // Verify the replacement actually happened

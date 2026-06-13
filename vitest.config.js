@@ -12,7 +12,7 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'html'],
-      include: ['sar-preflight-core.js', 'sar-preflight.js'],
+      include: ['sar-preflight-core.js', 'sar-preflight-raster.js', 'sar-preflight.js'],
     },
   },
 });
