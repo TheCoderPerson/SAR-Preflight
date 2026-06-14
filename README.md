@@ -2,6 +2,16 @@
 
 A browser-based pre-flight intelligence tool for UAS (drone) operators conducting Search and Rescue missions. Consolidates weather, airspace, terrain, fire danger, and operational data into a single map-based interface for Part 107 compliance.
 
+## Disclaimer
+
+**This tool is provided for informational and planning purposes only.**
+
+The data displayed in this application may be incomplete, inaccurate, outdated, or incorrect. Data is sourced from third-party APIs and open data services that may experience outages, delays, or errors. Calculated values (density altitude, airspace classification, risk assessments, etc.) are approximations and may not reflect actual conditions.
+
+**Users must independently verify all data before flight operations.** Always cross-check critical information (airspace, TFRs, NOTAMs, weather) against official FAA sources, certified weather briefings, and current aeronautical publications. The GO/CAUTION/NO-GO assessment is advisory only and does not replace the Remote Pilot In Command's responsibility to evaluate flight safety.
+
+## Website
+
 https://thecoderperson.github.io/SAR-Preflight/sar-preflight.html
 
 ## How to Use
@@ -81,13 +91,4 @@ All data is fetched from free, public APIs. No API keys are required.
 ## Offline Use
 
 The app uses a service worker to cache resources for offline use. You can pre-download map tiles for your area of operations via the Settings tab. Previously fetched API data is cached in IndexedDB with configurable TTLs.
-
-## Disclaimer
-
-**This tool is provided for informational and planning purposes only.**
-
-The data displayed in this application may be incomplete, inaccurate, outdated, or incorrect. Data is sourced from third-party APIs and open data services that may experience outages, delays, or errors. Calculated values (density altitude, airspace classification, risk assessments, etc.) are approximations and may not reflect actual conditions.
-
-**Users must independently verify all data before flight operations.** Always cross-check critical information (airspace, TFRs, NOTAMs, weather) against official FAA sources, certified weather briefings, and current aeronautical publications. The GO/CAUTION/NO-GO assessment is advisory only and does not replace the Remote Pilot In Command's responsibility to evaluate flight safety.
-
 This software is not certified by the FAA or any aviation authority. Use at your own risk. The developers assume no liability for decisions made based on information provided by this tool.
