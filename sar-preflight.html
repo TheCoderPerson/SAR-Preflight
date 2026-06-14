@@ -974,12 +974,24 @@ select.api-input { cursor: pointer; }
       <!-- NOTAMs Tab -->
       <div id="tab-notams" class="tab-panel" style="display:none;">
 
+        <!-- Automatic FAA check status (TFRs + NOTAMs) -->
+        <div class="data-section" id="autoCheckStatusSection" style="display:none;border-left:3px solid var(--border);">
+          <div class="data-section-title" style="display:flex;align-items:center;gap:8px;">
+            <div class="indicator" id="autoCheckIndicator" style="background:var(--text-muted)"></div>
+            <span>Automatic FAA Check</span>
+            <span class="fetch-status" id="autoCheckStatus" style="margin-left:6px;"></span>
+            <button class="btn btn-ghost" id="autoCheckReBtn" onclick="reCheckRestrictionsNow()" style="margin-left:auto;padding:3px 10px;font-size:10px;display:none;">Re-check now</button>
+          </div>
+          <div id="autoCheckDetail" style="font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);margin-top:8px;line-height:1.4;"></div>
+        </div>
+
         <div id="tfrStaleBanner" class="tfr-stale-banner" style="display:none;"></div>
 
-        <!-- Import controls -->
+        <!-- Import controls (manual fallback) -->
         <div class="data-section">
           <div class="data-section-title">
             <div class="indicator" style="background:var(--accent-red)"></div>Import FAA TFR / NOTAM
+            <span style="font-size:9px;color:var(--text-muted);font-weight:400;margin-left:6px;">manual fallback</span>
             <span class="fetch-status" id="notamStatus"></span>
           </div>
           <input type="file" id="faaFileInput" accept=".geojson,.json,.xml,.aixm,.txt,.notam" multiple style="display:none" onchange="handleFaaFiles(this)">
@@ -1111,11 +1123,11 @@ select.api-input { cursor: pointer; }
             <strong style="color:var(--accent-amber);">Optional API keys</strong> for enhanced data:
           </p>
           <div class="api-config">
-            <div class="data-label">FAA NOTAM API Key (api.faa.gov)</div>
-            <div class="api-input-group">
-              <input class="api-input" id="apiFAA" type="password" placeholder="client_id:client_secret" />
-              <button class="btn btn-ghost" onclick="saveApiKey('faa')">Save</button>
-            </div>
+            <div class="data-label">FAA NOTAM API Key (api.faa.gov) — legacy/optional; live NOTAMs use the Data proxy</div>
+            <form class="api-input-group" autocomplete="off" onsubmit="return false">
+              <input class="api-input" id="apiFAA" type="password" autocomplete="off" placeholder="client_id:client_secret" />
+              <button class="btn btn-ghost" type="button" onclick="saveApiKey('faa')">Save</button>
+            </form>
           </div>
           <div class="api-config">
             <div class="data-label">Auto-Refresh Interval</div>

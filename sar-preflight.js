@@ -40,6 +40,8 @@ const S = {
   canopy: {},
   viewshed: { marker: null, observer: null, grid: null, running: false },
   _viewshedPicking: false,
+  // Automatic FAA TFR/NOTAM check status (for the NOTAMs-tab indicator)
+  autoCheck: { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 },
 };
 
 const ADSB_APIS = [
@@ -1439,6 +1441,14 @@ async function fetchNotams(lat, lng, radiusNm) {
 // Orchestrate live TFR + NOTAM for an area and set a single combined status.
 async function fetchLiveRestrictions(center, bounds) {
   if (!center) return;
+  const proxySet = typeof getCanopyProxyBase === 'function' && !!getCanopyProxyBase();
+  if (!proxySet) { S.autoCheck = { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 }; renderAutoCheckStatus(); return; }
+  if (typeof isOnline === 'function' && !isOnline()) { S.autoCheck = { state: 'error', ms: Date.now(), tfrCount: 0, notamCount: 0 }; renderAutoCheckStatus(); return; }
+
+  clearDataSourceError('TFR'); clearDataSourceError('NOTAM');
+  S.autoCheck = { state: 'checking', ms: 0, tfrCount: 0, notamCount: 0 };
+  renderAutoCheckStatus();
+
   await fetchLiveTFRs(bounds);
   let radiusNm = 20;
   try {
@@ -1449,13 +1459,92 @@ async function fetchLiveRestrictions(center, bounds) {
     }
   } catch (_) { /* default radius */ }
   await fetchNotams(center.lat, center.lng, radiusNm);
-  if (typeof getCanopyProxyBase === 'function' && getCanopyProxyBase()) {
-    const nt = (S.tfrs || []).length, nn = (S.importedNotams || []).length;
-    const parts = [];
-    if (nt) parts.push(`${nt} TFR${nt > 1 ? 'S' : ''}`);
-    if (nn) parts.push(`${nn} NTM`);
-    setStatus('notamStatus', 'live', parts.length ? parts.join(' · ') + ' LIVE' : 'NONE (LIVE)');
+
+  const nt = (S.tfrs || []).filter(t => t._live).length;
+  const nn = (S.importedNotams || []).filter(n => n._live).length;
+  const bothFailed = S.dataSourceErrors && S.dataSourceErrors.TFR && S.dataSourceErrors.NOTAM;
+  const state = (bothFailed && nt === 0 && nn === 0) ? 'error' : 'ok';
+  S.autoCheck = { state, ms: Date.now(), tfrCount: nt, notamCount: nn };
+  renderAutoCheckStatus();
+
+  // Combined compact badge on the import section (kept for continuity).
+  const parts = [];
+  if (nt) parts.push(`${nt} TFR${nt > 1 ? 'S' : ''}`);
+  if (nn) parts.push(`${nn} NTM`);
+  setStatus('notamStatus', state === 'error' ? 'error' : 'live',
+    state === 'error' ? 'CHECK FAILED' : (parts.length ? parts.join(' · ') + ' LIVE' : 'NONE (LIVE)'));
+}
+
+function reCheckRestrictionsNow() {
+  if (!S.areaCenter || !S.areaBounds) return;
+  fetchLiveRestrictions(S.areaCenter, S.areaBounds);
+}
+
+// Context-aware empty-state for the TFR/NOTAM card lists, so "auto-checked, none
+// found" reads differently from "nothing loaded yet". kind = 'TFRs' | 'NOTAMs'.
+function _restrictionEmptyMsg(kind) {
+  const proxySet = typeof getCanopyProxyBase === 'function' && getCanopyProxyBase();
+  if (proxySet && S.currentArea && S.autoCheck) {
+    if (S.autoCheck.state === 'checking') return `Checking for ${kind}…`;
+    if (S.autoCheck.state === 'ok') return `Auto-checked — no active ${kind} in this area.`;
+    if (S.autoCheck.state === 'error') return `Auto-check failed — import ${kind} manually below, or Re-check.`;
   }
+  return kind === 'TFRs'
+    ? 'No TFR file imported. Download via the links above, then import.'
+    : 'No NOTAMs parsed yet.';
+}
+
+// Prominent "was this auto-checked?" panel at the top of the NOTAMs tab.
+// Reads S.autoCheck + whether a proxy is configured + whether an area is drawn.
+function renderAutoCheckStatus() {
+  const sec = document.getElementById('autoCheckStatusSection');
+  if (!sec) return;
+  const ind = document.getElementById('autoCheckIndicator');
+  const sta = document.getElementById('autoCheckStatus');
+  const det = document.getElementById('autoCheckDetail');
+  const btn = document.getElementById('autoCheckReBtn');
+  const proxySet = typeof getCanopyProxyBase === 'function' && !!getCanopyProxyBase();
+  const hasArea = !!S.currentArea;
+  const ac = S.autoCheck || {};
+  let color = 'var(--text-muted)', badge = '', badgeCls = 'fetch-status', detail = '', showBtn = false;
+
+  if (!proxySet) {
+    badge = 'OFF';
+    detail = 'Automatic FAA check is off. Add a Data proxy URL in Config to auto-fetch live TFRs & NOTAMs per area. Until then, use the manual import below.';
+  } else if (!hasArea) {
+    color = 'var(--accent-cyan)'; badge = 'READY';
+    detail = 'Draw an operational area — TFRs and NOTAMs are then checked automatically for it.';
+  } else if (ac.state === 'checking') {
+    color = 'var(--accent-amber)'; badge = 'CHECKING…'; badgeCls = 'fetch-status loading';
+    detail = 'Fetching live TFRs and NOTAMs for this area…';
+  } else if (ac.state === 'ok') {
+    color = 'var(--accent-green)'; badge = 'CHECKED'; badgeCls = 'fetch-status live';
+    const age = ac.ms && typeof formatAge === 'function' ? formatAge(Date.now() - ac.ms) : '';
+    const parts = [];
+    if (ac.tfrCount) parts.push(`${ac.tfrCount} TFR${ac.tfrCount > 1 ? 's' : ''}`);
+    if (ac.notamCount) parts.push(`${ac.notamCount} NOTAM${ac.notamCount > 1 ? 's' : ''}`);
+    detail = (parts.length ? `Auto-checked ${age} ago • ${parts.join(' • ')} in/near this area.`
+                           : `Auto-checked ${age} ago • no active TFRs or NOTAMs in this area.`)
+           + ' Advisory — verify against an official briefing before flight.';
+    showBtn = true;
+  } else if (ac.state === 'error') {
+    color = 'var(--accent-red)'; badge = 'FAILED'; badgeCls = 'fetch-status error';
+    detail = (typeof isOnline === 'function' && !isOnline())
+      ? 'Offline — could not auto-check; using any cached/manual data. Re-check when back online.'
+      : 'Auto-check failed to reach the FAA sources. Use the manual import below, or Re-check now.';
+    showBtn = true;
+  } else {
+    color = 'var(--accent-cyan)'; badge = 'READY';
+    detail = 'Ready — redraw or re-check to fetch live TFRs and NOTAMs for this area.';
+    showBtn = true;
+  }
+
+  if (ind) ind.style.background = color;
+  if (sta) { sta.className = badgeCls; sta.textContent = badge; }
+  if (det) det.textContent = detail;
+  if (btn) btn.style.display = (proxySet && hasArea) ? '' : 'none';
+  sec.style.borderLeftColor = color;
+  sec.style.display = '';
 }
 
 function _esc(s) {
@@ -1526,8 +1615,13 @@ async function renderNotamsTab(lat, lng) {
   renderTfrCards();
   renderNotamCards();
   renderImportStatus();
-  setStatus('notamStatus', (S.tfrs && S.tfrs.length) ? 'live' : 'manual',
-    (S.tfrs && S.tfrs.length) ? `${S.tfrs.length} TFR${S.tfrs.length > 1 ? 'S' : ''}` : 'IMPORT');
+  // When the proxy is set, fetchLiveRestrictions owns #notamStatus (don't let this
+  // async fn race-overwrite the combined "… LIVE" badge with a stale TFR-only one).
+  if (!(typeof getCanopyProxyBase === 'function' && getCanopyProxyBase())) {
+    setStatus('notamStatus', (S.tfrs && S.tfrs.length) ? 'live' : 'manual',
+      (S.tfrs && S.tfrs.length) ? `${S.tfrs.length} TFR${S.tfrs.length > 1 ? 'S' : ''}` : 'IMPORT');
+  }
+  renderAutoCheckStatus();
   computeAirspace(lat, lng);
 }
 
@@ -1560,7 +1654,7 @@ function renderTfrCards() {
   const countEl = document.getElementById('tfrCount');
   if (!el) return;
   if (!S.tfrs || !S.tfrs.length) {
-    el.innerHTML = `<div class="notam-body" style="color:var(--text-muted);font-style:italic;">No TFR file imported. Download via the links above, then import.</div>`;
+    el.innerHTML = `<div class="notam-body" style="color:var(--text-muted);font-style:italic;">${_restrictionEmptyMsg('TFRs')}</div>`;
     if (countEl) countEl.textContent = '';
     return;
   }
@@ -1593,7 +1687,7 @@ function renderNotamCards() {
   const el = document.getElementById('notamList');
   if (!el) return;
   if (!S.importedNotams || !S.importedNotams.length) {
-    el.innerHTML = `<div class="notam-body" style="color:var(--text-muted);font-style:italic;">No NOTAMs parsed yet.</div>`;
+    el.innerHTML = `<div class="notam-body" style="color:var(--text-muted);font-style:italic;">${_restrictionEmptyMsg('NOTAMs')}</div>`;
     return;
   }
   const areaPoly = currentAreaPolygon();
@@ -4312,6 +4406,7 @@ function switchTab(tab) {
   else document.getElementById('noAreaState').style.display = 'none';
   const btn = document.querySelector(`.tab-btn[data-tab="${tab}"]`);
   if (btn) btn.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+  if (tab === 'notams' && typeof renderAutoCheckStatus === 'function') renderAutoCheckStatus();
 }
 
 function buildLayerControl() {
@@ -6661,7 +6756,9 @@ if (typeof module !== 'undefined' && module.exports) {
     computeAirspace, computeOpsData, computeAssessment,
     fetchWeather, fetchKpIndex, fetchElevation, fetchSunMoon,
     renderNotamsTab, fetchWireHazards, processArea,
-    tfrGeoJsonUrlForBounds, fetchLiveTFRs, fetchNotams, fetchLiveRestrictions, toDMS, fmtTfrTime, currentAreaPolygon,
+    tfrGeoJsonUrlForBounds, fetchLiveTFRs, fetchNotams, fetchLiveRestrictions,
+    renderAutoCheckStatus, reCheckRestrictionsNow, _restrictionEmptyMsg,
+    toDMS, fmtTfrTime, currentAreaPolygon,
     renderDeepLinks, renderTfrCards, renderNotamCards, renderImportStatus,
     renderImportedTfrLayer, renderImportedNotamLayer,
     importFaaFile, handleFaaFiles, ingestFaaFileText, applyTfrImport,
