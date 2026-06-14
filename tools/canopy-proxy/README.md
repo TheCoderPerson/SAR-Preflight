@@ -1,16 +1,21 @@
-# Canopy CORS proxy (Cloudflare Worker)
+# SAR Preflight data proxy (Cloudflare Worker)
 
-The SAR Preflight app's **vegetation height overlay** and **viewshed** features read
-Meta/WRI Global Canopy Height 1 m tiles. Those tiles live in a public AWS S3 bucket
-(`dataforgood-fb-data.s3.amazonaws.com/forests/v1/alsgedi_global_v6_float`) that
-serves HTTP Range requests but **sends no CORS headers**, so a browser cannot read
-them directly. This tiny Worker re-serves that path with CORS + Range so the app's
-in-browser GeoTIFF reader can fetch COG windows. It is locked to the Meta prefix and
-is not a general open proxy.
+A small CORS+Range proxy so the browser-only app can read two CORS-blocked sources:
+
+1. **Canopy** — Meta/WRI Global Canopy Height 1 m tiles for the **vegetation overlay**
+   and **viewshed** (`dataforgood-fb-data.s3.amazonaws.com/forests/v1/alsgedi_global_v6_float`).
+   That public S3 bucket serves HTTP Range but **sends no CORS headers**, so the
+   in-browser GeoTIFF reader can't fetch COG windows directly. Served at `/chm/{quadkey}.tif`.
+2. **Live TFRs** — the FAA TFR GeoServer (`tfr.faa.gov`), also CORS-restricted. Served
+   at the `/tfr/...` route with a near-zero cache (TFRs are time-critical).
+
+It only ever forwards those two upstreams (it is not a general open proxy; `..` is
+rejected), and it enforces an Origin allowlist (below).
 
 > The app works without this proxy — the DEM/terrain side of the viewshed uses
-> USGS 3DEP (already CORS-enabled). The canopy overlay and the vegetation-aware
-> viewshed simply stay dormant (with a hint) until a proxy URL is configured.
+> USGS 3DEP (already CORS-enabled), and TFRs fall back to deep-link/import. The
+> canopy overlay, vegetation-aware viewshed, and live-TFR auto-fetch simply stay
+> dormant until a proxy URL is configured (Config tab → "Data proxy URL").
 
 ## Deploy
 
@@ -27,7 +32,7 @@ wrangler deploy
 https://sar-canopy-proxy.<your-subdomain>.workers.dev
 ```
 
-Paste that URL into the app: **Config tab → "Canopy proxy URL"**. The app stores it
+Paste that URL into the app: **Config tab → "Data proxy URL"**. The app stores it
 in `localStorage` and appends `/chm/{quadkey}.tif` to fetch tiles.
 
 ## Offline

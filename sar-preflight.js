@@ -498,6 +498,7 @@ async function processArea(layer, type) {
     fetchElevation(center, bounds),
     fetchSunMoon(center.lat, center.lng),
     renderNotamsTab(center.lat, center.lng),
+    fetchLiveTFRs(bounds),
     fetchWireHazards(bounds),
     fetchNWSAlerts(center.lat, center.lng),
     fetchRadar(),
@@ -1336,12 +1337,47 @@ const TFR_GEOSERVER_BASE = 'https://tfr.faa.gov/geoserver/TFR/ows';
 
 // Build the GeoServer WFS URL returning active TFR polygons (GeoJSON) for the
 // drawn area's bbox. Verified order: minLng,minLat,maxLng,maxLat,EPSG:4326.
-function tfrGeoJsonUrlForBounds(bounds) {
-  if (!bounds) return TFR_GEOSERVER_BASE;
+function _tfrWfsQuery(bounds) {
   const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
   const bbox = `${sw.lng.toFixed(4)},${sw.lat.toFixed(4)},${ne.lng.toFixed(4)},${ne.lat.toFixed(4)},EPSG:4326`;
-  return `${TFR_GEOSERVER_BASE}?service=WFS&version=1.1.0&request=GetFeature&typeName=TFR:V_TFR_LOC` +
+  return `?service=WFS&version=1.1.0&request=GetFeature&typeName=TFR:V_TFR_LOC` +
          `&outputFormat=application/json&srsname=EPSG:4326&bbox=${encodeURIComponent(bbox)}`;
+}
+
+function tfrGeoJsonUrlForBounds(bounds) {
+  if (!bounds) return TFR_GEOSERVER_BASE;
+  return TFR_GEOSERVER_BASE + _tfrWfsQuery(bounds);
+}
+
+// Live TFR retrieval through the data proxy (Cloudflare Worker, /tfr/ route).
+// No-op when no proxy is configured — the manual download/import flow in the
+// NOTAMs tab still applies. Reuses the same parse/merge/render pipeline as import.
+async function fetchLiveTFRs(bounds) {
+  const base = (typeof getCanopyProxyBase === 'function') ? getCanopyProxyBase() : null;
+  if (!base || !bounds) return;
+  if (typeof isOnline === 'function' && !isOnline()) return;
+  trackFetchStart('TFR');
+  setStatus('notamStatus', 'loading', 'TFR…');
+  try {
+    const res = await fetch(base + '/tfr/geoserver/TFR/ows' + _tfrWfsQuery(bounds));
+    if (!res.ok) throw new Error('TFR HTTP ' + res.status);
+    const gj = await res.json();
+    const parsed = (typeof parseTfrGeoJson === 'function') ? parseTfrGeoJson(gj) : { tfrs: [] };
+    const tfrs = (parsed.tfrs || []).map(t => Object.assign({}, t, { _live: true }));
+    // Replace the previously live-fetched set; keep any manually-imported TFRs.
+    S.tfrs = (S.tfrs || []).filter(t => !t._live);
+    if (tfrs.length) mergeTfrs(tfrs);
+    S.tfrImportMeta = { fileName: 'live', importedAtMs: Date.now(), source: 'FAA GeoServer (live via proxy)' };
+    afterFaaImport();
+    setStatus('notamStatus', 'live', tfrs.length ? `${tfrs.length} TFR${tfrs.length > 1 ? 'S' : ''} LIVE` : 'NO TFR (LIVE)');
+    clearDataSourceError('TFR');
+  } catch (e) {
+    console.warn('Live TFR fetch failed:', e);
+    recordDataSourceError('TFR', e);
+    // leave the manual import flow / any cached TFRs in place
+  } finally {
+    trackFetchEnd('TFR');
+  }
 }
 
 function _esc(s) {
@@ -6547,7 +6583,7 @@ if (typeof module !== 'undefined' && module.exports) {
     computeAirspace, computeOpsData, computeAssessment,
     fetchWeather, fetchKpIndex, fetchElevation, fetchSunMoon,
     renderNotamsTab, fetchWireHazards, processArea,
-    tfrGeoJsonUrlForBounds, toDMS, fmtTfrTime, currentAreaPolygon,
+    tfrGeoJsonUrlForBounds, fetchLiveTFRs, toDMS, fmtTfrTime, currentAreaPolygon,
     renderDeepLinks, renderTfrCards, renderNotamCards, renderImportStatus,
     renderImportedTfrLayer, renderImportedNotamLayer,
     importFaaFile, handleFaaFiles, ingestFaaFileText, applyTfrImport,

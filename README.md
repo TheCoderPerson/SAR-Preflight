@@ -20,7 +20,7 @@ https://thecoderperson.github.io/SAR-Preflight/sar-preflight.html
 - The **FAA Obstacles (DOF)** layer plots verified man-made obstacles color-coded by height (red ≥ 200 ft AGL, amber 100–199, yellow < 100); popups show AGL/AMSL height, lighting, and marking status
 - The **FAA Sectional** layer streams the current official FAA VFR sectional (56-day cycle); drawing an operational area auto-caches its tiles for offline use, and the cached edition is shown / refreshed when a newer one is published
 - Import FAA sectional chart GeoTIFFs for full-resolution offline chart overlay (backup to the live sectional)
-- Import active **TFRs and NOTAMs** in-app via area-scoped deep-links (no server) — see the NOTAMs tab
+- **Active TFRs**: when the data proxy is configured (see below) the app auto-fetches live TFRs for your area on every draw and folds an active TFR over the area into the assessment; otherwise it falls back to area-scoped deep-links + in-app file/paste import (NOTAMs tab). **NOTAMs** are still imported via deep-link/paste (no free live API — see Notes)
 - Toggle a **vegetation height overlay** (Meta/WRI 1 m canopy) over the current view with an opacity slider (Terrain tab → *Canopy & Visibility*)
 - Run a **viewshed**: tap an observer location and the tool shades every spot where a drone at your entered AGL would be visible to a 5.5 ft-eye observer, factoring terrain *and* vegetation into line-of-sight (Terrain tab, or the eye icon on the draw toolbar)
 - Use the **timebar** at the bottom to scrub through 24-hour wind and sun direction forecasts
@@ -53,7 +53,7 @@ All data is fetched from free, public APIs. No API keys are required.
 | National security UAS restrictions | [FAA UDDS](https://udds.faa.gov/) via ArcGIS | Static |
 | Man-made obstacles — verified AGL/AMSL height, lighting, marking, type (towers, antennas, stacks, cranes, met towers, etc.) | [FAA Digital Obstacle File](https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/dof/) via ArcGIS | 56-day cycle |
 | Current FAA VFR sectional chart tiles | [FAA Aeronautical Information Services](https://www.faa.gov/air_traffic/flight_info/aeronav/) via ArcGIS | 56-day cycle |
-| Active TFRs (in-app import + area-scoped deep-link) | [FAA TFR GeoServer](https://tfr.faa.gov/) | On import |
+| Active TFRs — live auto-fetch when the data proxy is set, else in-app import / deep-link | [FAA TFR GeoServer](https://tfr.faa.gov/) (live via the [`tools/canopy-proxy`](tools/canopy-proxy) Worker, `/tfr/` route) | Per area draw |
 | Airports, heliports, seaplane bases | [OpenStreetMap](https://www.openstreetmap.org/) via Overpass API | Cached 7 days |
 | Towers (comm, water, wind turbine, chimney, etc.) | [OpenStreetMap](https://www.openstreetmap.org/) via Overpass API | Cached 7 days |
 | Wire/cable hazards & power transmission lines (with voltage where tagged) | [OpenStreetMap](https://www.openstreetmap.org/) via Overpass API | Cached 7 days |
@@ -69,7 +69,8 @@ All data is fetched from free, public APIs. No API keys are required.
 | Bird strike risk | Calculated from season, time of day, terrain, altitude | Real-time |
 
 **Notes:**
-- **FAA NOTAM/TFR:** the official FAA NOTAM/TFR endpoints are CORS-restricted, so the app cannot poll them live. Instead it provides area-scoped deep-links to download active TFRs (GeoJSON) and NOTAMs, plus an in-app file/paste importer (no server) that parses and plots them on the map and folds an active TFR over your area into the assessment.
+- **FAA TFR:** the FAA TFR GeoServer is CORS-restricted, so direct browser polling is blocked. With the optional data proxy ([`tools/canopy-proxy`](tools/canopy-proxy)) configured, the app fetches live TFR polygons for your area through the Worker's `/tfr/` route (proxied server-side with a near-zero cache so they stay current). Without a proxy, it falls back to area-scoped deep-links + an in-app file/paste importer.
+- **FAA NOTAM:** the FAA NOTAM API is not currently self-serve, and there is no free, reliable JSON NOTAM feed that can be proxied, so NOTAMs remain a deep-link + paste/file import (the importer parses ICAO/domestic NOTAMs, geolocates them, and plots area NOTAMs). Always confirm NOTAMs against an official briefing source before flight.
 - **FAA Digital Obstacle File:** the DOF catalogs verified obstacles but is **not a complete low-altitude inventory** — below ~200 ft AGL away from airports it is intentionally sparse, so the absence of an obstacle is not proof of clear airspace. It complements (does not replace) the OpenStreetMap wire/tower hazard layers and visual reconnaissance.
 - **Vegetation / viewshed:** the USGS 3DEP terrain DEM is read directly in-browser (CORS-enabled), so the viewshed works "bare-earth" with no setup. The Meta 1 m canopy tiles, however, are served from an AWS bucket that sends no CORS headers, so the canopy overlay and vegetation-aware viewshed require a small **self-hosted Cloudflare Worker** proxy (free tier; one-time setup — see [`tools/canopy-proxy/README.md`](tools/canopy-proxy/README.md)) whose URL is set in the Config tab. Viewed areas are cached in IndexedDB for offline use. The viewshed is a **modeled** line-of-sight from terrain + canopy and is not a substitute for legal VLOS or on-scene judgment.
 

@@ -1,24 +1,32 @@
 // ============================================================
-// SAR Preflight — Canopy CORS+Range proxy (Cloudflare Worker)
+// SAR Preflight — data proxy (Cloudflare Worker): canopy + live TFR
 //
-// The Meta/WRI Global Canopy Height 1 m tiles live in a public AWS S3 bucket
-// that serves HTTP Range requests but sends NO CORS headers, so a browser
-// (the SAR Preflight app) cannot read them directly. This Worker re-serves the
-// Meta path with `Access-Control-Allow-Origin` + Range pass-through so the app's
-// GeoTIFF.js reader can fetch COG windows.
+// A small CORS+Range proxy so the browser-only SAR Preflight app can read data
+// from upstreams that either block CORS or need server-side fetching:
+//   • /chm/{quadkey}.tif , /tiles.geojson  → Meta/WRI 1 m canopy COG tiles
+//       (public S3 bucket that serves Range but sends NO CORS headers)
+//   • /tfr/...                              → FAA TFR GeoServer (live TFR polygons)
 //
-// Abuse protection (see README): it only proxies the Meta canopy prefix (never an
-// open proxy), AND it rejects any request whose Origin/Referer is not in
-// ALLOWED_ORIGINS below — so other sites can't hot-link it and burn your quota.
-// (On the Workers FREE plan there is no overage billing: past ~100k req/day the
-// Worker simply returns errors until the next UTC day — it cannot cost you money.)
+// Abuse protection (see README):
+//   • Only the two upstreams above are reachable (never an open proxy; `..` rejected).
+//   • Requests whose Origin/Referer isn't in ALLOWED_ORIGINS get 403, so other
+//     sites can't hot-link it and burn your quota.
+//   • Workers FREE plan has no overage billing — past ~100k req/day it just
+//     returns errors until the next UTC day; it cannot cost you money.
 //
-// Deploy: paste into a Worker at dash.cloudflare.com (Workers & Pages → Create →
-// Edit code → paste → Deploy), or `wrangler deploy` from this folder.
-// Then set the Worker URL in the app: Config tab → "Canopy proxy URL".
+// Deploy: paste into a Worker at dash.cloudflare.com (Workers & Pages → your
+// Worker → Edit code → paste → Deploy), or `wrangler deploy` from this folder.
+// Set the Worker URL in the app: Config tab → "Data proxy URL".
 // ============================================================
 
-const UPSTREAM = 'https://dataforgood-fb-data.s3.amazonaws.com/forests/v1/alsgedi_global_v6_float/';
+const CANOPY_UPSTREAM = 'https://dataforgood-fb-data.s3.amazonaws.com/forests/v1/alsgedi_global_v6_float/';
+const CANOPY_CACHE_TTL = 604800; // 7 days — canopy is static
+
+// Path-prefix routes (checked before the canopy default). TFR is safety-critical
+// and time-sensitive, so it is cached for only a few seconds.
+const ROUTES = [
+  { prefix: '/tfr/', upstream: 'https://tfr.faa.gov/', cacheTtl: 30 },
+];
 
 // Only these origins may use the proxy. Add your dev origin while testing.
 // NOTE: the offline single-file (opened via file://) sends no Origin and relies
@@ -29,9 +37,6 @@ const ALLOWED_ORIGINS = new Set([
   'http://127.0.0.1:8000',
 ]);
 
-// Resolve the allowed origin for this request (Origin header first, Referer host
-// as a fallback for browsers that omit Origin on same-page GETs). Returns the
-// matched origin string, or null if not allowed.
 function allowedOriginFor(req) {
   const origin = req.headers.get('Origin');
   if (origin && ALLOWED_ORIGINS.has(origin)) return origin;
@@ -40,6 +45,20 @@ function allowedOriginFor(req) {
     try { const o = new URL(ref).origin; if (ALLOWED_ORIGINS.has(o)) return o; } catch (_) { /* ignore */ }
   }
   return null;
+}
+
+// Map an incoming request path to its upstream URL + cache TTL (or null if invalid).
+function resolveTarget(url) {
+  for (const r of ROUTES) {
+    if (url.pathname.startsWith(r.prefix)) {
+      const rest = url.pathname.slice(r.prefix.length);
+      if (!rest || rest.includes('..')) return null;
+      return { target: r.upstream + rest + url.search, cacheTtl: r.cacheTtl };
+    }
+  }
+  const rel = url.pathname.replace(/^\/+/, '');
+  if (!rel || rel.includes('..')) return null;
+  return { target: CANOPY_UPSTREAM + rel, cacheTtl: CANOPY_CACHE_TTL };
 }
 
 export default {
@@ -55,14 +74,14 @@ export default {
     }
     if (!allow) return new Response('forbidden', { status: 403 });
 
-    const rel = new URL(req.url).pathname.replace(/^\/+/, '');
-    if (!rel || rel.includes('..')) return new Response('bad path', { status: 400, headers: corsHeaders(allow) });
+    const route = resolveTarget(new URL(req.url));
+    if (!route) return new Response('bad path', { status: 400, headers: corsHeaders(allow) });
 
     const range = req.headers.get('Range');
-    const up = await fetch(UPSTREAM + rel, {
+    const up = await fetch(route.target, {
       method: req.method,
       headers: range ? { Range: range } : {},
-      cf: { cacheEverything: true, cacheTtl: 604800 }, // 7-day edge cache
+      cf: { cacheEverything: true, cacheTtl: route.cacheTtl },
     });
 
     const h = new Headers(up.headers);

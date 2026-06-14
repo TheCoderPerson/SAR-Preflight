@@ -1139,12 +1139,12 @@ select.api-input { cursor: pointer; }
             </div>
           </div>
           <div class="api-config">
-            <div class="data-label">Canopy proxy URL (Cloudflare Worker — see tools/canopy-proxy)</div>
+            <div class="data-label">Data proxy URL — canopy + live TFR (Cloudflare Worker — see tools/canopy-proxy)</div>
             <div class="api-input-group">
               <input class="api-input" id="cfgCanopyProxy" type="text" placeholder="https://sar-canopy-proxy.you.workers.dev" onchange="saveCanopyProxy(this.value)" />
               <button class="btn btn-ghost" onclick="saveCanopyProxy(document.getElementById('cfgCanopyProxy').value)">Save</button>
             </div>
-            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">Meta/WRI 1&nbsp;m canopy tiles have no CORS; this proxy re-serves them so the in-browser vegetation overlay &amp; viewshed can read them. Terrain (3DEP) works without it. Viewed areas are cached for offline use.</div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">One self-hosted proxy serves two CORS-blocked sources: Meta/WRI 1&nbsp;m canopy tiles (vegetation overlay &amp; viewshed) and the FAA TFR GeoServer (live TFRs auto-fetched per area). Terrain (3DEP) works without it. Canopy is cached for offline use; live TFR needs a connection.</div>
           </div>
         </div>
         <div class="data-section">
