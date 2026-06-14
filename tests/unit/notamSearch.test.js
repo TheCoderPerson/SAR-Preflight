@@ -40,9 +40,21 @@ describe('parseNotamSearchItem', () => {
     expect(n.effectiveEnd).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
   });
 
-  it('keeps an unparseable date string verbatim', () => {
-    const n = parseNotamSearchItem({ ...sampleItem, startDate: 'PERM', endDate: '' });
-    expect(n.effectiveStart).toBe('PERM');
+  it('parses the real FAA "MM/DD/YYYY HHMM" format as UTC', () => {
+    const n = parseNotamSearchItem({ ...sampleItem, startDate: '03/17/2020 1826', endDate: '04/30/2027 2359' });
+    expect(n.effectiveStart).toBe('2020-03-17T18:26:00Z');
+    expect(n.effectiveEnd).toBe('2027-04-30T23:59:00Z');
+  });
+
+  it('handles a glued timezone suffix and the PERM sentinel', () => {
+    const n = parseNotamSearchItem({ ...sampleItem, startDate: '03/09/2026 1953EST', endDate: 'PERM' });
+    expect(n.effectiveStart).toBe('2026-03-09T19:53:00Z'); // TZ letters ignored (treated UTC)
+    expect(n.effectiveEnd).toBe('PERM');
+  });
+
+  it('returns null for an empty date', () => {
+    const n = parseNotamSearchItem({ ...sampleItem, startDate: '', endDate: null });
+    expect(n.effectiveStart).toBe(null);
     expect(n.effectiveEnd).toBe(null);
   });
 

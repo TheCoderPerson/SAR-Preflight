@@ -1647,6 +1647,15 @@ function _notamSearchDate(v) {
   if (v == null || v === '') return null;
   if (typeof v === 'number') { const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); }
   const s = String(v).trim();
+  if (/^perm/i.test(s)) return 'PERM'; // permanent — keep for display; no expiry
+  // FAA NOTAM Search format: MM/DD/YYYY HHMM (24h, no colon), optional glued TZ
+  // (e.g. "1953EST"). Treat as UTC (most NOTAM times are; a rare TZ-tagged one is
+  // off by its offset — acceptable for an advisory display).
+  const m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2})(\d{2})/);
+  if (m) {
+    const iso = `${m[3]}-${m[1]}-${m[2]}T${m[4]}:${m[5]}:00Z`;
+    return isNaN(Date.parse(iso)) ? s : iso;
+  }
   if (/^\d{12,}$/.test(s)) { const d = new Date(Number(s)); return isNaN(d.getTime()) ? s : d.toISOString(); }
   const t = Date.parse(s);
   return isNaN(t) ? s : new Date(t).toISOString();
