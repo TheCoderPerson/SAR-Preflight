@@ -4939,6 +4939,10 @@ function aggPopupStep(dir) {
 
 function _aggFeatureClick(e) {
   if (e && e.originalEvent && typeof L !== 'undefined' && L.DomEvent) L.DomEvent.stopPropagation(e);
+  // While picking a viewshed observer, a click that lands on an interactive
+  // feature (TFR/NOTAM polygon) must still place the observer — the feature
+  // handler stops propagation, so the map-level click handler never sees it.
+  if (S._viewshedPicking) { onViewshedMapClick(e.latlng); return; }
   openAggregatePopup(e.latlng, e);
 }
 
@@ -6474,10 +6478,16 @@ async function _fetchCanopyFromProxy(base, grid) {
   const canopy = new Float32Array(grid.rows * grid.cols).fill(NaN);
   let any = false;
   for (const qk of qks) {
-    let tiff;
-    try { tiff = await GeoTIFF.fromUrl(base + '/chm/' + qk + '.tif'); }
-    catch (_) { continue; } // tile missing / CORS — skip
-    const tileGrid = await _cogTileToGrid(tiff, grid);
+    const url = base + '/chm/' + qk + '.tif';
+    let tileGrid = null;
+    // Retry once: cold range-fetches of these large COGs through the proxy can
+    // intermittently 5xx (transient edge/S3 hiccup) even though the tile is valid.
+    for (let attempt = 0; attempt < 2 && tileGrid == null; attempt++) {
+      try {
+        const tiff = await GeoTIFF.fromUrl(url);
+        tileGrid = await _cogTileToGrid(tiff, grid);
+      } catch (_) { tileGrid = null; } // missing tile / CORS / transient — retry then skip
+    }
     if (!tileGrid) continue;
     for (let i = 0; i < canopy.length; i++) {
       if (Number.isNaN(canopy[i]) && Number.isFinite(tileGrid[i])) { canopy[i] = tileGrid[i]; any = true; }
@@ -6764,7 +6774,7 @@ if (typeof module !== 'undefined' && module.exports) {
     startViewshedPick, cancelViewshedPick, onViewshedMapClick, runViewshed, clearViewshed,
     buildLayerControl, toggleLayer, updateWireDisplay,
     openAggregatePopup, aggPopupStep, renderAggregatePopup, collectFeaturesAt,
-    wirePopupAggregation, eachPopupLayer,
+    wirePopupAggregation, eachPopupLayer, _aggFeatureClick,
     computeAirspace, computeOpsData, computeAssessment,
     fetchWeather, fetchKpIndex, fetchElevation, fetchSunMoon,
     renderNotamsTab, fetchWireHazards, processArea,
