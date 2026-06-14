@@ -22,10 +22,45 @@ const geojsonObj = {
   }],
 };
 
+// Detail XML for TFR 6/4112 (altitude band + effective/expire window).
+const detailXml = `<?xml version="1.0"?><XNOTAM><Group><Add><Not>
+  <txtLocalName>6/4112</txtLocalName>
+  <codeType>91.137</codeType>
+  <codeFacility>ZOA</codeFacility>
+  <txtNameUSState>CALIFORNIA</txtNameUSState>
+  <txtNameTitle>Wildfire near Placerville</txtNameTitle>
+  <txtDescrPurpose>TEMPORARY FLIGHT RESTRICTIONS</txtDescrPurpose>
+  <dateEffective>2026-06-13T22:30:00</dateEffective>
+  <dateExpire>2026-12-31T23:59:00</dateExpire>
+  <valDistVerLower>0</valDistVerLower>
+  <valDistVerUpper>10000</valDistVerUpper>
+  <uomDistVerUpper>FT</uomDistVerUpper>
+</Not></Add></Group></XNOTAM>`;
+
 const bounds = {
   getSouthWest: () => ({ lat: 38.6, lng: -121.0 }),
   getNorthEast: () => ({ lat: 38.7, lng: -120.9 }),
 };
+
+// fetch mock that routes by URL and records every call.
+function installFetch({ wfsOk = true, detailOk = true } = {}) {
+  const urls = [];
+  globalThis.fetch = (url) => {
+    urls.push(url);
+    if (url.includes('/geoserver/')) {
+      return Promise.resolve(wfsOk
+        ? { ok: true, json: async () => geojsonObj }
+        : { ok: false, status: 503 });
+    }
+    if (url.includes('/download/detail_')) {
+      return Promise.resolve(detailOk
+        ? { ok: true, text: async () => detailXml }
+        : { ok: false, status: 404 });
+    }
+    return Promise.resolve({ ok: false, status: 404 });
+  };
+  return urls;
+}
 
 function setBody() {
   document.body.innerHTML = `
@@ -61,32 +96,53 @@ describe('fetchLiveTFRs (live TFR via proxy)', () => {
 
   it('is a no-op when no proxy is configured', async () => {
     localStorage.removeItem('sar_canopy_proxy');
-    let called = false;
-    globalThis.fetch = () => { called = true; return Promise.resolve({ ok: true, json: async () => geojsonObj }); };
+    const urls = installFetch();
     await fetchLiveTFRs(bounds);
-    expect(called).toBe(false);
+    expect(urls.length).toBe(0);
     expect(S.tfrs.length).toBe(0);
   });
 
   it('fetches the proxied /tfr/ GeoServer URL and populates S.tfrs flagged _live', async () => {
-    let calledUrl = null;
-    globalThis.fetch = (url) => { calledUrl = url; return Promise.resolve({ ok: true, json: async () => geojsonObj }); };
+    const urls = installFetch();
     await fetchLiveTFRs(bounds);
-    expect(calledUrl).toContain('https://x.workers.dev/tfr/geoserver/TFR/ows');
-    expect(calledUrl).toContain('typeName=TFR:V_TFR_LOC');
-    expect(calledUrl).toContain('bbox=');
+    const wfs = urls.find(u => u.includes('/geoserver/'));
+    expect(wfs).toContain('https://x.workers.dev/tfr/geoserver/TFR/ows');
+    expect(wfs).toContain('typeName=TFR:V_TFR_LOC');
+    expect(wfs).toContain('bbox=');
     expect(S.tfrs.length).toBe(1);
     expect(S.tfrs[0].id).toBe('6/4112');
     expect(S.tfrs[0]._live).toBe(true);
     expect(document.getElementById('notamStatus').textContent).toContain('LIVE');
   });
 
+  it('enriches the TFR with altitude + times from its detail XML', async () => {
+    const urls = installFetch();
+    await fetchLiveTFRs(bounds);
+    expect(urls.some(u => u.includes('/tfr/download/detail_6_4112.xml'))).toBe(true);
+    const t = S.tfrs[0];
+    expect(t.lowerAlt).toBe(0);
+    expect(t.upperAlt).toBe(10000);
+    expect(t.altUom).toBe('FT');
+    expect(t.effectiveStart).toBeTruthy();
+    expect(t.effectiveEnd).toBeTruthy();
+    // geometry from the WFS feed is preserved through enrichment
+    expect(t.polygons && t.polygons.length).toBeTruthy();
+  });
+
+  it('still succeeds when a detail XML is missing (geometry-only TFR)', async () => {
+    installFetch({ detailOk: false });
+    await fetchLiveTFRs(bounds);
+    expect(S.tfrs.length).toBe(1);
+    expect(S.tfrs[0].id).toBe('6/4112');
+    expect(S.tfrs[0].upperAlt == null).toBe(true); // no enrichment, but TFR still present
+  });
+
   it('replaces a previous live set but keeps manually-imported TFRs', async () => {
     S.tfrs = [
-      { id: 'MANUAL-1', polygons: [], name: 'manual' },          // kept
-      { id: 'OLD-LIVE', polygons: [], name: 'stale', _live: true }, // dropped
+      { id: 'MANUAL-1', polygons: [], name: 'manual' },              // kept
+      { id: 'OLD-LIVE', polygons: [], name: 'stale', _live: true },  // dropped
     ];
-    globalThis.fetch = () => Promise.resolve({ ok: true, json: async () => geojsonObj });
+    installFetch();
     await fetchLiveTFRs(bounds);
     const ids = S.tfrs.map(t => t.id);
     expect(ids).toContain('MANUAL-1');
@@ -96,7 +152,7 @@ describe('fetchLiveTFRs (live TFR via proxy)', () => {
 
   it('on fetch error leaves existing TFRs intact (manual flow preserved)', async () => {
     S.tfrs = [{ id: 'MANUAL-1', polygons: [], name: 'manual' }];
-    globalThis.fetch = () => Promise.resolve({ ok: false, status: 503 });
+    installFetch({ wfsOk: false });
     await fetchLiveTFRs(bounds);
     expect(S.tfrs.map(t => t.id)).toContain('MANUAL-1');
   });

@@ -77,10 +77,14 @@ export default {
     const route = resolveTarget(new URL(req.url));
     if (!route) return new Response('bad path', { status: 400, headers: corsHeaders(allow) });
 
+    // A browser-ish User-Agent: the FAA TFR detail-XML host rejects default
+    // bot UAs. Harmless for the S3 canopy bucket.
+    const upHeaders = { 'User-Agent': 'Mozilla/5.0 (compatible; SAR-Preflight/1.0)' };
     const range = req.headers.get('Range');
+    if (range) upHeaders.Range = range;
     const up = await fetch(route.target, {
       method: req.method,
-      headers: range ? { Range: range } : {},
+      headers: upHeaders,
       cf: { cacheEverything: true, cacheTtl: route.cacheTtl },
     });
 

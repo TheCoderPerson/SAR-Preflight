@@ -1368,6 +1368,9 @@ async function fetchLiveTFRs(bounds) {
     S.tfrs = (S.tfrs || []).filter(t => !t._live);
     if (tfrs.length) mergeTfrs(tfrs);
     S.tfrImportMeta = { fileName: 'live', importedAtMs: Date.now(), source: 'FAA GeoServer (live via proxy)' };
+    // Enrich each live TFR with altitude band + effective/expire times from its
+    // detail XML (the GeoServer WFS feed carries geometry + id + title only).
+    await enrichLiveTfrDetails(base, tfrs);
     afterFaaImport();
     setStatus('notamStatus', 'live', tfrs.length ? `${tfrs.length} TFR${tfrs.length > 1 ? 'S' : ''} LIVE` : 'NO TFR (LIVE)');
     clearDataSourceError('TFR');
@@ -1378,6 +1381,30 @@ async function fetchLiveTFRs(bounds) {
   } finally {
     trackFetchEnd('TFR');
   }
+}
+
+// Fetch each live TFR's detail XML (altitude + effective/expire times) through the
+// proxy and merge it in by id. The WFS feed only carries geometry+id+title, so
+// without this every listed TFR is treated as active (conservative). Best-effort:
+// a failed/absent detail file just leaves that TFR geometry-only.
+async function enrichLiveTfrDetails(base, tfrs) {
+  if (!base || !Array.isArray(tfrs) || !tfrs.length || typeof parseTfrDetailXml !== 'function') return;
+  const targets = tfrs.slice(0, 20); // the bbox already limits results; cap as a backstop
+  const results = await Promise.allSettled(targets.map(t => _fetchTfrDetail(base, t.id)));
+  const enriched = results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value);
+  if (enriched.length) mergeTfrs(enriched);
+}
+
+async function _fetchTfrDetail(base, id) {
+  const fileId = String(id).replace(/\//g, '_'); // '4/3635' -> 'detail_4_3635.xml'
+  const res = await fetch(base + '/tfr/download/detail_' + fileId + '.xml');
+  if (!res.ok) return null;
+  const xml = await res.text();
+  const d = (parseTfrDetailXml(xml).tfrs || [])[0];
+  if (!d) return null;
+  // Force the id to the live TFR's id (so mergeTfrs folds it into the geometry
+  // record) and drop any detail polygons (keep the WFS geometry as authoritative).
+  return Object.assign({}, d, { id, polygons: [], _live: true });
 }
 
 function _esc(s) {
