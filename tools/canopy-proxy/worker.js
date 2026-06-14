@@ -22,6 +22,12 @@
 const CANOPY_UPSTREAM = 'https://dataforgood-fb-data.s3.amazonaws.com/forests/v1/alsgedi_global_v6_float/';
 const CANOPY_CACHE_TTL = 604800; // 7 days — canopy is static
 
+// FAA NOTAM Search public backend (undocumented; advisory). The /notam route does
+// the session-cookie + full-form-params + pagination dance the browser can't.
+const NOTAM_HOME = 'https://notams.aim.faa.gov/notamSearch/';
+const NOTAM_SEARCH = 'https://notams.aim.faa.gov/notamSearch/search';
+const UA = 'Mozilla/5.0 (compatible; SAR-Preflight/1.0)';
+
 // Path-prefix routes (checked before the canopy default). TFR is safety-critical
 // and time-sensitive, so it is cached for only a few seconds.
 const ROUTES = [
@@ -74,7 +80,12 @@ export default {
     }
     if (!allow) return new Response('forbidden', { status: 403 });
 
-    const route = resolveTarget(new URL(req.url));
+    const reqUrl = new URL(req.url);
+    if (reqUrl.pathname === '/notam' || reqUrl.pathname === '/notam/') {
+      return handleNotam(reqUrl, allow);
+    }
+
+    const route = resolveTarget(reqUrl);
     if (!route) return new Response('bad path', { status: 400, headers: corsHeaders(allow) });
 
     // A browser-ish User-Agent: the FAA TFR detail-XML host rejects default
@@ -105,4 +116,99 @@ function corsHeaders(origin) {
     'Access-Control-Allow-Headers': 'Range, Content-Type',
     'Access-Control-Max-Age': '86400',
   };
+}
+
+// ---- NOTAMs: drive the FAA NOTAM Search backend (cookie + full params + paging) ----
+function dms(v) {
+  v = Math.abs(v);
+  let d = Math.floor(v);
+  let m = Math.floor((v - d) * 60);
+  let s = Math.round((v - d - m / 60) * 3600);
+  if (s >= 60) { s -= 60; m += 1; }
+  if (m >= 60) { m -= 60; d += 1; }
+  return { d, m, s };
+}
+
+function extractCookies(resp) {
+  let arr = [];
+  try { if (typeof resp.headers.getSetCookie === 'function') arr = resp.headers.getSetCookie(); } catch (_) { /* ignore */ }
+  if (!arr.length) { const sc = resp.headers.get('set-cookie'); if (sc) arr = [sc]; }
+  return arr.map(c => String(c).split(';')[0]).filter(Boolean).join('; ');
+}
+
+function jsonResponse(obj, status, allow) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders(allow)),
+  });
+}
+
+async function handleNotam(url, allow) {
+  const lat = parseFloat(url.searchParams.get('lat'));
+  const lng = parseFloat(url.searchParams.get('lng'));
+  let radius = parseInt(url.searchParams.get('radius') || '20', 10);
+  if (!isFinite(lat) || !isFinite(lng)) return jsonResponse({ error: 'lat and lng required', notamList: [] }, 400, allow);
+  if (!isFinite(radius) || radius < 1) radius = 20;
+  if (radius > 100) radius = 100;
+
+  // 1) establish a session cookie (the backend 302s without it)
+  let cookie = '';
+  try { cookie = extractCookies(await fetch(NOTAM_HOME, { headers: { 'User-Agent': UA } })); } catch (_) { /* try anyway */ }
+
+  const la = dms(lat), lo = dms(lng);
+  const fields = (offset) => {
+    const p = new URLSearchParams();
+    // The backend silently 302s unless the COMPLETE field set is present (even empties).
+    p.set('searchType', '3');               // 3 = lat/long + radius
+    p.set('designatorsForLocation', '');
+    p.set('designatorForAccountable', '');
+    p.set('latDegrees', String(la.d)); p.set('latMinutes', String(la.m)); p.set('latSeconds', String(la.s));
+    p.set('latitudeDirection', lat >= 0 ? 'N' : 'S');
+    p.set('longDegrees', String(lo.d)); p.set('longMinutes', String(lo.m)); p.set('longSeconds', String(lo.s));
+    p.set('longitudeDirection', lng >= 0 ? 'E' : 'W');
+    p.set('radius', String(radius));        // NM
+    p.set('sortColumns', '5 false');
+    p.set('sortDirection', 'true');
+    p.set('radiusSearchOnDesignator', 'false');
+    p.set('radiusSearchDesignator', '');
+    p.set('freeFormText', '');
+    p.set('offset', String(offset));
+    p.set('notamsOnly', 'false');
+    p.set('filters', '');
+    p.set('minRunwayLength', '');
+    p.set('minRunwayWidth', '');
+    p.set('runwaySurfaceTypes', '');
+    return p.toString();
+  };
+
+  let all = [], total = 0, offset = 0, countsByType = null;
+  const MAX_PAGES = 6; // backstop: up to ~180 NOTAMs
+  for (let page = 0; page < MAX_PAGES; page++) {
+    let data;
+    try {
+      const r = await fetch(NOTAM_SEARCH, {
+        method: 'POST',
+        redirect: 'manual', // a 3xx = params/cookie rejected → stop
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'User-Agent': UA,
+          'Cookie': cookie,
+          'Origin': 'https://notams.aim.faa.gov',
+          'Referer': NOTAM_HOME,
+        },
+        body: fields(offset),
+      });
+      if (r.status !== 200) break;
+      data = await r.json();
+    } catch (_) { break; }
+    if (!data || data.error) break;
+    const list = Array.isArray(data.notamList) ? data.notamList : [];
+    all = all.concat(list);
+    if (!countsByType && data.countsByType) countsByType = data.countsByType;
+    total = (data.totalNotamCount != null) ? Number(data.totalNotamCount) : all.length;
+    offset += 30;
+    if (list.length === 0 || all.length >= total) break;
+  }
+
+  return jsonResponse({ notamList: all, totalNotamCount: total, countsByType }, 200, allow);
 }

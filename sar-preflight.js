@@ -498,7 +498,7 @@ async function processArea(layer, type) {
     fetchElevation(center, bounds),
     fetchSunMoon(center.lat, center.lng),
     renderNotamsTab(center.lat, center.lng),
-    fetchLiveTFRs(bounds),
+    fetchLiveRestrictions(center, bounds),
     fetchWireHazards(bounds),
     fetchNWSAlerts(center.lat, center.lng),
     fetchRadar(),
@@ -1405,6 +1405,57 @@ async function _fetchTfrDetail(base, id) {
   // Force the id to the live TFR's id (so mergeTfrs folds it into the geometry
   // record) and drop any detail polygons (keep the WFS geometry as authoritative).
   return Object.assign({}, d, { id, polygons: [], _live: true });
+}
+
+// Live NOTAM retrieval through the data proxy (Cloudflare Worker, /notam route →
+// the FAA NOTAM Search backend). No-op without a proxy. The source is unofficial,
+// so results are advisory; the manual file/paste import remains available.
+async function fetchNotams(lat, lng, radiusNm) {
+  const base = (typeof getCanopyProxyBase === 'function') ? getCanopyProxyBase() : null;
+  if (!base || lat == null || lng == null) return;
+  if (typeof isOnline === 'function' && !isOnline()) return;
+  trackFetchStart('NOTAM');
+  try {
+    const r = Math.max(5, Math.min(100, Math.round(radiusNm || 20)));
+    const res = await fetch(base + '/notam?lat=' + lat.toFixed(5) + '&lng=' + lng.toFixed(5) + '&radius=' + r);
+    if (!res.ok) throw new Error('NOTAM HTTP ' + res.status);
+    const data = await res.json();
+    const parsed = (typeof parseNotamSearchResponse === 'function') ? parseNotamSearchResponse(data) : [];
+    const notams = parsed.map(n => Object.assign({}, n, { _live: true }));
+    S.importedNotams = (S.importedNotams || []).filter(n => !n._live); // drop previous live set; keep manual imports
+    if (notams.length) mergeNotams(notams);
+    renderImportedNotamLayer();
+    renderNotamCards();
+    if (S.currentArea) computeAssessment();
+    clearDataSourceError('NOTAM');
+  } catch (e) {
+    console.warn('Live NOTAM fetch failed:', e);
+    recordDataSourceError('NOTAM', e);
+  } finally {
+    trackFetchEnd('NOTAM');
+  }
+}
+
+// Orchestrate live TFR + NOTAM for an area and set a single combined status.
+async function fetchLiveRestrictions(center, bounds) {
+  if (!center) return;
+  await fetchLiveTFRs(bounds);
+  let radiusNm = 20;
+  try {
+    if (bounds && typeof haversine === 'function') {
+      const ne = bounds.getNorthEast();
+      const km = haversine(center.lat, center.lng, ne.lat, ne.lng);
+      radiusNm = Math.max(10, Math.min(50, Math.round(km / 1.852) + 10));
+    }
+  } catch (_) { /* default radius */ }
+  await fetchNotams(center.lat, center.lng, radiusNm);
+  if (typeof getCanopyProxyBase === 'function' && getCanopyProxyBase()) {
+    const nt = (S.tfrs || []).length, nn = (S.importedNotams || []).length;
+    const parts = [];
+    if (nt) parts.push(`${nt} TFR${nt > 1 ? 'S' : ''}`);
+    if (nn) parts.push(`${nn} NTM`);
+    setStatus('notamStatus', 'live', parts.length ? parts.join(' · ') + ' LIVE' : 'NONE (LIVE)');
+  }
 }
 
 function _esc(s) {
@@ -6610,7 +6661,7 @@ if (typeof module !== 'undefined' && module.exports) {
     computeAirspace, computeOpsData, computeAssessment,
     fetchWeather, fetchKpIndex, fetchElevation, fetchSunMoon,
     renderNotamsTab, fetchWireHazards, processArea,
-    tfrGeoJsonUrlForBounds, fetchLiveTFRs, toDMS, fmtTfrTime, currentAreaPolygon,
+    tfrGeoJsonUrlForBounds, fetchLiveTFRs, fetchNotams, fetchLiveRestrictions, toDMS, fmtTfrTime, currentAreaPolygon,
     renderDeepLinks, renderTfrCards, renderNotamCards, renderImportStatus,
     renderImportedTfrLayer, renderImportedNotamLayer,
     importFaaFile, handleFaaFiles, ingestFaaFileText, applyTfrImport,

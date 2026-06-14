@@ -1639,6 +1639,52 @@ function currentSectionalCycle(todayISO) {
   return new Date(anchor + k * cycleMs).toISOString().slice(0, 10);
 }
 
+// --- FAA NOTAM Search backend (notamSearch/search) JSON → app NOTAM objects ---
+// The Worker proxies the public FAA NOTAM Search backend; this turns its JSON
+// into the same NOTAM shape used by the file/paste importer. Undocumented source
+// — treated as advisory; safety-critical NOTAMs must still be verified officially.
+function _notamSearchDate(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') { const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); }
+  const s = String(v).trim();
+  if (/^\d{12,}$/.test(s)) { const d = new Date(Number(s)); return isNaN(d.getTime()) ? s : d.toISOString(); }
+  const t = Date.parse(s);
+  return isNaN(t) ? s : new Date(t).toISOString();
+}
+
+function parseNotamSearchItem(item) {
+  if (!item || typeof item !== 'object') return null;
+  if (item.cancelledOrExpired === true) return null;
+  let lat = null, lng = null;
+  if (item.mapPointer) {
+    const m = String(item.mapPointer).match(/POINT\s*\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)/i);
+    if (m) { lng = parseFloat(m[1]); lat = parseFloat(m[2]); } // WKT is POINT(lon lat)
+  }
+  const location = item.facilityDesignator || item.icaoId || item.airportName || '';
+  const body = item.traditionalMessage || item.icaoMessage || item.plainLanguageMessage || '';
+  const id = item.notamNumber || item.id || (location + ' ' + (item.featureName || '')).trim() || 'NOTAM';
+  return {
+    id: String(id),
+    location: String(location),
+    type: String(item.keyword || item.featureName || ''),
+    body: String(body).trim(),
+    effectiveStart: _notamSearchDate(item.startDate),
+    effectiveEnd: _notamSearchDate(item.endDate),
+    lowerAlt: null, upperAlt: null,
+    lat, lng, polygons: [],
+    source: 'notamSearch',
+  };
+}
+
+function parseNotamSearchResponse(data) {
+  const out = [];
+  let obj = data;
+  if (typeof data === 'string') { try { obj = JSON.parse(data); } catch (_) { return out; } }
+  if (!obj || !Array.isArray(obj.notamList)) return out;
+  obj.notamList.forEach(item => { const n = parseNotamSearchItem(item); if (n) out.push(n); });
+  return out;
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -1661,6 +1707,7 @@ if (typeof module !== 'undefined' && module.exports) {
     circleToPolygon, parseFaaCoord, normalizeFaaDate, geoJsonOuterRings,
     parseTfrGeoJson, parseTfrList, normalizeTfrDetailDoc, parseTfrDetailXml,
     filterTfrsIntersectingArea, isTfrActiveNow, parseNotamText, geolocateNotam,
+    parseNotamSearchResponse, parseNotamSearchItem,
     ARTCC_REF, ARTCC_BOUNDS, artccForPoint, artccsForArea,
   };
 }

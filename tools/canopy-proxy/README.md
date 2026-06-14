@@ -1,6 +1,6 @@
 # SAR Preflight data proxy (Cloudflare Worker)
 
-A small CORS+Range proxy so the browser-only app can read two CORS-blocked sources:
+A small CORS+Range proxy so the browser-only app can read CORS-blocked sources:
 
 1. **Canopy** — Meta/WRI Global Canopy Height 1 m tiles for the **vegetation overlay**
    and **viewshed** (`dataforgood-fb-data.s3.amazonaws.com/forests/v1/alsgedi_global_v6_float`).
@@ -8,13 +8,17 @@ A small CORS+Range proxy so the browser-only app can read two CORS-blocked sourc
    in-browser GeoTIFF reader can't fetch COG windows directly. Served at `/chm/{quadkey}.tif`.
 2. **Live TFRs** — the FAA TFR GeoServer (`tfr.faa.gov`), also CORS-restricted. Served
    at the `/tfr/...` route with a near-zero cache (TFRs are time-critical).
+3. **Live NOTAMs** — the public FAA NOTAM Search backend (`notams.aim.faa.gov`). The
+   `/notam?lat=&lng=&radius=` route does the session-cookie + full-form-params +
+   pagination dance server-side and returns aggregated JSON. **Unofficial/undocumented
+   endpoint — advisory only.**
 
-It only ever forwards those two upstreams (it is not a general open proxy; `..` is
+It only ever forwards those upstreams (it is not a general open proxy; `..` is
 rejected), and it enforces an Origin allowlist (below).
 
 > The app works without this proxy — the DEM/terrain side of the viewshed uses
-> USGS 3DEP (already CORS-enabled), and TFRs fall back to deep-link/import. The
-> canopy overlay, vegetation-aware viewshed, and live-TFR auto-fetch simply stay
+> USGS 3DEP (already CORS-enabled), and TFR/NOTAM fall back to deep-link/import.
+> The canopy overlay, vegetation-aware viewshed, and live TFR/NOTAM auto-fetch stay
 > dormant until a proxy URL is configured (Config tab → "Data proxy URL").
 
 ## Deploy
