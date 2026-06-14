@@ -1005,15 +1005,25 @@ function computeAdsbSearchRadius(centerLat, centerLng, ne, sw) {
  * Parse raw ADS-B API response into normalized, sorted aircraft array.
  * Filters stale positions, computes distance and AGL.
  */
-function parseAdsbAircraft(acArray, centerLat, centerLng, groundElevFt) {
+// groundElev may be either a fixed elevation in feet (legacy single-point AGL,
+// the AOI-centre elevation) OR a function (lat, lng) => elevationFt that returns
+// the terrain elevation directly under each aircraft. The function form lets AGL
+// reflect the ground beneath the plane rather than the operating site; it should
+// return null/NaN when it has no data for that point so we can fall back to 0.
+function parseAdsbAircraft(acArray, centerLat, centerLng, groundElev) {
   if (!Array.isArray(acArray)) return [];
+  const groundFn = typeof groundElev === 'function'
+    ? groundElev
+    : () => (typeof groundElev === 'number' ? groundElev : 0);
   return acArray
     .filter(ac => ac.lat != null && ac.lon != null && (ac.seen_pos == null || ac.seen_pos <= 60))
     .map(ac => {
       const altBaro = ac.alt_baro === 'ground' ? 0 : (typeof ac.alt_baro === 'number' ? ac.alt_baro : null);
       const altGeom = typeof ac.alt_geom === 'number' ? ac.alt_geom : null;
       const alt = altBaro != null ? altBaro : (altGeom != null ? altGeom : 0);
-      const agl = Math.max(0, alt - (groundElevFt || 0));
+      let groundElevFt = groundFn(ac.lat, ac.lon);
+      if (groundElevFt == null || !isFinite(groundElevFt)) groundElevFt = 0;
+      const agl = Math.max(0, alt - groundElevFt);
       const distKm = haversine(centerLat, centerLng, ac.lat, ac.lon);
       return {
         hex: ac.hex || '',
@@ -1024,6 +1034,7 @@ function parseAdsbAircraft(acArray, centerLat, centerLng, groundElevFt) {
         lon: ac.lon,
         alt_baro: altBaro,
         alt_geom: altGeom,
+        groundElevFt: Math.round(groundElevFt),
         agl: Math.round(agl),
         gs: ac.gs != null ? ac.gs : null,
         track: ac.track != null ? ac.track : null,

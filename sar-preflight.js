@@ -36,6 +36,14 @@ const S = {
   _adsbLastFetch: 0,
   _adsbApiIndex: 0,
   _adsbEnabled: true,
+  // Terrain DEM covering the ADS-B search area, for per-aircraft (terrain-relative) AGL
+  adsbDem: null,        // { grid, demFlat } — elevations in metres
+  _adsbDemKey: null,    // identity guard so the DEM is fetched once per center+radius
+  _adsbDemFetching: false,
+  // High-res 3DEP point-sampled ground elevation (metres) for the low+close
+  // deconfliction-relevant subset of traffic, keyed by rounded lat,lng
+  _adsbHiresCache: null,
+  _adsbHiresFetching: false,
   // Vegetation overlay + viewshed
   canopy: {},
   viewshed: { marker: null, observer: null, grid: null, running: false },
@@ -3446,6 +3454,188 @@ function _adsbAttemptUrls(lat, lon, dist) {
   return list;
 }
 
+// Lazily fetch (once per area) a terrain DEM covering the whole ADS-B search
+// area so each aircraft's AGL can be computed against the ground directly
+// beneath it rather than the single operating-site elevation. 3DEP is
+// CORS-enabled and cached in IndexedDB, so no proxy is needed and revisits are
+// offline-capable. Self-guarded and non-blocking: the first poll may use the
+// fallback elevation until the DEM arrives, then subsequent polls use terrain.
+async function ensureAdsbDem() {
+  if (!S.areaCenter || !S.adsbSearchRadiusNm) return;
+  if (typeof makeGrid !== 'function' || typeof fetch3DEPDEM !== 'function') return;
+  const c = S.areaCenter;
+  const key = c.lat.toFixed(3) + ',' + c.lng.toFixed(3) + '@' + S.adsbSearchRadiusNm;
+  if (S._adsbDemKey === key && S.adsbDem) return;   // already loaded for this area
+  if (S._adsbDemFetching) return;                   // a fetch is already in flight
+  S._adsbDemFetching = true;
+  try {
+    const halfWidthM = S.adsbSearchRadiusNm * 1852;
+    // ~300 m/cell target, capped to MAX_GRID (512) by makeGrid. Coarse vs the
+    // viewshed, but ample for traffic AGL across a 15–50 NM radius.
+    const grid = makeGrid(c.lat, c.lng, halfWidthM, 300);
+    const dem = await fetch3DEPDEM(grid);
+    if (dem && dem.demFlat) {
+      S.adsbDem = { grid: grid, demFlat: dem.demFlat };
+      S._adsbDemKey = key;
+      // Re-render with terrain-relative AGL now that the DEM is available.
+      if (S.adsbAircraft && S.adsbAircraft.length) {
+        const groundFn = adsbGroundElevFnFt();
+        S.adsbAircraft = parseAdsbAircraft(
+          S.adsbAircraft.map(_adsbToRaw), S.areaCenter.lat, S.areaCenter.lng, groundFn);
+        renderAdsbMap();
+        renderAdsbTab();
+      }
+    }
+  } catch (e) {
+    console.warn('ADS-B terrain DEM fetch failed:', e && e.message);
+  } finally {
+    S._adsbDemFetching = false;
+  }
+}
+
+// Re-shape a parsed aircraft back to the raw API field names so it can be
+// re-run through parseAdsbAircraft when the DEM finishes loading mid-cycle.
+function _adsbToRaw(ac) {
+  return {
+    hex: ac.hex, flight: ac.flight, r: ac.reg, t: ac.type,
+    lat: ac.lat, lon: ac.lon, alt_baro: ac.alt_baro, alt_geom: ac.alt_geom,
+    gs: ac.gs, track: ac.track, baro_rate: ac.baro_rate,
+    squawk: ac.squawk, emergency: ac.emergency, seen: ac.seen, seen_pos: ac.seen_pos,
+  };
+}
+
+// Returns (lat, lng) => terrain elevation in FEET under that point, read from
+// the cached ADS-B DEM (stored in metres). Falls back to the AOI-centre
+// elevation where the DEM has no usable value, so AGL is never worse than the
+// legacy single-point behaviour.
+// Resolution order: (1) high-res 3DEP point sample (cached, for low+close
+// traffic) → (2) coarse area raster → (3) AOI-centre elevation. Each tier is
+// strictly better than the next, so AGL is never worse than the legacy behaviour.
+function adsbGroundElevFnFt() {
+  const dem = S.adsbDem;
+  const cache = S._adsbHiresCache;
+  const fallbackFt = (S.elev && typeof S.elev.center === 'number') ? S.elev.center : 0;
+  const haveRaster = !!(dem && dem.demFlat && dem.grid && typeof sampleGridBilinear === 'function');
+  return (lat, lng) => {
+    // 1. High-res point sample for this rounded position, if we have one.
+    if (cache && cache.size) {
+      const v = cache.get(_adsbHiresKey(lat, lng));
+      if (v != null && isFinite(v)) return v * 3.28084;
+    }
+    // 2. Coarse area raster.
+    if (haveRaster) {
+      const m = sampleGridBilinear(dem.grid, dem.demFlat, lat, lng);
+      if (m != null && isFinite(m)) return m * 3.28084;
+    }
+    // 3. AOI-centre fallback.
+    return fallbackFt;
+  };
+}
+
+// --- High-res AGL for the deconfliction-relevant subset -------------------
+// Only aircraft that are both LOW and CLOSE get a full-resolution 3DEP point
+// sample (the ground directly beneath them), since precise AGL only matters for
+// nearby low traffic. Distant cruisers keep the cheap coarse-raster AGL.
+const ADSB_HIRES_AGL_FT = 1500;   // refine only aircraft below this AGL
+const ADSB_HIRES_DIST_NM = 5;     // ...and within this distance of the AOI
+const ADSB_HIRES_CACHE_MAX = 2000;
+
+function _adsbHiresKey(lat, lng) {
+  // ~11 m granularity: a hovering helicopter reuses its cached sample instead of
+  // re-querying every poll; a moving aircraft re-samples as it crosses cells.
+  return lat.toFixed(4) + ',' + lng.toFixed(4);
+}
+
+function _isAdsbLowClose(ac) {
+  return ac.agl > 0 && ac.agl < ADSB_HIRES_AGL_FT && ac.distNm != null && ac.distNm < ADSB_HIRES_DIST_NM;
+}
+
+// Parse a 3DEP getSamples JSON response into { key: metres }. The samples array
+// is NOT in input order and NoData points are silently dropped, so we join by
+// locationId; any input index missing from the response stays uncached (→ falls
+// back to the coarse raster).
+function _parseGetSamples(json, points) {
+  const out = {};
+  const samples = (json && json.samples) || [];
+  for (const s of samples) {
+    const id = s && s.locationId;
+    if (id == null || id < 0 || id >= points.length) continue;
+    const v = parseFloat(s.value);
+    if (isFinite(v)) out[points[id].key] = v;
+  }
+  return out;
+}
+
+// 3DEP getSamples: native-resolution ground elevation (metres) at each point in
+// ONE request. CORS-open; single retry for the occasional transient 5xx.
+async function fetch3DEPPointElevations(points) {
+  if (!points.length) return {};
+  const geometry = { points: points.map(p => [p.lng, p.lat]), spatialReference: { wkid: 4326 } };
+  const url = 'https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/getSamples';
+  const body = new URLSearchParams({
+    geometry: JSON.stringify(geometry),
+    geometryType: 'esriGeometryMultipoint',
+    returnFirstValueOnly: 'true',
+    f: 'json',
+  }).toString();
+  const doFetch = async () => {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+    if (!res.ok) throw new Error('3DEP getSamples HTTP ' + res.status);
+    return res.json();
+  };
+  let json;
+  try {
+    json = await doFetch();
+  } catch (e) {
+    json = await doFetch();   // one retry on transient (endpoint occasionally 502s)
+  }
+  return _parseGetSamples(json, points);
+}
+
+// Find low+close aircraft whose ground elevation isn't cached, sample them at
+// full resolution in one request, cache the result, then re-derive AGL + render.
+// Async/non-blocking — the coarse AGL shows instantly and is sharpened in place.
+async function refineLowCloseAdsbAgl() {
+  const list = S.adsbAircraft || [];
+  if (!list.length || !S.areaCenter) return;
+  if (typeof isOnline === 'function' && !isOnline()) return;   // offline → keep raster AGL
+  if (S._adsbHiresFetching) return;                            // no overlapping requests
+  if (!S._adsbHiresCache) S._adsbHiresCache = new Map();
+  const cache = S._adsbHiresCache;
+  const need = [];
+  const seen = new Set();
+  for (const ac of list) {
+    if (!_isAdsbLowClose(ac)) continue;
+    const key = _adsbHiresKey(ac.lat, ac.lon);
+    if (cache.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    need.push({ lat: ac.lat, lng: ac.lon, key });
+  }
+  if (!need.length) return;
+  S._adsbHiresFetching = true;
+  try {
+    const elevByKey = await fetch3DEPPointElevations(need);
+    let changed = false;
+    for (const k in elevByKey) { cache.set(k, elevByKey[k]); changed = true; }
+    if (cache.size > ADSB_HIRES_CACHE_MAX) cache.clear();   // bound memory; terrain is static so re-fetch is cheap
+    if (changed && S.adsbAircraft && S.adsbAircraft.length) {
+      const groundFn = adsbGroundElevFnFt();
+      S.adsbAircraft = parseAdsbAircraft(
+        S.adsbAircraft.map(_adsbToRaw), S.areaCenter.lat, S.areaCenter.lng, groundFn);
+      renderAdsbMap();
+      renderAdsbTab();
+    }
+  } catch (e) {
+    console.warn('ADS-B hi-res elevation sample failed:', e && e.message);
+  } finally {
+    S._adsbHiresFetching = false;
+  }
+}
+
 async function fetchAdsb() {
   if (!S.areaCenter || !S.adsbSearchRadiusNm) return;
   trackFetchStart('ADS-B');
@@ -3471,13 +3661,15 @@ async function fetchAdsb() {
       }
     }
     if (!json) throw lastErr || new Error('All ADS-B APIs failed');
-    const groundElev = S.elev?.center ?? 0;
-    const aircraft = parseAdsbAircraft(json.ac || [], S.areaCenter.lat, S.areaCenter.lng, groundElev);
+    ensureAdsbDem(); // load/refresh terrain DEM for per-aircraft AGL (non-blocking, self-guarded)
+    const groundFn = adsbGroundElevFnFt();
+    const aircraft = parseAdsbAircraft(json.ac || [], S.areaCenter.lat, S.areaCenter.lng, groundFn);
     S.adsbAircraft = aircraft;
     S._adsbLastFetch = Date.now();
     updateAdsbTrails(aircraft);
     renderAdsbMap();
     renderAdsbTab(usedApi);
+    refineLowCloseAdsbAgl(); // sharpen AGL for low+close traffic via 3DEP point sampling (non-blocking)
     clearDataSourceError('ADS-B');
     const now = new Date();
     const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: _localTZ() });
@@ -3580,7 +3772,10 @@ function renderAdsbMap() {
 
     // Build popup
     const altMsl = ac.alt_baro != null ? ac.alt_baro.toLocaleString() + ' ft MSL' : 'N/A';
-    const altAgl = ac.agl + ' ft AGL';
+    const altAgl = ac.agl.toLocaleString() + ' ft AGL';
+    const hiRes = !!(S._adsbHiresCache && S._adsbHiresCache.has(_adsbHiresKey(ac.lat, ac.lon)));
+    const terrainBelow = (ac.groundElevFt != null && isFinite(ac.groundElevFt))
+      ? `<span style="opacity:0.6;">Terrain below: ${ac.groundElevFt.toLocaleString()} ft MSL${hiRes ? ' (3DEP point)' : ''}</span><br>` : '';
     const speed = ac.gs != null ? Math.round(ac.gs) + ' kts' : 'N/A';
     const track = ac.track != null ? Math.round(ac.track) + '\u00B0' : 'N/A';
     const vrate = ac.baro_rate != null ? (ac.baro_rate > 0 ? '+' : '') + ac.baro_rate + ' ft/min' : 'N/A';
@@ -3593,6 +3788,7 @@ function renderAdsbMap() {
       (ac.reg ? `Reg: ${ac.reg}<br>` : '') +
       (ac.type ? `Type: ${ac.type}<br>` : '') +
       `Alt: ${altMsl} / ${altAgl}<br>` +
+      terrainBelow +
       `GS: ${speed} | Trk: ${track}<br>` +
       `VS: ${vrate}<br>` +
       `<span style="${sqkStyle}">Squawk: ${sqk}</span>` +
@@ -3697,6 +3893,9 @@ function stopAdsbPolling() {
   S.adsbAircraft = [];
   S.adsbTrails = {};
   S.adsbSearchRadiusNm = null;
+  S.adsbDem = null;
+  S._adsbDemKey = null;
+  S._adsbHiresCache = null;
   if (S.mapLayers.adsb_aircraft) S.mapLayers.adsb_aircraft.clearLayers();
   if (S.mapLayers.adsb_trails) S.mapLayers.adsb_trails.clearLayers();
   const statusEl = document.getElementById('adsbPollStatus');
@@ -6865,5 +7064,7 @@ if (typeof module !== 'undefined' && module.exports) {
     // ADS-B
     ADSB_APIS, fetchAdsb, _adsbAttemptUrls, updateAdsbTrails, renderAdsbMap, renderAdsbTab,
     startAdsbPolling, stopAdsbPolling, toggleAdsbPolling, adsbAglColor,
+    ensureAdsbDem, adsbGroundElevFnFt, _adsbToRaw,
+    refineLowCloseAdsbAgl, fetch3DEPPointElevations, _parseGetSamples, _adsbHiresKey, _isAdsbLowClose,
   };
 }

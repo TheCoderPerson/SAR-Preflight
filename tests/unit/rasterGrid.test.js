@@ -1,6 +1,6 @@
 const {
   makeGrid, gridColToLng, gridRowToLat, latLngToCell,
-  resampleToGrid, MAX_GRID,
+  resampleToGrid, sampleGridBilinear, MAX_GRID,
 } = require('../../sar-preflight-raster.js');
 
 // ============================================================
@@ -85,5 +85,44 @@ describe('resampleToGrid', () => {
     const out = resampleToGrid(g, { ...src, data: new Float32Array([10, -9999, 30, 40]), nodata: -9999 });
     expect(Number.isNaN(out[1])).toBe(true);
     expect(out[0]).toBe(10);
+  });
+});
+
+// ============================================================
+// sampleGridBilinear (terrain lookup under a moving point)
+// ============================================================
+
+describe('sampleGridBilinear', () => {
+  // 2x2 grid over ~[0,1]x[0,1]; cells: row0=[10,20], row1=[30,40]
+  // (col0=west, row0=north). Cell centres sit at lat/lng 0.25 / 0.75.
+  const g = makeGrid(0.5, 0.5, 55660, 55660);
+  const flat = new Float32Array([10, 20, 30, 40]);
+
+  it('returns the exact cell value when sampled at a cell centre', () => {
+    // Use the grid's own cell-centre helpers so the sample lands dead-centre.
+    expect(sampleGridBilinear(g, flat, gridRowToLat(g, 0), gridColToLng(g, 0))).toBeCloseTo(10, 5); // NW
+    expect(sampleGridBilinear(g, flat, gridRowToLat(g, 0), gridColToLng(g, 1))).toBeCloseTo(20, 5); // NE
+    expect(sampleGridBilinear(g, flat, gridRowToLat(g, 1), gridColToLng(g, 0))).toBeCloseTo(30, 5); // SW
+    expect(sampleGridBilinear(g, flat, gridRowToLat(g, 1), gridColToLng(g, 1))).toBeCloseTo(40, 5); // SE
+  });
+
+  it('interpolates between cells (box centre = mean of the four corners)', () => {
+    expect(sampleGridBilinear(g, flat, 0.5, 0.5)).toBeCloseTo(25, 5);
+  });
+
+  it('returns NaN outside the grid bounds', () => {
+    expect(Number.isNaN(sampleGridBilinear(g, flat, 5, 5))).toBe(true);
+    expect(Number.isNaN(sampleGridBilinear(g, flat, -5, -5))).toBe(true);
+  });
+
+  it('falls back to the nearest finite corner when a neighbour is NaN', () => {
+    const holed = new Float32Array([10, 20, 30, NaN]); // SE corner missing
+    // (0.3,0.3) is weighted toward the SW corner (30) and away from the NaN SE.
+    expect(sampleGridBilinear(g, holed, 0.3, 0.3)).toBe(30);
+  });
+
+  it('returns NaN when no input is provided', () => {
+    expect(Number.isNaN(sampleGridBilinear(null, flat, 0.5, 0.5))).toBe(true);
+    expect(Number.isNaN(sampleGridBilinear(g, null, 0.5, 0.5))).toBe(true);
   });
 });

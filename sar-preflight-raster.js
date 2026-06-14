@@ -148,6 +148,46 @@ function latLngToCell(grid, lat, lng) {
 }
 
 // ============================================================
+// Bilinearly sample a flat grid (row-major, cols-wide) at a lat/lng.
+// Used to read terrain elevation directly under a moving point (e.g. an
+// aircraft) so the value varies smoothly instead of snapping per cell.
+// Falls back to the nearest finite corner when some neighbours are NaN
+// (grid edge / nodata); returns NaN only when no usable neighbour exists or
+// the point is outside the grid bounds.
+// ============================================================
+function sampleGridBilinear(grid, flat, lat, lng) {
+  if (!grid || !flat) return NaN;
+  // Continuous cell coordinates (cell centres at integer indices).
+  const fx = (lng - grid.west) / (grid.east - grid.west) * grid.cols - 0.5;
+  const fy = (grid.north - lat) / (grid.north - grid.south) * grid.rows - 0.5;
+  if (fx < -0.5 || fy < -0.5 || fx > grid.cols - 0.5 || fy > grid.rows - 0.5) return NaN;
+  const x0 = Math.floor(fx), y0 = Math.floor(fy);
+  const x1 = x0 + 1, y1 = y0 + 1;
+  const tx = fx - x0, ty = fy - y0;
+  const at = (x, y) => {
+    if (x < 0 || y < 0 || x >= grid.cols || y >= grid.rows) return NaN;
+    return flat[y * grid.cols + x];
+  };
+  const v00 = at(x0, y0), v10 = at(x1, y0), v01 = at(x0, y1), v11 = at(x1, y1);
+  // Fast path: all four corners finite → true bilinear.
+  if (Number.isFinite(v00) && Number.isFinite(v10) && Number.isFinite(v01) && Number.isFinite(v11)) {
+    const top = v00 * (1 - tx) + v10 * tx;
+    const bot = v01 * (1 - tx) + v11 * tx;
+    return top * (1 - ty) + bot * ty;
+  }
+  // Degraded path: nearest finite corner (by bilinear weight).
+  const cands = [
+    { v: v00, w: (1 - tx) * (1 - ty) },
+    { v: v10, w: tx * (1 - ty) },
+    { v: v01, w: (1 - tx) * ty },
+    { v: v11, w: tx * ty },
+  ].filter(c => Number.isFinite(c.v));
+  if (!cands.length) return NaN;
+  cands.sort((a, b) => b.w - a.w);
+  return cands[0].v;
+}
+
+// ============================================================
 // RESAMPLE a georeferenced source raster onto the target grid (nearest-neighbour).
 // src = { data, srcCols, srcRows, srcBounds:{west,south,east,north}, srcIsMercator, nodata }
 // srcIsMercator: pixels are equally spaced in Web Mercator Y (Meta COG tiles);
@@ -342,6 +382,7 @@ if (typeof module !== 'undefined' && module.exports) {
     lngToMercX, latToMercY, mercXToLng, mercYToLat,
     lngLatToTileXY, tileXYToQuadkey, quadkeyToTileXY, tileXYBounds, quadkeyBounds, metaQuadkeysForBBox,
     makeGrid, gridColToLng, gridRowToLat, gridLngToCol, gridLatToRow, latLngToCell,
+    sampleGridBilinear,
     resampleToGrid, buildDSM, sanitizeForKernel,
     curvatureDrop, isVisible, computeViewshed, viewshedCoverage,
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,
