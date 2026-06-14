@@ -1412,6 +1412,23 @@ async function _fetchTfrDetail(base, id) {
 // Live NOTAM retrieval through the data proxy (Cloudflare Worker, /notam route →
 // the FAA NOTAM Search backend). No-op without a proxy. The source is unofficial,
 // so results are advisory; the manual file/paste import remains available.
+// Build the AOI descriptor used to judge NOTAM relevance (proximity to the area).
+function _buildNotamAoi(lat, lng, searchRadiusNm) {
+  let radiusNm = 0;
+  try {
+    if (S.areaBounds && typeof haversine === 'function') {
+      const ne = S.areaBounds.getNorthEast();
+      radiusNm = haversine(lat, lng, ne.lat, ne.lng) / 1.852;
+    }
+  } catch (_) { /* point AOI */ }
+  return {
+    center: { lat, lng },
+    radiusNm,
+    searchRadiusNm: searchRadiusNm || 0,
+    polygon: (typeof currentAreaPolygon === 'function') ? currentAreaPolygon() : null,
+  };
+}
+
 async function fetchNotams(lat, lng, radiusNm) {
   const base = (typeof getCanopyProxyBase === 'function') ? getCanopyProxyBase() : null;
   if (!base || lat == null || lng == null) return;
@@ -1423,7 +1440,12 @@ async function fetchNotams(lat, lng, radiusNm) {
     if (!res.ok) throw new Error('NOTAM HTTP ' + res.status);
     const data = await res.json();
     const parsed = (typeof parseNotamSearchResponse === 'function') ? parseNotamSearchResponse(data) : [];
-    const notams = parsed.map(n => Object.assign({}, n, { _live: true }));
+    const aoi = _buildNotamAoi(lat, lng, r);
+    const notams = parsed.map(n => {
+      const o = Object.assign({}, n, { _live: true });
+      if (typeof classifyNotamForUAS === 'function') o._relevance = classifyNotamForUAS(o, aoi);
+      return o;
+    });
     S.importedNotams = (S.importedNotams || []).filter(n => !n._live); // drop previous live set; keep manual imports
     if (notams.length) mergeNotams(notams);
     renderImportedNotamLayer();
@@ -1692,23 +1714,51 @@ function renderNotamCards() {
   }
   const areaPoly = currentAreaPolygon();
   const now = Date.now();
-  el.innerHTML = S.importedNotams.map(n => {
+  const all = S.importedNotams;
+  const isRel = n => !n._relevance || n._relevance.relevant;
+  const hiddenCount = all.filter(n => !isRel(n)).length;
+  const showAll = !!S.notamShowAll;
+  const shown = showAll ? all : all.filter(isRel);
+
+  let html = '';
+  if (hiddenCount > 0) {
+    html += `<div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:8px;">`
+      + `<span>${shown.length} relevant · ${hiddenCount} filtered (far / high-altitude / not UAS)</span>`
+      + `<a href="#" onclick="toggleNotamShowAll();return false;" style="color:var(--accent-cyan);white-space:nowrap;">${showAll ? 'Hide filtered' : 'Show all'}</a>`
+      + `</div>`;
+  }
+  if (!shown.length) {
+    html += `<div class="notam-body" style="color:var(--text-muted);font-style:italic;">No UAS-relevant NOTAMs in this area. <a href="#" onclick="toggleNotamShowAll();return false;" style="color:var(--accent-cyan);">Show all ${hiddenCount}</a></div>`;
+  }
+  html += shown.map(n => {
     const hasPoly = n.polygons && n.polygons.length;
     const overArea = hasPoly && areaPoly && n.polygons.some(r => polygonsIntersect(r, areaPoly));
-    const active = isTfrActiveNow(n, now);
-    const danger = overArea && active;
-    const times = (n.effectiveStart || n.effectiveEnd) ? `${fmtTfrTime(n.effectiveStart)} → ${fmtTfrTime(n.effectiveEnd)}` : '';
-    const alt = (n.lowerAlt || n.upperAlt) ? `${n.lowerAlt || '?'}–${n.upperAlt || '?'}` : '';
-    const geo = hasPoly ? (overArea ? 'AREA OVER SEARCH' : 'area plotted') : (n.lat != null && n.lng != null ? 'point plotted' : 'no map geom');
-    return `<div class="notam-card clickable ${danger ? 'tfr' : 'notam-style'}" onclick="focusNotam('${(n.id || '').replace(/['"\\]/g, '')}')" title="Click to center the map on this NOTAM">
+    const danger = overArea && isTfrActiveNow(n, now);
+    const filtered = !isRel(n);
+    const summary = (typeof notamPlainSummary === 'function') ? notamPlainSummary(n) : '';
+    const cat = (n._relevance && n._relevance.category) ? n._relevance.category.replace('_', '/') : '';
+    const distTxt = (n._relevance && n._relevance.distanceNm != null) ? `${Math.round(n._relevance.distanceNm)} NM` : '';
+    const raw = (typeof expandNotamText === 'function') ? expandNotamText(n.body || '') : (n.body || '');
+    const idSafe = (n.id || '').replace(/['"\\]/g, '');
+    return `<div class="notam-card clickable ${danger ? 'tfr' : 'notam-style'}"${filtered ? ' style="opacity:0.6;"' : ''} onclick="focusNotam('${idSafe}')" title="Click to center the map on this NOTAM">
       <div class="notam-header">
-        <span class="notam-id">${_esc(n.id || 'NOTAM')}${n.type ? ` • ${_esc(n.type)}` : ''}</span>
-        <span class="notam-type ${danger ? 'tfr-type' : 'notam-type-tag'}">${_esc(n.location || geo)}</span>
+        <span class="notam-id">${_esc(n.id || 'NOTAM')}${cat ? ` • ${_esc(cat)}` : ''}</span>
+        <span class="notam-type ${danger ? 'tfr-type' : 'notam-type-tag'}">${overArea ? 'OVER AREA' : _esc(n.location || distTxt)}</span>
       </div>
-      <div class="notam-body" style="font-family:var(--font-mono);font-size:11px;white-space:pre-wrap;">${_esc((n.body || '').slice(0, 500))}</div>
-      <div class="notam-meta">${alt ? `Alt: ${_esc(alt)} • ` : ''}${times ? `${_esc(times)} • ` : ''}${geo}</div>
+      ${summary ? `<div class="notam-body" style="font-size:12px;line-height:1.4;">${_esc(summary)}</div>` : ''}
+      <details style="margin-top:4px;" onclick="event.stopPropagation()"><summary style="font-size:10px;color:var(--text-muted);cursor:pointer;">Raw NOTAM text</summary>
+        <div class="notam-body" style="font-family:var(--font-mono);font-size:10px;white-space:pre-wrap;color:var(--text-secondary);margin-top:4px;">${_esc(raw.slice(0, 600))}</div>
+      </details>
+      <div class="notam-meta">${danger ? 'ACTIVE over your area • ' : ''}${distTxt ? distTxt + ' from area' : ''}${filtered ? ' • filtered' : ''}</div>
     </div>`;
   }).join('');
+  el.innerHTML = html;
+}
+
+function toggleNotamShowAll() {
+  S.notamShowAll = !S.notamShowAll;
+  renderNotamCards();
+  renderImportedNotamLayer();
 }
 
 function renderImportStatus() {
@@ -1754,7 +1804,9 @@ function renderImportedNotamLayer() {
   if (S.mapLayers.notam_imported) S.mapLayers.notam_imported.clearLayers();
   else S.mapLayers.notam_imported = L.layerGroup();
   const areaPoly = currentAreaPolygon();
+  const showAll = !!S.notamShowAll;
   (S.importedNotams || []).forEach(n => {
+    if (n._relevance && !n._relevance.relevant && !showAll) return; // hide filtered NOTAMs from the map too
     if (n.polygons && n.polygons.length) {
       const overArea = areaPoly ? n.polygons.some(r => polygonsIntersect(r, areaPoly)) : false;
       const color = overArea ? '#ef4444' : '#f59e0b';
@@ -6783,7 +6835,7 @@ if (typeof module !== 'undefined' && module.exports) {
     toDMS, fmtTfrTime, currentAreaPolygon,
     renderDeepLinks, renderTfrCards, renderNotamCards, renderImportStatus,
     renderImportedTfrLayer, renderImportedNotamLayer,
-    importFaaFile, handleFaaFiles, ingestFaaFileText, applyTfrImport,
+    importFaaFile, handleFaaFiles, ingestFaaFileText, applyTfrImport, toggleNotamShowAll,
     mergeTfrs, mergeNotams, afterFaaImport, setupTfrDropzone,
     parsePastedNotams, clearImportedNotams, focusTfr, focusNotam,
     fetchFAAairspace, renderFAAairspaceLayers, fetchProtectedAreas, renderProtectedAreaLayers,

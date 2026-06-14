@@ -1672,7 +1672,7 @@ function parseNotamSearchItem(item) {
   const location = item.facilityDesignator || item.icaoId || item.airportName || '';
   const body = item.traditionalMessage || item.icaoMessage || item.plainLanguageMessage || '';
   const id = item.notamNumber || item.id || (location + ' ' + (item.featureName || '')).trim() || 'NOTAM';
-  return {
+  const n = {
     id: String(id),
     location: String(location),
     type: String(item.keyword || item.featureName || ''),
@@ -1683,6 +1683,23 @@ function parseNotamSearchItem(item) {
     lat, lng, polygons: [],
     source: 'notamSearch',
   };
+  // Enrich from the message text: the FAA backend gives only a point, but the
+  // body often defines the real area ("3NM RADIUS OF <dms>"), altitude band, and
+  // schedule. Reuse the existing NOTAM-text parser to recover those.
+  try {
+    const ext = _parseOneNotam(n.body);
+    if (ext) {
+      if (ext.polygons && ext.polygons.length) {
+        n.polygons = ext.polygons;
+        if (ext.lat != null && ext.lng != null) { n.lat = ext.lat; n.lng = ext.lng; } // real-area center beats the point
+      }
+      if (n.lowerAlt == null && ext.lowerAlt != null) n.lowerAlt = ext.lowerAlt;
+      if (n.upperAlt == null && ext.upperAlt != null) n.upperAlt = ext.upperAlt;
+      if (n.effectiveStart == null && ext.effectiveStart != null) n.effectiveStart = ext.effectiveStart;
+      if (n.effectiveEnd == null && ext.effectiveEnd != null) n.effectiveEnd = ext.effectiveEnd;
+    }
+  } catch (_) { /* keep base fields */ }
+  return n;
 }
 
 function parseNotamSearchResponse(data) {
@@ -1692,6 +1709,284 @@ function parseNotamSearchResponse(data) {
   if (!obj || !Array.isArray(obj.notamList)) return out;
   obj.notamList.forEach(item => { const n = parseNotamSearchItem(item); if (n) out.push(n); });
   return out;
+}
+
+// ============================================================
+// NOTAM readability + UAS relevance (for the live NOTAM feed)
+// ============================================================
+
+// FAA/ICAO NOTAM contraction -> plain English (high-frequency domestic + airport
+// + airspace + obstacle set). Used by expandNotamText. Single-letter and
+// ICAO-field-marker-colliding tokens are intentionally omitted.
+const NOTAM_CONTRACTIONS = {
+  ACT: 'active', ACTV: 'active', ABN: 'abandoned', AVBL: 'available',
+  CLSD: 'closed', CMSND: 'commissioned', DCMSND: 'decommissioned',
+  DEACTVT: 'deactivated', DSPLCD: 'displaced', INOP: 'inoperative',
+  OTS: 'out of service', UNUSBL: 'unusable', USBL: 'usable', WIP: 'work in progress',
+  UNMKD: 'unmarked', UNLGTD: 'unlighted', OPR: 'operate', OPRG: 'operating',
+  OPN: 'open', OBSC: 'obscured', RMVD: 'removed', RPLCD: 'replaced',
+  REL: 'released', REP: 'report', RSTD: 'restricted', SVC: 'service',
+  TEMPO: 'temporary', TEMP: 'temporary', WEF: 'with effect from',
+  UFN: 'until further notice', COND: 'condition', EXC: 'except', EXCP: 'except',
+  MAINT: 'maintenance', CTC: 'contact', CHG: 'change', CNL: 'cancel', CXL: 'cancel',
+  DEP: 'departure', ARR: 'arrival', CTL: 'control', MON: 'monitor', ESTD: 'established',
+  ACFT: 'aircraft', UAS: 'unmanned aircraft system', UA: 'unmanned aircraft',
+  RPA: 'remotely piloted aircraft', HEL: 'helicopter', GLD: 'glider', BLN: 'balloon',
+  PJE: 'parachute jumping exercise', AEROBATIC: 'aerobatic', ARSPC: 'airspace',
+  AIRSPACE: 'airspace', FLT: 'flight', OPS: 'operations', TFC: 'traffic', TFFC: 'traffic',
+  VEH: 'vehicle', PERS: 'personnel', EQPT: 'equipment', LSR: 'laser', FRNG: 'firing',
+  ARPT: 'airport', AD: 'aerodrome', APRX: 'approximately', RWY: 'runway', RY: 'runway',
+  TWY: 'taxiway', TXWY: 'taxiway', APRON: 'apron', RAMP: 'ramp', TWR: 'tower',
+  TDZ: 'touchdown zone', THR: 'threshold', THLD: 'threshold', SWY: 'stopway',
+  CWY: 'clearway', OVRN: 'overrun', HLDG: 'holding', INTXN: 'intersection',
+  PRKG: 'parking', DTHR: 'displaced threshold', AGL: 'above ground level',
+  AMSL: 'above mean sea level', MSL: 'mean sea level', SFC: 'surface', GND: 'ground',
+  ELEV: 'elevation', HGT: 'height', LGT: 'light', LGTD: 'lighted', LGTS: 'lights',
+  HIRL: 'high intensity runway lights', MIRL: 'medium intensity runway lights',
+  LIRL: 'low intensity runway lights', REIL: 'runway end identifier lights',
+  PAPI: 'precision approach path indicator', VASI: 'visual approach slope indicator',
+  ALS: 'approach lighting system', MALSR: 'medium approach lighting w/ runway alignment',
+  RVR: 'runway visual range', PCL: 'pilot controlled lighting',
+  OBST: 'obstacle', OBSTN: 'obstruction', CRANE: 'crane', BLDG: 'building',
+  POLE: 'pole', ANT: 'antenna', STACK: 'stack', HAZ: 'hazard', UNL: 'unlimited',
+  WLDLF: 'wildlife', NAV: 'navigation', NAVAID: 'navigational aid',
+  VORTAC: 'VORTAC', DME: 'distance measuring equipment', TACAN: 'TACAN',
+  NDB: 'nondirectional beacon', ILS: 'instrument landing system', LOC: 'localizer',
+  GP: 'glide path', GS: 'glide slope', LDA: 'localizer directional aid',
+  WAAS: 'wide area augmentation system', GPS: 'GPS', GNSS: 'GNSS', RNAV: 'area navigation',
+  RNP: 'required navigation performance', ATIS: 'automatic terminal information service',
+  AWOS: 'automated weather observing system', ASOS: 'automated surface observing system',
+  COM: 'communications', FREQ: 'frequency', FREQS: 'frequencies',
+  CTAF: 'common traffic advisory frequency', RMK: 'remark', RMKS: 'remarks',
+  APCH: 'approach', APP: 'approach', IAP: 'instrument approach procedure',
+  SID: 'standard instrument departure', STAR: 'standard terminal arrival',
+  ODP: 'obstacle departure procedure', IFR: 'IFR', VFR: 'VFR',
+  MVA: 'minimum vectoring altitude', MEA: 'minimum enroute altitude',
+  FAF: 'final approach fix', MAP: 'missed approach point', IAF: 'initial approach fix',
+  MOA: 'military operations area', TFR: 'temporary flight restriction',
+  ADIZ: 'air defense identification zone', CTR: 'control zone', FIR: 'flight information region',
+  ARTCC: 'air route traffic control center', TRACON: 'terminal radar approach control',
+  ATC: 'air traffic control', CLNC: 'clearance',
+  FL: 'flight level', FT: 'feet', NM: 'nautical miles', SM: 'statute miles',
+  KT: 'knots', KTS: 'knots', DEG: 'degrees', MAG: 'magnetic', RDL: 'radial',
+  PSN: 'position', RAD: 'radius', NE: 'northeast', NW: 'northwest', SE: 'southeast',
+  SW: 'southwest', NNE: 'north-northeast', ENE: 'east-northeast', ESE: 'east-southeast',
+  SSE: 'south-southeast', SSW: 'south-southwest', WSW: 'west-southwest',
+  WNW: 'west-northwest', NNW: 'north-northwest', BTN: 'between', WI: 'within',
+  VCY: 'vicinity', ADJ: 'adjacent', ABV: 'above', BLW: 'below', BYD: 'beyond',
+  OVR: 'over', THRU: 'through', DLY: 'daily', H24: '24 hours', HR: 'hour', HRS: 'hours',
+  SR: 'sunrise', SS: 'sunset', UTC: 'UTC', LCL: 'local', PERM: 'permanent',
+  EST: 'estimated', DURG: 'during', WX: 'weather', TS: 'thunderstorm', VIS: 'visibility',
+  WND: 'wind', AUTH: 'authorized', UNAUTH: 'unauthorized', CONT: 'continuous',
+  DIST: 'distance', EFF: 'effective', GA: 'general aviation', MIL: 'military',
+  CIV: 'civil', NR: 'number', PPR: 'prior permission required', REQ: 'request',
+  TKOF: 'takeoff', LDG: 'landing', PROC: 'procedure',
+};
+
+// Expand contractions in a NOTAM body for display, protecting coordinates,
+// runway identifiers, frequencies, flight levels, ids and date groups.
+function expandNotamText(body) {
+  if (typeof body !== 'string' || !body.trim()) return '';
+  const masks = [];
+  const stash = (re) => { body = body.replace(re, (m) => { const t = '\x00' + masks.length + '\x00'; masks.push(m); return t; }); };
+  stash(/\d{6}(?:\.\d+)?[NS]\s*\d{7}(?:\.\d+)?[EW]/g);                 // DMS pair
+  stash(/\b(?:RWY|RY|TWY|TXWY)\s*\d{1,2}[LRC]?(?:\/\d{1,2}[LRC]?)?/gi); // RWY 09L/27R
+  stash(/\b[A-Z]\d{4}\/\d{2}\b/g);                                     // NOTAM id
+  stash(/!\s*[A-Z]{3,4}\b/g);                                          // !OAK header tag
+  stash(/\b\d{10}(?:-\d{10})?\b/g);                                    // date groups
+  stash(/\bFL\d{2,3}\b/g);                                             // flight levels
+  stash(/\b\d{3}\.\d{1,3}\b/g);                                        // frequencies
+  stash(/-?\d{1,3}\.\d+[NSEW]?/g);                                     // decimal coords
+  const keys = Object.keys(NOTAM_CONTRACTIONS).sort((a, b) => b.length - a.length);
+  const re = new RegExp('\\b(' + keys.join('|') + ')\\b', 'g');
+  body = body.replace(re, (t) => NOTAM_CONTRACTIONS[t] || t);
+  body = body.replace(/\x00(\d+)\x00/g, (_, i) => masks[+i]);
+  return body.replace(/[ \t]{2,}/g, ' ').trim();
+}
+
+function toDmsDisplay(lat, lng) {
+  const d = (v, pos, neg, deg) => {
+    const hemi = v < 0 ? neg : pos; v = Math.abs(v);
+    const D = Math.floor(v), mF = (v - D) * 60; let M = Math.floor(mF), S = Math.round((mF - M) * 60);
+    if (S === 60) { S = 0; M += 1; }
+    return `${String(D).padStart(deg, '0')}°${String(M).padStart(2, '0')}'${String(S).padStart(2, '0')}"${hemi}`;
+  };
+  return `${d(lat, 'N', 'S', 2)} ${d(lng, 'E', 'W', 3)}`;
+}
+
+function fmtNotamDate(iso, withYear) {
+  if (!iso) return null;
+  if (iso === 'PERM') return 'permanent';
+  const t = Date.parse(iso); if (isNaN(t)) return null;
+  return new Date(t).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: withYear ? 'numeric' : undefined, timeZone: 'UTC' });
+}
+
+function fmtAlt(a) {
+  if (a == null) return null;
+  const s = String(a).toUpperCase().replace(/\s+/g, '');
+  if (/^(SFC|GND)/.test(s)) return 'surface';
+  if (/^UNL/.test(s)) return 'unlimited';
+  let m = s.match(/^FL(\d{2,3})/); if (m) return `${(+m[1] * 100).toLocaleString()} ft (FL${m[1]})`;
+  m = s.match(/^(\d{2,6})FT/) || s.match(/^(\d{2,6})$/);
+  if (m) return `${(+m[1]).toLocaleString()} ft`;
+  return null;
+}
+
+const NOTAM_SUBJECTS = {
+  AIRSPACE: 'Airspace activity', OBSTACLE: 'Obstacle', GPS: 'GPS/GNSS or surveillance issue',
+  HAZARD_ACTIVITY: 'Low-altitude hazard activity', TFR: 'Flight restriction', UAS: 'UAS operations',
+  AERODROME: 'Aerodrome notice', RUNWAY_TWY: 'Runway/taxiway notice', PROCEDURE: 'Instrument procedure notice',
+  NAVAID: 'Navaid notice', COM: 'Communications notice', SERVICE: 'Airport service notice',
+  OTHER: 'NOTAM', UNKNOWN: 'NOTAM',
+};
+
+function ringRadiusNm(center, ring) {
+  if (!center || !Array.isArray(ring) || ring.length < 3) return 0;
+  let sum = 0;
+  for (const v of ring) sum += haversine(center[0], center[1], v[0], v[1]);
+  return (sum / ring.length) / 1.852;
+}
+
+// A single readable sentence describing a NOTAM, built from parsed fields.
+function notamPlainSummary(notam) {
+  if (!notam) return '';
+  const body = String(notam.body || '');
+  const category = (notam._relevance && notam._relevance.category) || classifyNotamForUAS(notam, null).category;
+  let subject = NOTAM_SUBJECTS[category] || 'NOTAM';
+  // Enrich AIRSPACE/HAZARD subject with the activity phrase from the body.
+  if (category === 'AIRSPACE' || category === 'HAZARD_ACTIVITY' || category === 'OBSTACLE') {
+    // Strip "!FAC id ARTCC KEYWORD " then grab the 1-2 word activity phrase.
+    const lead = body.replace(/^!\s*[A-Z]{3,4}\s+\S+\s+[A-Z]{3,4}\s+[A-Z]+\s+/, '').match(/^([A-Z][A-Z\/]+(?:\s+[A-Z][A-Z\/]+){0,1})/);
+    if (lead) { const e = expandNotamText(lead[1]); if (e && e.length <= 42) subject = e.charAt(0).toUpperCase() + e.slice(1); }
+  }
+  // geometry
+  let geo = '';
+  if (notam.lat != null && notam.lng != null && !isNaN(notam.lat) && !isNaN(notam.lng)) {
+    const dms = toDmsDisplay(notam.lat, notam.lng);
+    const r = ringRadiusNm([notam.lat, notam.lng], notam.polygons && notam.polygons[0]);
+    const rel = body.match(/\(([\d.]+)\s*NM\s+([NSEW]{1,3})\s+(?:OF\s+)?([A-Z0-9]{3,4})\)/i);
+    const relTxt = rel ? ` (${rel[1]} NM ${rel[2].toUpperCase()} of ${rel[3].toUpperCase()})` : '';
+    if (r > 0.3) geo = `within ${Math.round(r * 10) / 10} NM of ${dms}${relTxt}`;
+    else if (notam.polygons && notam.polygons.length) geo = `over an area near ${dms}${relTxt}`;
+    else geo = `near ${dms}${relTxt}`;
+  }
+  // altitude
+  const lo = fmtAlt(notam.lowerAlt), hi = fmtAlt(notam.upperAlt);
+  let alt = '';
+  if (lo && hi) alt = lo === hi ? `at ${hi}` : `${lo} to ${hi}`;
+  else if (hi) alt = `below ${hi}`;
+  else if (lo) alt = `above ${lo}`;
+  // schedule (time-of-day)
+  let sched = '';
+  const sm = body.match(/\bDLY\s+(\d{4})-(\d{4})\b/) || body.match(/\b(\d{4})-(\d{4})\b(?!\d)/);
+  if (sm) sched = `${/\bDLY\b/.test(body) ? 'daily ' : ''}${sm[1]}-${sm[2]}Z`;
+  // effective window
+  const sY = (notam.effectiveStart || '').slice(0, 4), eY = (notam.effectiveEnd || '').slice(0, 4);
+  const sameYr = sY && eY && sY === eY;
+  const s = fmtNotamDate(notam.effectiveStart, !sameYr || !notam.effectiveEnd);
+  const e = notam.effectiveEnd ? fmtNotamDate(notam.effectiveEnd, true) : null;
+  let eff = '';
+  if (s && e) eff = `${s} – ${e}`;
+  else if (s) eff = `from ${s}`;
+
+  const head = [subject, geo].filter(Boolean).join(' ');
+  const tail = [alt, sched].filter(Boolean).join(', ');
+  let out = head + (tail ? ', ' + tail : '');
+  if (eff) out += ` (${eff})`;
+  return (out || 'NOTAM').replace(/\s+,/g, ',').trim().replace(/\.*$/, '') + '.';
+}
+
+// --- UAS relevance classifier (safety-reviewed: errs toward KEEP) ---
+const NOTAM_ALT_FLOOR_THRESH_FT = 1500;
+// Category relevance for a SFC-400ft drone. 'launch' = only if at the launch area.
+const NOTAM_CATEGORY_RELEVANT = {
+  AIRSPACE: true, TFR: true, UAS: true, OBSTACLE: true, GPS: true, HAZARD_ACTIVITY: true,
+  AERODROME: 'launch', RUNWAY_TWY: 'launch',
+  PROCEDURE: false, NAVAID: false, COM: false, SERVICE: false,
+  OTHER: true, UNKNOWN: true,
+};
+
+function _notamFloorFt(v) {
+  if (v == null) return null;
+  if (typeof v === 'number') return isFinite(v) ? v : null;
+  const s = String(v).toUpperCase().replace(/\s+/g, '');
+  if (!s) return null;
+  if (/^(SFC|GND)/.test(s)) return 0;
+  if (/^UNL/.test(s)) return null;
+  const fl = s.match(/^FL(\d{2,3})/); if (fl) return parseInt(fl[1], 10) * 100;
+  const ft = s.match(/^(\d{1,5})FT/) || s.match(/^(\d{1,5})$/); if (ft) return parseInt(ft[1], 10);
+  return null;
+}
+
+// Categorize a NOTAM. Body-signal detection runs FIRST and is authoritative so a
+// mis-keyworded surface hazard can never be filed into a "not relevant" bucket.
+function notamCategory(notam) {
+  const body = String((notam && (notam.body || notam.icaoMessage)) || '').toUpperCase();
+  const kw = String((notam && notam.type) || '').toUpperCase();
+  if (/\bTFR\b|TEMPORARY FLIGHT RESTRICT|SECURITY INSTRUCTION|STADIUM|PROHIBITED AREA|NO\s*S?UAS|NO\s*DRONE|UAS\s*PROHIBIT/.test(body)) return 'TFR';
+  if (/\bUAS\b|UNMANNED|\bDRONE\b|\bSUAS\b/.test(body)) return 'UAS';
+  if (/\bGPS\b|\bGNSS\b|\bRAIM\b|WAAS|JAMMING|INTERFERENCE|ADS-?B|MODE\s?C|TRANSPONDER|TIS-?B|FIS-?B/.test(body)) return 'GPS';
+  if (/PARACHUTE|\bPJE\b|\bJUMP|A[EC]ROBATIC|\bLASER\b|AIR\s?SHOW|\bGLIDER\b|BALLOON|FIREWORK|PYROTECHNIC|HANG\s?GLID/.test(body)) return 'HAZARD_ACTIVITY';
+  if (/\bCRANE\b|\bOBST\b|OBSTRUCT|ANTENNA|WIND\s?TURBINE|\bTOWER\b(?!\s+CLSD)/.test(body)) return 'OBSTACLE';
+  if (/AIRSPACE/.test(kw)) return 'AIRSPACE';
+  if (/OBST/.test(kw)) return 'OBSTACLE';
+  if (/\bUAS\b|UNMANNED|^U$/.test(kw)) return 'UAS';
+  if (/GPS|GNSS/.test(kw)) return 'GPS';
+  if (/TFR|SECURITY|VIP/.test(kw)) return 'TFR';
+  if (/IAP|SID|STAR|ODP|PROCEDURE|RNAV|AIRWAY|ROUTE/.test(kw)) return 'PROCEDURE';
+  if (/ILS|VOR|DME|TACAN|NDB|NAVAID|\bNAV\b|LOC/.test(kw)) return 'NAVAID';
+  if (/COM|FREQ|RADIO/.test(kw)) return 'COM';
+  if (/RWY|RUNWAY|TWY|TAXIWAY/.test(kw)) return 'RUNWAY_TWY';
+  if (/AERODROME|APRON|RAMP|\bAD\b/.test(kw)) return 'AERODROME';
+  if (/SVC|SERVICE|FUEL|RVR/.test(kw)) return 'SERVICE';
+  return 'UNKNOWN';
+}
+
+// Decide whether a NOTAM is relevant to a SFC-400ft UAS operating in the AOI.
+// aoi = { center:{lat,lng}, radiusNm, polygon:[[lat,lng]...], searchRadiusNm } or null.
+function classifyNotamForUAS(notam, aoi) {
+  try {
+    const category = notamCategory(notam);
+    let kwRel = NOTAM_CATEGORY_RELEVANT[category];
+    if (kwRel === undefined) kwRel = true;
+    const reasons = [];
+
+    // Distance — only from real coordinates; missing geometry => keep.
+    let distanceNm = null, tooFar = false;
+    if (notam && notam.lat != null && notam.lng != null && !isNaN(notam.lat) && !isNaN(notam.lng) && aoi && aoi.center) {
+      const notamRadNm = (notam.polygons && notam.polygons[0]) ? ringRadiusNm([notam.lat, notam.lng], notam.polygons[0]) : 0;
+      let overlap = false;
+      if (notam.polygons && notam.polygons.length && aoi.polygon && aoi.polygon.length >= 3) {
+        overlap = notam.polygons.some(r => r && r.length >= 3 && polygonsIntersect(r, aoi.polygon));
+      }
+      if (overlap) distanceNm = 0;
+      else {
+        const cd = haversine(aoi.center.lat, aoi.center.lng, notam.lat, notam.lng) / 1.852;
+        distanceNm = Math.max(0, cd - (aoi.radiusNm || 0) - notamRadNm);
+      }
+      const buffer = Math.max(aoi.radiusNm || 0, aoi.searchRadiusNm || 0) + notamRadNm + 5;
+      if (distanceNm > buffer) { tooFar = true; reasons.push(`${Math.round(distanceNm)} NM from your area`); }
+    }
+
+    // Altitude — only ever hides enroute PROCEDURE/NAVAID with a high floor.
+    let tooHigh = false;
+    if (category === 'PROCEDURE' || category === 'NAVAID') {
+      const floor = _notamFloorFt(notam.lowerAlt);
+      if (floor != null && floor > NOTAM_ALT_FLOOR_THRESH_FT) tooHigh = true;
+    }
+
+    // Conditional categories: keep only if at the launch area (unknown distance => keep).
+    if (kwRel === 'launch') {
+      const atLaunch = (distanceNm === null) ? true : distanceNm <= Math.max((aoi && aoi.radiusNm) || 0, 1);
+      kwRel = atLaunch;
+      if (!atLaunch) reasons.push('runway/aerodrome notice away from your area');
+    }
+    if (kwRel === false) reasons.push(NOTAM_SUBJECTS[category] + ' — not relevant to low-altitude UAS');
+
+    return { relevant: !!kwRel && !tooFar && !tooHigh, category, distanceNm, tooFar, tooHigh, reasons };
+  } catch (_) {
+    return { relevant: true, category: 'UNKNOWN', distanceNm: null, tooFar: false, tooHigh: false, reasons: [] };
+  }
 }
 
 // --- CJS export for Node/Vitest ---
@@ -1717,6 +2012,9 @@ if (typeof module !== 'undefined' && module.exports) {
     parseTfrGeoJson, parseTfrList, normalizeTfrDetailDoc, parseTfrDetailXml,
     filterTfrsIntersectingArea, isTfrActiveNow, parseNotamText, geolocateNotam,
     parseNotamSearchResponse, parseNotamSearchItem,
+    NOTAM_CONTRACTIONS, expandNotamText, toDmsDisplay, fmtNotamDate, fmtAlt,
+    NOTAM_SUBJECTS, ringRadiusNm, notamPlainSummary,
+    notamCategory, classifyNotamForUAS, NOTAM_CATEGORY_RELEVANT,
     ARTCC_REF, ARTCC_BOUNDS, artccForPoint, artccsForArea,
   };
 }
