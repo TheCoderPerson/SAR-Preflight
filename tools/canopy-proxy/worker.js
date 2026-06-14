@@ -28,6 +28,14 @@ const NOTAM_HOME = 'https://notams.aim.faa.gov/notamSearch/';
 const NOTAM_SEARCH = 'https://notams.aim.faa.gov/notamSearch/search';
 const UA = 'Mozilla/5.0 (compatible; SAR-Preflight/1.0)';
 
+// Live ADS-B traffic — the public providers increasingly block browser CORS, so
+// the /adsb route fetches them server-side (first success wins) and adds CORS.
+const ADSB_UPSTREAMS = [
+  { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
+  { name: 'airplanes.live', url: (lat, lon, dist) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${dist}` },
+  { name: 'adsb.lol',       url: (lat, lon, dist) => `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
+];
+
 // Path-prefix routes (checked before the canopy default). TFR is safety-critical
 // and time-sensitive, so it is cached for only a few seconds.
 const ROUTES = [
@@ -83,6 +91,9 @@ export default {
     const reqUrl = new URL(req.url);
     if (reqUrl.pathname === '/notam' || reqUrl.pathname === '/notam/') {
       return handleNotam(reqUrl, allow);
+    }
+    if (reqUrl.pathname === '/adsb' || reqUrl.pathname === '/adsb/') {
+      return handleAdsb(reqUrl, allow);
     }
 
     const route = resolveTarget(reqUrl);
@@ -211,4 +222,30 @@ async function handleNotam(url, allow) {
   }
 
   return jsonResponse({ notamList: all, totalNotamCount: total, countsByType }, 200, allow);
+}
+
+// ---- ADS-B: first provider that responds wins; pass its JSON through ----
+async function handleAdsb(url, allow) {
+  const lat = url.searchParams.get('lat');
+  const lon = url.searchParams.get('lon');
+  let dist = parseInt(url.searchParams.get('dist') || '0', 10);
+  if (!isFinite(parseFloat(lat)) || !isFinite(parseFloat(lon)) || !dist) {
+    return jsonResponse({ error: 'lat, lon, dist required', ac: [] }, 400, allow);
+  }
+  if (dist > 250) dist = 250; // provider cap
+
+  for (const up of ADSB_UPSTREAMS) {
+    try {
+      const r = await fetch(up.url(lat, lon, dist), { headers: { 'User-Agent': UA } });
+      if (!r.ok) continue;
+      const body = await r.text();
+      const h = Object.assign(
+        { 'Content-Type': 'application/json', 'X-Adsb-Source': up.name },
+        corsHeaders(allow),
+      );
+      h['Access-Control-Expose-Headers'] = 'X-Adsb-Source'; // let the app read which provider served
+      return new Response(body, { status: 200, headers: h }); // real-time data: no edge cache
+    } catch (_) { /* try next provider */ }
+  }
+  return jsonResponse({ error: 'all ADS-B providers failed', ac: [] }, 502, allow);
 }

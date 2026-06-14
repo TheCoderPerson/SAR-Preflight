@@ -12,6 +12,10 @@ A small CORS+Range proxy so the browser-only app can read CORS-blocked sources:
    `/notam?lat=&lng=&radius=` route does the session-cookie + full-form-params +
    pagination dance server-side and returns aggregated JSON. **Unofficial/undocumented
    endpoint — advisory only.**
+4. **Live ADS-B traffic** — the public providers (adsb.fi / airplanes.live / adsb.lol)
+   increasingly block browser CORS. The `/adsb?lat=&lon=&dist=` route fetches them
+   server-side (first success wins), passes the JSON through, and adds CORS (real-time,
+   uncached). The served provider is reported in the `X-Adsb-Source` response header.
 
 It only ever forwards those upstreams (it is not a general open proxy; `..` is
 rejected), and it enforces an Origin allowlist (below).

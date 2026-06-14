@@ -63,7 +63,7 @@ All data is fetched from free, public APIs. No API keys are required.
 | Dams | [HIFLD](https://hifld-geoplatform.opendata.arcgis.com/) via ArcGIS | Static |
 | Wilderness areas | [USFS](https://services1.arcgis.com/) via ArcGIS | Static |
 | National parks | [NPS](https://services1.arcgis.com/) via ArcGIS | Static |
-| Live ADS-B aircraft traffic (with 15-min trails) | [adsb.fi](https://adsb.fi/), [airplanes.live](https://airplanes.live/), [adsb.lol](https://www.adsb.lol/) (fallback chain) | 5 sec polling |
+| Live ADS-B aircraft traffic (with 15-min trails) | [adsb.fi](https://adsb.fi/), [airplanes.live](https://airplanes.live/), [adsb.lol](https://www.adsb.lol/) (fallback chain; routed through the data proxy's `/adsb` route when configured, since these providers increasingly block browser CORS) | 5 sec polling |
 | Magnetic declination | Approximate WMM 2025 model | Static |
 | Density altitude | Calculated from station pressure and temperature | Real-time |
 | Battery derating | Calculated from temperature, altitude, wind | Real-time |

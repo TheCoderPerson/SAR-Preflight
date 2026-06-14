@@ -3380,6 +3380,20 @@ function updateRadarTime() {
 // ADS-B LIVE TRAFFIC
 // ============================================================
 
+// Ordered ADS-B fetch attempts: the data proxy first (direct providers are
+// increasingly CORS-blocked from a browser), then the direct providers as
+// fallback. Pure/testable.
+function _adsbAttemptUrls(lat, lon, dist) {
+  const list = [];
+  const proxyBase = (typeof getCanopyProxyBase === 'function') ? getCanopyProxyBase() : null;
+  if (proxyBase) list.push({ name: 'proxy', url: `${proxyBase}/adsb?lat=${lat}&lon=${lon}&dist=${dist}`, proxy: true });
+  for (let i = 0; i < ADSB_APIS.length; i++) {
+    const idx = (S._adsbApiIndex + i) % ADSB_APIS.length;
+    list.push({ name: ADSB_APIS[idx].name, url: ADSB_APIS[idx].url(lat, lon, dist), idx });
+  }
+  return list;
+}
+
 async function fetchAdsb() {
   if (!S.areaCenter || !S.adsbSearchRadiusNm) return;
   trackFetchStart('ADS-B');
@@ -3391,19 +3405,17 @@ async function fetchAdsb() {
     let json = null;
     let lastErr = null;
     let usedApi = null;
-    for (let attempt = 0; attempt < ADSB_APIS.length; attempt++) {
-      const idx = (S._adsbApiIndex + attempt) % ADSB_APIS.length;
-      const api = ADSB_APIS[idx];
+    for (const a of _adsbAttemptUrls(lat, lon, dist)) {
       try {
-        const res = await fetch(api.url(lat, lon, dist));
+        const res = await fetch(a.url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         json = await res.json();
-        S._adsbApiIndex = idx;
-        usedApi = api.name;
+        if (a.idx != null) S._adsbApiIndex = a.idx;
+        usedApi = a.proxy ? ('proxy (' + (res.headers && res.headers.get && res.headers.get('X-Adsb-Source') || '?') + ')') : a.name;
         break;
       } catch (e) {
         lastErr = e;
-        console.warn(`ADS-B ${api.name} failed:`, e.message);
+        console.warn(`ADS-B ${a.name} failed:`, e.message);
       }
     }
     if (!json) throw lastErr || new Error('All ADS-B APIs failed');
@@ -6789,7 +6801,7 @@ if (typeof module !== 'undefined' && module.exports) {
     enterTrainingMode, exitTrainingMode, populateTrainingScenarios,
     showAuditTrail, closeAuditTrailModal, exportAuditTrailAsCSV, clearAuditTrailUI,
     // ADS-B
-    ADSB_APIS, fetchAdsb, updateAdsbTrails, renderAdsbMap, renderAdsbTab,
+    ADSB_APIS, fetchAdsb, _adsbAttemptUrls, updateAdsbTrails, renderAdsbMap, renderAdsbTab,
     startAdsbPolling, stopAdsbPolling, toggleAdsbPolling, adsbAglColor,
   };
 }
