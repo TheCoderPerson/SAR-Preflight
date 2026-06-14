@@ -1454,9 +1454,10 @@ function _parseOneNotam(block) {
     const lng = parseFaaCoord(cm[3] + cm[4]);
     if (!isNaN(lat) && !isNaN(lng)) verts.push([lat, lng]);
   }
-  // Circle: "5NM RADIUS OF <coord>" or "WI 5NM OF <coord>"
-  const circ = block.match(/(\d+(?:\.\d+)?)\s*NM\s+RADIUS\s+OF\s+(\d{6}(?:\.\d+)?)([NS])\s*(\d{7}(?:\.\d+)?)([EW])/i)
-            || block.match(/\bWI\s+(\d+(?:\.\d+)?)\s*NM\s+OF\s+(\d{6}(?:\.\d+)?)([NS])\s*(\d{7}(?:\.\d+)?)([EW])/i);
+  // Circle: "5NM RADIUS OF <coord>" or "WI 5NM OF <coord>". The radius pattern is
+  // \d*\.?\d+ so a leading-decimal radius like ".25NM" is captured as 0.25, not 25.
+  const circ = block.match(/(\d*\.?\d+)\s*NM\s+RADIUS\s+OF\s+(\d{6}(?:\.\d+)?)([NS])\s*(\d{7}(?:\.\d+)?)([EW])/i)
+            || block.match(/\bWI\s+(\d*\.?\d+)\s*NM\s+OF\s+(\d{6}(?:\.\d+)?)([NS])\s*(\d{7}(?:\.\d+)?)([EW])/i);
   if (circ) {
     const radNm = parseFloat(circ[1]);
     const clat = parseFaaCoord(circ[2] + circ[3]);
@@ -1866,7 +1867,7 @@ function notamPlainSummary(notam) {
     const r = ringRadiusNm([notam.lat, notam.lng], notam.polygons && notam.polygons[0]);
     const rel = body.match(/\(([\d.]+)\s*NM\s+([NSEW]{1,3})\s+(?:OF\s+)?([A-Z0-9]{3,4})\)/i);
     const relTxt = rel ? ` (${rel[1]} NM ${rel[2].toUpperCase()} of ${rel[3].toUpperCase()})` : '';
-    if (r > 0.3) geo = `within ${Math.round(r * 10) / 10} NM of ${dms}${relTxt}`;
+    if (r > 0.02) { const rr = r < 1 ? Math.round(r * 100) / 100 : Math.round(r * 10) / 10; geo = `within ${rr} NM of ${dms}${relTxt}`; }
     else if (notam.polygons && notam.polygons.length) geo = `over an area near ${dms}${relTxt}`;
     else geo = `near ${dms}${relTxt}`;
   }

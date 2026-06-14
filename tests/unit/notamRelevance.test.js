@@ -23,6 +23,27 @@ describe('parseNotamSearchItem enrichment from the message body', () => {
   });
 });
 
+describe('leading-decimal radius (.25NM must be 0.25 NM, not 25)', () => {
+  const MHR = {
+    notamNumber: '06/007', facilityDesignator: 'MHR', keyword: 'AIRSPACE',
+    traditionalMessage: '!MHR 06/007 MHR AIRSPACE NUMEROUS UAS WI AN AREA DEFINED AS .25NM RADIUS OF 382927N1211649W (4.6NM SE MHR) SFC-400FT AGL DLY 1500-2300 2606131500-2606142300',
+    startDate: '06/13/2026 1500', endDate: '06/14/2026 2300', mapPointer: 'POINT(-121.2803 38.4908)',
+  };
+  it('builds a ~0.25 NM circle, not a 25 NM one', () => {
+    const { ringRadiusNm } = require('../../sar-preflight-core.js');
+    const n = parseNotamSearchItem(MHR);
+    expect(n.polygons.length).toBe(1);
+    const r = ringRadiusNm([n.lat, n.lng], n.polygons[0]);
+    expect(r).toBeGreaterThan(0.2);
+    expect(r).toBeLessThan(0.35);   // would be ~25 with the bug
+  });
+  it('summary shows the small radius and keeps the UAS NOTAM', () => {
+    const n = parseNotamSearchItem(MHR);
+    expect(n._relevance ? n._relevance.category : notamCategory(n)).toBe('UAS');
+    expect(notamPlainSummary(n)).toContain('within 0.25 NM');
+  });
+});
+
 describe('notamCategory (body-signal authoritative)', () => {
   const cat = (body, keyword) => notamCategory({ body, type: keyword || '' });
   it('classifies surface hazards by body even if keyworded otherwise', () => {
