@@ -104,11 +104,13 @@ export default {
     const upHeaders = { 'User-Agent': 'Mozilla/5.0 (compatible; SAR-Preflight/1.0)' };
     const range = req.headers.get('Range');
     if (range) upHeaders.Range = range;
-    const up = await fetch(route.target, {
-      method: req.method,
-      headers: upHeaders,
-      cf: { cacheEverything: true, cacheTtl: route.cacheTtl },
-    });
+    // IMPORTANT: do NOT force-cache Range requests. With cacheEverything, Cloudflare
+    // tries to pull the FULL object into cache to satisfy a range — on the 300 MB+
+    // canopy COGs that times out and returns 500 on cold fetches. Range reads are
+    // proxied uncached (the app caches the processed raster in IndexedDB anyway);
+    // only whole-object GETs (tiles.geojson, TFR/XML) use the edge cache.
+    const cf = range ? { cacheEverything: false } : { cacheEverything: true, cacheTtl: route.cacheTtl };
+    const up = await fetch(route.target, { method: req.method, headers: upHeaders, cf });
 
     const h = new Headers(up.headers);
     h.set('Access-Control-Allow-Origin', allow);
