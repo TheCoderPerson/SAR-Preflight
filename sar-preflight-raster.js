@@ -456,6 +456,101 @@ function encodeGeoTiffRGBA(rgba, width, height, bounds) {
   return buf;
 }
 
+// ESRI world file (.tfw) for a north-up EPSG:4326 raster + matching .prj WKT —
+// sidecars some tools use when they don't read the embedded GeoTIFF georeferencing.
+function worldFileForBounds(bounds, width, height) {
+  const sx = (bounds.east - bounds.west) / width;
+  const sy = (bounds.north - bounds.south) / height;
+  const fmt = (v) => (Math.abs(v) < 1e-13 ? '0' : v.toFixed(12));
+  return [
+    fmt(sx),                    // A: pixel size in X
+    '0',                        // D
+    '0',                        // B
+    fmt(-sy),                   // E: pixel size in Y (negative — north up)
+    fmt(bounds.west + sx / 2),  // C: X of centre of top-left pixel
+    fmt(bounds.north - sy / 2), // F: Y of centre of top-left pixel
+  ].join('\n') + '\n';
+}
+const WGS84_WKT = 'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],' +
+  'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433],AUTHORITY["EPSG","4326"]]';
+
+// --- Minimal store-only ZIP (for KMZ) ---
+const _CRC_TABLE = (function () {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(buf) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) crc = (crc >>> 8) ^ _CRC_TABLE[(crc ^ buf[i]) & 0xFF];
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+// entries: [{ name, data: Uint8Array }]. Returns a Uint8Array of the ZIP (stored, no
+// compression) — enough for KMZ (doc.kml + image). DOS time/date are fixed (no clock).
+function zipStore(entries) {
+  const enc = (s) => { const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i) & 0xFF; return a; };
+  const locals = [];
+  const central = [];
+  let offset = 0;
+  for (const e of entries) {
+    const nameBytes = enc(e.name);
+    const data = e.data;
+    const crc = crc32(data);
+    const lh = new Uint8Array(30 + nameBytes.length);
+    const lv = new DataView(lh.buffer);
+    lv.setUint32(0, 0x04034b50, true);   // local file header sig
+    lv.setUint16(4, 20, true);           // version needed
+    lv.setUint16(6, 0, true);            // flags
+    lv.setUint16(8, 0, true);            // method = store
+    lv.setUint16(10, 0, true);           // mod time
+    lv.setUint16(12, 0x21, true);        // mod date (1980-01-01)
+    lv.setUint32(14, crc, true);
+    lv.setUint32(18, data.length, true); // compressed size
+    lv.setUint32(22, data.length, true); // uncompressed size
+    lv.setUint16(26, nameBytes.length, true);
+    lv.setUint16(28, 0, true);           // extra len
+    lh.set(nameBytes, 30);
+    locals.push(lh, data);
+
+    const ch = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(ch.buffer);
+    cv.setUint32(0, 0x02014b50, true);   // central dir sig
+    cv.setUint16(4, 20, true);           // version made by
+    cv.setUint16(6, 20, true);           // version needed
+    cv.setUint16(8, 0, true);
+    cv.setUint16(10, 0, true);
+    cv.setUint16(12, 0, true);
+    cv.setUint16(14, 0x21, true);
+    cv.setUint32(16, crc, true);
+    cv.setUint32(20, data.length, true);
+    cv.setUint32(24, data.length, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint32(42, offset, true);      // local header offset
+    ch.set(nameBytes, 46);
+    central.push(ch);
+
+    offset += lh.length + data.length;
+  }
+  const centralSize = central.reduce((s, c) => s + c.length, 0);
+  const eocd = new Uint8Array(22);
+  const ev = new DataView(eocd.buffer);
+  ev.setUint32(0, 0x06054b50, true);     // EOCD sig
+  ev.setUint16(8, entries.length, true);
+  ev.setUint16(10, entries.length, true);
+  ev.setUint32(12, centralSize, true);
+  ev.setUint32(16, offset, true);        // central dir offset
+  const parts = locals.concat(central, [eocd]);
+  const total = parts.reduce((s, p) => s + p.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -469,6 +564,6 @@ if (typeof module !== 'undefined' && module.exports) {
     resampleToGrid, buildDSM, sanitizeForKernel,
     curvatureDrop, isVisible, computeViewshed, viewshedCoverage,
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,
-    encodeGeoTiffRGBA,
+    encodeGeoTiffRGBA, worldFileForBounds, WGS84_WKT, crc32, zipStore,
   };
 }

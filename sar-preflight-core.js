@@ -2017,6 +2017,24 @@ function kmlCdata(html) {
   return '<![CDATA[' + String(html == null ? '' : html).replace(/\]\]>/g, ']]]]><![CDATA[>') + ']]>';
 }
 
+// Flatten HTML (popup markup) to readable plain text — block/break tags become
+// newlines, list items get a bullet, remaining tags are stripped and entities
+// decoded. Used so KML descriptions read as plain text (e.g. in CalTopo notes)
+// instead of raw markup.
+function htmlToPlainText(html) {
+  if (html == null) return '';
+  let s = String(html);
+  s = s.replace(/<\s*br\s*\/?>/gi, '\n');
+  s = s.replace(/<\s*li[^>]*>/gi, '• ');
+  s = s.replace(/<\s*(p|div|tr|h[1-6]|table|section)[^>]*>/gi, '\n');   // opening block tags
+  s = s.replace(/<\/\s*(p|div|tr|li|h[1-6]|ul|ol|table|section)\s*>/gi, '\n'); // closing block tags
+  s = s.replace(/<[^>]+>/g, '');                       // strip remaining tags
+  s = s.replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<')
+       .replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#0*39;|&apos;/gi, "'");
+  s = s.replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)));
+  return s.replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 function _kmlCoord(lng, lat, alt) {
   return `${(+lng).toFixed(6)},${(+lat).toFixed(6)},${alt || 0}`;
 }
@@ -2081,20 +2099,24 @@ function kmlDocument(name, styles, folders, description) {
 }
 
 // Shared <Style> blocks. Colors are KML AABBGGRR (app palette). Every style covers
-// icon + line + poly so any geometry type renders sensibly under it.
+// icon + line + poly so any geometry type renders sensibly under it. `icon` is a
+// Google KML shape href applied to point features (plane for airports, circle-H
+// for heliports, etc.) — rendered by Google Earth; CalTopo maps it to a marker.
+const KML_ICON_BASE = 'https://maps.google.com/mapfiles/kml/shapes/';
 const KML_STYLE_DEFS = {
   opsArea:   { color: 'fffd8b3d', fill: '20fd8b3d', width: 2 }, // blue
-  restrict:  { color: 'ff4444ef', fill: '404444ef', width: 2 }, // red — TFR/NOTAM/prohibited/NS/alert
+  restrict:  { color: 'ff4444ef', fill: '404444ef', width: 2, icon: 'caution.png' }, // red — TFR/NOTAM/prohibited/NS/alert
   sua:       { color: 'ff0b9ef5', fill: '300b9ef5', width: 2 }, // amber — special use
   airspace:  { color: 'fffd8b3d', fill: '1afd8b3d', width: 2 }, // blue — class airspace/LAANC
-  fire:      { color: 'ff4444ef', fill: '304444ef', width: 2 }, // red — fire perimeter
+  fire:      { color: 'ff4444ef', fill: '304444ef', width: 2, icon: 'firedept.png' }, // red — fire perimeter
   protected: { color: 'ff5ec522', fill: '205ec522', width: 2 }, // green — wilderness/parks
   wire:      { color: 'ff0b9ef5', width: 3 },                   // amber — wires/cables
-  obstacle:  { color: 'ff0b9ef5', width: 2 },                   // amber — obstacles
-  airport:   { color: 'fffd8b3d', width: 2 },                   // blue — airports
-  tower:     { color: 'ff0b9ef5', width: 2 },                   // amber — towers
-  dam:       { color: 'ffd4b606', width: 2 },                   // cyan — dams
-  aircraft:  { color: 'ffd4b606', width: 2 },                   // cyan — ADS-B
+  obstacle:  { color: 'ff0b9ef5', width: 2, icon: 'caution.png' },   // amber — obstacles
+  airport:   { color: 'fffd8b3d', width: 2, icon: 'airports.png' },  // blue — airports (plane)
+  heliport:  { color: 'fffa8ba7', width: 2, icon: 'heliport.png' },  // purple — heliports (circle-H)
+  tower:     { color: 'ff0b9ef5', width: 2, icon: 'electronics.png' }, // amber — towers
+  dam:       { color: 'ffd4b606', width: 2, icon: 'water.png' },     // cyan — dams
+  aircraft:  { color: 'ffd4b606', width: 2, icon: 'airports.png' },  // cyan — ADS-B (plane)
   generic:   { color: 'ffffffff', fill: '20ffffff', width: 2 }, // white — fallback
   sunArrow:  { color: 'ff00ccff', width: 3 },                   // gold — sun
   windArrow: { color: 'ffd4b606', width: 3 },                   // cyan — wind
@@ -2105,13 +2127,30 @@ function kmlStyles() {
   for (const id in KML_STYLE_DEFS) {
     const d = KML_STYLE_DEFS[id];
     out += `<Style id="${id}">` +
-      `<IconStyle><color>${d.color}</color><scale>1.0</scale></IconStyle>` +
+      `<IconStyle><color>${d.color}</color><scale>1.1</scale>` +
+      (d.icon ? `<Icon><href>${KML_ICON_BASE}${d.icon}</href></Icon>` : '') +
+      `</IconStyle>` +
       `<LabelStyle><scale>0.8</scale></LabelStyle>` +
       `<LineStyle><color>${d.color}</color><width>${d.width || 2}</width></LineStyle>` +
       (d.fill ? `<PolyStyle><color>${d.fill}</color></PolyStyle>` : `<PolyStyle><fill>0</fill></PolyStyle>`) +
       `</Style>`;
   }
   return out;
+}
+
+// A standalone KML document with a single GroundOverlay — the reliable way to put
+// a georeferenced raster into CalTopo (and Google Earth). `href` is the image path
+// inside the KMZ; `bounds` is {west,south,east,north} in EPSG:4326.
+function groundOverlayKml(name, bounds, href, opts) {
+  opts = opts || {};
+  const b = bounds;
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Document>` +
+    `<name>${kmlEscape(name)}</name>` +
+    `<GroundOverlay><name>${kmlEscape(name)}</name>` +
+    (opts.description ? `<description>${kmlCdata(opts.description)}</description>` : '') +
+    `<Icon><href>${kmlEscape(href)}</href></Icon>` +
+    `<LatLonBox><north>${b.north}</north><south>${b.south}</south><east>${b.east}</east><west>${b.west}</west><rotation>0</rotation></LatLonBox>` +
+    `</GroundOverlay></Document></kml>`;
 }
 
 // ============================================================
@@ -2126,20 +2165,17 @@ function destPoint(lat, lng, bearingDeg, distM) {
   return [lat + dLat, lng + dLng];
 }
 
-// KML <MultiGeometry> for an arrow: shaft center->tip plus two barbs at the tip
-// (KML has no native arrowhead).
-function arrowMultiGeometry(centerLat, centerLng, bearingDeg, lengthM) {
+// A plain bearing line from the centre out along `bearingDeg` (no arrowhead —
+// KML has no native one, and CalTopo lets the user set a line-arrow pattern
+// after import if desired).
+function bearingLineGeometry(centerLat, centerLng, bearingDeg, lengthM) {
   const tip = destPoint(centerLat, centerLng, bearingDeg, lengthM);
-  const barbLen = Math.max(lengthM * 0.22, 1);
-  const b1 = destPoint(tip[0], tip[1], (bearingDeg + 150) % 360, barbLen);
-  const b2 = destPoint(tip[0], tip[1], (bearingDeg + 210) % 360, barbLen);
-  const seg = (a, b) => `<LineString><tessellate>1</tessellate><coordinates>${_kmlCoord(a[1], a[0])} ${_kmlCoord(b[1], b[0])}</coordinates></LineString>`;
-  return `<MultiGeometry>${seg([centerLat, centerLng], tip)}${seg(tip, b1)}${seg(tip, b2)}</MultiGeometry>`;
+  return `<LineString><tessellate>1</tessellate><coordinates>${_kmlCoord(centerLng, centerLat)} ${_kmlCoord(tip[1], tip[0])}</coordinates></LineString>`;
 }
 
-function _arrowPlacemark(name, centerLat, centerLng, bearingDeg, lengthM, styleUrl, description, timestamp) {
+function _bearingPlacemark(name, centerLat, centerLng, bearingDeg, lengthM, styleUrl, description, timestamp) {
   return _kmlHead(name, styleUrl, description, timestamp) +
-    arrowMultiGeometry(centerLat, centerLng, bearingDeg, lengthM) + `</Placemark>`;
+    bearingLineGeometry(centerLat, centerLng, bearingDeg, lengthM) + `</Placemark>`;
 }
 
 // Sun arrows for each timestamp where the sun is above the horizon. Arrow points
@@ -2159,8 +2195,8 @@ function sunArrowsKml(lat, lng, times, centerLat, centerLng, opts) {
     const az = Math.round(sp.azimuth), el = Math.round(sp.elevation);
     const hhmm = String(t).slice(11, 16);
     const name = `Sun ${hhmm} — AZ ${az}° EL ${el}°`;
-    const desc = `Sun position at ${t}\nAzimuth: ${az}° (true) — arrow points toward the sun\nElevation: ${el}° above horizon`;
-    inner += _arrowPlacemark(name, centerLat, centerLng, sp.azimuth, lengthM, 'sunArrow', desc, t);
+    const desc = `Sun position at ${t}\nAzimuth: ${az}° (true) — line points toward the sun\nElevation: ${el}° above horizon`;
+    inner += _bearingPlacemark(name, centerLat, centerLng, sp.azimuth, lengthM, 'sunArrow', desc, t);
   }
   return inner;
 }
@@ -2185,8 +2221,8 @@ function windArrowsKml(times, dir, speed, gust, centerLat, centerLng, opts) {
     const hhmm = String(t).slice(11, 16);
     const name = `Wind ${hhmm} — FROM ${Math.round(from)}°` + (spd != null ? ` ${Math.round(spd)} mph` : '');
     const desc = `Wind at ${t}\nFROM ${Math.round(from)}° (true)\nSpeed: ${spd != null ? Math.round(spd) + ' mph' : '--'}` +
-      (g != null ? `\nGust: ${Math.round(g)} mph` : '') + `\nArrow points downwind (direction of drift).`;
-    inner += _arrowPlacemark(name, centerLat, centerLng, toward, len, 'windArrow', desc, t);
+      (g != null ? `\nGust: ${Math.round(g)} mph` : '') + `\nLine points downwind (direction of drift).`;
+    inner += _bearingPlacemark(name, centerLat, centerLng, toward, len, 'windArrow', desc, t);
   }
   return inner;
 }
@@ -2218,8 +2254,9 @@ if (typeof module !== 'undefined' && module.exports) {
     NOTAM_SUBJECTS, ringRadiusNm, notamPlainSummary,
     notamCategory, classifyNotamForUAS, NOTAM_CATEGORY_RELEVANT,
     ARTCC_REF, ARTCC_BOUNDS, artccForPoint, artccsForArea,
-    kmlEscape, kmlCdata, kmlRingFromLatLng, kmlRingFromGeoJson,
+    kmlEscape, kmlCdata, htmlToPlainText, kmlRingFromLatLng, kmlRingFromGeoJson,
     kmlPolygonPlacemark, kmlPointPlacemark, kmlLinePlacemark, kmlFolder, kmlDocument,
-    KML_STYLE_DEFS, kmlStyles, destPoint, arrowMultiGeometry, sunArrowsKml, windArrowsKml,
+    KML_STYLE_DEFS, kmlStyles, groundOverlayKml, destPoint, bearingLineGeometry,
+    sunArrowsKml, windArrowsKml,
   };
 }

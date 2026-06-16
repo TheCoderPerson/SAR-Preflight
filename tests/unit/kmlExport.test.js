@@ -1,8 +1,8 @@
 const core = require('../../sar-preflight-core.js');
 const {
-  kmlEscape, kmlCdata, kmlRingFromLatLng, kmlRingFromGeoJson,
+  kmlEscape, kmlCdata, htmlToPlainText, kmlRingFromLatLng, kmlRingFromGeoJson,
   kmlPolygonPlacemark, kmlPointPlacemark, kmlLinePlacemark, kmlFolder, kmlDocument,
-  kmlStyles, destPoint, sunArrowsKml, windArrowsKml,
+  kmlStyles, groundOverlayKml, destPoint, sunArrowsKml, windArrowsKml,
 } = core;
 
 const countPlacemarks = (s) => (s.match(/<Placemark>/g) || []).length;
@@ -73,6 +73,33 @@ describe('KML primitives', () => {
   });
 });
 
+describe('htmlToPlainText', () => {
+  it('strips tags, turns <br> and block closers into newlines, decodes entities', () => {
+    const html = '<b>Power line</b> 115&nbsp;kV<br>OSM Way 42<div>extra</div>';
+    const out = htmlToPlainText(html);
+    expect(out).toBe('Power line 115 kV\nOSM Way 42\nextra');
+    expect(out).not.toMatch(/[<>]/);            // no markup leaks through
+  });
+
+  it('handles entities and numeric refs and collapses blank lines', () => {
+    expect(htmlToPlainText('a &amp; b &#38; c')).toBe('a & b & c');
+    expect(htmlToPlainText('x<br><br><br>y')).toBe('x\n\ny'); // 3+ newlines collapse to 2
+    expect(htmlToPlainText(null)).toBe('');
+  });
+});
+
+describe('groundOverlayKml', () => {
+  it('builds a GroundOverlay with a LatLonBox and image href', () => {
+    const kml = groundOverlayKml('Canopy', { west: -121, south: 38, east: -120, north: 39 }, 'overlay.png', { description: 'd' });
+    expect(kml).toContain('<GroundOverlay>');
+    expect(kml).toContain('<Icon><href>overlay.png</href></Icon>');
+    expect(kml).toContain('<north>39</north>');
+    expect(kml).toContain('<south>38</south>');
+    expect(kml).toContain('<east>-120</east>');
+    expect(kml).toContain('<west>-121</west>');
+  });
+});
+
 describe('destPoint', () => {
   it('moves east for bearing 90 and north for bearing 0', () => {
     const [latE, lngE] = destPoint(38, -120, 90, 1000);
@@ -120,5 +147,11 @@ describe('wind arrows', () => {
   it('skips hours with no wind direction', () => {
     const inner = windArrowsKml(['t0', 't1'], [null, 90], [5, 5], [null, null], 38, -120, {});
     expect(countPlacemarks(inner)).toBe(1);
+  });
+
+  it('draws a plain bearing line, not an arrowhead/MultiGeometry', () => {
+    const inner = windArrowsKml(['t0'], [270], [10], [15], 38, -120, {});
+    expect(inner).toContain('<LineString>');
+    expect(inner).not.toContain('<MultiGeometry>');
   });
 });

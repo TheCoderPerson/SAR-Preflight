@@ -4605,21 +4605,102 @@ function _exportLayerPlacemarks(key, group) {
     let html = '';
     try { html = _aggContentToHtml(pl.getPopup().getContent()); } catch (e) { html = ''; }
     const name = _exportPlainText(html).slice(0, 48) || fallback;
+    // Descriptions are plain text (no HTML markup) so they read cleanly in CalTopo notes.
+    const desc = (typeof htmlToPlainText === 'function') ? htmlToPlainText(html) : html;
     try {
       if (typeof L !== 'undefined' && L.Polygon && pl instanceof L.Polygon) {
         _polyRingsGroups(pl.getLatLngs()).forEach(rings => {
-          inner += kmlPolygonPlacemark({ name, styleUrl, description: html, rings: rings.map(r => kmlRingFromLatLng(r)) });
+          inner += kmlPolygonPlacemark({ name, styleUrl, description: desc, rings: rings.map(r => kmlRingFromLatLng(r)) });
         });
       } else if (typeof L !== 'undefined' && L.Polyline && pl instanceof L.Polyline) {
         const segs = [];
         const collect = a => { if (!Array.isArray(a)) return; if (a.length && a[0] && typeof a[0].lat === 'number') segs.push(a); else a.forEach(collect); };
         collect(pl.getLatLngs());
-        segs.forEach(seg => { inner += kmlLinePlacemark({ name, styleUrl, description: html, coords: seg.map(p => [p.lat, p.lng]) }); });
+        segs.forEach(seg => { inner += kmlLinePlacemark({ name, styleUrl, description: desc, coords: seg.map(p => [p.lat, p.lng]) }); });
       } else if (pl.getLatLng) {
         const ll = pl.getLatLng();
-        inner += kmlPointPlacemark({ name, styleUrl, description: html, lat: ll.lat, lng: ll.lng });
+        inner += kmlPointPlacemark({ name, styleUrl, description: desc, lat: ll.lat, lng: ll.lng });
       }
     } catch (e) { /* skip malformed feature */ }
+  });
+  return inner;
+}
+
+// Imported NOTAMs — plain-English summary first, then the full text. Built from
+// state (S.importedNotams) so the description is richer than the map popup.
+function _exportNotamPlacemarks() {
+  let inner = '';
+  const showAll = !!S.notamShowAll;
+  (S.importedNotams || []).forEach(n => {
+    if (n._relevance && !n._relevance.relevant && !showAll) return; // match what's on the map
+    const summary = (typeof notamPlainSummary === 'function') ? notamPlainSummary(n) : '';
+    const body = String(n.body || '').trim();
+    const expanded = (typeof expandNotamText === 'function') ? expandNotamText(body) : body;
+    const desc = [
+      summary,
+      body ? '\n— Full NOTAM —\n' + body : '',
+      (expanded && expanded !== body) ? '\n— Decoded —\n' + expanded : '',
+    ].filter(Boolean).join('\n').trim();
+    const name = `NOTAM ${n.id || ''}${n.location ? ' ' + n.location : ''}`.trim();
+    if (n.polygons && n.polygons.length) {
+      n.polygons.forEach(ring => {
+        if (!ring || ring.length < 3) return;
+        inner += kmlPolygonPlacemark({ name, styleUrl: 'restrict', description: desc, rings: [kmlRingFromLatLng(ring)] });
+      });
+    } else if (n.lat != null && n.lng != null && !isNaN(n.lat) && !isNaN(n.lng)) {
+      inner += kmlPointPlacemark({ name, styleUrl: 'restrict', description: desc, lat: n.lat, lng: n.lng });
+    }
+  });
+  return inner;
+}
+
+// Imported TFRs — plain-English summary first, then the structured details.
+function _exportTfrPlacemarks() {
+  let inner = '';
+  const now = Date.now();
+  (S.tfrs || []).forEach(t => {
+    const active = (typeof isTfrActiveNow === 'function') ? isTfrActiveNow(t, now) : null;
+    const alt = (t.lowerAlt != null || t.upperAlt != null)
+      ? `${t.lowerAlt != null ? t.lowerAlt : 'SFC'}-${t.upperAlt != null ? t.upperAlt : 'UNL'} ${t.altUom || 'ft'}`.trim()
+      : 'altitude n/a';
+    const status = active === true ? 'ACTIVE NOW' : active === false ? 'inactive / scheduled' : 'status unknown';
+    const summary = `TFR ${t.id || ''}: ${t.name || 'Temporary Flight Restriction'} — ${status}. Altitude ${alt}.`.replace(/\s+/g, ' ').trim();
+    const details = [
+      `ID: ${t.id || '--'}`,
+      t.type ? `Type: ${t.type}` : '',
+      `Altitude: ${alt}`,
+      t.artcc ? `ARTCC: ${t.artcc}` : '',
+      (t.effectiveStart || t.effectiveEnd) ? `Effective: ${t.effectiveStart || '?'} to ${t.effectiveEnd || '?'}` : '',
+      t.reason ? `Reason: ${t.reason}` : '',
+    ].filter(Boolean).join('\n');
+    const desc = summary + '\n\n— Details —\n' + details;
+    const name = `TFR ${t.id || ''}`.trim();
+    (t.polygons || []).forEach(ring => {
+      if (!ring || ring.length < 3) return;
+      inner += kmlPolygonPlacemark({ name, styleUrl: 'restrict', description: desc, rings: [kmlRingFromLatLng(ring)] });
+    });
+  });
+  return inner;
+}
+
+// Airports — point per airport, plane icon for airports / circle-H for heliports.
+function _exportAirportPlacemarks() {
+  let inner = '';
+  const c = S.areaCenter;
+  const list = (typeof filterAirportsByDistance === 'function' && c)
+    ? filterAirportsByDistance(S.nearbyAirports || [], c.lat, c.lng, 55)
+    : (S.nearbyAirports || []);
+  list.forEach(a => {
+    if (a.lat == null || a.lng == null) return;
+    const isHeli = a.type === 'heliport';
+    const typeLabel = String(a.type || '').replace(/_/g, ' ');
+    const desc = [
+      `${a.icao || ''} — ${a.name || ''}`.trim(),
+      typeLabel ? `Type: ${typeLabel}` : '',
+      a.elevation_ft ? `Elevation: ${a.elevation_ft} ft` : '',
+      a.municipality ? `Municipality: ${a.municipality}` : '',
+    ].filter(Boolean).join('\n');
+    inner += kmlPointPlacemark({ name: a.icao || a.name || 'Airport', styleUrl: isHeli ? 'heliport' : 'airport', description: desc, lat: a.lat, lng: a.lng });
   });
   return inner;
 }
@@ -4635,7 +4716,13 @@ function gatherVisibleLayerFolders(selectedKeys) {
   const byLabel = {}; const order = [];
   keys.forEach(k => {
     if (selectedKeys && !selectedKeys.has(k)) return;
-    const pm = _exportLayerPlacemarks(k, S.mapLayers[k]);
+    // Layers we describe richly from state (plain-English first, icon by type)
+    // rather than scraping their popups generically.
+    let pm;
+    if (k === 'notam_imported') pm = _exportNotamPlacemarks();
+    else if (k === 'tfr_imported') pm = _exportTfrPlacemarks();
+    else if (k === 'airports') pm = _exportAirportPlacemarks();
+    else pm = _exportLayerPlacemarks(k, S.mapLayers[k]);
     if (!pm) return;
     const label = _aggMeta(k).label || 'Other';
     if (!byLabel[label]) { byLabel[label] = { inner: '', disclaim: false }; order.push(label); }
@@ -4669,11 +4756,11 @@ function buildSunWindFolders() {
   const lengthM = _exportArrowLengthM();
   if (document.getElementById('expSun')?.checked && typeof sunArrowsKml === 'function') {
     folders += kmlFolder('Sun Position (hourly, daylight only)', sunArrowsKml(c.lat, c.lng, times, c.lat, c.lng, { lengthM }),
-      { description: 'Hourly arrows pointing toward the sun over the next 24 h (omitted while the sun is below the horizon). Drag the Google Earth time slider to animate.' });
+      { description: 'Hourly bearing lines pointing toward the sun over the next 24 h (omitted while the sun is below the horizon). Drag the Google Earth time slider to animate.' });
   }
   if (document.getElementById('expWind')?.checked && typeof windArrowsKml === 'function') {
     folders += kmlFolder('Wind (hourly)', windArrowsKml(times, hourly.wind_direction_10m, hourly.wind_speed_10m, hourly.wind_gusts_10m, c.lat, c.lng, { lengthM }),
-      { description: 'Hourly wind arrows for the next 24 h. Arrow points DOWNWIND (drift direction); label gives the meteorological FROM bearing, speed and gust. Drag the time slider to animate.' });
+      { description: 'Hourly wind bearing lines for the next 24 h. Line points DOWNWIND (drift direction); label gives the meteorological FROM bearing, speed and gust. Drag the time slider to animate.' });
   }
   return folders;
 }
@@ -4694,22 +4781,68 @@ function downloadBlob(blob, filename) {
   URL.revokeObjectURL(url);
 }
 
-// Export a computed raster overlay (canopy / viewshed) as a georeferenced GeoTIFF.
+// Resolve a raster overlay's grid + RGBA + label, or null if not loaded.
+function _exportRasterData(layerId) {
+  if (layerId === 'canopy' && S.canopy && S.canopy.grid && S.canopy.canopyFlat) {
+    return { grid: S.canopy.grid, rgba: canopyGridToRGBA(S.canopy.grid, S.canopy.canopyFlat), label: 'Canopy' };
+  }
+  if (layerId === 'viewshed' && S.viewshed && S.viewshed.grid && S.viewshed.mask) {
+    return { grid: S.viewshed.grid, rgba: viewshedMaskToRGBA(S.viewshed.grid, S.viewshed.mask), label: 'Viewshed' };
+  }
+  return null;
+}
+
+// RGBA -> PNG bytes via an offscreen canvas (browser only).
+function _rgbaToPngBytes(rgba, w, h) {
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  canvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+  const b64 = canvas.toDataURL('image/png').split(',')[1];
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+// Export a raster overlay as a georeferenced GeoTIFF (EPSG:4326) plus .tfw/.prj
+// sidecars for tools that read world files instead of embedded georeferencing.
 function exportRasterGeoTiff(layerId) {
   const ts = new Date().toISOString().split('T')[0];
-  let grid, rgba, label;
-  if (layerId === 'canopy' && S.canopy && S.canopy.grid && S.canopy.canopyFlat) {
-    grid = S.canopy.grid; rgba = canopyGridToRGBA(grid, S.canopy.canopyFlat); label = 'Canopy';
-  } else if (layerId === 'viewshed' && S.viewshed && S.viewshed.grid && S.viewshed.mask) {
-    grid = S.viewshed.grid; rgba = viewshedMaskToRGBA(grid, S.viewshed.mask); label = 'Viewshed';
-  } else { return; }
+  const r = _exportRasterData(layerId);
+  if (!r) return;
   try {
-    const buf = encodeGeoTiffRGBA(rgba, grid.cols, grid.rows, grid.bounds);
-    downloadBlob(new Blob([buf], { type: 'image/tiff' }), `SAR_${label}_${ts}.tif`);
+    const { grid, rgba, label } = r;
+    const base = `SAR_${label}_${ts}`;
+    downloadBlob(new Blob([encodeGeoTiffRGBA(rgba, grid.cols, grid.rows, grid.bounds)], { type: 'image/tiff' }), base + '.tif');
+    downloadBlob(new Blob([worldFileForBounds(grid.bounds, grid.cols, grid.rows)], { type: 'text/plain' }), base + '.tfw');
+    downloadBlob(new Blob([WGS84_WKT], { type: 'text/plain' }), base + '.prj');
     if (typeof logAudit === 'function') logAudit('geotiff_exported', { layer: layerId });
   } catch (e) {
     console.error('GeoTIFF export error:', e);
-    alert('Could not export ' + label + ' GeoTIFF: ' + (e && e.message || e));
+    alert('Could not export ' + r.label + ' GeoTIFF: ' + (e && e.message || e));
+  }
+}
+
+// Export a raster overlay as a KMZ GroundOverlay — the reliable way to load a
+// georeferenced image into CalTopo (and Google Earth).
+function exportRasterKmz(layerId) {
+  const ts = new Date().toISOString().split('T')[0];
+  const r = _exportRasterData(layerId);
+  if (!r) return;
+  try {
+    const { grid, rgba, label } = r;
+    const png = _rgbaToPngBytes(rgba, grid.cols, grid.rows);
+    const doc = groundOverlayKml(`SAR ${label} — ${ts}`, grid.bounds, 'overlay.png',
+      { description: label + ' overlay exported from SAR Pre-Flight. Georeferenced (WGS84).' });
+    const kmz = zipStore([
+      { name: 'doc.kml', data: new TextEncoder().encode(doc) },
+      { name: 'overlay.png', data: png },
+    ]);
+    downloadBlob(new Blob([kmz], { type: 'application/vnd.google-earth.kmz' }), `SAR_${label}_${ts}.kmz`);
+    if (typeof logAudit === 'function') logAudit('kmz_overlay_exported', { layer: layerId });
+  } catch (e) {
+    console.error('KMZ overlay export error:', e);
+    alert('Could not export ' + r.label + ' KMZ overlay: ' + (e && e.message || e));
   }
 }
 
@@ -4720,9 +4853,9 @@ function openExport() {
 }
 function closeExport() { document.getElementById('exportModal').classList.remove('active'); }
 
-function _setExportRasterRow(cbId, rowId, enabled) {
+function _setExportRasterRow(cbId, rowId, enabled, checkedDefault) {
   const cb = document.getElementById(cbId); const row = document.getElementById(rowId);
-  if (cb) { cb.disabled = !enabled; cb.checked = enabled; }
+  if (cb) { cb.disabled = !enabled; cb.checked = enabled && checkedDefault !== false; }
   if (row) row.style.display = enabled ? '' : 'none';
 }
 
@@ -4751,8 +4884,13 @@ function populateExportModal() {
       }).join('');
     }
   }
-  _setExportRasterRow('expCanopyTiff', 'expCanopyRow', !!(S.canopy && S.canopy.canopyFlat));
-  _setExportRasterRow('expViewshedTiff', 'expViewshedRow', !!(S.viewshed && S.viewshed.mask));
+  const canopyOk = !!(S.canopy && S.canopy.canopyFlat);
+  const viewshedOk = !!(S.viewshed && S.viewshed.mask);
+  // KMZ GroundOverlay (CalTopo-friendly) is the default; GeoTIFF (GIS) is opt-in.
+  _setExportRasterRow('expCanopyKmz', 'expCanopyKmzRow', canopyOk, true);
+  _setExportRasterRow('expCanopyTiff', 'expCanopyRow', canopyOk, false);
+  _setExportRasterRow('expViewshedKmz', 'expViewshedKmzRow', viewshedOk, true);
+  _setExportRasterRow('expViewshedTiff', 'expViewshedRow', viewshedOk, false);
 }
 
 function doExport() {
@@ -4792,14 +4930,16 @@ function doExport() {
   // 3. Every currently-visible map overlay as real geometry
   folders += gatherVisibleLayerFolders(_exportSelectedLayerKeys());
 
-  // 4. Hourly sun + wind arrows
+  // 4. Hourly sun + wind bearing lines
   folders += buildSunWindFolders();
 
   const kml = kmlDocument(`SAR Preflight Intel \u2014 ${ts}`, kmlStyles(), folders, EXPORT_DISCLAIMER);
   downloadBlob(new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' }), `SAR_Preflight_${ts}.kml`);
 
-  // 5. Canopy / viewshed rasters as separate georeferenced GeoTIFFs
+  // 5. Canopy / viewshed rasters: KMZ GroundOverlay (CalTopo) and/or GeoTIFF (GIS)
+  if (document.getElementById('expCanopyKmz')?.checked) exportRasterKmz('canopy');
   if (document.getElementById('expCanopyTiff')?.checked) exportRasterGeoTiff('canopy');
+  if (document.getElementById('expViewshedKmz')?.checked) exportRasterKmz('viewshed');
   if (document.getElementById('expViewshedTiff')?.checked) exportRasterGeoTiff('viewshed');
 
   closeExport();
@@ -7244,9 +7384,10 @@ if (typeof module !== 'undefined' && module.exports) {
     renderForecastChart, fetchRadar,
     radarToggle, radarStep, updateRadarTime,
     openExport, closeExport, doExport, getKMLCoords, populateExportModal,
-    downloadBlob, exportRasterGeoTiff, gatherVisibleLayerFolders, buildSunWindFolders,
+    downloadBlob, exportRasterGeoTiff, exportRasterKmz, gatherVisibleLayerFolders, buildSunWindFolders,
     _exportLayerPlacemarks, _polyRingsGroups, _exportStyleForLayer, _exportNeedsDisclaimer,
     _exportSelectedLayerKeys, _exportArrowLengthM, EXPORT_DISCLAIMER,
+    _exportNotamPlacemarks, _exportTfrPlacemarks, _exportAirportPlacemarks, _exportRasterData,
     saveApiKey, saveConfig, updateClock, refreshData,
     initMap, startDraw, clearDrawBtns, clearArea, enterCoords,
     getStoredTheme, applyTheme, cycleTheme,

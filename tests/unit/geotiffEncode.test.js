@@ -1,4 +1,4 @@
-const { encodeGeoTiffRGBA } = require('../../sar-preflight-raster.js');
+const { encodeGeoTiffRGBA, worldFileForBounds, WGS84_WKT, crc32, zipStore } = require('../../sar-preflight-raster.js');
 
 // Minimal little-endian TIFF reader: returns { header, tags: Map(id -> {type,count,values}) }.
 function readTiff(buf) {
@@ -74,5 +74,48 @@ describe('encodeGeoTiffRGBA', () => {
     const { stripOffset } = readTiff(buf);
     const out = new Uint8Array(buf, stripOffset, W * H * 4);
     expect(Array.from(out)).toEqual(Array.from(rgba));
+  });
+});
+
+describe('worldFileForBounds / WGS84_WKT', () => {
+  it('emits the 6 affine terms for a north-up EPSG:4326 raster', () => {
+    const lines = worldFileForBounds({ west: -120, east: -119, south: 38, north: 39 }, 2, 2).trim().split('\n');
+    expect(parseFloat(lines[0])).toBeCloseTo(0.5, 10);    // A: +pixel X
+    expect(lines[1]).toBe('0');                            // D
+    expect(lines[2]).toBe('0');                            // B
+    expect(parseFloat(lines[3])).toBeCloseTo(-0.5, 10);   // E: -pixel Y
+    expect(parseFloat(lines[4])).toBeCloseTo(-119.75, 10);// C: centre of TL pixel X
+    expect(parseFloat(lines[5])).toBeCloseTo(38.75, 10);  // F: centre of TL pixel Y
+    expect(WGS84_WKT).toContain('GEOGCS["WGS 84"');
+    expect(WGS84_WKT).toContain('"EPSG","4326"');
+  });
+});
+
+describe('zipStore (KMZ)', () => {
+  const u8 = (s) => new TextEncoder().encode(s);
+
+  it('produces a valid stored ZIP with correct signatures and CRC', () => {
+    const data = u8('hello kml');
+    const zip = zipStore([{ name: 'doc.kml', data }]);
+    const dv = new DataView(zip.buffer, zip.byteOffset, zip.byteLength);
+    expect(dv.getUint32(0, true)).toBe(0x04034b50);  // local file header
+    expect(dv.getUint16(8, true)).toBe(0);           // method = store
+    expect(dv.getUint32(14, true)).toBe(crc32(data));// CRC matches
+    expect(dv.getUint32(18, true)).toBe(data.length);// compressed size = raw size
+    // The End-Of-Central-Directory signature appears in the tail.
+    let foundEocd = false;
+    for (let i = zip.length - 22; i >= 0; i--) {
+      if (dv.getUint32(i, true) === 0x06054b50) { foundEocd = true; break; }
+    }
+    expect(foundEocd).toBe(true);
+  });
+
+  it('round-trips the stored bytes verbatim (uncompressed)', () => {
+    const data = u8('PNGDATA\x00\x01\x02');
+    const zip = zipStore([{ name: 'overlay.png', data }]);
+    // Stored payload begins right after the 30-byte header + the filename.
+    const nameLen = 'overlay.png'.length;
+    const payload = zip.subarray(30 + nameLen, 30 + nameLen + data.length);
+    expect(Array.from(payload)).toEqual(Array.from(data));
   });
 });
