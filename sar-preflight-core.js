@@ -2117,6 +2117,7 @@ const KML_STYLE_DEFS = {
   tower:     { color: 'ff0b9ef5', width: 2, icon: 'electronics.png' }, // amber — towers
   dam:       { color: 'ffd4b606', width: 2, icon: 'water.png' },     // cyan — dams
   aircraft:  { color: 'ffd4b606', width: 2, icon: 'airports.png' },  // cyan — ADS-B (plane)
+  observer:  { color: 'ff5ec522', width: 2, icon: 'placemark_circle.png' }, // green — viewshed observer
   generic:   { color: 'ffffffff', fill: '20ffffff', width: 2 }, // white — fallback
   sunArrow:  { color: 'ff00ccff', width: 3 },                   // gold — sun
   windArrow: { color: 'ffd4b606', width: 3 },                   // cyan — wind

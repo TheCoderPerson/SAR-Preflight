@@ -517,6 +517,20 @@ select.api-input { cursor: pointer; }
   margin: 12px 0 4px; padding-bottom: 3px; border-bottom: 1px solid var(--border);
 }
 #exportLayerList { max-height: 160px; overflow-y: auto; }
+.vs-obs-row {
+  display: flex; align-items: center; gap: 6px; padding: 3px 6px; margin: 2px 0;
+  border: 1px solid var(--border); border-radius: 4px; font-size: 11px;
+  background: var(--bg-secondary);
+}
+.vs-obs-row.active { border-color: var(--accent-green); background: var(--bg-tertiary); }
+.vs-obs-name { flex: 1; color: var(--text-primary); cursor: text; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vs-obs-cov { font-family: var(--font-mono); font-size: 10px; color: var(--text-secondary); min-width: 38px; text-align: right; }
+.vs-obs-actions { display: flex; gap: 2px; }
+.vs-obs-actions button {
+  background: transparent; border: none; color: var(--text-secondary); cursor: pointer;
+  font-size: 12px; padding: 1px 4px; border-radius: 3px;
+}
+.vs-obs-actions button:hover { background: var(--bg-elevated); color: var(--text-primary); }
 
 @media (max-width: 900px) {
   html, body { overflow-x: hidden; width: 100%; }
@@ -896,9 +910,10 @@ select.api-input { cursor: pointer; }
             </div>
             <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">Observer eye height: 5.5&nbsp;ft above ground (assumed).</div>
             <div style="display:flex;gap:6px;margin-top:6px;">
-              <button class="btn btn-primary" id="vsPickBtn" onclick="startViewshedPick()" style="padding:5px 12px;font-size:11px;">Pick Observer</button>
-              <button class="btn btn-ghost" onclick="clearViewshed()" style="padding:5px 12px;font-size:11px;">Clear</button>
+              <button class="btn btn-primary" id="vsPickBtn" onclick="startViewshedPick()" style="padding:5px 12px;font-size:11px;">+ Add Observer</button>
+              <button class="btn btn-ghost" onclick="clearAllViewsheds()" style="padding:5px 12px;font-size:11px;">Clear All</button>
             </div>
+            <div id="vsObserverList" style="margin-top:6px;"></div>
             <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
               <label style="font-size:11px;color:var(--text-secondary);white-space:nowrap;">Opacity:</label>
               <input type="range" id="vsOpacity" min="0" max="1" step="0.05" value="0.5" style="width:110px;" oninput="setViewshedOpacity(this.value)">
@@ -1322,8 +1337,8 @@ select.api-input { cursor: pointer; }
     <label class="export-check-row"><input type="checkbox" id="expWind" checked> Wind — hourly bearing lines (24 h)</label>
     <label class="export-check-row" id="expCanopyRow"><input type="checkbox" id="expCanopyTiff" checked> Canopy → GeoTIFF, Web Mercator (CalTopo Map Sheet / QGIS)</label>
     <label class="export-check-row" id="expCanopyKmzRow"><input type="checkbox" id="expCanopyKmz"> Canopy → KMZ overlay (Google Earth)</label>
-    <label class="export-check-row" id="expViewshedRow"><input type="checkbox" id="expViewshedTiff" checked> Viewshed → GeoTIFF, Web Mercator (CalTopo Map Sheet / QGIS)</label>
-    <label class="export-check-row" id="expViewshedKmzRow"><input type="checkbox" id="expViewshedKmz"> Viewshed → KMZ overlay (Google Earth)</label>
+    <label class="export-check-row" id="expViewshedRow"><input type="checkbox" id="expViewshedTiff" checked> <span id="expViewshedTiffLabel">Viewsheds → GeoTIFF, Web Mercator (CalTopo Map Sheet / QGIS)</span></label>
+    <label class="export-check-row" id="expViewshedKmzRow"><input type="checkbox" id="expViewshedKmz"> <span id="expViewshedKmzLabel">Viewsheds → KMZ overlay (Google Earth)</span></label>
 
     <div class="modal-actions">
       <button class="btn btn-primary" onclick="doExport()">Download</button>

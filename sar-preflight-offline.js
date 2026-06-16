@@ -4,7 +4,7 @@
 // ============================================================
 
 const SAR_DB_NAME = 'sar-preflight-db';
-const SAR_DB_VERSION = 2;
+const SAR_DB_VERSION = 3;
 
 // TTL per endpoint in milliseconds
 const ENDPOINT_TTL = {
@@ -65,6 +65,12 @@ function openDB() {
         const at = db.createObjectStore('auditTrail', { keyPath: 'id', autoIncrement: true });
         at.createIndex('timestamp', 'timestamp', { unique: false });
         at.createIndex('action', 'action', { unique: false });
+      }
+      // Version 3 store: saved observer viewsheds (mask + grid), scoped per area.
+      if (!db.objectStoreNames.contains('viewsheds')) {
+        const vs = db.createObjectStore('viewsheds', { keyPath: 'id' });
+        vs.createIndex('areaKey', 'areaKey', { unique: false });
+        vs.createIndex('computedAt', 'computedAt', { unique: false });
       }
     };
     req.onsuccess = e => resolve(e.target.result);
@@ -477,6 +483,86 @@ async function clearAuditTrail() {
   }
 }
 
+// --- Viewshed CRUD (saved observer viewsheds, keyPath 'id', area-scoped) ---
+
+async function saveViewshed(record) {
+  try {
+    const db = await openDB();
+    const tx = db.transaction('viewsheds', 'readwrite');
+    tx.objectStore('viewsheds').put(record);
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (e) {
+    console.warn('Viewshed save failed:', e);
+  }
+}
+
+async function getViewshed(id) {
+  try {
+    const db = await openDB();
+    const tx = db.transaction('viewsheds', 'readonly');
+    const req = tx.objectStore('viewsheds').get(id);
+    return new Promise((resolve, reject) => {
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) {
+    console.warn('Viewshed get failed:', e);
+    return null;
+  }
+}
+
+async function getAllViewsheds(areaKeyFilter) {
+  try {
+    const db = await openDB();
+    const tx = db.transaction('viewsheds', 'readonly');
+    const store = tx.objectStore('viewsheds');
+    const req = (areaKeyFilter != null)
+      ? store.index('areaKey').getAll(areaKeyFilter)
+      : store.getAll();
+    return new Promise((resolve, reject) => {
+      req.onsuccess = () => {
+        const out = (req.result || []).sort((a, b) => (a.computedAt || 0) - (b.computedAt || 0));
+        resolve(out);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) {
+    console.warn('Viewsheds getAll failed:', e);
+    return [];
+  }
+}
+
+async function deleteViewshed(id) {
+  try {
+    const db = await openDB();
+    const tx = db.transaction('viewsheds', 'readwrite');
+    tx.objectStore('viewsheds').delete(id);
+    return new Promise(resolve => { tx.oncomplete = resolve; });
+  } catch (e) {
+    console.warn('Viewshed delete failed:', e);
+  }
+}
+
+async function clearViewsheds(areaKeyFilter) {
+  try {
+    const db = await openDB();
+    const tx = db.transaction('viewsheds', 'readwrite');
+    const store = tx.objectStore('viewsheds');
+    if (areaKeyFilter == null) {
+      store.clear();
+    } else {
+      const cur = store.index('areaKey').openKeyCursor(IDBKeyRange.only(areaKeyFilter));
+      cur.onsuccess = e => { const c = e.target.result; if (c) { store.delete(c.primaryKey); c.continue(); } };
+    }
+    return new Promise(resolve => { tx.oncomplete = resolve; });
+  } catch (e) {
+    console.warn('Viewsheds clear failed:', e);
+  }
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -491,5 +577,6 @@ if (typeof module !== 'undefined' && module.exports) {
     saveSopProfile, getSopProfile, getAllSopProfiles, deleteSopProfile,
     saveMissionLog, getMissionLogs, getMissionLog, deleteMissionLog,
     logAudit, getAuditTrail, clearAuditTrail,
+    saveViewshed, getViewshed, getAllViewsheds, deleteViewshed, clearViewsheds,
   };
 }

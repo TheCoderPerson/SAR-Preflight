@@ -21,7 +21,7 @@ globalThis.L = { Polygon: MPolygon, Polyline: MPolyline, Marker: MMarker, Circle
 const app = require('../../sar-preflight.js');
 const {
   S, gatherVisibleLayerFolders, buildSunWindFolders, populateExportModal,
-  exportRasterGeoTiff, EXPORT_DISCLAIMER,
+  exportRasterGeoTiff, exportAllViewshedGeoTiffs, EXPORT_DISCLAIMER,
 } = app;
 
 // Capture every Blob handed to the downloader (URL.createObjectURL).
@@ -42,6 +42,8 @@ beforeEach(() => {
   S.areaCenter = LL(38.7, -120.99);
   S.areaType = 'CIRCLE';
   S.currentArea = { getRadius: () => 1500 };
+  S.viewsheds = [];
+  S.activeViewshedId = null;
   document.body.innerHTML = '';
 });
 
@@ -168,5 +170,36 @@ describe('exportRasterGeoTiff', () => {
     const blobs = captureDownloads(() => exportRasterGeoTiff('canopy'));
     expect(blobs.length).toBe(1);
     expect(blobs[0].type).toBe('image/tiff');
+  });
+});
+
+describe('observer + multi-viewshed export', () => {
+  const grid = { cols: 4, rows: 4, bounds: { west: -121, east: -120.99, south: 38.7, north: 38.71 } };
+  const rec = (id, name, lat, lng, computed) => ({
+    id, name, observer: { lat, lng }, aglFt: 200, vlosFt: 2500,
+    grid: computed ? grid : null, mask: computed ? new Uint8Array(16).fill(1) : null,
+    coverage: computed ? 0.6 : null, demSource: '3DEP', canopySource: 'Meta 1 m', computedAt: computed ? 1 : 0,
+  });
+
+  it('exports observer points as KML with the observer style and rich descriptions', () => {
+    S.mapLayers.observers = new MockGroup([]); // visibility flag; data comes from S.viewsheds
+    S.viewsheds = [rec('vs1', 'LZ-1', 38.72, -120.75, true)];
+    const kml = gatherVisibleLayerFolders(new Set(['observers']));
+    expect(kml).toContain('<Folder><name>Observer</name>');
+    expect(kml).toContain('<styleUrl>#observer</styleUrl>');
+    expect(kml).toContain('<name>LZ-1</name>');
+    expect(kml).toContain('Drone AGL: 200 ft');
+    expect(kml).toContain('60% of VLOS visible');
+  });
+
+  it('exports one GeoTIFF per computed viewshed, skipping uncomputed ones', () => {
+    S.viewsheds = [
+      rec('vs1', 'Ridge', 38.72, -120.75, true),
+      rec('vs2', 'Valley', 38.70, -120.80, true),
+      rec('vs3', 'Pending', 38.69, -120.81, false), // no mask -> skipped
+    ];
+    const blobs = captureDownloads(() => exportAllViewshedGeoTiffs());
+    expect(blobs.length).toBe(2);
+    expect(blobs.every(b => b.type === 'image/tiff')).toBe(true);
   });
 });

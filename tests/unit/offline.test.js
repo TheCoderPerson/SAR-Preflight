@@ -1,4 +1,5 @@
-const { areaKey, classifyStaleness, formatAge, ENDPOINT_TTL } = require('../../sar-preflight-offline.js');
+const offline = require('../../sar-preflight-offline.js');
+const { areaKey, classifyStaleness, formatAge, ENDPOINT_TTL } = offline;
 
 describe('areaKey(lat, lng)', () => {
   it('rounds to 3 decimal places', () => {
@@ -100,5 +101,17 @@ describe('ENDPOINT_TTL', () => {
   it('elevation has longest TTL (static data)', () => {
     expect(ENDPOINT_TTL.elevation).toBeGreaterThan(ENDPOINT_TTL.weather);
     expect(ENDPOINT_TTL.elevation).toBeGreaterThan(ENDPOINT_TTL.nws);
+  });
+});
+
+describe('viewsheds store (v3)', () => {
+  it('bumps the DB version to 3 for the viewsheds store', () => {
+    expect(offline.SAR_DB_VERSION).toBe(3);
+  });
+
+  it('exports the viewshed CRUD surface', () => {
+    for (const fn of ['saveViewshed', 'getViewshed', 'getAllViewsheds', 'deleteViewshed', 'clearViewsheds']) {
+      expect(typeof offline[fn]).toBe('function');
+    }
   });
 });

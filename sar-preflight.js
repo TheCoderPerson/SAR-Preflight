@@ -46,7 +46,9 @@ const S = {
   _adsbHiresFetching: false,
   // Vegetation overlay + viewshed
   canopy: {},
-  viewshed: { marker: null, observer: null, grid: null, running: false },
+  viewsheds: [],            // saved observer viewshed records (see makeViewshedRecord)
+  activeViewshedId: null,   // the one currently displayed (only one overlay at a time)
+  _viewshedRunningId: null, // id currently computing (serializes the kernel)
   _viewshedPicking: false,
   // Automatic FAA TFR/NOTAM check status (for the NOTAMs-tab indicator)
   autoCheck: { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 },
@@ -399,10 +401,11 @@ function clearArea() {
   if (S.mapLayers.dams) S.mapLayers.dams.clearLayers();
   if (S.mapLayers.wilderness) S.mapLayers.wilderness.clearLayers();
   if (S.mapLayers.national_parks) S.mapLayers.national_parks.clearLayers();
-  // Vegetation overlay + viewshed (analysis overlays) — teardown without rebuilding
+  // Vegetation overlay + viewsheds (analysis overlays) — teardown without rebuilding
   // the layer control (clearArea intentionally leaves that to the next processArea).
-  if (S.viewshed && S.viewshed.marker && S.map && S.map.hasLayer(S.viewshed.marker)) S.map.removeLayer(S.viewshed.marker);
-  if (S.viewshed) { S.viewshed.marker = null; S.viewshed.observer = null; S.viewshed.grid = null; }
+  // Saved viewsheds stay in IndexedDB; restoreViewsheds re-hydrates them per area.
+  if (S.mapLayers.observers) S.mapLayers.observers.clearLayers();
+  S.viewsheds = []; S.activeViewshedId = null;
   if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
   if (S.mapLayers.canopy && S.map && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
   const _canopyCb = document.getElementById('canopyToggle'); if (_canopyCb) _canopyCb.checked = false;
@@ -494,6 +497,8 @@ async function processArea(layer, type) {
   S.areaCenter = center; S.areaBounds = bounds; S.currentArea = layer;
   document.getElementById('areaCenter').textContent = `${center.lat.toFixed(4)}, ${center.lng.toFixed(4)}`;
   document.getElementById('areaType').textContent = S.areaType;
+  // Re-hydrate this area's saved observer viewsheds (markers + active overlay) from IndexedDB.
+  if (typeof restoreViewsheds === 'function') restoreViewsheds();
 
   if (typeof logAudit === 'function') logAudit('area_defined', { center: { lat: center.lat, lng: center.lng }, type: S.areaType, size: document.getElementById('areaSize')?.textContent });
   document.getElementById('areaPerimeter').textContent = `${perimKm.toFixed(2)} km`;
@@ -4573,7 +4578,7 @@ function _exportStyleForLayer(key) {
     fire_perimeters: 'fire', faa_sua: 'sua', faa_class_airspace: 'airspace', faa_laanc: 'airspace',
     faa_obstacles: 'obstacle', airports: 'airport', cell_towers: 'tower', dams: 'dam',
     adsb_aircraft: 'aircraft', wilderness: 'protected', national_parks: 'protected',
-    emergency_lz: 'protected', swap_radius: 'opsArea', flight_plan: 'opsArea',
+    emergency_lz: 'protected', swap_radius: 'opsArea', flight_plan: 'opsArea', observers: 'observer',
   };
   return m[key] || 'generic';
 }
@@ -4705,6 +4710,19 @@ function _exportAirportPlacemarks() {
   return inner;
 }
 
+// Observer points (one per viewshed record) — name + AGL/VLOS/coverage description.
+function _exportObserverPlacemarks() {
+  let inner = '';
+  (S.viewsheds || []).forEach(rec => {
+    if (!rec.observer || rec.observer.lat == null || rec.observer.lng == null) return;
+    inner += kmlPointPlacemark({
+      name: rec.name || 'Observer', styleUrl: 'observer',
+      description: observerKmlDescription(rec), lat: rec.observer.lat, lng: rec.observer.lng,
+    });
+  });
+  return inner;
+}
+
 // Build KML folders for every currently-visible map overlay. `selectedKeys` (a Set
 // of layer keys) optionally restricts which layers are included; null = all visible.
 function gatherVisibleLayerFolders(selectedKeys) {
@@ -4722,6 +4740,7 @@ function gatherVisibleLayerFolders(selectedKeys) {
     if (k === 'notam_imported') pm = _exportNotamPlacemarks();
     else if (k === 'tfr_imported') pm = _exportTfrPlacemarks();
     else if (k === 'airports') pm = _exportAirportPlacemarks();
+    else if (k === 'observers') pm = _exportObserverPlacemarks();
     else pm = _exportLayerPlacemarks(k, S.mapLayers[k]);
     if (!pm) return;
     const label = _aggMeta(k).label || 'Other';
@@ -4782,12 +4801,19 @@ function downloadBlob(blob, filename) {
 }
 
 // Resolve a raster overlay's grid + RGBA + label, or null if not loaded.
-function _exportRasterData(layerId) {
+// For viewsheds, `ref` selects a record (id, record, or default = active).
+function _exportRasterData(layerId, ref) {
   if (layerId === 'canopy' && S.canopy && S.canopy.grid && S.canopy.canopyFlat) {
     return { grid: S.canopy.grid, rgba: canopyGridToRGBA(S.canopy.grid, S.canopy.canopyFlat), label: 'Canopy' };
   }
-  if (layerId === 'viewshed' && S.viewshed && S.viewshed.grid && S.viewshed.mask) {
-    return { grid: S.viewshed.grid, rgba: viewshedMaskToRGBA(S.viewshed.grid, S.viewshed.mask), label: 'Viewshed' };
+  if (layerId === 'viewshed') {
+    let rec = null;
+    if (ref && typeof ref === 'object') rec = ref;
+    else if (ref) rec = (S.viewsheds || []).find(r => r.id === ref);
+    else rec = (S.viewsheds || []).find(r => r.id === S.activeViewshedId);
+    if (rec && rec.grid && rec.mask) {
+      return { grid: rec.grid, rgba: viewshedMaskToRGBA(rec.grid, rec.mask), label: 'Viewshed', name: rec.name };
+    }
   }
   return null;
 }
@@ -4807,15 +4833,16 @@ function _rgbaToPngBytes(rgba, w, h) {
 // Export a raster overlay as a georeferenced GeoTIFF in EPSG:3857 (Web Mercator) —
 // the projection CalTopo's "Map Sheet" import expects (matches the SAR_UAS_Segment
 // tool's working export). The 4326 grid is resampled to a square-pixel mercator grid.
-function exportRasterGeoTiff(layerId) {
+function exportRasterGeoTiff(layerId, ref) {
   const ts = new Date().toISOString().split('T')[0];
-  const r = _exportRasterData(layerId);
+  const r = _exportRasterData(layerId, ref);
   if (!r) return;
   try {
-    const { grid, rgba, label } = r;
+    const { grid, rgba, label, name } = r;
     const merc = reprojectRgbaTo3857(rgba, grid);
     const buf = encodeGeoTiffRGBA(merc.rgba, merc.width, merc.height, merc.bounds, { epsg: 3857 });
-    downloadBlob(new Blob([buf], { type: 'image/tiff' }), `SAR_${label}_${ts}.tif`);
+    const fname = name ? `SAR_Viewshed_${viewshedFilenameSlug(name)}_${ts}.tif` : `SAR_${label}_${ts}.tif`;
+    downloadBlob(new Blob([buf], { type: 'image/tiff' }), fname);
     if (typeof logAudit === 'function') logAudit('geotiff_exported', { layer: layerId });
   } catch (e) {
     console.error('GeoTIFF export error:', e);
@@ -4823,27 +4850,44 @@ function exportRasterGeoTiff(layerId) {
   }
 }
 
+// One EPSG:3857 GeoTIFF per computed viewshed (filenames de-duped by slug).
+function exportAllViewshedGeoTiffs() {
+  const seen = {};
+  (S.viewsheds || []).filter(r => r.grid && r.mask).forEach(rec => {
+    let slug = viewshedFilenameSlug(rec.name);
+    if (seen[slug]) { seen[slug]++; slug = slug + '_' + seen[slug]; } else { seen[slug] = 1; }
+    // Pass a shallow record whose name carries the de-duped slug for the filename.
+    exportRasterGeoTiff('viewshed', Object.assign({}, rec, { name: slug }));
+  });
+}
+
 // Export a raster overlay as a KMZ GroundOverlay — the reliable way to load a
 // georeferenced image into CalTopo (and Google Earth).
-function exportRasterKmz(layerId) {
+function exportRasterKmz(layerId, ref) {
   const ts = new Date().toISOString().split('T')[0];
-  const r = _exportRasterData(layerId);
+  const r = _exportRasterData(layerId, ref);
   if (!r) return;
   try {
-    const { grid, rgba, label } = r;
+    const { grid, rgba, label, name } = r;
     const png = _rgbaToPngBytes(rgba, grid.cols, grid.rows);
-    const doc = groundOverlayKml(`SAR ${label} — ${ts}`, grid.bounds, 'overlay.png',
-      { description: label + ' overlay exported from SAR Pre-Flight. Georeferenced (WGS84).' });
+    const title = name ? `SAR Viewshed ${name}` : `SAR ${label} — ${ts}`;
+    const doc = groundOverlayKml(title, grid.bounds, 'overlay.png',
+      { description: (name || label) + ' overlay exported from SAR Pre-Flight. Georeferenced (WGS84).' });
     const kmz = zipStore([
       { name: 'doc.kml', data: new TextEncoder().encode(doc) },
       { name: 'overlay.png', data: png },
     ]);
-    downloadBlob(new Blob([kmz], { type: 'application/vnd.google-earth.kmz' }), `SAR_${label}_${ts}.kmz`);
+    const fname = name ? `SAR_Viewshed_${viewshedFilenameSlug(name)}_${ts}.kmz` : `SAR_${label}_${ts}.kmz`;
+    downloadBlob(new Blob([kmz], { type: 'application/vnd.google-earth.kmz' }), fname);
     if (typeof logAudit === 'function') logAudit('kmz_overlay_exported', { layer: layerId });
   } catch (e) {
     console.error('KMZ overlay export error:', e);
     alert('Could not export ' + r.label + ' KMZ overlay: ' + (e && e.message || e));
   }
+}
+
+function exportAllViewshedKmz() {
+  (S.viewsheds || []).filter(r => r.grid && r.mask).forEach(rec => exportRasterKmz('viewshed', rec.id));
 }
 
 function openExport() {
@@ -4885,13 +4929,18 @@ function populateExportModal() {
     }
   }
   const canopyOk = !!(S.canopy && S.canopy.canopyFlat);
-  const viewshedOk = !!(S.viewshed && S.viewshed.mask);
+  const nViewsheds = (S.viewsheds || []).filter(r => r.grid && r.mask).length;
   // GeoTIFF (EPSG:3857) is the default — CalTopo Map Sheet import; KMZ overlay
   // (Google Earth) is opt-in.
   _setExportRasterRow('expCanopyTiff', 'expCanopyRow', canopyOk, true);
   _setExportRasterRow('expCanopyKmz', 'expCanopyKmzRow', canopyOk, false);
-  _setExportRasterRow('expViewshedTiff', 'expViewshedRow', viewshedOk, true);
-  _setExportRasterRow('expViewshedKmz', 'expViewshedKmzRow', viewshedOk, false);
+  _setExportRasterRow('expViewshedTiff', 'expViewshedRow', nViewsheds > 0, true);
+  _setExportRasterRow('expViewshedKmz', 'expViewshedKmzRow', nViewsheds > 0, false);
+  // Reflect the count in the row labels (one GeoTIFF per observer).
+  const vt = document.getElementById('expViewshedTiffLabel');
+  if (vt) vt.textContent = `Viewsheds (${nViewsheds}) → GeoTIFF, Web Mercator (CalTopo Map Sheet / QGIS)`;
+  const vk = document.getElementById('expViewshedKmzLabel');
+  if (vk) vk.textContent = `Viewsheds (${nViewsheds}) → KMZ overlay (Google Earth)`;
 }
 
 function doExport() {
@@ -4937,11 +4986,11 @@ function doExport() {
   const kml = kmlDocument(`SAR Preflight Intel \u2014 ${ts}`, kmlStyles(), folders, EXPORT_DISCLAIMER);
   downloadBlob(new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' }), `SAR_Preflight_${ts}.kml`);
 
-  // 5. Canopy / viewshed rasters: KMZ GroundOverlay (CalTopo) and/or GeoTIFF (GIS)
+  // 5. Canopy raster + one raster per observer viewshed (GeoTIFF for CalTopo, KMZ for Google Earth)
   if (document.getElementById('expCanopyKmz')?.checked) exportRasterKmz('canopy');
   if (document.getElementById('expCanopyTiff')?.checked) exportRasterGeoTiff('canopy');
-  if (document.getElementById('expViewshedKmz')?.checked) exportRasterKmz('viewshed');
-  if (document.getElementById('expViewshedTiff')?.checked) exportRasterGeoTiff('viewshed');
+  if (document.getElementById('expViewshedKmz')?.checked) exportAllViewshedKmz();
+  if (document.getElementById('expViewshedTiff')?.checked) exportAllViewshedGeoTiffs();
 
   closeExport();
   if (typeof logAudit === 'function') logAudit('kml_exported');
@@ -5252,8 +5301,14 @@ function buildLayerControl() {
   // Analysis overlays: vegetation height + viewshed (each with an opacity slider)
   const hasCanopy = S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy);
   const hasViewshed = S.mapLayers.viewshed && S.map.hasLayer(S.mapLayers.viewshed);
-  if (hasCanopy || hasViewshed) {
+  const hasObservers = S.mapLayers.observers && S.map.hasLayer(S.mapLayers.observers) && (S.viewsheds || []).length;
+  if (hasCanopy || hasViewshed || hasObservers) {
     html += `<h4 style="margin-top:10px">Analysis</h4>`;
+    if (hasObservers) {
+      html += `<div class="layer-item active" data-layer="observers" onclick="toggleLayer('observers',this)">
+        <div class="layer-check"></div><div class="layer-color" style="background:#5ec522"></div><span>Observers (${S.viewsheds.length})</span>
+      </div>`;
+    }
     if (hasCanopy) {
       const op = S.mapLayers.canopy.options.opacity != null ? S.mapLayers.canopy.options.opacity : CANOPY_OVERLAY_OPACITY;
       html += `<div class="layer-item active" data-layer="canopy" onclick="toggleLayer('canopy',this)">
@@ -5316,7 +5371,7 @@ function toggleLayer(id, el) {
     // Play panel is visible only while the radar layer is checked on
     const controls = document.getElementById('radarControls');
     if (controls) controls.style.display = on ? 'flex' : 'none';
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'flight_plan' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_')) && S.mapLayers[id]) {
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'flight_plan' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'observers' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_')) && S.mapLayers[id]) {
     if (id === 'canopy') { const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = on; }
     if (on) S.map.addLayer(S.mapLayers[id]);
     else S.map.removeLayer(S.mapLayers[id]);
@@ -5351,7 +5406,7 @@ const AGG_LAYER_META = {
   faa_obstacles: { label: 'Obstacle', pri: 4 }, dams: { label: 'Dam', pri: 4 },
   cell_towers: { label: 'Tower', pri: 5 }, wilderness: { label: 'Wilderness', pri: 6 },
   national_parks: { label: 'National Park', pri: 6 }, swap_radius: { label: 'Swap Radius', pri: 8 },
-  flight_plan: { label: 'Flight Plan', pri: 8 },
+  flight_plan: { label: 'Flight Plan', pri: 8 }, observers: { label: 'Observer', pri: 3 },
 };
 
 function _aggMeta(key) {
@@ -7242,32 +7297,75 @@ function cancelViewshedPick() {
   if (S.map) S.map.getContainer().style.cursor = '';
 }
 
-function onViewshedMapClick(latlng) {
-  cancelViewshedPick();
-  if (!S.viewshed) S.viewshed = {};
-  S.viewshed.observer = { lat: latlng.lat, lng: latlng.lng };
-  if (S.viewshed.marker && S.map.hasLayer(S.viewshed.marker)) S.map.removeLayer(S.viewshed.marker);
-  const m = L.marker(latlng, { draggable: true, title: 'Viewshed observer (drag to move)' });
-  m.on('dragend', () => {
-    const p = m.getLatLng();
-    S.viewshed.observer = { lat: p.lat, lng: p.lng };
-    runViewshed();
-  });
-  m.addTo(S.map);
-  S.viewshed.marker = m;
-  runViewshed();
+function genViewshedId() {
+  return 'vs_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
 }
 
-function clearViewshed() {
-  if (S.viewshed) {
-    if (S.viewshed.marker && S.map.hasLayer(S.viewshed.marker)) S.map.removeLayer(S.viewshed.marker);
-    S.viewshed.marker = null; S.viewshed.observer = null; S.viewshed.grid = null;
+function _currentAreaKey() {
+  return (S.areaCenter && typeof areaKey === 'function') ? areaKey(S.areaCenter.lat, S.areaCenter.lng) : null;
+}
+
+function _ensureObserverLayer() {
+  if (!S.mapLayers.observers) {
+    S.mapLayers.observers = L.layerGroup();
+    if (S.map) S.mapLayers.observers.addTo(S.map);
   }
-  if (S.mapLayers.viewshed && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
-  setStatus('viewshedStatus', '', '');
-  const r = document.getElementById('vsResult'); if (r) r.textContent = '';
-  const pb = document.getElementById('vsProgressBar'); if (pb) pb.style.width = '0';
-  buildLayerControl();
+  return S.mapLayers.observers;
+}
+
+function _observerPopupHtml(rec) {
+  const cov = rec.coverage == null
+    ? (rec.computedAt && !(rec.grid && rec.mask) ? 'no terrain (not computed)' : '')
+    : Math.round(rec.coverage * 100) + '% of VLOS visible';
+  return `<b>${_esc(rec.name || 'Observer')}</b><br>Drone ${rec.aglFt} ft AGL · VLOS ${rec.vlosFt} ft`
+    + (cov ? `<br>${_esc(cov)}` : '');
+}
+
+function _addObserverMarker(rec) {
+  if (typeof L === 'undefined' || !L.marker) return null;
+  _ensureObserverLayer();
+  const m = L.marker([rec.observer.lat, rec.observer.lng], { draggable: true, title: rec.name || 'Observer' });
+  if (m.bindPopup) m.bindPopup(_observerPopupHtml(rec));
+  if (m.on) m.on('dragend', () => {
+    const p = m.getLatLng();
+    const r = S.viewsheds.find(x => x.id === rec.id);
+    if (!r) return;
+    r.observer = { lat: p.lat, lng: p.lng };
+    setActiveViewshed(r.id);
+    runViewshed(r.id);
+  });
+  rec._marker = m;
+  S.mapLayers.observers.addLayer(m);
+  return m;
+}
+
+// Strip runtime-only fields before persisting to IndexedDB.
+function _toPersistable(rec) {
+  return {
+    id: rec.id, areaKey: rec.areaKey, name: rec.name, observer: rec.observer,
+    aglFt: rec.aglFt, vlosFt: rec.vlosFt, grid: rec.grid, mask: rec.mask,
+    coverage: rec.coverage, demSource: rec.demSource, canopySource: rec.canopySource,
+    computedAt: rec.computedAt,
+  };
+}
+
+// Map-click handler when "Add Observer" is armed: append a record + compute it.
+function onViewshedMapClick(latlng) {
+  cancelViewshedPick();
+  const { aglFt, vlosFt } = _readVsInputs();
+  const names = S.viewsheds.map(r => r.name);
+  const name = uniqueViewshedName('Observer ' + (S.viewsheds.length + 1), names);
+  const rec = makeViewshedRecord({
+    id: genViewshedId(), areaKey: _currentAreaKey(), name,
+    observer: { lat: latlng.lat, lng: latlng.lng }, aglFt, vlosFt,
+  });
+  if (!rec) return;
+  S.viewsheds.push(rec);
+  S.activeViewshedId = rec.id;
+  if (typeof saveAppState === 'function') saveAppState('activeViewshedId', rec.id);
+  _addObserverMarker(rec);
+  renderObserverList();
+  runViewshed(rec.id);
 }
 
 function _vsProgress(frac) {
@@ -7275,13 +7373,151 @@ function _vsProgress(frac) {
   if (pb) pb.style.width = Math.round(frac * 100) + '%';
 }
 
-async function runViewshed() {
-  if (!S.viewshed || !S.viewshed.observer || S.viewshed.running) return;
-  S.viewshed.running = true;
+// Paint ONLY the active record's stored mask — no recompute. Removes the overlay
+// when there is no active record (or it has no computed mask yet).
+function _renderActiveViewshed() {
+  const rec = S.viewsheds.find(r => r.id === S.activeViewshedId);
+  const r = document.getElementById('vsResult');
+  if (!rec || !rec.grid || !rec.mask) {
+    if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
+    if (r) r.textContent = rec ? `${rec.name}: ${rec.computedAt ? 'terrain unavailable — no viewshed' : 'computing…'}` : '';
+    buildLayerControl();
+    return;
+  }
+  const op = parseFloat((document.getElementById('vsOpacity') || {}).value) || VIEWSHED_OVERLAY_OPACITY;
+  renderRasterOverlay('viewshed', viewshedMaskToRGBA(rec.grid, rec.mask), rec.grid, op);
+  if (r) {
+    const canLabel = rec.canopySource ? ('canopy ' + rec.canopySource) : 'bare earth (no canopy)';
+    r.textContent = `${rec.name}: ${Math.round((rec.coverage || 0) * 100)}% of ${rec.vlosFt} ft VLOS visible @ ${rec.aglFt} ft AGL · DEM ${rec.demSource} · ${canLabel}`;
+  }
+  buildLayerControl();
+}
+
+// Switch which observer's viewshed is shown (instant — reads the stored mask).
+function setActiveViewshed(id) {
+  S.activeViewshedId = id;
+  if (typeof saveAppState === 'function') saveAppState('activeViewshedId', id);
+  _renderActiveViewshed();
+  renderObserverList();
+}
+
+function recomputeViewshed(id) {
+  const rec = S.viewsheds.find(r => r.id === id);
+  if (!rec) return;
+  const { aglFt, vlosFt } = _readVsInputs();
+  rec.aglFt = aglFt; rec.vlosFt = vlosFt;
+  setActiveViewshed(id);
+  runViewshed(id);
+}
+
+function renameViewshed(id, name) {
+  const rec = S.viewsheds.find(r => r.id === id);
+  if (!rec) return;
+  const others = S.viewsheds.filter(r => r.id !== id).map(r => r.name);
+  rec.name = uniqueViewshedName(name, others);
+  if (rec._marker && rec._marker.setPopupContent) rec._marker.setPopupContent(_observerPopupHtml(rec));
+  if (typeof saveViewshed === 'function') saveViewshed(_toPersistable(rec));
+  renderObserverList();
+  if (id === S.activeViewshedId) _renderActiveViewshed();
+}
+
+function renameViewshedPrompt(id) {
+  const rec = S.viewsheds.find(r => r.id === id);
+  if (!rec) return;
+  const name = (typeof prompt === 'function') ? prompt('Observer name:', rec.name) : null;
+  if (name != null && String(name).trim()) renameViewshed(id, String(name).trim());
+}
+
+// App-level delete handler (named removeViewshed to avoid shadowing offline's deleteViewshed CRUD).
+function removeViewshed(id) {
+  const idx = S.viewsheds.findIndex(r => r.id === id);
+  if (idx < 0) return;
+  const rec = S.viewsheds[idx];
+  if (rec._marker && S.mapLayers.observers) S.mapLayers.observers.removeLayer(rec._marker);
+  S.viewsheds.splice(idx, 1);
+  if (typeof deleteViewshed === 'function') deleteViewshed(id);
+  if (S.activeViewshedId === id) {
+    const next = S.viewsheds[idx] || S.viewsheds[idx - 1] || null;
+    S.activeViewshedId = next ? next.id : null;
+    if (typeof saveAppState === 'function') saveAppState('activeViewshedId', S.activeViewshedId);
+    _renderActiveViewshed();
+  }
+  renderObserverList();
+  buildLayerControl();
+}
+
+function clearAllViewsheds() {
+  if (S.mapLayers.observers) S.mapLayers.observers.clearLayers();
+  if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
+  if (typeof clearViewsheds === 'function') clearViewsheds(_currentAreaKey());
+  S.viewsheds = [];
+  S.activeViewshedId = null;
+  if (typeof saveAppState === 'function') saveAppState('activeViewshedId', null);
+  setStatus('viewshedStatus', '', '');
+  const r = document.getElementById('vsResult'); if (r) r.textContent = '';
+  const pb = document.getElementById('vsProgressBar'); if (pb) pb.style.width = '0';
+  renderObserverList();
+  buildLayerControl();
+}
+
+// Render the observer list UI (one row per record).
+function renderObserverList() {
+  const el = document.getElementById('vsObserverList');
+  if (!el) return;
+  if (!S.viewsheds.length) {
+    el.innerHTML = '<div style="font-size:10px;color:var(--text-muted);padding:4px 0;">No observers yet — tap “Add Observer”, then tap the map.</div>';
+    return;
+  }
+  el.innerHTML = S.viewsheds.map(r => {
+    const active = r.id === S.activeViewshedId;
+    const cov = r.coverage == null
+      ? (r.computedAt ? (r.grid && r.mask ? '' : 'no DEM') : 'pending…')
+      : Math.round(r.coverage * 100) + '%';
+    return `<div class="vs-obs-row${active ? ' active' : ''}" data-id="${r.id}">`
+      + `<span class="vs-obs-name" title="Rename" onclick="renameViewshedPrompt('${r.id}')">${_esc(r.name)}</span>`
+      + `<span class="vs-obs-cov">${_esc(cov)}</span>`
+      + `<span class="vs-obs-actions">`
+      + `<button title="Show" onclick="setActiveViewshed('${r.id}')">${active ? '◉' : '○'}</button>`
+      + `<button title="Recompute" onclick="recomputeViewshed('${r.id}')">↻</button>`
+      + `<button title="Delete" onclick="removeViewshed('${r.id}')">✕</button>`
+      + `</span></div>`;
+  }).join('');
+}
+
+// Restore this area's saved viewsheds from IndexedDB (markers + active overlay,
+// repainted from the stored mask — no DEM/canopy refetch, no recompute). Idempotent.
+async function restoreViewsheds() {
+  if (typeof getAllViewsheds !== 'function') return;
+  const ak = _currentAreaKey();
+  if (S.mapLayers.observers) S.mapLayers.observers.clearLayers();
+  if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
+  S.viewsheds = [];
+  let recs = [];
+  try { recs = await getAllViewsheds(ak); } catch (e) { recs = []; }
+  recs.forEach(raw => {
+    const rec = makeViewshedRecord(raw);
+    if (!rec) return;
+    S.viewsheds.push(rec);
+    _addObserverMarker(rec);
+  });
+  let activeId = null;
+  if (typeof getAppState === 'function') { try { activeId = await getAppState('activeViewshedId'); } catch (e) { /* ignore */ } }
+  if (!S.viewsheds.find(r => r.id === activeId)) activeId = S.viewsheds.length ? S.viewsheds[S.viewsheds.length - 1].id : null;
+  S.activeViewshedId = activeId;
+  _renderActiveViewshed();
+  renderObserverList();
+  buildLayerControl();
+}
+
+async function runViewshed(id) {
+  const rec = S.viewsheds.find(r => r.id === id);
+  if (!rec) return;
+  if (S._viewshedRunningId) { rec._pendingRecompute = true; return; }
+  S._viewshedRunningId = id;
   trackFetchStart('Viewshed');
   setStatus('viewshedStatus', 'loading', 'Computing...');
-  const { aglFt, vlosFt } = _readVsInputs();
-  const obs = S.viewshed.observer;
+  const obs = rec.observer;
+  const aglFt = rec.aglFt, vlosFt = rec.vlosFt;
   try {
     const vlosM = ftToM(vlosFt), aglM = ftToM(aglFt);
     const halfWidthM = vlosM + 50;
@@ -7293,7 +7529,12 @@ async function runViewshed() {
     const can = canRes.status === 'fulfilled' ? canRes.value : { canopyFlat: null, source: 'unavailable' };
     if (!dem.demFlat) {
       setStatus('viewshedStatus', 'error', 'NO DEM');
-      const r = document.getElementById('vsResult'); if (r) r.textContent = 'Terrain (3DEP) unavailable — cannot compute viewshed.';
+      rec.grid = null; rec.mask = null; rec.coverage = null;
+      rec.demSource = 'unavailable'; rec.canopySource = can.canopyFlat ? can.source : null;
+      rec.computedAt = Date.now();
+      if (typeof saveViewshed === 'function') await saveViewshed(_toPersistable(rec));
+      if (id === S.activeViewshedId) _renderActiveViewshed();
+      renderObserverList();
       return;
     }
     _vsProgress(0.2);
@@ -7301,24 +7542,27 @@ async function runViewshed() {
     const dsm = sanitizeForKernel(buildDSM(dem.demFlat, can.canopyFlat, n), n);
     const { col: obsCol, row: obsRow } = latLngToCell(grid, obs.lat, obs.lng);
     const mask = await _runViewshedKernel({ grid, dem: dem.demFlat, dsm, obsCol, obsRow, aglM, vlosRangeM: vlosM });
-    const op = parseFloat((document.getElementById('vsOpacity') || {}).value) || VIEWSHED_OVERLAY_OPACITY;
-    renderRasterOverlay('viewshed', viewshedMaskToRGBA(grid, mask), grid, op);
-    S.viewshed.grid = grid;
-    S.viewshed.mask = mask; // retain mask for GeoTIFF export
-    const cov = viewshedCoverage(grid, mask, obsCol, obsRow, vlosM);
-    const canLabel = can.canopyFlat ? ('canopy ' + can.source) : 'bare earth (no canopy)';
-    const r = document.getElementById('vsResult');
-    if (r) r.textContent = `${Math.round(cov * 100)}% of ${vlosFt} ft VLOS visible @ ${aglFt} ft AGL · DEM ${dem.source} · ${canLabel}`;
+    rec.grid = grid;
+    rec.mask = mask;
+    rec.coverage = viewshedCoverage(grid, mask, obsCol, obsRow, vlosM);
+    rec.demSource = dem.source;
+    rec.canopySource = can.canopyFlat ? can.source : null;
+    rec.computedAt = Date.now();
+    if (rec._marker && rec._marker.setPopupContent) rec._marker.setPopupContent(_observerPopupHtml(rec));
+    if (typeof saveViewshed === 'function') await saveViewshed(_toPersistable(rec));
+    if (id === S.activeViewshedId) _renderActiveViewshed();
     setStatus('viewshedStatus', 'live', 'DONE');
     _vsProgress(1);
+    renderObserverList();
     buildLayerControl();
   } catch (e) {
     console.error('Viewshed error:', e);
     recordDataSourceError('Viewshed', e);
     setStatus('viewshedStatus', 'error', 'ERROR');
   } finally {
-    S.viewshed.running = false;
+    S._viewshedRunningId = null;
     trackFetchEnd('Viewshed');
+    if (rec._pendingRecompute) { rec._pendingRecompute = false; runViewshed(id); }
   }
 }
 
@@ -7364,7 +7608,10 @@ if (typeof module !== 'undefined' && module.exports) {
     getCanopyProxyBase, saveCanopyProxy, fetch3DEPDEM, fetchCanopyRaster,
     renderRasterOverlay, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,
-    startViewshedPick, cancelViewshedPick, onViewshedMapClick, runViewshed, clearViewshed,
+    startViewshedPick, cancelViewshedPick, onViewshedMapClick, runViewshed, clearAllViewsheds,
+    genViewshedId, _ensureObserverLayer, _addObserverMarker, _observerPopupHtml, _toPersistable,
+    _renderActiveViewshed, setActiveViewshed, recomputeViewshed, renameViewshed, renameViewshedPrompt,
+    removeViewshed, renderObserverList, restoreViewsheds,
     buildLayerControl, toggleLayer, updateWireDisplay,
     openAggregatePopup, aggPopupStep, renderAggregatePopup, collectFeaturesAt,
     wirePopupAggregation, eachPopupLayer, _aggFeatureClick,
@@ -7386,6 +7633,7 @@ if (typeof module !== 'undefined' && module.exports) {
     radarToggle, radarStep, updateRadarTime,
     openExport, closeExport, doExport, getKMLCoords, populateExportModal,
     downloadBlob, exportRasterGeoTiff, exportRasterKmz, gatherVisibleLayerFolders, buildSunWindFolders,
+    exportAllViewshedGeoTiffs, exportAllViewshedKmz, _exportObserverPlacemarks,
     _exportLayerPlacemarks, _polyRingsGroups, _exportStyleForLayer, _exportNeedsDisclaimer,
     _exportSelectedLayerKeys, _exportArrowLengthM, EXPORT_DISCLAIMER,
     _exportNotamPlacemarks, _exportTfrPlacemarks, _exportAirportPlacemarks, _exportRasterData,

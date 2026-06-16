@@ -599,6 +599,77 @@ function zipStore(entries) {
   return out;
 }
 
+// ============================================================
+// OBSERVER / VIEWSHED RECORDS (pure) — multi-observer support. A record bundles
+// an observer location with its computed viewshed (mask + grid) so it can be
+// saved, re-displayed without recompute, and exported.
+// ============================================================
+
+// Normalize/validate a viewshed record. Caller supplies `id` (and usually a grid+mask
+// once computed). `mask` is coerced to Uint8Array. Returns null if observer is invalid.
+function makeViewshedRecord(opts) {
+  opts = opts || {};
+  const o = opts.observer || {};
+  const lat = +o.lat, lng = +o.lng;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  let mask = opts.mask;
+  if (mask != null && !(mask instanceof Uint8Array)) mask = new Uint8Array(mask);
+  return {
+    id: opts.id,
+    areaKey: opts.areaKey != null ? opts.areaKey : null,
+    name: opts.name != null ? String(opts.name) : '',
+    observer: { lat, lng },
+    aglFt: Number.isFinite(+opts.aglFt) ? +opts.aglFt : 200,
+    vlosFt: Number.isFinite(+opts.vlosFt) ? +opts.vlosFt : 2500,
+    grid: opts.grid || null,
+    mask: mask || null,
+    coverage: opts.coverage != null ? opts.coverage : null,
+    demSource: opts.demSource || null,
+    canopySource: opts.canopySource || null,
+    computedAt: opts.computedAt != null ? opts.computedAt : null,
+  };
+}
+
+// Safe filename core for a viewshed export, e.g. "Ridge Top #2" -> "Ridge_Top_2".
+function viewshedFilenameSlug(name) {
+  const s = String(name == null ? '' : name)
+    .replace(/[^A-Za-z0-9-]+/g, '_')   // non-alphanumerics -> underscore
+    .replace(/_+/g, '_')                // collapse runs
+    .replace(/^_+|_+$/g, '')            // trim
+    .slice(0, 40);
+  return s || 'observer';
+}
+
+// Resolve a name collision against a set/array of existing names: "Ridge" -> "Ridge (2)".
+function uniqueViewshedName(base, existingNames) {
+  const set = existingNames instanceof Set ? existingNames : new Set(existingNames || []);
+  let name = String(base == null || base === '' ? 'Observer' : base).trim() || 'Observer';
+  if (!set.has(name)) return name;
+  for (let i = 2; ; i++) {
+    const cand = `${name} (${i})`;
+    if (!set.has(cand)) return cand;
+  }
+}
+
+// Plain-text KML <description> for an observer point (no HTML — reads cleanly in CalTopo).
+function observerKmlDescription(rec) {
+  if (!rec) return '';
+  const o = rec.observer || {};
+  const cov = (rec.coverage == null) ? (rec.grid && rec.mask ? '--' : 'not computed')
+    : Math.round(rec.coverage * 100) + '% of VLOS visible';
+  const lines = [
+    rec.name ? `Observer: ${rec.name}` : 'Observer',
+    (Number.isFinite(+o.lat) && Number.isFinite(+o.lng)) ? `Location: ${(+o.lat).toFixed(5)}, ${(+o.lng).toFixed(5)}` : '',
+    `Drone AGL: ${rec.aglFt} ft`,
+    `VLOS range: ${rec.vlosFt} ft`,
+    `Viewshed: ${cov}`,
+    rec.demSource ? `Terrain: ${rec.demSource}` : '',
+    rec.canopySource ? `Canopy: ${rec.canopySource}` : '',
+    rec.computedAt ? `Computed: ${new Date(rec.computedAt).toISOString()}` : '',
+  ];
+  return lines.filter(Boolean).join('\n');
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -613,5 +684,6 @@ if (typeof module !== 'undefined' && module.exports) {
     curvatureDrop, isVisible, computeViewshed, viewshedCoverage,
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,
     encodeGeoTiffRGBA, reprojectRgbaTo3857, worldFileForBounds, WGS84_WKT, WEBMERC_WKT, crc32, zipStore,
+    makeViewshedRecord, viewshedFilenameSlug, uniqueViewshedName, observerKmlDescription,
   };
 }
