@@ -1,4 +1,7 @@
-const { encodeGeoTiffRGBA, worldFileForBounds, WGS84_WKT, crc32, zipStore } = require('../../sar-preflight-raster.js');
+const {
+  encodeGeoTiffRGBA, reprojectRgbaTo3857, worldFileForBounds, WGS84_WKT, WEBMERC_WKT, crc32, zipStore,
+  lngToMercX, latToMercY,
+} = require('../../sar-preflight-raster.js');
 
 // Minimal little-endian TIFF reader: returns { header, tags: Map(id -> {type,count,values}) }.
 function readTiff(buf) {
@@ -74,6 +77,32 @@ describe('encodeGeoTiffRGBA', () => {
     const { stripOffset } = readTiff(buf);
     const out = new Uint8Array(buf, stripOffset, W * H * 4);
     expect(Array.from(out)).toEqual(Array.from(rgba));
+  });
+
+  it('writes projected geokeys (GTModelType=1, ProjectedCSTypeGeoKey) for EPSG:3857', () => {
+    const buf = encodeGeoTiffRGBA(rgba, W, H, { west: -13_000_000, east: -12_990_000, south: 4_600_000, north: 4_610_000 }, { epsg: 3857 });
+    const { tags } = readTiff(buf);
+    const keys = tags.get(34735).values;
+    expect(keys[keys.indexOf(1024) + 3]).toBe(1);     // GTModelType = projected
+    expect(keys).toContain(3072);                     // ProjectedCSTypeGeoKey present
+    expect(keys[keys.indexOf(3072) + 3]).toBe(3857);  // = EPSG:3857
+    expect(keys).not.toContain(2048);                 // not the geographic key
+  });
+});
+
+describe('reprojectRgbaTo3857', () => {
+  it('resamples a 4326 grid to a Web-Mercator grid with metre bounds', () => {
+    const grid = { cols: 8, rows: 8, bounds: { west: -120.99, east: -120.95, south: 38.66, north: 38.70 } };
+    const rgba = new Uint8ClampedArray(8 * 8 * 4).fill(200);
+    const out = reprojectRgbaTo3857(rgba, grid);
+    expect(out.width).toBeGreaterThan(0);
+    expect(out.height).toBeGreaterThan(0);
+    expect(out.bounds.west).toBeCloseTo(lngToMercX(grid.bounds.west), 3);   // metres
+    expect(out.bounds.east).toBeCloseTo(lngToMercX(grid.bounds.east), 3);
+    expect(out.bounds.north).toBeCloseTo(latToMercY(grid.bounds.north), 3);
+    expect(out.bounds.north).toBeGreaterThan(out.bounds.south);
+    expect(out.rgba.length).toBe(out.width * out.height * 4);
+    expect(WEBMERC_WKT).toContain('"EPSG","3857"');
   });
 });
 

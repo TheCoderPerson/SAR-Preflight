@@ -4804,18 +4804,18 @@ function _rgbaToPngBytes(rgba, w, h) {
   return bytes;
 }
 
-// Export a raster overlay as a georeferenced GeoTIFF (EPSG:4326) plus .tfw/.prj
-// sidecars for tools that read world files instead of embedded georeferencing.
+// Export a raster overlay as a georeferenced GeoTIFF in EPSG:3857 (Web Mercator) —
+// the projection CalTopo's "Map Sheet" import expects (matches the SAR_UAS_Segment
+// tool's working export). The 4326 grid is resampled to a square-pixel mercator grid.
 function exportRasterGeoTiff(layerId) {
   const ts = new Date().toISOString().split('T')[0];
   const r = _exportRasterData(layerId);
   if (!r) return;
   try {
     const { grid, rgba, label } = r;
-    const base = `SAR_${label}_${ts}`;
-    downloadBlob(new Blob([encodeGeoTiffRGBA(rgba, grid.cols, grid.rows, grid.bounds)], { type: 'image/tiff' }), base + '.tif');
-    downloadBlob(new Blob([worldFileForBounds(grid.bounds, grid.cols, grid.rows)], { type: 'text/plain' }), base + '.tfw');
-    downloadBlob(new Blob([WGS84_WKT], { type: 'text/plain' }), base + '.prj');
+    const merc = reprojectRgbaTo3857(rgba, grid);
+    const buf = encodeGeoTiffRGBA(merc.rgba, merc.width, merc.height, merc.bounds, { epsg: 3857 });
+    downloadBlob(new Blob([buf], { type: 'image/tiff' }), `SAR_${label}_${ts}.tif`);
     if (typeof logAudit === 'function') logAudit('geotiff_exported', { layer: layerId });
   } catch (e) {
     console.error('GeoTIFF export error:', e);
@@ -4886,11 +4886,12 @@ function populateExportModal() {
   }
   const canopyOk = !!(S.canopy && S.canopy.canopyFlat);
   const viewshedOk = !!(S.viewshed && S.viewshed.mask);
-  // KMZ GroundOverlay (CalTopo-friendly) is the default; GeoTIFF (GIS) is opt-in.
-  _setExportRasterRow('expCanopyKmz', 'expCanopyKmzRow', canopyOk, true);
-  _setExportRasterRow('expCanopyTiff', 'expCanopyRow', canopyOk, false);
-  _setExportRasterRow('expViewshedKmz', 'expViewshedKmzRow', viewshedOk, true);
-  _setExportRasterRow('expViewshedTiff', 'expViewshedRow', viewshedOk, false);
+  // GeoTIFF (EPSG:3857) is the default — CalTopo Map Sheet import; KMZ overlay
+  // (Google Earth) is opt-in.
+  _setExportRasterRow('expCanopyTiff', 'expCanopyRow', canopyOk, true);
+  _setExportRasterRow('expCanopyKmz', 'expCanopyKmzRow', canopyOk, false);
+  _setExportRasterRow('expViewshedTiff', 'expViewshedRow', viewshedOk, true);
+  _setExportRasterRow('expViewshedKmz', 'expViewshedKmzRow', viewshedOk, false);
 }
 
 function doExport() {

@@ -151,10 +151,10 @@ describe('populateExportModal', () => {
     const list = document.getElementById('exportLayerList');
     expect(list.querySelectorAll('input[type="checkbox"]').length).toBe(1);
     expect(list.querySelector('input').dataset.layerKey).toBe('faa_obstacles');
-    // Canopy available -> KMZ checked by default, GeoTIFF enabled but unchecked.
-    expect(document.getElementById('expCanopyKmz').checked).toBe(true);
-    expect(document.getElementById('expCanopyTiff').disabled).toBe(false);
-    expect(document.getElementById('expCanopyTiff').checked).toBe(false);
+    // Canopy available -> GeoTIFF (CalTopo) checked by default, KMZ opt-in.
+    expect(document.getElementById('expCanopyTiff').checked).toBe(true);
+    expect(document.getElementById('expCanopyKmz').disabled).toBe(false);
+    expect(document.getElementById('expCanopyKmz').checked).toBe(false);
     // Viewshed unavailable -> both disabled.
     expect(document.getElementById('expViewshedKmz').disabled).toBe(true);
     expect(document.getElementById('expViewshedTiff').disabled).toBe(true);
@@ -162,12 +162,11 @@ describe('populateExportModal', () => {
 });
 
 describe('exportRasterGeoTiff', () => {
-  it('hands a .tif plus .tfw/.prj world-file sidecars to the downloader', () => {
-    const grid = { cols: 2, rows: 2, bounds: { west: -121, east: -120.99, south: 38.7, north: 38.71 } };
-    S.canopy = { grid, canopyFlat: new Float32Array([5, 0, 12, 30]) };
+  it('reprojects to Web Mercator and hands a single .tif blob to the downloader', () => {
+    const grid = { cols: 4, rows: 4, bounds: { west: -121, east: -120.99, south: 38.7, north: 38.71 } };
+    S.canopy = { grid, canopyFlat: new Float32Array(16).fill(12) };
     const blobs = captureDownloads(() => exportRasterGeoTiff('canopy'));
-    expect(blobs.length).toBe(3);
-    expect(blobs.filter(b => b.type === 'image/tiff').length).toBe(1);
-    expect(blobs.filter(b => b.type === 'text/plain').length).toBe(2); // .tfw + .prj
+    expect(blobs.length).toBe(1);
+    expect(blobs[0].type).toBe('image/tiff');
   });
 });

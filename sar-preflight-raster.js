@@ -375,11 +375,16 @@ function viewshedMaskToRGBA(grid, mask) {
 
 // ============================================================
 // GEOTIFF ENCODER (pure) — write a georeferenced RGBA GeoTIFF for the canopy /
-// viewshed overlays. Uncompressed, single-strip, little-endian, EPSG:4326.
+// viewshed overlays. Uncompressed, single-strip, little-endian.
 // `rgba` is the Uint8ClampedArray from canopyGridToRGBA / viewshedMaskToRGBA;
-// `bounds` is grid.bounds ({west,south,east,north} in degrees).
+// `bounds` is {west,south,east,north} in the units of `opts.epsg`
+// (degrees for 4326, metres for projected CRSs like 3857).
+// `opts.epsg` defaults to 4326 (geographic). Pass 3857 for Web Mercator —
+// CalTopo's "Map Sheet" GeoTIFF import expects EPSG:3857.
 // ============================================================
-function encodeGeoTiffRGBA(rgba, width, height, bounds) {
+function encodeGeoTiffRGBA(rgba, width, height, bounds, opts) {
+  opts = opts || {};
+  const epsg = opts.epsg || 4326;
   const SAMPLES = 4;
   const imageLen = width * height * SAMPLES;
   const NUM_TAGS = 14;
@@ -449,8 +454,12 @@ function encodeGeoTiffRGBA(rgba, width, height, bounds) {
   // Tiepoint: raster (0,0) = top-left = (west, north).
   const tp = [0, 0, 0, bounds.west, bounds.north, 0];
   for (let i = 0; i < 6; i++) dv.setFloat64(tiepointOffset + i * 8, tp[i], LE);
-  // GeoKeyDirectory: Geographic / PixelIsArea / WGS84 (EPSG:4326).
-  const geoKeys = [1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326];
+  // GeoKeyDirectory: PixelIsArea + either geographic (GTModelType=2,
+  // GeographicTypeGeoKey 2048) or projected (GTModelType=1, ProjectedCSTypeGeoKey 3072).
+  const projected = epsg !== 4326;
+  const csKey = projected ? 3072 : 2048;
+  const modelType = projected ? 1 : 2;
+  const geoKeys = [1, 1, 0, 3, 1024, 0, 1, modelType, 1025, 0, 1, 1, csKey, 0, 1, epsg];
   for (let i = 0; i < geoKeys.length; i++) dv.setUint16(geoKeyOffset + i * 2, geoKeys[i], LE);
 
   return buf;
@@ -473,6 +482,45 @@ function worldFileForBounds(bounds, width, height) {
 }
 const WGS84_WKT = 'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],' +
   'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433],AUTHORITY["EPSG","4326"]]';
+
+// Resample an EPSG:4326 (geographic, row 0 = north) RGBA grid onto a square-pixel
+// EPSG:3857 (Web Mercator) grid — the projection CalTopo's GeoTIFF import expects.
+// `grid` has .bounds {west,east,south,north} (degrees) and .cols/.rows matching rgba.
+// Returns { rgba, width, height, bounds } where bounds are in Web-Mercator metres.
+function reprojectRgbaTo3857(rgba, grid) {
+  const b = grid.bounds;
+  const minX = lngToMercX(b.west), maxX = lngToMercX(b.east);
+  const minY = latToMercY(b.south), maxY = latToMercY(b.north);
+  const mercW = maxX - minX, mercH = maxY - minY;
+  const srcCols = grid.cols, srcRows = grid.rows;
+  // Square metric pixels; longer side ~ the source's longer side.
+  const res = Math.max(mercW, mercH) / Math.max(1, Math.max(srcCols, srcRows));
+  const outW = Math.max(1, Math.round(mercW / res));
+  const outH = Math.max(1, Math.round(mercH / res));
+  const out = new Uint8ClampedArray(outW * outH * 4);
+  const lonSpan = b.east - b.west, latSpan = b.north - b.south;
+  for (let row = 0; row < outH; row++) {
+    const my = maxY - (row + 0.5) * (mercH / outH);
+    const lat = mercYToLat(my);
+    const srcRow = Math.floor((b.north - lat) / latSpan * srcRows);
+    for (let col = 0; col < outW; col++) {
+      const o = (row * outW + col) * 4;
+      if (srcRow < 0 || srcRow >= srcRows) continue; // leave transparent (0,0,0,0)
+      const mx = minX + (col + 0.5) * (mercW / outW);
+      const lng = mercXToLng(mx);
+      const srcCol = Math.floor((lng - b.west) / lonSpan * srcCols);
+      if (srcCol < 0 || srcCol >= srcCols) continue;
+      const si = (srcRow * srcCols + srcCol) * 4;
+      out[o] = rgba[si]; out[o + 1] = rgba[si + 1]; out[o + 2] = rgba[si + 2]; out[o + 3] = rgba[si + 3];
+    }
+  }
+  return { rgba: out, width: outW, height: outH, bounds: { west: minX, east: maxX, south: minY, north: maxY } };
+}
+const WEBMERC_WKT = 'PROJCS["WGS 84 / Pseudo-Mercator",GEOGCS["WGS 84",DATUM["WGS_1984",' +
+  'SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],' +
+  'PROJECTION["Mercator_1SP"],PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],' +
+  'PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["metre",1],AXIS["X",EAST],AXIS["Y",NORTH],' +
+  'AUTHORITY["EPSG","3857"]]';
 
 // --- Minimal store-only ZIP (for KMZ) ---
 const _CRC_TABLE = (function () {
@@ -564,6 +612,6 @@ if (typeof module !== 'undefined' && module.exports) {
     resampleToGrid, buildDSM, sanitizeForKernel,
     curvatureDrop, isVisible, computeViewshed, viewshedCoverage,
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,
-    encodeGeoTiffRGBA, worldFileForBounds, WGS84_WKT, crc32, zipStore,
+    encodeGeoTiffRGBA, reprojectRgbaTo3857, worldFileForBounds, WGS84_WKT, WEBMERC_WKT, crc32, zipStore,
   };
 }
