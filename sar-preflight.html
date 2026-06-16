@@ -510,6 +510,13 @@ select.api-input { cursor: pointer; }
   cursor: pointer; font-size: 12px; color: var(--text-secondary);
 }
 .export-check-row input { accent-color: var(--accent-blue); }
+.export-check-row input:disabled + * , .export-check-row input:disabled { opacity: 0.4; }
+.export-group-label {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 1px;
+  text-transform: uppercase; color: var(--text-muted);
+  margin: 12px 0 4px; padding-bottom: 3px; border-bottom: 1px solid var(--border);
+}
+#exportLayerList { max-height: 160px; overflow-y: auto; }
 
 @media (max-width: 900px) {
   html, body { overflow-x: hidden; width: 100%; }
@@ -1294,19 +1301,30 @@ select.api-input { cursor: pointer; }
 
 <!-- Export Modal -->
 <div class="modal-overlay" id="exportModal">
-  <div class="modal">
-    <h3>Export KML</h3>
-    <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px;">Select data to include:</p>
+  <div class="modal" style="max-height:85vh;overflow-y:auto;">
+    <h3>Export</h3>
+    <p style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;">Vector layers export to a KML (opens in Google Earth). Canopy and viewshed export as separate georeferenced GeoTIFFs for GIS.</p>
+
+    <div class="export-group-label">Data summaries</div>
     <label class="export-check-row"><input type="checkbox" id="expOpsArea" checked> Operational Area Polygon</label>
     <label class="export-check-row"><input type="checkbox" id="expWxData" checked> Weather Data</label>
     <label class="export-check-row"><input type="checkbox" id="expWindData" checked> Wind Profile</label>
     <label class="export-check-row"><input type="checkbox" id="expAirspace" checked> Airspace Info</label>
     <label class="export-check-row"><input type="checkbox" id="expTerrain" checked> Terrain Data</label>
     <label class="export-check-row"><input type="checkbox" id="expAstro" checked> Sun/Moon/Twilight</label>
-    <label class="export-check-row"><input type="checkbox" id="expNOTAMs" checked> NOTAMs/TFRs</label>
     <label class="export-check-row"><input type="checkbox" id="expOps" checked> Ops/Battery Assessment</label>
+
+    <div class="export-group-label">Map layers (visible)</div>
+    <div id="exportLayerList"></div>
+
+    <div class="export-group-label">Overlays &amp; analysis</div>
+    <label class="export-check-row"><input type="checkbox" id="expSun" checked> Sun position — hourly arrows (24 h, daylight only)</label>
+    <label class="export-check-row"><input type="checkbox" id="expWind" checked> Wind — hourly arrows (24 h)</label>
+    <label class="export-check-row" id="expCanopyRow"><input type="checkbox" id="expCanopyTiff"> Canopy → georeferenced GeoTIFF</label>
+    <label class="export-check-row" id="expViewshedRow"><input type="checkbox" id="expViewshedTiff"> Viewshed → georeferenced GeoTIFF</label>
+
     <div class="modal-actions">
-      <button class="btn btn-primary" onclick="doExport()">Download KML</button>
+      <button class="btn btn-primary" onclick="doExport()">Download</button>
       <button class="btn btn-ghost" onclick="closeExport()">Cancel</button>
     </div>
   </div>

@@ -4553,25 +4553,224 @@ function computeAssessment() {
 // ============================================================
 // KML EXPORT
 // ============================================================
+// Advisory note attached to wire/obstacle/NOTAM/TFR folders and the document root.
+const EXPORT_DISCLAIMER = 'Advisory only \u2014 NOT a complete inventory. Wires, obstacles, TFRs and ' +
+  'NOTAMs from these public datasets are frequently incomplete. Verify against official FAA sources ' +
+  '(B4UFLY / LAANC, current sectional, FAA TFR & NOTAM search) and a visual scan of the area before flight.';
+// Keys whose folder carries the disclaimer (wire_* handled by prefix).
+const EXPORT_DISCLAIMER_KEYS = new Set(['faa_tfr', 'tfr_imported', 'notam_imported', 'faa_obstacles']);
+
+function _exportNeedsDisclaimer(key) {
+  return key.indexOf('wire_') === 0 || EXPORT_DISCLAIMER_KEYS.has(key);
+}
+
+// Map a map-layer key to one of the shared KML <Style> ids (see KML_STYLE_DEFS).
+function _exportStyleForLayer(key) {
+  if (key.indexOf('wire_') === 0) return 'wire';
+  const m = {
+    faa_tfr: 'restrict', tfr_imported: 'restrict', faa_prohibited: 'restrict',
+    faa_ns_restrictions: 'restrict', notam_imported: 'restrict', nws_alerts: 'restrict',
+    fire_perimeters: 'fire', faa_sua: 'sua', faa_class_airspace: 'airspace', faa_laanc: 'airspace',
+    faa_obstacles: 'obstacle', airports: 'airport', cell_towers: 'tower', dams: 'dam',
+    adsb_aircraft: 'aircraft', wilderness: 'protected', national_parks: 'protected',
+    emergency_lz: 'protected', swap_radius: 'opsArea', flight_plan: 'opsArea',
+  };
+  return m[key] || 'generic';
+}
+
+// Strip HTML to a short plain-text title for the placemark <name>.
+function _exportPlainText(html) {
+  return String(html || '')
+    .replace(/<br\s*\/?>(?=.)/gi, ' \u00b7 ').replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+
+// Normalize Leaflet getLatLngs() into an array of polygons; each polygon is an
+// array of rings; each ring an array of [lat,lng]. Handles simple / holed / multi.
+function _polyRingsGroups(latlngs) {
+  if (!Array.isArray(latlngs) || !latlngs.length) return [];
+  const isLL = (x) => x && typeof x.lat === 'number';
+  if (isLL(latlngs[0])) return [[latlngs.map(p => [p.lat, p.lng])]];
+  if (Array.isArray(latlngs[0]) && isLL(latlngs[0][0])) return [latlngs.map(ring => ring.map(p => [p.lat, p.lng]))];
+  return latlngs.map(poly => (poly || []).map(ring => ring.map(p => [p.lat, p.lng])));
+}
+
+// Convert every popup-bearing feature in a layer group into KML placemarks.
+function _exportLayerPlacemarks(key, group) {
+  const styleUrl = _exportStyleForLayer(key);
+  const fallback = _aggMeta(key).label || 'Feature';
+  let inner = '';
+  eachPopupLayer(group, pl => {
+    let html = '';
+    try { html = _aggContentToHtml(pl.getPopup().getContent()); } catch (e) { html = ''; }
+    const name = _exportPlainText(html).slice(0, 48) || fallback;
+    try {
+      if (typeof L !== 'undefined' && L.Polygon && pl instanceof L.Polygon) {
+        _polyRingsGroups(pl.getLatLngs()).forEach(rings => {
+          inner += kmlPolygonPlacemark({ name, styleUrl, description: html, rings: rings.map(r => kmlRingFromLatLng(r)) });
+        });
+      } else if (typeof L !== 'undefined' && L.Polyline && pl instanceof L.Polyline) {
+        const segs = [];
+        const collect = a => { if (!Array.isArray(a)) return; if (a.length && a[0] && typeof a[0].lat === 'number') segs.push(a); else a.forEach(collect); };
+        collect(pl.getLatLngs());
+        segs.forEach(seg => { inner += kmlLinePlacemark({ name, styleUrl, description: html, coords: seg.map(p => [p.lat, p.lng]) }); });
+      } else if (pl.getLatLng) {
+        const ll = pl.getLatLng();
+        inner += kmlPointPlacemark({ name, styleUrl, description: html, lat: ll.lat, lng: ll.lng });
+      }
+    } catch (e) { /* skip malformed feature */ }
+  });
+  return inner;
+}
+
+// Build KML folders for every currently-visible map overlay. `selectedKeys` (a Set
+// of layer keys) optionally restricts which layers are included; null = all visible.
+function gatherVisibleLayerFolders(selectedKeys) {
+  let folders = '';
+  if (!S.map || !S.mapLayers) return folders;
+  const keys = Object.keys(S.mapLayers).filter(k =>
+    !AGG_SKIP_LAYERS.has(k) && S.mapLayers[k] && S.map.hasLayer(S.mapLayers[k]));
+  keys.sort((a, b) => _aggMeta(a).pri - _aggMeta(b).pri); // safety layers first
+  const byLabel = {}; const order = [];
+  keys.forEach(k => {
+    if (selectedKeys && !selectedKeys.has(k)) return;
+    const pm = _exportLayerPlacemarks(k, S.mapLayers[k]);
+    if (!pm) return;
+    const label = _aggMeta(k).label || 'Other';
+    if (!byLabel[label]) { byLabel[label] = { inner: '', disclaim: false }; order.push(label); }
+    byLabel[label].inner += pm;
+    if (_exportNeedsDisclaimer(k)) byLabel[label].disclaim = true;
+  });
+  order.forEach(label => {
+    const g = byLabel[label];
+    folders += kmlFolder(label, g.inner, g.disclaim ? { description: EXPORT_DISCLAIMER } : {});
+  });
+  return folders;
+}
+
+// Arrow length scaled to the operational area (clamped 400 m .. 4 km).
+function _exportArrowLengthM() {
+  let r = 1500;
+  try {
+    if (S.areaType === 'CIRCLE' && S.currentArea && S.currentArea.getRadius) r = S.currentArea.getRadius();
+    else if (S.areaBounds && S.areaCenter && S.map) r = S.map.distance(S.areaCenter, { lat: S.areaBounds.getNorth(), lng: S.areaCenter.lng });
+  } catch (e) { /* default */ }
+  return Math.max(400, Math.min(4000, r * 0.9));
+}
+
+// Folders of hourly sun + wind arrows from the 24 h weather timeline.
+function buildSunWindFolders() {
+  let folders = '';
+  const c = S.areaCenter;
+  const hourly = S.wx && S.wx.hourly;
+  const times = hourly && hourly.time;
+  if (!c || !times) return folders;
+  const lengthM = _exportArrowLengthM();
+  if (document.getElementById('expSun')?.checked && typeof sunArrowsKml === 'function') {
+    folders += kmlFolder('Sun Position (hourly, daylight only)', sunArrowsKml(c.lat, c.lng, times, c.lat, c.lng, { lengthM }),
+      { description: 'Hourly arrows pointing toward the sun over the next 24 h (omitted while the sun is below the horizon). Drag the Google Earth time slider to animate.' });
+  }
+  if (document.getElementById('expWind')?.checked && typeof windArrowsKml === 'function') {
+    folders += kmlFolder('Wind (hourly)', windArrowsKml(times, hourly.wind_direction_10m, hourly.wind_speed_10m, hourly.wind_gusts_10m, c.lat, c.lng, { lengthM }),
+      { description: 'Hourly wind arrows for the next 24 h. Arrow points DOWNWIND (drift direction); label gives the meteorological FROM bearing, speed and gust. Drag the time slider to animate.' });
+  }
+  return folders;
+}
+
+// Which dynamic layer checkboxes are ticked (null = no list rendered \u2192 include all visible).
+function _exportSelectedLayerKeys() {
+  const boxes = document.querySelectorAll('#exportLayerList input[type="checkbox"]');
+  if (!boxes || !boxes.length) return null;
+  const set = new Set();
+  boxes.forEach(b => { if (b.checked && b.dataset.layerKey) b.dataset.layerKey.split(',').forEach(k => set.add(k)); });
+  return set;
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Export a computed raster overlay (canopy / viewshed) as a georeferenced GeoTIFF.
+function exportRasterGeoTiff(layerId) {
+  const ts = new Date().toISOString().split('T')[0];
+  let grid, rgba, label;
+  if (layerId === 'canopy' && S.canopy && S.canopy.grid && S.canopy.canopyFlat) {
+    grid = S.canopy.grid; rgba = canopyGridToRGBA(grid, S.canopy.canopyFlat); label = 'Canopy';
+  } else if (layerId === 'viewshed' && S.viewshed && S.viewshed.grid && S.viewshed.mask) {
+    grid = S.viewshed.grid; rgba = viewshedMaskToRGBA(grid, S.viewshed.mask); label = 'Viewshed';
+  } else { return; }
+  try {
+    const buf = encodeGeoTiffRGBA(rgba, grid.cols, grid.rows, grid.bounds);
+    downloadBlob(new Blob([buf], { type: 'image/tiff' }), `SAR_${label}_${ts}.tif`);
+    if (typeof logAudit === 'function') logAudit('geotiff_exported', { layer: layerId });
+  } catch (e) {
+    console.error('GeoTIFF export error:', e);
+    alert('Could not export ' + label + ' GeoTIFF: ' + (e && e.message || e));
+  }
+}
+
 function openExport() {
   if (!S.currentArea) return alert('Draw an operational area first.');
+  populateExportModal();
   document.getElementById('exportModal').classList.add('active');
 }
 function closeExport() { document.getElementById('exportModal').classList.remove('active'); }
 
+function _setExportRasterRow(cbId, rowId, enabled) {
+  const cb = document.getElementById(cbId); const row = document.getElementById(rowId);
+  if (cb) { cb.disabled = !enabled; cb.checked = enabled; }
+  if (row) row.style.display = enabled ? '' : 'none';
+}
+
+// (Re)build the dynamic parts of the export modal: a checklist of currently-visible
+// map layers (merged by label, with feature counts) and the raster GeoTIFF rows.
+function populateExportModal() {
+  const list = document.getElementById('exportLayerList');
+  if (list) {
+    const keys = (S.map && S.mapLayers) ? Object.keys(S.mapLayers).filter(k =>
+      !AGG_SKIP_LAYERS.has(k) && S.mapLayers[k] && S.map.hasLayer(S.mapLayers[k])) : [];
+    keys.sort((a, b) => _aggMeta(a).pri - _aggMeta(b).pri);
+    const byLabel = {}; const order = [];
+    keys.forEach(k => {
+      let n = 0; eachPopupLayer(S.mapLayers[k], () => { n++; });
+      if (!n) return;
+      const label = _aggMeta(k).label || 'Other';
+      if (!byLabel[label]) { byLabel[label] = { keys: [], count: 0 }; order.push(label); }
+      byLabel[label].keys.push(k); byLabel[label].count += n;
+    });
+    if (!order.length) {
+      list.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:4px 0;">No visible map layers to export.</div>';
+    } else {
+      list.innerHTML = order.map(label => {
+        const g = byLabel[label];
+        return `<label class="export-check-row"><input type="checkbox" data-layer-key="${g.keys.join(',')}" checked> ${label} (${g.count})</label>`;
+      }).join('');
+    }
+  }
+  _setExportRasterRow('expCanopyTiff', 'expCanopyRow', !!(S.canopy && S.canopy.canopyFlat));
+  _setExportRasterRow('expViewshedTiff', 'expViewshedRow', !!(S.viewshed && S.viewshed.mask));
+}
+
 function doExport() {
+  if (!S.areaCenter) return alert('Draw an operational area first.');
   const c = S.areaCenter;
-  const now = new Date().toISOString();
-  const ts = now.split('T')[0];
+  const ts = new Date().toISOString().split('T')[0];
   let folders = '';
 
-  if (document.getElementById('expOpsArea').checked) {
-    folders += `<Folder><name>Operational Area</name><Placemark><name>${S.areaType} Search Area</name>
-      <styleUrl>#opsArea</styleUrl><description>Center: ${c.lat.toFixed(5)}, ${c.lng.toFixed(5)}\nType: ${S.areaType}</description>
-      <Polygon><outerBoundaryIs><LinearRing><coordinates>${getKMLCoords()}</coordinates></LinearRing></outerBoundaryIs></Polygon>
-    </Placemark></Folder>`;
+  // 1. Operational area polygon
+  if (document.getElementById('expOpsArea')?.checked) {
+    folders += kmlFolder('Operational Area', kmlPolygonPlacemark({
+      name: `${S.areaType} Search Area`, styleUrl: 'opsArea',
+      description: `Center: ${c.lat.toFixed(5)}, ${c.lng.toFixed(5)}\nType: ${S.areaType}`,
+      rings: [getKMLCoords()],
+    }));
   }
 
+  // 2. Text-summary placemarks (weather / terrain / ops etc.) at the area centre
   const sections = [
     { id: 'expWxData', name: 'Weather', fields: ['wxTemp','wxFeels','wxDew','wxHumidity','wxPressure','wxDensity','wxVis','wxCloud','wxCeiling','wxConditions','wxPrecip','wxLightning','wxUV','wxKp','wxIcing','wxFire','wxAQI'] },
     { id: 'expWindData', name: 'Wind Profile', fields: ['windMax','windGustMax','windDir','windImpact'] },
@@ -4580,7 +4779,6 @@ function doExport() {
     { id: 'expAstro', name: 'Sun Moon Twilight', fields: ['astSunrise','astSunset','astTwilightAM','astTwilightPM','astSunAz','astSunEl','astMoonPhase','astMoonIllum','astDayWindow','astMagDec'] },
     { id: 'expOps', name: 'Operations', fields: ['opsTempFactor','opsAltFactor','opsWindFactor','opsFlightTime','opsCapacity'] },
   ];
-
   sections.forEach(s => {
     if (!document.getElementById(s.id)?.checked) return;
     const desc = s.fields.map(f => {
@@ -4588,20 +4786,22 @@ function doExport() {
       const label = el?.closest('.data-cell')?.querySelector('.data-label')?.textContent || f;
       return `${label}: ${el?.textContent || '--'}`;
     }).join('\n');
-    folders += `<Folder><name>${s.name}</name><Placemark><name>${s.name} \u2014 ${ts}</name>
-      <Point><coordinates>${c.lng},${c.lat},0</coordinates></Point>
-      <description><![CDATA[${desc}]]></description></Placemark></Folder>`;
+    folders += kmlFolder(s.name, kmlPointPlacemark({ name: `${s.name} \u2014 ${ts}`, lat: c.lat, lng: c.lng, description: desc }));
   });
 
-  const kml = `<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document>
-    <name>SAR Preflight Intel \u2014 ${ts}</name>
-    <Style id="opsArea"><LineStyle><color>fffd8b3d</color><width>2</width></LineStyle><PolyStyle><color>20fd8b3d</color></PolyStyle></Style>
-    ${folders}</Document></kml>`;
+  // 3. Every currently-visible map overlay as real geometry
+  folders += gatherVisibleLayerFolders(_exportSelectedLayerKeys());
 
-  const blob = new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url; a.download = `SAR_Preflight_${ts}.kml`; a.click();
-  URL.revokeObjectURL(url);
+  // 4. Hourly sun + wind arrows
+  folders += buildSunWindFolders();
+
+  const kml = kmlDocument(`SAR Preflight Intel \u2014 ${ts}`, kmlStyles(), folders, EXPORT_DISCLAIMER);
+  downloadBlob(new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' }), `SAR_Preflight_${ts}.kml`);
+
+  // 5. Canopy / viewshed rasters as separate georeferenced GeoTIFFs
+  if (document.getElementById('expCanopyTiff')?.checked) exportRasterGeoTiff('canopy');
+  if (document.getElementById('expViewshedTiff')?.checked) exportRasterGeoTiff('viewshed');
+
   closeExport();
   if (typeof logAudit === 'function') logAudit('kml_exported');
 }
@@ -6862,7 +7062,7 @@ async function loadCanopyForView() {
     }
     const op = parseFloat((document.getElementById('canopyOpacity') || {}).value) || CANOPY_OVERLAY_OPACITY;
     renderRasterOverlay('canopy', canopyGridToRGBA(grid, canopyFlat), grid, op);
-    S.canopy = { grid, source };
+    S.canopy = { grid, source, canopyFlat }; // retain pixels for GeoTIFF export
     const cached = source.includes('cached');
     setStatus('canopyStatus', cached ? 'cached' : 'live', cached ? 'CACHED' : 'LIVE');
     const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = true;
@@ -6963,6 +7163,7 @@ async function runViewshed() {
     const op = parseFloat((document.getElementById('vsOpacity') || {}).value) || VIEWSHED_OVERLAY_OPACITY;
     renderRasterOverlay('viewshed', viewshedMaskToRGBA(grid, mask), grid, op);
     S.viewshed.grid = grid;
+    S.viewshed.mask = mask; // retain mask for GeoTIFF export
     const cov = viewshedCoverage(grid, mask, obsCol, obsRow, vlosM);
     const canLabel = can.canopyFlat ? ('canopy ' + can.source) : 'bare earth (no canopy)';
     const r = document.getElementById('vsResult');
@@ -7042,7 +7243,10 @@ if (typeof module !== 'undefined' && module.exports) {
     renderAirportMarkers, fetchNWSAlerts, renderNWSAlertCards, renderNWSAlertPolygons,
     renderForecastChart, fetchRadar,
     radarToggle, radarStep, updateRadarTime,
-    openExport, closeExport, doExport, getKMLCoords,
+    openExport, closeExport, doExport, getKMLCoords, populateExportModal,
+    downloadBlob, exportRasterGeoTiff, gatherVisibleLayerFolders, buildSunWindFolders,
+    _exportLayerPlacemarks, _polyRingsGroups, _exportStyleForLayer, _exportNeedsDisclaimer,
+    _exportSelectedLayerKeys, _exportArrowLengthM, EXPORT_DISCLAIMER,
     saveApiKey, saveConfig, updateClock, refreshData,
     initMap, startDraw, clearDrawBtns, clearArea, enterCoords,
     getStoredTheme, applyTheme, cycleTheme,
