@@ -2001,6 +2001,196 @@ function classifyNotamForUAS(notam, aoi) {
   }
 }
 
+// ============================================================
+// KML EXPORT BUILDERS (pure — assembled by doExport in sar-preflight.js)
+// Coordinate format matches getKMLCoords: "lng,lat,alt".
+// ============================================================
+
+function kmlEscape(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
+// Popup descriptions carry arbitrary HTML — wrap in CDATA, escaping any "]]>".
+function kmlCdata(html) {
+  return '<![CDATA[' + String(html == null ? '' : html).replace(/\]\]>/g, ']]]]><![CDATA[>') + ']]>';
+}
+
+function _kmlCoord(lng, lat, alt) {
+  return `${(+lng).toFixed(6)},${(+lat).toFixed(6)},${alt || 0}`;
+}
+
+// Ring of [lat,lng] pairs -> "lng,lat,0 ..." (auto-closed).
+function kmlRingFromLatLng(ring) {
+  const pts = (ring || []).filter(p => p && isFinite(p[0]) && isFinite(p[1])).map(p => _kmlCoord(p[1], p[0]));
+  if (pts.length && pts[0] !== pts[pts.length - 1]) pts.push(pts[0]);
+  return pts.join(' ');
+}
+
+// Ring of GeoJSON [lng,lat] pairs -> "lng,lat,0 ..." (auto-closed).
+function kmlRingFromGeoJson(ring) {
+  const pts = (ring || []).filter(p => p && isFinite(p[0]) && isFinite(p[1])).map(p => _kmlCoord(p[0], p[1]));
+  if (pts.length && pts[0] !== pts[pts.length - 1]) pts.push(pts[0]);
+  return pts.join(' ');
+}
+
+function _kmlHead(name, styleUrl, description, timestamp) {
+  return `<Placemark><name>${kmlEscape(name)}</name>` +
+    (styleUrl ? `<styleUrl>#${styleUrl}</styleUrl>` : '') +
+    (timestamp ? `<TimeStamp><when>${kmlEscape(timestamp)}</when></TimeStamp>` : '') +
+    (description ? `<description>${kmlCdata(description)}</description>` : '');
+}
+
+// rings: array of coordinate STRINGS (build with kmlRingFrom*). rings[0]=outer, rest=holes.
+function kmlPolygonPlacemark(o) {
+  const r = (o.rings || []).filter(Boolean);
+  if (!r.length) return '';
+  const outer = `<outerBoundaryIs><LinearRing><coordinates>${r[0]}</coordinates></LinearRing></outerBoundaryIs>`;
+  const inner = r.slice(1).map(h => `<innerBoundaryIs><LinearRing><coordinates>${h}</coordinates></LinearRing></innerBoundaryIs>`).join('');
+  return _kmlHead(o.name, o.styleUrl, o.description, o.timestamp) + `<Polygon>${outer}${inner}</Polygon></Placemark>`;
+}
+
+function kmlPointPlacemark(o) {
+  if (!isFinite(o.lat) || !isFinite(o.lng)) return '';
+  return _kmlHead(o.name, o.styleUrl, o.description, o.timestamp) +
+    `<Point><coordinates>${_kmlCoord(o.lng, o.lat)}</coordinates></Point></Placemark>`;
+}
+
+// coords: array of [lat,lng] pairs.
+function kmlLinePlacemark(o) {
+  const pts = (o.coords || []).filter(p => p && isFinite(p[0]) && isFinite(p[1])).map(p => _kmlCoord(p[1], p[0]));
+  if (pts.length < 2) return '';
+  return _kmlHead(o.name, o.styleUrl, o.description, o.timestamp) +
+    `<LineString><tessellate>1</tessellate><coordinates>${pts.join(' ')}</coordinates></LineString></Placemark>`;
+}
+
+function kmlFolder(name, inner, opts) {
+  opts = opts || {};
+  if (!inner) return '';
+  return `<Folder><name>${kmlEscape(name)}</name>` +
+    (opts.description ? `<description>${kmlCdata(opts.description)}</description>` : '') +
+    inner + `</Folder>`;
+}
+
+function kmlDocument(name, styles, folders, description) {
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Document>` +
+    `<name>${kmlEscape(name)}</name>` +
+    (description ? `<description>${kmlCdata(description)}</description>` : '') +
+    (styles || '') + (folders || '') + `</Document></kml>`;
+}
+
+// Shared <Style> blocks. Colors are KML AABBGGRR (app palette). Every style covers
+// icon + line + poly so any geometry type renders sensibly under it.
+const KML_STYLE_DEFS = {
+  opsArea:   { color: 'fffd8b3d', fill: '20fd8b3d', width: 2 }, // blue
+  restrict:  { color: 'ff4444ef', fill: '404444ef', width: 2 }, // red — TFR/NOTAM/prohibited/NS/alert
+  sua:       { color: 'ff0b9ef5', fill: '300b9ef5', width: 2 }, // amber — special use
+  airspace:  { color: 'fffd8b3d', fill: '1afd8b3d', width: 2 }, // blue — class airspace/LAANC
+  fire:      { color: 'ff4444ef', fill: '304444ef', width: 2 }, // red — fire perimeter
+  protected: { color: 'ff5ec522', fill: '205ec522', width: 2 }, // green — wilderness/parks
+  wire:      { color: 'ff0b9ef5', width: 3 },                   // amber — wires/cables
+  obstacle:  { color: 'ff0b9ef5', width: 2 },                   // amber — obstacles
+  airport:   { color: 'fffd8b3d', width: 2 },                   // blue — airports
+  tower:     { color: 'ff0b9ef5', width: 2 },                   // amber — towers
+  dam:       { color: 'ffd4b606', width: 2 },                   // cyan — dams
+  aircraft:  { color: 'ffd4b606', width: 2 },                   // cyan — ADS-B
+  generic:   { color: 'ffffffff', fill: '20ffffff', width: 2 }, // white — fallback
+  sunArrow:  { color: 'ff00ccff', width: 3 },                   // gold — sun
+  windArrow: { color: 'ffd4b606', width: 3 },                   // cyan — wind
+};
+
+function kmlStyles() {
+  let out = '';
+  for (const id in KML_STYLE_DEFS) {
+    const d = KML_STYLE_DEFS[id];
+    out += `<Style id="${id}">` +
+      `<IconStyle><color>${d.color}</color><scale>1.0</scale></IconStyle>` +
+      `<LabelStyle><scale>0.8</scale></LabelStyle>` +
+      `<LineStyle><color>${d.color}</color><width>${d.width || 2}</width></LineStyle>` +
+      (d.fill ? `<PolyStyle><color>${d.fill}</color></PolyStyle>` : `<PolyStyle><fill>0</fill></PolyStyle>`) +
+      `</Style>`;
+  }
+  return out;
+}
+
+// ============================================================
+// SUN / WIND HOURLY ARROWS (pure)
+// ============================================================
+
+// Equirectangular offset — adequate at the few-km arrow lengths used here.
+function destPoint(lat, lng, bearingDeg, distM) {
+  const br = bearingDeg * Math.PI / 180;
+  const dLat = (distM * Math.cos(br)) / 111320;
+  const dLng = (distM * Math.sin(br)) / (111320 * Math.cos(lat * Math.PI / 180));
+  return [lat + dLat, lng + dLng];
+}
+
+// KML <MultiGeometry> for an arrow: shaft center->tip plus two barbs at the tip
+// (KML has no native arrowhead).
+function arrowMultiGeometry(centerLat, centerLng, bearingDeg, lengthM) {
+  const tip = destPoint(centerLat, centerLng, bearingDeg, lengthM);
+  const barbLen = Math.max(lengthM * 0.22, 1);
+  const b1 = destPoint(tip[0], tip[1], (bearingDeg + 150) % 360, barbLen);
+  const b2 = destPoint(tip[0], tip[1], (bearingDeg + 210) % 360, barbLen);
+  const seg = (a, b) => `<LineString><tessellate>1</tessellate><coordinates>${_kmlCoord(a[1], a[0])} ${_kmlCoord(b[1], b[0])}</coordinates></LineString>`;
+  return `<MultiGeometry>${seg([centerLat, centerLng], tip)}${seg(tip, b1)}${seg(tip, b2)}</MultiGeometry>`;
+}
+
+function _arrowPlacemark(name, centerLat, centerLng, bearingDeg, lengthM, styleUrl, description, timestamp) {
+  return _kmlHead(name, styleUrl, description, timestamp) +
+    arrowMultiGeometry(centerLat, centerLng, bearingDeg, lengthM) + `</Placemark>`;
+}
+
+// Sun arrows for each timestamp where the sun is above the horizon. Arrow points
+// TOWARD the sun (azimuth). `opts.calcSunPosition` overridable for tests.
+function sunArrowsKml(lat, lng, times, centerLat, centerLng, opts) {
+  opts = opts || {};
+  const lengthM = opts.lengthM || 1500;
+  const calc = opts.calcSunPosition || (typeof calcSunPosition === 'function' ? calcSunPosition : null);
+  if (!calc || !Array.isArray(times)) return '';
+  let inner = '';
+  for (let i = 0; i < times.length; i++) {
+    const t = times[i];
+    const d = new Date(t);
+    if (isNaN(d.getTime())) continue;
+    const sp = calc(lat, lng, d);
+    if (!sp || !(sp.elevation > 0)) continue; // sun down — skip
+    const az = Math.round(sp.azimuth), el = Math.round(sp.elevation);
+    const hhmm = String(t).slice(11, 16);
+    const name = `Sun ${hhmm} — AZ ${az}° EL ${el}°`;
+    const desc = `Sun position at ${t}\nAzimuth: ${az}° (true) — arrow points toward the sun\nElevation: ${el}° above horizon`;
+    inner += _arrowPlacemark(name, centerLat, centerLng, sp.azimuth, lengthM, 'sunArrow', desc, t);
+  }
+  return inner;
+}
+
+// Wind arrows for each timestamp. Arrow points DOWNWIND (where the wind blows
+// toward = drift direction); label reports the meteorological "FROM" bearing.
+function windArrowsKml(times, dir, speed, gust, centerLat, centerLng, opts) {
+  opts = opts || {};
+  if (!Array.isArray(times)) return '';
+  const lengthM = opts.lengthM || 1500;
+  const speedMax = opts.speedMax || 30; // mph reference for length scaling
+  let inner = '';
+  for (let i = 0; i < times.length; i++) {
+    const t = times[i];
+    const from = dir && isFinite(dir[i]) ? dir[i] : null;
+    if (from == null) continue;
+    const spd = speed && isFinite(speed[i]) ? speed[i] : null;
+    const g = gust && isFinite(gust[i]) ? gust[i] : null;
+    const toward = (from + 180) % 360;
+    const frac = spd != null ? Math.min(spd, speedMax) / speedMax : 0.5;
+    const len = lengthM * (0.4 + 0.6 * frac);
+    const hhmm = String(t).slice(11, 16);
+    const name = `Wind ${hhmm} — FROM ${Math.round(from)}°` + (spd != null ? ` ${Math.round(spd)} mph` : '');
+    const desc = `Wind at ${t}\nFROM ${Math.round(from)}° (true)\nSpeed: ${spd != null ? Math.round(spd) + ' mph' : '--'}` +
+      (g != null ? `\nGust: ${Math.round(g)} mph` : '') + `\nArrow points downwind (direction of drift).`;
+    inner += _arrowPlacemark(name, centerLat, centerLng, toward, len, 'windArrow', desc, t);
+  }
+  return inner;
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -2028,5 +2218,8 @@ if (typeof module !== 'undefined' && module.exports) {
     NOTAM_SUBJECTS, ringRadiusNm, notamPlainSummary,
     notamCategory, classifyNotamForUAS, NOTAM_CATEGORY_RELEVANT,
     ARTCC_REF, ARTCC_BOUNDS, artccForPoint, artccsForArea,
+    kmlEscape, kmlCdata, kmlRingFromLatLng, kmlRingFromGeoJson,
+    kmlPolygonPlacemark, kmlPointPlacemark, kmlLinePlacemark, kmlFolder, kmlDocument,
+    KML_STYLE_DEFS, kmlStyles, destPoint, arrowMultiGeometry, sunArrowsKml, windArrowsKml,
   };
 }

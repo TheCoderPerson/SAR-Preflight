@@ -373,6 +373,89 @@ function viewshedMaskToRGBA(grid, mask) {
   return rgba;
 }
 
+// ============================================================
+// GEOTIFF ENCODER (pure) — write a georeferenced RGBA GeoTIFF for the canopy /
+// viewshed overlays. Uncompressed, single-strip, little-endian, EPSG:4326.
+// `rgba` is the Uint8ClampedArray from canopyGridToRGBA / viewshedMaskToRGBA;
+// `bounds` is grid.bounds ({west,south,east,north} in degrees).
+// ============================================================
+function encodeGeoTiffRGBA(rgba, width, height, bounds) {
+  const SAMPLES = 4;
+  const imageLen = width * height * SAMPLES;
+  const NUM_TAGS = 14;
+  const ifdLen = 2 + NUM_TAGS * 12 + 4;
+  const ifdOffset = 8 + imageLen;
+
+  // External value blocks live after the IFD; doubles padded to 8-byte alignment.
+  const align8 = (o) => (o % 8 === 0 ? o : o + (8 - (o % 8)));
+  let ext = ifdOffset + ifdLen;
+  const bpsOffset = ext; ext = bpsOffset + 8;            // BitsPerSample: 4 shorts
+  const pixScaleOffset = align8(ext); ext = pixScaleOffset + 24; // ModelPixelScale: 3 doubles
+  const tiepointOffset = align8(ext); ext = tiepointOffset + 48; // ModelTiepoint: 6 doubles
+  const geoKeyOffset = ext; ext = geoKeyOffset + 32;     // GeoKeyDirectory: 16 shorts
+  const totalLen = ext;
+
+  const buf = new ArrayBuffer(totalLen);
+  const dv = new DataView(buf);
+  const u8 = new Uint8Array(buf);
+  const LE = true;
+
+  // TIFF header (little-endian)
+  dv.setUint8(0, 0x49); dv.setUint8(1, 0x49); // "II"
+  dv.setUint16(2, 42, LE);
+  dv.setUint32(4, ifdOffset, LE);
+
+  // Image strip — RGBA, row-major, top (north) row first.
+  if (rgba && rgba.length) u8.set(rgba.length > imageLen ? rgba.subarray(0, imageLen) : rgba, 8);
+
+  // IFD
+  const SHORT = 3, LONG = 4, DOUBLE = 12;
+  const TSIZE = { 3: 2, 4: 4, 12: 8 };
+  let p = ifdOffset;
+  dv.setUint16(p, NUM_TAGS, LE); p += 2;
+  function tag(id, type, count, val) {
+    dv.setUint16(p, id, LE); dv.setUint16(p + 2, type, LE); dv.setUint32(p + 4, count, LE);
+    if (TSIZE[type] * count <= 4) {
+      if (type === SHORT) { dv.setUint16(p + 8, val, LE); dv.setUint16(p + 10, 0, LE); }
+      else dv.setUint32(p + 8, val, LE);
+    } else {
+      dv.setUint32(p + 8, val, LE); // offset to external value
+    }
+    p += 12;
+  }
+  tag(256, LONG, 1, width);        // ImageWidth
+  tag(257, LONG, 1, height);       // ImageLength
+  tag(258, SHORT, 4, bpsOffset);   // BitsPerSample [8,8,8,8]
+  tag(259, SHORT, 1, 1);           // Compression = none
+  tag(262, SHORT, 1, 2);           // PhotometricInterpretation = RGB
+  tag(273, LONG, 1, 8);            // StripOffsets -> image data at byte 8
+  tag(277, SHORT, 1, SAMPLES);     // SamplesPerPixel
+  tag(278, LONG, 1, height);       // RowsPerStrip (single strip)
+  tag(279, LONG, 1, imageLen);     // StripByteCounts
+  tag(284, SHORT, 1, 1);           // PlanarConfiguration = chunky
+  tag(338, SHORT, 1, 2);           // ExtraSamples = unassociated alpha
+  tag(33550, DOUBLE, 3, pixScaleOffset); // ModelPixelScale
+  tag(33922, DOUBLE, 6, tiepointOffset); // ModelTiepoint
+  tag(34735, SHORT, 16, geoKeyOffset);   // GeoKeyDirectory
+  dv.setUint32(p, 0, LE);          // no next IFD
+
+  // External values
+  for (let i = 0; i < 4; i++) dv.setUint16(bpsOffset + i * 2, 8, LE);
+  const sx = (bounds.east - bounds.west) / width;
+  const sy = (bounds.north - bounds.south) / height;
+  dv.setFloat64(pixScaleOffset, sx, LE);
+  dv.setFloat64(pixScaleOffset + 8, sy, LE);
+  dv.setFloat64(pixScaleOffset + 16, 0, LE);
+  // Tiepoint: raster (0,0) = top-left = (west, north).
+  const tp = [0, 0, 0, bounds.west, bounds.north, 0];
+  for (let i = 0; i < 6; i++) dv.setFloat64(tiepointOffset + i * 8, tp[i], LE);
+  // GeoKeyDirectory: Geographic / PixelIsArea / WGS84 (EPSG:4326).
+  const geoKeys = [1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326];
+  for (let i = 0; i < geoKeys.length; i++) dv.setUint16(geoKeyOffset + i * 2, geoKeys[i], LE);
+
+  return buf;
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -386,5 +469,6 @@ if (typeof module !== 'undefined' && module.exports) {
     resampleToGrid, buildDSM, sanitizeForKernel,
     curvatureDrop, isVisible, computeViewshed, viewshedCoverage,
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,
+    encodeGeoTiffRGBA,
   };
 }

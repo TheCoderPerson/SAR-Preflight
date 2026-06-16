@@ -12,7 +12,7 @@ https://thecoderperson.github.io/SAR-Preflight/sar-preflight.html
 4. All data tabs auto-populate with conditions for your area
 5. The **GO / CAUTION / NO-GO** assessment banner appears based on current conditions
 6. Use the **Data Panel** tabs (Weather, Wind, Airspace, Traffic, Terrain, Sun/Moon, GNSS, NOTAMs, Ops) to review detailed information
-7. **Export** a pre-flight briefing as PDF, email, clipboard text, or KML
+7. **Export** a pre-flight briefing as PDF, email, clipboard text, or KML. The KML export captures **every currently-visible map layer** as real geometry — airspace, TFRs, NOTAMs, obstacles, wires, airports, towers, fires, NWS alerts, ADS-B, etc. — plus **hourly sun & wind arrows** (24 h, with a time-slider animation; sun omitted while below the horizon, wind drawn downwind). Canopy and viewshed overlays export alongside as **standalone georeferenced GeoTIFFs** (EPSG:4326) for QGIS/CalTopo/Avenza. Wire, obstacle, NOTAM and TFR folders carry a *"verify independently — not a complete inventory"* note
 
 ### Map Features
 - Toggle map layers (satellite, topo, FAA sectional, weather radar, airspace, LAANC grid, FAA obstacles, towers, wire hazards, dams, fire perimeters, live aircraft traffic) via the **Map Layers** control
