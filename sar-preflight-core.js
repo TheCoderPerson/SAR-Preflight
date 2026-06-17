@@ -2228,6 +2228,80 @@ function windArrowsKml(times, dir, speed, gust, centerLat, centerLng, opts) {
   return inner;
 }
 
+// ============================================================
+// GEOJSON EXPORT (CalTopo native format) — pure builders
+// ============================================================
+// CalTopo imports GeoJSON with its folder hierarchy intact (unlike KML, which it
+// flattens by geometry type). A folder is a Feature with geometry:null and
+// class:"Folder"; every object references its folder via properties.folderId.
+// Styling is the simplestyle spec (stroke/fill/marker-symbol), derived here from
+// the same KML_STYLE_DEFS so colors live in one place.
+
+// KML AABBGGRR hex -> { hex:'#rrggbb', opacity:0..1 }. (e.g. '20fd8b3d' -> #3d8bfd, 0.1254902)
+function kmlColorToRgba(aabbggrr) {
+  const s = String(aabbggrr == null ? '' : aabbggrr).replace(/[^0-9a-fA-F]/g, '').padStart(8, 'f').slice(-8);
+  const a = parseInt(s.slice(0, 2), 16);
+  const b = parseInt(s.slice(2, 4), 16);
+  const g = parseInt(s.slice(4, 6), 16);
+  const r = parseInt(s.slice(6, 8), 16);
+  const h2 = n => (isFinite(n) ? n : 0).toString(16).padStart(2, '0');
+  return { hex: '#' + h2(r) + h2(g) + h2(b), opacity: (isFinite(a) ? a : 255) / 255 };
+}
+
+// CalTopo simplestyle props for a shared style id. Markers carry stroke (their
+// color, per CalTopo's own exports) + marker-symbol; filled styles add fill.
+function caltopoStyleProps(styleId) {
+  const d = KML_STYLE_DEFS[styleId] || KML_STYLE_DEFS.generic;
+  const line = kmlColorToRgba(d.color);
+  const props = { stroke: line.hex, 'stroke-width': d.width || 2, 'stroke-opacity': line.opacity };
+  if (d.fill) { const f = kmlColorToRgba(d.fill); props.fill = f.hex; props['fill-opacity'] = f.opacity; }
+  if (d.icon) props['marker-symbol'] = KML_ICON_BASE + d.icon;
+  return props;
+}
+
+function geojsonFolderFeature(id, title) {
+  return { type: 'Feature', id, geometry: null,
+    properties: { title, class: 'Folder', visible: true, labelVisible: true } };
+}
+
+// o: { name, description, lat, lng, styleId }
+function geojsonMarkerFeature(id, folderId, o) {
+  if (!isFinite(o.lat) || !isFinite(o.lng)) return null;
+  const props = Object.assign({ title: o.name, class: 'Marker' }, caltopoStyleProps(o.styleId));
+  if (o.description) props.description = o.description;
+  if (folderId) props.folderId = folderId;
+  return { type: 'Feature', id, geometry: { type: 'Point', coordinates: [+o.lng, +o.lat, 0, 0] }, properties: props };
+}
+
+// o: { name, description, geometry, styleId } — geometry is a GeoJSON LineString/Polygon.
+function geojsonShapeFeature(id, folderId, o) {
+  if (!o.geometry || !o.geometry.coordinates || !o.geometry.coordinates.length) return null;
+  const props = Object.assign({ title: o.name, class: 'Shape' }, caltopoStyleProps(o.styleId));
+  if (o.description) props.description = o.description;
+  if (folderId) props.folderId = folderId;
+  return { type: 'Feature', id, geometry: o.geometry, properties: props };
+}
+
+// coords: array of [lat,lng] -> GeoJSON LineString ([lng,lat]).
+function geojsonLineGeometry(coords) {
+  const pts = (coords || []).filter(p => p && isFinite(p[0]) && isFinite(p[1])).map(p => [+p[1], +p[0]]);
+  return { type: 'LineString', coordinates: pts };
+}
+
+// rings: array of [lat,lng] rings (rings[0] outer) -> GeoJSON Polygon (auto-closed, [lng,lat]).
+function geojsonPolygonGeometry(rings) {
+  const out = (rings || []).map(ring => {
+    const c = (ring || []).filter(p => p && isFinite(p[0]) && isFinite(p[1])).map(p => [+p[1], +p[0]]);
+    if (c.length && (c[0][0] !== c[c.length - 1][0] || c[0][1] !== c[c.length - 1][1])) c.push(c[0]);
+    return c;
+  }).filter(r => r.length >= 4);
+  return { type: 'Polygon', coordinates: out };
+}
+
+function geojsonFeatureCollection(features) {
+  return { type: 'FeatureCollection', features: (features || []).filter(Boolean) };
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -2259,5 +2333,7 @@ if (typeof module !== 'undefined' && module.exports) {
     kmlPolygonPlacemark, kmlPointPlacemark, kmlLinePlacemark, kmlFolder, kmlDocument,
     KML_STYLE_DEFS, kmlStyles, groundOverlayKml, destPoint, bearingLineGeometry,
     sunArrowsKml, windArrowsKml,
+    KML_ICON_BASE, kmlColorToRgba, caltopoStyleProps, geojsonFolderFeature, geojsonMarkerFeature,
+    geojsonShapeFeature, geojsonLineGeometry, geojsonPolygonGeometry, geojsonFeatureCollection,
   };
 }

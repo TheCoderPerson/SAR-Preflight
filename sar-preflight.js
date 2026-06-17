@@ -4569,6 +4569,25 @@ function _exportNeedsDisclaimer(key) {
   return key.indexOf('wire_') === 0 || EXPORT_DISCLAIMER_KEYS.has(key);
 }
 
+// Data-summary sections shown at the area centre (shared by KML + GeoJSON export).
+const EXPORT_SUMMARY_SECTIONS = [
+  { id: 'expWxData', name: 'Weather', fields: ['wxTemp','wxFeels','wxDew','wxHumidity','wxPressure','wxDensity','wxVis','wxCloud','wxCeiling','wxConditions','wxPrecip','wxLightning','wxUV','wxKp','wxIcing','wxFire','wxAQI'] },
+  { id: 'expWindData', name: 'Wind Profile', fields: ['windMax','windGustMax','windDir','windImpact'] },
+  { id: 'expAirspace', name: 'Airspace', fields: ['airClass','airLAANC','airLAANCAlt','airNearAirport','airNearDist'] },
+  { id: 'expTerrain', name: 'Terrain', fields: ['terrMin','terrMax','terrRange','terrLaunch','terrClass','terrSlope','terrVeg','terrCell'] },
+  { id: 'expAstro', name: 'Sun Moon Twilight', fields: ['astSunrise','astSunset','astTwilightAM','astTwilightPM','astSunAz','astSunEl','astMoonPhase','astMoonIllum','astDayWindow','astMagDec'] },
+  { id: 'expOps', name: 'Operations', fields: ['opsTempFactor','opsAltFactor','opsWindFactor','opsFlightTime','opsCapacity'] },
+];
+
+// Plain-text description for a summary section, scraped from the live data cells.
+function _exportSummaryDesc(s) {
+  return s.fields.map(f => {
+    const el = document.getElementById(f);
+    const label = el?.closest('.data-cell')?.querySelector('.data-label')?.textContent || f;
+    return `${label}: ${el?.textContent || '--'}`;
+  }).join('\n');
+}
+
 // Map a map-layer key to one of the shared KML <Style> ids (see KML_STYLE_DEFS).
 function _exportStyleForLayer(key) {
   if (key.indexOf('wire_') === 0) return 'wire';
@@ -4601,47 +4620,53 @@ function _polyRingsGroups(latlngs) {
   return latlngs.map(poly => (poly || []).map(ring => ring.map(p => [p.lat, p.lng])));
 }
 
-// Convert every popup-bearing feature in a layer group into KML placemarks.
-function _exportLayerPlacemarks(key, group) {
-  const styleUrl = _exportStyleForLayer(key);
+// ----- Neutral export records -----
+// The harvesters below produce format-agnostic feature records so the same
+// geometry/description/style can be serialized to either KML or CalTopo GeoJSON.
+// A record is: { kind:'point'|'line'|'polygon', name, description, styleId,
+//   lat,lng | coords:[[lat,lng],...] | rings:[[[lat,lng],...], ...] }.
+
+// Convert every popup-bearing feature in a layer group into export records.
+function _exportLayerRecords(key, group) {
+  const styleId = _exportStyleForLayer(key);
   const fallback = _aggMeta(key).label || 'Feature';
-  let inner = '';
+  const recs = [];
   eachPopupLayer(group, pl => {
     let html = '';
     try { html = _aggContentToHtml(pl.getPopup().getContent()); } catch (e) { html = ''; }
     const name = _exportPlainText(html).slice(0, 48) || fallback;
     // Descriptions are plain text (no HTML markup) so they read cleanly in CalTopo notes.
-    const desc = (typeof htmlToPlainText === 'function') ? htmlToPlainText(html) : html;
+    const description = (typeof htmlToPlainText === 'function') ? htmlToPlainText(html) : html;
     try {
       if (typeof L !== 'undefined' && L.Polygon && pl instanceof L.Polygon) {
         _polyRingsGroups(pl.getLatLngs()).forEach(rings => {
-          inner += kmlPolygonPlacemark({ name, styleUrl, description: desc, rings: rings.map(r => kmlRingFromLatLng(r)) });
+          recs.push({ kind: 'polygon', name, styleId, description, rings });
         });
       } else if (typeof L !== 'undefined' && L.Polyline && pl instanceof L.Polyline) {
         const segs = [];
         const collect = a => { if (!Array.isArray(a)) return; if (a.length && a[0] && typeof a[0].lat === 'number') segs.push(a); else a.forEach(collect); };
         collect(pl.getLatLngs());
-        segs.forEach(seg => { inner += kmlLinePlacemark({ name, styleUrl, description: desc, coords: seg.map(p => [p.lat, p.lng]) }); });
+        segs.forEach(seg => { recs.push({ kind: 'line', name, styleId, description, coords: seg.map(p => [p.lat, p.lng]) }); });
       } else if (pl.getLatLng) {
         const ll = pl.getLatLng();
-        inner += kmlPointPlacemark({ name, styleUrl, description: desc, lat: ll.lat, lng: ll.lng });
+        recs.push({ kind: 'point', name, styleId, description, lat: ll.lat, lng: ll.lng });
       }
     } catch (e) { /* skip malformed feature */ }
   });
-  return inner;
+  return recs;
 }
 
 // Imported NOTAMs — plain-English summary first, then the full text. Built from
 // state (S.importedNotams) so the description is richer than the map popup.
-function _exportNotamPlacemarks() {
-  let inner = '';
+function _exportNotamRecords() {
+  const recs = [];
   const showAll = !!S.notamShowAll;
   (S.importedNotams || []).forEach(n => {
     if (n._relevance && !n._relevance.relevant && !showAll) return; // match what's on the map
     const summary = (typeof notamPlainSummary === 'function') ? notamPlainSummary(n) : '';
     const body = String(n.body || '').trim();
     const expanded = (typeof expandNotamText === 'function') ? expandNotamText(body) : body;
-    const desc = [
+    const description = [
       summary,
       body ? '\n— Full NOTAM —\n' + body : '',
       (expanded && expanded !== body) ? '\n— Decoded —\n' + expanded : '',
@@ -4650,18 +4675,18 @@ function _exportNotamPlacemarks() {
     if (n.polygons && n.polygons.length) {
       n.polygons.forEach(ring => {
         if (!ring || ring.length < 3) return;
-        inner += kmlPolygonPlacemark({ name, styleUrl: 'restrict', description: desc, rings: [kmlRingFromLatLng(ring)] });
+        recs.push({ kind: 'polygon', name, styleId: 'restrict', description, rings: [ring] });
       });
     } else if (n.lat != null && n.lng != null && !isNaN(n.lat) && !isNaN(n.lng)) {
-      inner += kmlPointPlacemark({ name, styleUrl: 'restrict', description: desc, lat: n.lat, lng: n.lng });
+      recs.push({ kind: 'point', name, styleId: 'restrict', description, lat: n.lat, lng: n.lng });
     }
   });
-  return inner;
+  return recs;
 }
 
 // Imported TFRs — plain-English summary first, then the structured details.
-function _exportTfrPlacemarks() {
-  let inner = '';
+function _exportTfrRecords() {
+  const recs = [];
   const now = Date.now();
   (S.tfrs || []).forEach(t => {
     const active = (typeof isTfrActiveNow === 'function') ? isTfrActiveNow(t, now) : null;
@@ -4678,19 +4703,19 @@ function _exportTfrPlacemarks() {
       (t.effectiveStart || t.effectiveEnd) ? `Effective: ${t.effectiveStart || '?'} to ${t.effectiveEnd || '?'}` : '',
       t.reason ? `Reason: ${t.reason}` : '',
     ].filter(Boolean).join('\n');
-    const desc = summary + '\n\n— Details —\n' + details;
+    const description = summary + '\n\n— Details —\n' + details;
     const name = `TFR ${t.id || ''}`.trim();
     (t.polygons || []).forEach(ring => {
       if (!ring || ring.length < 3) return;
-      inner += kmlPolygonPlacemark({ name, styleUrl: 'restrict', description: desc, rings: [kmlRingFromLatLng(ring)] });
+      recs.push({ kind: 'polygon', name, styleId: 'restrict', description, rings: [ring] });
     });
   });
-  return inner;
+  return recs;
 }
 
 // Airports — point per airport, plane icon for airports / circle-H for heliports.
-function _exportAirportPlacemarks() {
-  let inner = '';
+function _exportAirportRecords() {
+  const recs = [];
   const c = S.areaCenter;
   const list = (typeof filterAirportsByDistance === 'function' && c)
     ? filterAirportsByDistance(S.nearbyAirports || [], c.lat, c.lng, 55)
@@ -4699,60 +4724,103 @@ function _exportAirportPlacemarks() {
     if (a.lat == null || a.lng == null) return;
     const isHeli = a.type === 'heliport';
     const typeLabel = String(a.type || '').replace(/_/g, ' ');
-    const desc = [
+    const description = [
       `${a.icao || ''} — ${a.name || ''}`.trim(),
       typeLabel ? `Type: ${typeLabel}` : '',
       a.elevation_ft ? `Elevation: ${a.elevation_ft} ft` : '',
       a.municipality ? `Municipality: ${a.municipality}` : '',
     ].filter(Boolean).join('\n');
-    inner += kmlPointPlacemark({ name: a.icao || a.name || 'Airport', styleUrl: isHeli ? 'heliport' : 'airport', description: desc, lat: a.lat, lng: a.lng });
+    recs.push({ kind: 'point', name: a.icao || a.name || 'Airport', styleId: isHeli ? 'heliport' : 'airport', description, lat: a.lat, lng: a.lng });
   });
-  return inner;
+  return recs;
 }
 
 // Observer points (one per viewshed record) — name + AGL/VLOS/coverage description.
-function _exportObserverPlacemarks() {
-  let inner = '';
+function _exportObserverRecords() {
+  const recs = [];
   (S.viewsheds || []).forEach(rec => {
     if (!rec.observer || rec.observer.lat == null || rec.observer.lng == null) return;
-    inner += kmlPointPlacemark({
-      name: rec.name || 'Observer', styleUrl: 'observer',
-      description: observerKmlDescription(rec), lat: rec.observer.lat, lng: rec.observer.lng,
-    });
+    recs.push({ kind: 'point', name: rec.name || 'Observer', styleId: 'observer',
+      description: observerKmlDescription(rec), lat: rec.observer.lat, lng: rec.observer.lng });
   });
-  return inner;
+  return recs;
 }
 
-// Build KML folders for every currently-visible map overlay. `selectedKeys` (a Set
-// of layer keys) optionally restricts which layers are included; null = all visible.
-function gatherVisibleLayerFolders(selectedKeys) {
-  let folders = '';
-  if (!S.map || !S.mapLayers) return folders;
+// Group every currently-visible map overlay into ordered folder groups of records.
+// `selectedKeys` (a Set of layer keys) optionally restricts which layers are
+// included; null = all visible. Returns [{ label, disclaim, features:[record,...] }].
+function collectExportFolderGroups(selectedKeys) {
+  const groups = [];
+  if (!S.map || !S.mapLayers) return groups;
   const keys = Object.keys(S.mapLayers).filter(k =>
     !AGG_SKIP_LAYERS.has(k) && S.mapLayers[k] && S.map.hasLayer(S.mapLayers[k]));
   keys.sort((a, b) => _aggMeta(a).pri - _aggMeta(b).pri); // safety layers first
-  const byLabel = {}; const order = [];
+  const byLabel = {};
   keys.forEach(k => {
     if (selectedKeys && !selectedKeys.has(k)) return;
     // Layers we describe richly from state (plain-English first, icon by type)
     // rather than scraping their popups generically.
-    let pm;
-    if (k === 'notam_imported') pm = _exportNotamPlacemarks();
-    else if (k === 'tfr_imported') pm = _exportTfrPlacemarks();
-    else if (k === 'airports') pm = _exportAirportPlacemarks();
-    else if (k === 'observers') pm = _exportObserverPlacemarks();
-    else pm = _exportLayerPlacemarks(k, S.mapLayers[k]);
-    if (!pm) return;
+    let recs;
+    if (k === 'notam_imported') recs = _exportNotamRecords();
+    else if (k === 'tfr_imported') recs = _exportTfrRecords();
+    else if (k === 'airports') recs = _exportAirportRecords();
+    else if (k === 'observers') recs = _exportObserverRecords();
+    else recs = _exportLayerRecords(k, S.mapLayers[k]);
+    if (!recs || !recs.length) return;
     const label = _aggMeta(k).label || 'Other';
-    if (!byLabel[label]) { byLabel[label] = { inner: '', disclaim: false }; order.push(label); }
-    byLabel[label].inner += pm;
+    if (!byLabel[label]) { byLabel[label] = { label, disclaim: false, features: [] }; groups.push(byLabel[label]); }
+    byLabel[label].features.push(...recs);
     if (_exportNeedsDisclaimer(k)) byLabel[label].disclaim = true;
   });
-  order.forEach(label => {
-    const g = byLabel[label];
-    folders += kmlFolder(label, g.inner, g.disclaim ? { description: EXPORT_DISCLAIMER } : {});
+  return groups;
+}
+
+// ----- Record serializers -----
+function recordToKml(f) {
+  if (f.kind === 'point') return kmlPointPlacemark({ name: f.name, styleUrl: f.styleId, description: f.description, lat: f.lat, lng: f.lng });
+  if (f.kind === 'line') return kmlLinePlacemark({ name: f.name, styleUrl: f.styleId, description: f.description, coords: f.coords });
+  if (f.kind === 'polygon') return kmlPolygonPlacemark({ name: f.name, styleUrl: f.styleId, description: f.description, rings: (f.rings || []).map(r => kmlRingFromLatLng(r)) });
+  return '';
+}
+
+// CalTopo GeoJSON feature for a record, bound to its folder.
+function recordToGeoJsonFeature(f, folderId, id) {
+  if (f.kind === 'point') {
+    return geojsonMarkerFeature(id, folderId, { name: f.name, description: f.description, lat: f.lat, lng: f.lng, styleId: f.styleId });
+  }
+  if (f.kind === 'line') {
+    return geojsonShapeFeature(id, folderId, { name: f.name, description: f.description, styleId: f.styleId, geometry: geojsonLineGeometry(f.coords) });
+  }
+  if (f.kind === 'polygon') {
+    return geojsonShapeFeature(id, folderId, { name: f.name, description: f.description, styleId: f.styleId, geometry: geojsonPolygonGeometry(f.rings) });
+  }
+  return null;
+}
+
+function folderGroupsToKml(groups) {
+  let folders = '';
+  (groups || []).forEach(g => {
+    let inner = '';
+    g.features.forEach(f => { inner += recordToKml(f); });
+    folders += kmlFolder(g.label, inner, g.disclaim ? { description: EXPORT_DISCLAIMER } : {});
   });
   return folders;
+}
+
+// One CalTopo folder feature per group, followed by its member features.
+function folderGroupsToGeoJsonFeatures(groups, idGen) {
+  const out = [];
+  (groups || []).forEach(g => {
+    const folderId = idGen();
+    out.push(geojsonFolderFeature(folderId, g.label));
+    g.features.forEach(f => { const feat = recordToGeoJsonFeature(f, folderId, idGen()); if (feat) out.push(feat); });
+  });
+  return out;
+}
+
+// Build KML folders for every currently-visible map overlay (back-compat wrapper).
+function gatherVisibleLayerFolders(selectedKeys) {
+  return folderGroupsToKml(collectExportFolderGroups(selectedKeys));
 }
 
 // Arrow length scaled to the operational area (clamped 400 m .. 4 km).
@@ -4798,6 +4866,34 @@ function downloadBlob(blob, filename) {
   const a = document.createElement('a');
   a.href = url; a.download = filename; a.click();
   URL.revokeObjectURL(url);
+}
+
+// RFC-4122 v4 id for CalTopo GeoJSON features (crypto where available).
+function _uuid() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, ch => {
+    const r = Math.floor(Math.random() * 16);
+    return (ch === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
+// Operational-area boundary as an array of [lat,lng] (open ring; auto-closed downstream).
+function _areaRingLatLng() {
+  const ring = [];
+  const c = S.areaCenter;
+  if (S.areaType === 'CIRCLE' && c && S.currentArea && S.currentArea.getRadius) {
+    const r = S.currentArea.getRadius();
+    for (let i = 0; i <= 36; i++) {
+      const a = (i * 10) * Math.PI / 180;
+      ring.push([c.lat + (r / 111320) * Math.cos(a), c.lng + (r / (111320 * Math.cos(c.lat * Math.PI / 180))) * Math.sin(a)]);
+    }
+  } else if (S.areaType === 'RECTANGLE' && S.areaBounds) {
+    [S.areaBounds.getNorthWest(), S.areaBounds.getNorthEast(), S.areaBounds.getSouthEast(), S.areaBounds.getSouthWest()]
+      .forEach(p => ring.push([p.lat, p.lng]));
+  } else if (S.currentArea && S.currentArea.getLatLngs) {
+    (S.currentArea.getLatLngs()[0] || []).forEach(p => ring.push([p.lat, p.lng]));
+  }
+  return ring;
 }
 
 // Resolve a raster overlay's grid + RGBA + label, or null if not loaded.
@@ -4959,22 +5055,9 @@ function doExport() {
   }
 
   // 2. Text-summary placemarks (weather / terrain / ops etc.) at the area centre
-  const sections = [
-    { id: 'expWxData', name: 'Weather', fields: ['wxTemp','wxFeels','wxDew','wxHumidity','wxPressure','wxDensity','wxVis','wxCloud','wxCeiling','wxConditions','wxPrecip','wxLightning','wxUV','wxKp','wxIcing','wxFire','wxAQI'] },
-    { id: 'expWindData', name: 'Wind Profile', fields: ['windMax','windGustMax','windDir','windImpact'] },
-    { id: 'expAirspace', name: 'Airspace', fields: ['airClass','airLAANC','airLAANCAlt','airNearAirport','airNearDist'] },
-    { id: 'expTerrain', name: 'Terrain', fields: ['terrMin','terrMax','terrRange','terrLaunch','terrClass','terrSlope','terrVeg','terrCell'] },
-    { id: 'expAstro', name: 'Sun Moon Twilight', fields: ['astSunrise','astSunset','astTwilightAM','astTwilightPM','astSunAz','astSunEl','astMoonPhase','astMoonIllum','astDayWindow','astMagDec'] },
-    { id: 'expOps', name: 'Operations', fields: ['opsTempFactor','opsAltFactor','opsWindFactor','opsFlightTime','opsCapacity'] },
-  ];
-  sections.forEach(s => {
+  EXPORT_SUMMARY_SECTIONS.forEach(s => {
     if (!document.getElementById(s.id)?.checked) return;
-    const desc = s.fields.map(f => {
-      const el = document.getElementById(f);
-      const label = el?.closest('.data-cell')?.querySelector('.data-label')?.textContent || f;
-      return `${label}: ${el?.textContent || '--'}`;
-    }).join('\n');
-    folders += kmlFolder(s.name, kmlPointPlacemark({ name: `${s.name} \u2014 ${ts}`, lat: c.lat, lng: c.lng, description: desc }));
+    folders += kmlFolder(s.name, kmlPointPlacemark({ name: `${s.name} \u2014 ${ts}`, lat: c.lat, lng: c.lng, description: _exportSummaryDesc(s) }));
   });
 
   // 3. Every currently-visible map overlay as real geometry
@@ -4994,6 +5077,54 @@ function doExport() {
 
   closeExport();
   if (typeof logAudit === 'function') logAudit('kml_exported');
+}
+
+// Export the same vector content as CalTopo-native GeoJSON, which preserves the
+// folder hierarchy on import (KML does not — CalTopo flattens it by geometry type).
+// Rasters can't live in GeoJSON, so canopy/viewshed still export as GeoTIFF/KMZ.
+// The hourly sun/wind bearing lines are KML-only (they rely on KML time animation).
+function doExportGeoJson() {
+  if (!S.areaCenter) return alert('Draw an operational area first.');
+  const c = S.areaCenter;
+  const ts = new Date().toISOString().split('T')[0];
+  const features = [];
+
+  // 1. Operational area polygon (own folder)
+  if (document.getElementById('expOpsArea')?.checked) {
+    const fid = _uuid();
+    features.push(geojsonFolderFeature(fid, 'Operational Area'));
+    features.push(geojsonShapeFeature(_uuid(), fid, {
+      name: `${S.areaType} Search Area`, styleId: 'opsArea',
+      description: `Center: ${c.lat.toFixed(5)}, ${c.lng.toFixed(5)}\nType: ${S.areaType}`,
+      geometry: geojsonPolygonGeometry([_areaRingLatLng()]),
+    }));
+  }
+
+  // 2. Data-summary markers at the area centre, grouped under one "Info" folder.
+  const infoMarkers = EXPORT_SUMMARY_SECTIONS.filter(s => document.getElementById(s.id)?.checked);
+  if (infoMarkers.length) {
+    const fid = _uuid();
+    features.push(geojsonFolderFeature(fid, 'Info'));
+    infoMarkers.forEach(s => features.push(geojsonMarkerFeature(_uuid(), fid, {
+      name: `${s.name} — ${ts}`, description: _exportSummaryDesc(s), lat: c.lat, lng: c.lng, styleId: 'generic',
+    })));
+  }
+
+  // 3. Every currently-visible map overlay as real geometry, one folder per layer.
+  folderGroupsToGeoJsonFeatures(collectExportFolderGroups(_exportSelectedLayerKeys()), _uuid)
+    .forEach(f => features.push(f));
+
+  const fc = geojsonFeatureCollection(features);
+  downloadBlob(new Blob([JSON.stringify(fc)], { type: 'application/geo+json' }), `SAR_Preflight_${ts}.geojson`);
+
+  // 4. Canopy + viewshed rasters (GeoTIFF for CalTopo Map Sheet, KMZ for Google Earth) — same as KML.
+  if (document.getElementById('expCanopyKmz')?.checked) exportRasterKmz('canopy');
+  if (document.getElementById('expCanopyTiff')?.checked) exportRasterGeoTiff('canopy');
+  if (document.getElementById('expViewshedKmz')?.checked) exportAllViewshedKmz();
+  if (document.getElementById('expViewshedTiff')?.checked) exportAllViewshedGeoTiffs();
+
+  closeExport();
+  if (typeof logAudit === 'function') logAudit('geojson_exported');
 }
 
 function getKMLCoords() {
@@ -7631,12 +7762,14 @@ if (typeof module !== 'undefined' && module.exports) {
     renderAirportMarkers, fetchNWSAlerts, renderNWSAlertCards, renderNWSAlertPolygons,
     renderForecastChart, fetchRadar,
     radarToggle, radarStep, updateRadarTime,
-    openExport, closeExport, doExport, getKMLCoords, populateExportModal,
+    openExport, closeExport, doExport, doExportGeoJson, getKMLCoords, populateExportModal,
     downloadBlob, exportRasterGeoTiff, exportRasterKmz, gatherVisibleLayerFolders, buildSunWindFolders,
-    exportAllViewshedGeoTiffs, exportAllViewshedKmz, _exportObserverPlacemarks,
-    _exportLayerPlacemarks, _polyRingsGroups, _exportStyleForLayer, _exportNeedsDisclaimer,
-    _exportSelectedLayerKeys, _exportArrowLengthM, EXPORT_DISCLAIMER,
-    _exportNotamPlacemarks, _exportTfrPlacemarks, _exportAirportPlacemarks, _exportRasterData,
+    exportAllViewshedGeoTiffs, exportAllViewshedKmz, _exportObserverRecords,
+    _exportLayerRecords, _polyRingsGroups, _exportStyleForLayer, _exportNeedsDisclaimer,
+    _exportSelectedLayerKeys, _exportArrowLengthM, EXPORT_DISCLAIMER, EXPORT_SUMMARY_SECTIONS,
+    _exportNotamRecords, _exportTfrRecords, _exportAirportRecords, _exportRasterData,
+    collectExportFolderGroups, folderGroupsToKml, folderGroupsToGeoJsonFeatures,
+    recordToKml, recordToGeoJsonFeature, _uuid, _areaRingLatLng, _exportSummaryDesc,
     saveApiKey, saveConfig, updateClock, refreshData,
     initMap, startDraw, clearDrawBtns, clearArea, enterCoords,
     getStoredTheme, applyTheme, cycleTheme,

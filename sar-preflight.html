@@ -576,7 +576,7 @@ select.api-input { cursor: pointer; }
   <button class="header-btn header-hamburger" onclick="toggleHeaderMenu()">&#9776;</button>
   <div class="header-actions" id="headerActions">
     <button class="header-btn" id="btnPanel" onclick="togglePanel()">DATA PANEL</button>
-    <button class="header-btn" id="btnExport" onclick="openExport()">EXPORT KML</button>
+    <button class="header-btn" id="btnExport" onclick="openExport()">EXPORT</button>
     <button class="header-btn" id="btnCopy" onclick="copyBriefing()">COPY</button>
     <button class="header-btn" id="btnPDF" onclick="generatePDFBriefing()">PDF</button>
     <button class="header-btn" id="btnEmail" onclick="shareBriefingEmail()">EMAIL</button>
@@ -1318,7 +1318,7 @@ select.api-input { cursor: pointer; }
 <div class="modal-overlay" id="exportModal">
   <div class="modal" style="max-height:85vh;overflow-y:auto;">
     <h3>Export</h3>
-    <p style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;">Vector layers export to a KML (opens in Google Earth). Canopy and viewshed export as separate georeferenced GeoTIFFs for GIS.</p>
+    <p style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;">Vector layers export to <b>KML</b> (Google Earth) or <b>GeoJSON</b> (CalTopo — keeps these folders intact on import; KML gets flattened). Canopy and viewshed export as separate georeferenced GeoTIFFs for GIS. Hourly sun/wind bearing lines are KML-only.</p>
 
     <div class="export-group-label">Data summaries</div>
     <label class="export-check-row"><input type="checkbox" id="expOpsArea" checked> Operational Area Polygon</label>
@@ -1341,7 +1341,8 @@ select.api-input { cursor: pointer; }
     <label class="export-check-row" id="expViewshedKmzRow"><input type="checkbox" id="expViewshedKmz"> <span id="expViewshedKmzLabel">Viewsheds → KMZ overlay (Google Earth)</span></label>
 
     <div class="modal-actions">
-      <button class="btn btn-primary" onclick="doExport()">Download</button>
+      <button class="btn btn-primary" onclick="doExport()">Download KML</button>
+      <button class="btn btn-primary" onclick="doExportGeoJson()">Download GeoJSON (CalTopo)</button>
       <button class="btn btn-ghost" onclick="closeExport()">Cancel</button>
     </div>
   </div>
