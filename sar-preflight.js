@@ -142,7 +142,8 @@ const Diag = {
       }
       // 4) Heartbeat so idle/panning sessions still get timestamped heap + DOM samples.
       if (typeof setInterval !== 'undefined') setInterval(() => this.note('heartbeat', this._domSnapshot()), 20000);
-      this.note('app.start', { v: (typeof APP_VERSION !== 'undefined') ? APP_VERSION : '?', mode: this._uaTag() });
+      const ver = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : ((typeof APP_VERSION !== 'undefined') ? APP_VERSION : '?');
+      this.note('app.start', { v: ver, mode: this._uaTag() });
     } catch (_) { /* never throw */ }
   },
 
@@ -159,12 +160,39 @@ const Diag = {
 
   _domSnapshot() {
     try {
-      return {
+      const snap = {
         dom: document.querySelectorAll('*').length,
         img: document.querySelectorAll('img').length,
         cnv: document.querySelectorAll('canvas').length,
         vs: (typeof S !== 'undefined' && S.viewsheds) ? S.viewsheds.length : 0,
       };
+      try { if (typeof window !== 'undefined' && window.devicePixelRatio) snap.dpr = window.devicePixelRatio; } catch (_) {}
+      // Renderer-side signals (the part our byte counter can't see). At extreme
+      // zoom, tile memory and a stretched image overlay dominate the page total.
+      if (typeof S !== 'undefined' && S.map && S.mapLayers && S.map.hasLayer) {
+        const on = []; let tiles = 0;
+        Object.keys(S.mapLayers).forEach(k => {
+          const ly = S.mapLayers[k];
+          if (!ly || !S.map.hasLayer(ly)) return;
+          on.push(k);
+          if (ly._tiles) tiles += Object.keys(ly._tiles).length;
+        });
+        snap.lay = on.join(',');
+        snap.tiles = tiles;
+        try { snap.z = S.map.getZoom(); } catch (_) {}
+        // On-screen pixel size of each raster image overlay (stretched-overlay test).
+        ['viewshed', 'canopy'].forEach(id => {
+          const ov = S.mapLayers[id];
+          if (ov && ov._bounds && S.map.hasLayer(ov)) {
+            try {
+              const ne = S.map.latLngToContainerPoint(ov._bounds.getNorthEast());
+              const sw = S.map.latLngToContainerPoint(ov._bounds.getSouthWest());
+              snap[id + 'px'] = Math.round(Math.abs(ne.x - sw.x)) + 'x' + Math.round(Math.abs(ne.y - sw.y));
+            } catch (_) {}
+          }
+        });
+      }
+      return snap;
     } catch (_) { return null; }
   },
 
@@ -553,8 +581,14 @@ function cacheSectionalForArea(bounds) {
 // ============================================================
 // MAP INIT
 // ============================================================
+// Max interactive zoom. Capped at 18 (was effectively 19 via the basemap/
+// satellite layers) because iOS Safari killed the PWA from renderer memory
+// at z19 — heavy ESRI satellite tiles + a stretched viewshed image overlay
+// at sub-meter zoom blow past the per-tab memory ceiling. z18 still shows
+// individual trees/buildings; the FAA sectional is only native to z12.
+const MAX_MAP_ZOOM = 18;
 function initMap() {
-  S.map = L.map('map', { center: [38.685, -120.99], zoom: 11, zoomControl: false, attributionControl: false });
+  S.map = L.map('map', { center: [38.685, -120.99], zoom: 11, maxZoom: MAX_MAP_ZOOM, zoomControl: false, attributionControl: false });
   // Pan/zoom heartbeat — samples heap estimate + DOM/img counts while the user
   // moves the map with overlays on (a primary reported pre-crash activity).
   try { S.map.on('moveend zoomend', () => Diag.noteThrottled('map.move', 2500, Object.assign({ z: S.map.getZoom() }, Diag._domSnapshot()))); } catch (_) {}
