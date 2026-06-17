@@ -54,6 +54,315 @@ const S = {
   autoCheck: { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 },
 };
 
+// ============================================================
+// DIAGNOSTICS — on-device crash tracing
+// ------------------------------------------------------------
+// iOS Safari/WKWebView silently relaunches the app fresh when it
+// kills the page for memory pressure (or an unresponsive-main-thread
+// "watchdog" kill) — exactly the "crash → reboot with no data"
+// symptom. Safari exposes NO JS memory API (no performance.memory),
+// so we cannot read heap directly. Instead we:
+//   1) keep a breadcrumb ring buffer in localStorage (which is
+//      written synchronously and therefore SURVIVES a tab kill,
+//      unlike in-memory state or in-flight IndexedDB writes),
+//   2) mark a clean-exit flag only on a genuine teardown so the
+//      next launch can tell it was killed ungracefully,
+//   3) self-tally our own big allocations (typed arrays, RGBA
+//      buffers, dataURL strings, tile blobs) + DOM/img counts as a
+//      memory proxy, stamped into every breadcrumb, and
+//   4) surface the last-session trail in an on-device panel
+//      (tap the version label 5x, or it auto-opens after a crash).
+// Everything here is best-effort and must NEVER throw — all storage
+// and DOM access is wrapped, so it is a no-op under Node/Vitest and
+// in private-mode Safari.
+// ============================================================
+const Diag = {
+  CRUMB_KEY: 'sar_diag_crumbs',
+  SESSION_KEY: 'sar_diag_session',
+  LAST_CRASH_KEY: 'sar_diag_last_crash',
+  MAX_CRUMBS: 240,
+  enabled: true,
+  sessionId: null,
+  startedAt: 0,
+  mem: { liveKb: 0, leakedKb: 0, peakKb: 0, byKind: {} },
+  _crumbs: [],
+  _lastCrash: null,
+  _throttle: {},
+  _tapCount: 0,
+  _tapTimer: null,
+  _panelTimer: null,
+
+  _ls() { try { return (typeof localStorage !== 'undefined') ? localStorage : null; } catch (_) { return null; } },
+  _now() { try { return Date.now(); } catch (_) { return 0; } },
+  totalKb() { return this.mem.liveKb + this.mem.leakedKb; },
+
+  init() {
+    if (!this.enabled) return;
+    const ls = this._ls();
+    if (!ls) { this.enabled = false; return; }
+    try {
+      // 1) Was the PREVIOUS session ended cleanly? If not, snapshot its trail.
+      let prev = null;
+      try { prev = JSON.parse(ls.getItem(this.SESSION_KEY) || 'null'); } catch (_) { prev = null; }
+      if (prev && prev.cleanExit !== true) {
+        let crumbs = [];
+        try { crumbs = JSON.parse(ls.getItem(this.CRUMB_KEY) || '[]'); } catch (_) { crumbs = []; }
+        this._lastCrash = {
+          session: prev,
+          detectedAt: this._now(),
+          lastOp: crumbs.length ? crumbs[crumbs.length - 1].op : null,
+          crumbs: crumbs.slice(-80),
+        };
+        try { ls.setItem(this.LAST_CRASH_KEY, JSON.stringify(this._lastCrash)); } catch (_) {}
+      } else {
+        try { const lc = ls.getItem(this.LAST_CRASH_KEY); if (lc) this._lastCrash = JSON.parse(lc); } catch (_) {}
+      }
+      // 2) Start a fresh session.
+      this.startedAt = this._now();
+      this.sessionId = 's' + this.startedAt.toString(36) + '_' + Math.floor(Math.random() * 1e6).toString(36);
+      this._crumbs = [];
+      try { ls.setItem(this.CRUMB_KEY, '[]'); } catch (_) {}
+      this._persistSession(false);
+      // 3) Lifecycle: mark clean exit only on a real teardown (navigation/close).
+      //    A backgrounded/frozen page (pagehide persisted=true) may still be killed,
+      //    so we leave it un-clean and let the trail show whether it died mid-op.
+      if (typeof window !== 'undefined' && window.addEventListener) {
+        window.addEventListener('pagehide', (e) => {
+          if (e && e.persisted) { this.note('app.frozen', this._domSnapshot()); }
+          else { this._persistSession(true); this.note('app.pagehide'); }
+        });
+        window.addEventListener('freeze', () => { this.note('app.freeze', this._domSnapshot()); });
+        window.addEventListener('error', (e) => {
+          this.note('js.error', { msg: (e && e.message) ? String(e.message).slice(0, 140) : '?' });
+        });
+        window.addEventListener('unhandledrejection', (e) => {
+          let m = '?'; try { m = String((e.reason && (e.reason.message || e.reason)) || '?').slice(0, 140); } catch (_) {}
+          this.note('js.reject', { msg: m });
+        });
+      }
+      // 4) Heartbeat so idle/panning sessions still get timestamped heap + DOM samples.
+      if (typeof setInterval !== 'undefined') setInterval(() => this.note('heartbeat', this._domSnapshot()), 20000);
+      this.note('app.start', { v: (typeof APP_VERSION !== 'undefined') ? APP_VERSION : '?', mode: this._uaTag() });
+    } catch (_) { /* never throw */ }
+  },
+
+  _uaTag() {
+    try {
+      const ua = navigator.userAgent || '';
+      const m = ua.match(/(iPhone|iPad) OS [\d_]+|CPU OS [\d_]+|Version\/[\d.]+/);
+      let standalone = 'tab';
+      try { if (navigator.standalone === true || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)) standalone = 'pwa'; } catch (_) {}
+      let mem = ''; try { if (navigator.deviceMemory) mem = ' ram~' + navigator.deviceMemory + 'GB'; } catch (_) {}
+      return (m ? m[0].replace(/_/g, '.') : 'ua?') + ' ' + standalone + mem;
+    } catch (_) { return '?'; }
+  },
+
+  _domSnapshot() {
+    try {
+      return {
+        dom: document.querySelectorAll('*').length,
+        img: document.querySelectorAll('img').length,
+        cnv: document.querySelectorAll('canvas').length,
+        vs: (typeof S !== 'undefined' && S.viewsheds) ? S.viewsheds.length : 0,
+      };
+    } catch (_) { return null; }
+  },
+
+  _persistSession(cleanExit) {
+    const ls = this._ls(); if (!ls) return;
+    try {
+      ls.setItem(this.SESSION_KEY, JSON.stringify({
+        id: this.sessionId, startedAt: this.startedAt, cleanExit: !!cleanExit,
+        peakKb: Math.round(this.mem.peakKb), lastTotalKb: Math.round(this.totalKb()), tag: this._sessTag,
+      }));
+    } catch (_) {}
+  },
+
+  // --- self-tallied memory estimate (no localStorage write — cheap) ---
+  alloc(kind, bytes) {
+    if (!this.enabled || !bytes) return;
+    const kb = bytes / 1024;
+    this.mem.liveKb += kb;
+    this.mem.byKind[kind] = (this.mem.byKind[kind] || 0) + kb;
+    if (this.totalKb() > this.mem.peakKb) this.mem.peakKb = this.totalKb();
+  },
+  free(kind, bytes) {
+    if (!this.enabled || !bytes) return;
+    const kb = bytes / 1024;
+    this.mem.liveKb = Math.max(0, this.mem.liveKb - kb);
+    this.mem.byKind[kind] = Math.max(0, (this.mem.byKind[kind] || 0) - kb);
+  },
+  // Allocation we cannot reliably release (un-revoked blob URLs, dataURL strings
+  // handed to Leaflet): tracked monotonically as "leaked" so the trail shows the
+  // cumulative un-released memory climbing toward the kill.
+  leak(kind, bytes) {
+    if (!this.enabled || !bytes) return;
+    const kb = bytes / 1024;
+    this.mem.leakedKb += kb;
+    this.mem.byKind[kind] = (this.mem.byKind[kind] || 0) + kb;
+    if (this.totalKb() > this.mem.peakKb) this.mem.peakKb = this.totalKb();
+  },
+
+  // --- breadcrumbs ---
+  note(op, detail) {
+    if (!this.enabled) return;
+    try {
+      const c = { t: this._now(), op: op, heap: Math.round(this.totalKb()) };
+      if (this.mem.leakedKb > 1) c.leak = Math.round(this.mem.leakedKb);
+      if (detail) c.d = detail;
+      this._crumbs.push(c);
+      if (this._crumbs.length > this.MAX_CRUMBS) this._crumbs.splice(0, this._crumbs.length - this.MAX_CRUMBS);
+      const ls = this._ls();
+      if (ls) ls.setItem(this.CRUMB_KEY, JSON.stringify(this._crumbs));
+      this._persistSession(false);
+    } catch (_) {}
+  },
+  noteThrottled(op, ms, detail) {
+    if (!this.enabled) return;
+    const now = this._now();
+    if ((now - (this._throttle[op] || 0)) < (ms || 2000)) return;
+    this._throttle[op] = now;
+    this.note(op, detail);
+  },
+
+  // --- on-device panel ---
+  bindTrigger() {
+    try {
+      if (typeof document === 'undefined') return;
+      const el = document.getElementById('appVersionLabel');
+      if (!el) return;
+      el.style.cursor = 'pointer';
+      el.title = 'tap 5× for diagnostics';
+      el.addEventListener('click', () => {
+        this._tapCount++;
+        if (this._tapTimer) clearTimeout(this._tapTimer);
+        this._tapTimer = setTimeout(() => { this._tapCount = 0; }, 1500);
+        if (this._tapCount >= 5) { this._tapCount = 0; this.showPanel(); }
+      });
+    } catch (_) {}
+  },
+  maybeAutoShow() { if (this._lastCrash) { try { this.showPanel(); } catch (_) {} } },
+
+  showPanel() {
+    try {
+      if (typeof document === 'undefined') return;
+      if (document.getElementById('sarDiagOverlay')) { this._refreshPanel(); return; }
+      const ov = document.createElement('div');
+      ov.id = 'sarDiagOverlay';
+      ov.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.85);display:flex;' +
+        'align-items:stretch;justify-content:center;padding:max(8px,env(safe-area-inset-top)) 8px max(8px,env(safe-area-inset-bottom));font-family:monospace;';
+      const panel = document.createElement('div');
+      panel.style.cssText = 'background:#0a0e14;border:1px solid #1f6feb;border-radius:8px;width:100%;max-width:680px;display:flex;flex-direction:column;overflow:hidden;color:#cfe;';
+      const hdr = document.createElement('div');
+      hdr.style.cssText = 'padding:10px 12px;border-bottom:1px solid #223;display:flex;justify-content:space-between;align-items:center;gap:8px;';
+      hdr.innerHTML = '<b style="color:#58a6ff;font-size:13px;">SAR DIAGNOSTICS</b>';
+      const closeBtn = document.createElement('button');
+      closeBtn.textContent = '✕ Close';
+      closeBtn.style.cssText = 'background:#21262d;color:#cfe;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-size:12px;';
+      closeBtn.onclick = () => this.hidePanel();
+      hdr.appendChild(closeBtn);
+      const stats = document.createElement('div');
+      stats.id = 'sarDiagStats';
+      stats.style.cssText = 'padding:8px 12px;font-size:11px;color:#9fb;border-bottom:1px solid #223;white-space:pre-wrap;';
+      const ta = document.createElement('textarea');
+      ta.id = 'sarDiagReport'; ta.readOnly = true;
+      ta.style.cssText = 'flex:1;width:100%;box-sizing:border-box;background:#06090f;color:#bcd;border:0;padding:10px 12px;font-family:monospace;font-size:11px;line-height:1.45;resize:none;';
+      const bar = document.createElement('div');
+      bar.style.cssText = 'padding:8px 12px;border-top:1px solid #223;display:flex;gap:8px;flex-wrap:wrap;';
+      const mkBtn = (label, fn, color) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.style.cssText = 'flex:1;min-width:90px;background:' + (color || '#21262d') + ';color:#fff;border:1px solid #30363d;border-radius:6px;padding:10px;font-size:12px;';
+        b.onclick = fn; return b;
+      };
+      bar.appendChild(mkBtn('Copy report', () => this._copyReport(), '#1f6feb'));
+      bar.appendChild(mkBtn('Refresh', () => this._refreshPanel()));
+      bar.appendChild(mkBtn('Clear logs', () => { this.clear(); this._refreshPanel(); }, '#8b2c2c'));
+      panel.appendChild(hdr); panel.appendChild(stats); panel.appendChild(ta); panel.appendChild(bar);
+      ov.appendChild(panel);
+      ov.addEventListener('click', (e) => { if (e.target === ov) this.hidePanel(); });
+      document.body.appendChild(ov);
+      this._refreshPanel();
+      this._panelTimer = setInterval(() => this._refreshStats(), 1000);
+      this.note('diag.panel.open');
+    } catch (_) {}
+  },
+  hidePanel() {
+    try {
+      if (this._panelTimer) { clearInterval(this._panelTimer); this._panelTimer = null; }
+      const ov = document.getElementById('sarDiagOverlay'); if (ov) ov.remove();
+    } catch (_) {}
+  },
+  _refreshPanel() { try { const ta = document.getElementById('sarDiagReport'); if (ta) ta.value = this.report(); this._refreshStats(); } catch (_) {} },
+  _refreshStats() {
+    try {
+      const el = document.getElementById('sarDiagStats'); if (!el) return;
+      const mb = (kb) => (kb / 1024).toFixed(1) + 'MB';
+      el.textContent = 'heap≈' + mb(this.totalKb()) + '   live ' + mb(this.mem.liveKb) + '   leaked ' + mb(this.mem.leakedKb) + '   peak ' + mb(this.mem.peakKb) +
+        (this._lastCrash ? '\n⚠ previous session ended ungracefully — see report below' : '');
+      el.style.color = this._lastCrash ? '#f7b' : '#9fb';
+    } catch (_) {}
+  },
+  _copyReport() {
+    const txt = this.report();
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(txt).then(() => this._flash('Copied ✓')).catch(() => this._fallbackCopy());
+        return;
+      }
+    } catch (_) {}
+    this._fallbackCopy();
+  },
+  _fallbackCopy() {
+    try {
+      const ta = document.getElementById('sarDiagReport');
+      if (ta) { ta.focus(); ta.select(); try { ta.setSelectionRange(0, ta.value.length); } catch (_) {} try { document.execCommand('copy'); } catch (_) {} this._flash('Selected — long-press → Copy'); }
+    } catch (_) {}
+  },
+  _flash(msg) { try { const el = document.getElementById('sarDiagStats'); if (el) { el.textContent = msg; setTimeout(() => this._refreshStats(), 1300); } } catch (_) {} },
+  clear() {
+    try {
+      this._crumbs = []; this._lastCrash = null;
+      const ls = this._ls();
+      if (ls) { ls.setItem(this.CRUMB_KEY, '[]'); ls.removeItem(this.LAST_CRASH_KEY); }
+    } catch (_) {}
+  },
+
+  report() {
+    const out = [];
+    const mb = (kb) => (kb / 1024).toFixed(1) + 'MB';
+    out.push('SAR DIAGNOSTICS  ' + this._uaTag());
+    out.push('generated ' + this._fmtTime(this._now()));
+    const up = this.startedAt ? Math.round((this._now() - this.startedAt) / 60000) : 0;
+    out.push('session ' + this.sessionId + '  uptime ' + up + 'm');
+    out.push('heap est ' + mb(this.totalKb()) + '  (live ' + mb(this.mem.liveKb) + ', leaked ' + mb(this.mem.leakedKb) + ')  peak ' + mb(this.mem.peakKb));
+    const kinds = Object.keys(this.mem.byKind).filter(k => this.mem.byKind[k] > 1).sort((a, b) => this.mem.byKind[b] - this.mem.byKind[a]);
+    if (kinds.length) out.push('by kind: ' + kinds.map(k => k + ' ' + mb(this.mem.byKind[k])).join(', '));
+    if (this._lastCrash) {
+      const c = this._lastCrash;
+      out.push('');
+      out.push('===== PREVIOUS SESSION ENDED UNGRACEFULLY (likely crash/kill) =====');
+      out.push('detected ' + this._fmtTime(c.detectedAt));
+      if (c.session) out.push('that session: started ' + this._fmtTime(c.session.startedAt) + ', peak ' + mb(c.session.peakKb || 0) + ', last total ' + mb(c.session.lastTotalKb || 0) + (c.session.tag ? ', ' + c.session.tag : ''));
+      out.push('LAST OP BEFORE IT DIED: ' + (c.lastOp || '?'));
+      out.push('--- last ' + ((c.crumbs && c.crumbs.length) || 0) + ' breadcrumbs before the crash (oldest→newest) ---');
+      (c.crumbs || []).forEach(cr => out.push('  ' + this._fmtCrumb(cr)));
+    }
+    out.push('');
+    out.push('===== CURRENT SESSION breadcrumbs (oldest→newest, ' + this._crumbs.length + ') =====');
+    this._crumbs.forEach(cr => out.push('  ' + this._fmtCrumb(cr)));
+    return out.join('\n');
+  },
+  _fmtCrumb(cr) {
+    let s = this._fmtTime(cr.t) + '  ' + String(cr.op || '?').padEnd(18) + ' heap=' + ((cr.heap || 0) / 1024).toFixed(1) + 'MB';
+    if (cr.leak) s += ' leak=' + (cr.leak / 1024).toFixed(1) + 'MB';
+    if (cr.d) { try { s += '  ' + JSON.stringify(cr.d); } catch (_) {} }
+    return s;
+  },
+  _fmtTime(t) { try { return new Date(t).toLocaleTimeString(); } catch (_) { return String(t); } },
+};
+try { if (typeof window !== 'undefined') window.SARDiag = Diag; } catch (_) {}
+
 const ADSB_APIS = [
   { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
   { name: 'airplanes.live', url: (lat, lon, dist) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${dist}` },
@@ -246,6 +555,9 @@ function cacheSectionalForArea(bounds) {
 // ============================================================
 function initMap() {
   S.map = L.map('map', { center: [38.685, -120.99], zoom: 11, zoomControl: false, attributionControl: false });
+  // Pan/zoom heartbeat — samples heap estimate + DOM/img counts while the user
+  // moves the map with overlays on (a primary reported pre-crash activity).
+  try { S.map.on('moveend zoomend', () => Diag.noteThrottled('map.move', 2500, Object.assign({ z: S.map.getZoom() }, Diag._domSnapshot()))); } catch (_) {}
   // Tracked basemaps so the theme toggle can swap between them (dark default).
   S.mapLayers.basemap_dark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
   S.mapLayers.basemap_light = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
@@ -405,6 +717,11 @@ function clearArea() {
   // the layer control (clearArea intentionally leaves that to the next processArea).
   // Saved viewsheds stay in IndexedDB; restoreViewsheds re-hydrates them per area.
   if (S.mapLayers.observers) S.mapLayers.observers.clearLayers();
+  try {
+    let freed = 0;
+    (S.viewsheds || []).forEach(r => { if (r && r.mask && r.mask.length) { Diag.free('viewshedMask', r.mask.length); freed += r.mask.length; } });
+    Diag.note('area.clear', { vsFreedKb: Math.round(freed / 1024) });
+  } catch (_) {}
   S.viewsheds = []; S.activeViewshedId = null;
   if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
   if (S.mapLayers.canopy && S.map && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
@@ -449,6 +766,7 @@ function enterCoords() {
 // PROCESS AREA — Triggers all API fetches
 // ============================================================
 async function processArea(layer, type) {
+  try { Diag.note('area.process', { type: type, dom: Diag._domSnapshot() }); } catch (_) {}
   document.getElementById('noAreaOverlay').style.display = 'none';
   document.getElementById('assessmentBanner').style.display = 'flex';
   document.getElementById('areaInfoBar').style.display = 'flex';
@@ -4935,6 +5253,7 @@ function exportRasterGeoTiff(layerId, ref) {
   if (!r) return;
   try {
     const { grid, rgba, label, name } = r;
+    try { Diag.note('export.geotiff', { layer: layerId, px: grid.cols * grid.rows }); } catch (_) {}
     const merc = reprojectRgbaTo3857(rgba, grid);
     const buf = encodeGeoTiffRGBA(merc.rgba, merc.width, merc.height, merc.bounds, { epsg: 3857 });
     const fname = name ? `SAR_Viewshed_${viewshedFilenameSlug(name)}_${ts}.tif` : `SAR_${label}_${ts}.tif`;
@@ -5041,6 +5360,7 @@ function populateExportModal() {
 
 function doExport() {
   if (!S.areaCenter) return alert('Draw an operational area first.');
+  try { Diag.note('export.kml.start'); } catch (_) {}
   const c = S.areaCenter;
   const ts = new Date().toISOString().split('T')[0];
   let folders = '';
@@ -5787,6 +6107,9 @@ function acceptDisclaimer() {
 }
 
 function startApp() {
+  // Crash tracing must run as early as possible so the "did the previous
+  // session exit cleanly?" check sees the prior flag before anything resets it.
+  try { Diag.init(); Diag.bindTrigger(); Diag.maybeAutoShow(); } catch (_) {}
   checkDisclaimer();
   initMap();
   resolveSectionalEdition();
@@ -6630,6 +6953,9 @@ if (typeof L !== 'undefined' && L.TileLayer && typeof L.TileLayer.extend === 'fu
       }).then(blob => {
         if (blob) {
           tile.src = URL.createObjectURL(blob);
+          // NOTE: this object URL is never revoked — tracked as a leak so the
+          // trail shows imported-FAA-chart tile memory climbing with pan/zoom.
+          try { Diag.leak('faaTileBlob', blob.size || 0); Diag.noteThrottled('faaTile', 1500, { kb: Math.round((blob.size || 0) / 1024) }); } catch (_) {}
           done(null, tile);
         } else {
           // No cached tile — return transparent
@@ -7326,6 +7652,9 @@ function renderRasterOverlay(layerId, rgba, grid, opacity) {
   const ctx = canvas.getContext('2d');
   ctx.putImageData(new ImageData(rgba, grid.cols, grid.rows), 0, 0);
   const url = canvas.toDataURL('image/png');
+  // The prior dataURL handed to Leaflet's imageOverlay is not explicitly
+  // released; count each encoded string as leaked + the transient RGBA buffer.
+  try { Diag.leak('rasterDataUrl', url.length); Diag.note('overlay.render', { id: layerId, kb: Math.round(url.length / 1024) }); } catch (_) {}
   const bounds = L.latLngBounds([grid.bounds.south, grid.bounds.west], [grid.bounds.north, grid.bounds.east]);
   let layer = S.mapLayers[layerId];
   if (layer && layer.setUrl) {
@@ -7389,7 +7718,9 @@ async function loadCanopyForView() {
     }
     const op = parseFloat((document.getElementById('canopyOpacity') || {}).value) || CANOPY_OVERLAY_OPACITY;
     renderRasterOverlay('canopy', canopyGridToRGBA(grid, canopyFlat), grid, op);
+    try { if (S.canopy && S.canopy.canopyFlat && S.canopy.canopyFlat.byteLength) Diag.free('canopyFlat', S.canopy.canopyFlat.byteLength); } catch (_) {}
     S.canopy = { grid, source, canopyFlat }; // retain pixels for GeoTIFF export
+    try { Diag.alloc('canopyFlat', canopyFlat.byteLength); Diag.note('canopy.loaded', { src: source }); } catch (_) {}
     const cached = source.includes('cached');
     setStatus('canopyStatus', cached ? 'cached' : 'live', cached ? 'CACHED' : 'LIVE');
     const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = true;
@@ -7629,8 +7960,10 @@ async function restoreViewsheds() {
     const rec = makeViewshedRecord(raw);
     if (!rec) return;
     S.viewsheds.push(rec);
+    try { if (rec.mask && rec.mask.length) Diag.alloc('viewshedMask', rec.mask.length); } catch (_) {}
     _addObserverMarker(rec);
   });
+  try { Diag.note('viewshed.restore', { n: S.viewsheds.length, maskKb: Math.round((S.viewsheds || []).reduce((a, r) => a + ((r.mask && r.mask.length) || 0), 0) / 1024) }); } catch (_) {}
   let activeId = null;
   if (typeof getAppState === 'function') { try { activeId = await getAppState('activeViewshedId'); } catch (e) { /* ignore */ } }
   if (!S.viewsheds.find(r => r.id === activeId)) activeId = S.viewsheds.length ? S.viewsheds[S.viewsheds.length - 1].id : null;
@@ -7649,6 +7982,7 @@ async function runViewshed(id) {
   setStatus('viewshedStatus', 'loading', 'Computing...');
   const obs = rec.observer;
   const aglFt = rec.aglFt, vlosFt = rec.vlosFt;
+  try { Diag.note('viewshed.start', { vlosFt, aglFt, n: S.viewsheds.length }); } catch (_) {}
   try {
     const vlosM = ftToM(vlosFt), aglM = ftToM(aglFt);
     const halfWidthM = vlosM + 50;
@@ -7673,8 +8007,10 @@ async function runViewshed(id) {
     const dsm = sanitizeForKernel(buildDSM(dem.demFlat, can.canopyFlat, n), n);
     const { col: obsCol, row: obsRow } = latLngToCell(grid, obs.lat, obs.lng);
     const mask = await _runViewshedKernel({ grid, dem: dem.demFlat, dsm, obsCol, obsRow, aglM, vlosRangeM: vlosM });
+    try { if (rec.mask && rec.mask.length) Diag.free('viewshedMask', rec.mask.length); } catch (_) {}
     rec.grid = grid;
     rec.mask = mask;
+    try { Diag.alloc('viewshedMask', mask.length); } catch (_) {}
     rec.coverage = viewshedCoverage(grid, mask, obsCol, obsRow, vlosM);
     rec.demSource = dem.source;
     rec.canopySource = can.canopyFlat ? can.source : null;
@@ -7693,6 +8029,7 @@ async function runViewshed(id) {
   } finally {
     S._viewshedRunningId = null;
     trackFetchEnd('Viewshed');
+    try { Diag.note('viewshed.end', { n: S.viewsheds.length }); } catch (_) {}
     if (rec._pendingRecompute) { rec._pendingRecompute = false; runViewshed(id); }
   }
 }
@@ -7735,7 +8072,7 @@ async function _runViewshedKernel(opts) {
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    S, setText, setColor, setStatus, switchTab, togglePanel,
+    S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     getCanopyProxyBase, saveCanopyProxy, fetch3DEPDEM, fetchCanopyRaster,
     renderRasterOverlay, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,
