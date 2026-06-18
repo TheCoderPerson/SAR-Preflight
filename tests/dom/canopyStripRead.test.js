@@ -4,7 +4,9 @@ const core = require('../../sar-preflight-core.js');
 Object.assign(globalThis, core);
 const raster = require('../../sar-preflight-raster.js');
 Object.assign(globalThis, raster);
-globalThis.L = { layerGroup: () => ({ addLayer() {}, clearLayers() {}, getLayers: () => [], addTo() { return this; } }) };
+// Force constrained (mobile) mode so the bounded strip path is exercised
+// (desktop reads the whole window in one pass).
+globalThis.L = { layerGroup: () => ({ addLayer() {}, clearLayers() {}, getLayers: () => [], addTo() { return this; } }), Browser: { mobile: true } };
 
 const { _cogTileToGrid } = require('../../sar-preflight.js');
 

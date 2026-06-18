@@ -4054,7 +4054,9 @@ async function fetchAdsb() {
     if (pollEl) pollEl.textContent = 'Updated ' + timeStr;
   } catch (err) {
     recordDataSourceError('ADS-B', err);
-    setStatus('adsbStatus', 'error', 'FETCH ERROR');
+    // Both the proxy /adsb route and the direct providers are unreachable
+    // (CORS / upstream 5xx). Polling continues, so it will retry automatically.
+    setStatus('adsbStatus', 'error', 'UNAVAILABLE — RETRYING');
   } finally {
     trackFetchEnd('ADS-B');
   }
@@ -7556,6 +7558,7 @@ const CANOPY_DECODE_BUDGET_PX = 32000000;
 // 1 m canopy over a wider area is hundreds of MB–GB to fetch/decode and is only
 // upscaled blur at that scale, so we tell the user to zoom in instead.
 const MAX_CANOPY_HALF_M = 6000;
+const CANOPY_TILE_ATTEMPTS = 4; // retry a tile this many times (with backoff) on transient proxy/S3 5xx before skipping it
 
 function getCanopyProxyBase() {
   try {
@@ -7625,11 +7628,12 @@ async function fetchCanopyRaster(grid) {
   const cacheKey = 'canopy_' + _aoiKey(b) + '_' + grid.cols + 'x' + grid.rows;
   if (base && (typeof isOnline !== 'function' || isOnline())) {
     try {
-      const canopy = await _fetchCanopyFromProxy(base, grid);
-      if (canopy) {
-        if (typeof cacheRaster === 'function') cacheRaster('canopy', cacheKey, { canopyArr: canopy });
-        clearDataSourceError('Canopy');
-        return { canopyFlat: canopy, source: 'Meta 1 m' };
+      const res = await _fetchCanopyFromProxy(base, grid);
+      if (res && res.canopy) {
+        if (typeof cacheRaster === 'function') cacheRaster('canopy', cacheKey, { canopyArr: res.canopy });
+        if (res.tilesFailed > 0) recordDataSourceError('Canopy', new Error(`${res.tilesFailed} of ${res.tilesTotal} canopy tiles failed to load (proxy/data-service errors)`));
+        else clearDataSourceError('Canopy');
+        return { canopyFlat: res.canopy, source: 'Meta 1 m', tilesTotal: res.tilesTotal, tilesLoaded: res.tilesLoaded, tilesFailed: res.tilesFailed };
       }
     } catch (e) {
       recordDataSourceError('Canopy', e);
@@ -7647,24 +7651,26 @@ async function _fetchCanopyFromProxy(base, grid) {
   const qks = metaQuadkeysForBBox(b.west, b.south, b.east, b.north);
   try { Diag.note('canopy.tiles', { qk: qks.length }); } catch (_) {}
   const canopy = new Float32Array(grid.rows * grid.cols).fill(NaN);
-  let any = false;
+  let any = false, loaded = 0, failed = 0;
   for (const qk of qks) {
     const url = base + '/chm/' + qk + '.tif';
     let tileGrid = null;
-    // Retry once: cold range-fetches of these large COGs through the proxy can
-    // intermittently 5xx (transient edge/S3 hiccup) even though the tile is valid.
-    for (let attempt = 0; attempt < 2 && tileGrid == null; attempt++) {
+    // Retry transient proxy/S3 errors: cold Range fetches of these large COGs
+    // intermittently 5xx even though the tile is valid. Back off between tries.
+    for (let attempt = 0; attempt < CANOPY_TILE_ATTEMPTS && tileGrid == null; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 300 * attempt)); // 300/600/900ms backoff
       try {
         const tiff = await GeoTIFF.fromUrl(url);
         tileGrid = await _cogTileToGrid(tiff, grid);
-      } catch (_) { tileGrid = null; } // missing tile / CORS / transient — retry then skip
+      } catch (_) { tileGrid = null; } // missing tile / CORS / transient
     }
-    if (!tileGrid) continue;
+    if (!tileGrid) { failed++; try { Diag.note('canopy.tileFail', { qk }); } catch (_) {} continue; }
+    loaded++;
     for (let i = 0; i < canopy.length; i++) {
       if (Number.isNaN(canopy[i]) && Number.isFinite(tileGrid[i])) { canopy[i] = tileGrid[i]; any = true; }
     }
   }
-  return any ? canopy : null;
+  return any ? { canopy, tilesTotal: qks.length, tilesLoaded: loaded, tilesFailed: failed } : null;
 }
 
 // Read the AOI window from a (Web-Mercator) COG, choosing an overview so the read
@@ -7704,7 +7710,11 @@ async function _cogTileToGrid(tiff, grid) {
   // free it, so peak memory stays ~128 MB regardless of AOI size.
   const winW = px1 - px0;
   const sampleW = Math.min(winW, 1024);                                  // horizontal downsample of each strip
-  const stripRows = Math.max(1, Math.floor(CANOPY_DECODE_BUDGET_PX / winW)); // native rows per strip within the budget
+  // Desktop has no per-tab memory ceiling, so read the whole window in one pass
+  // (one readRasters = far fewer proxy Range requests, less transient-5xx
+  // exposure). Mobile keeps the bounded strip budget to avoid the OOM crash.
+  const budget = _isConstrained() ? CANOPY_DECODE_BUDGET_PX : Infinity;
+  const stripRows = Math.max(1, Math.floor(budget / winW));              // native rows per strip within the budget
   const nStrips = Math.ceil((py1 - py0) / stripRows);
   const peakBytes = Math.min(py1 - py0, stripRows) * winW * 4;
   try { Diag.note('canopy.read', { winW, winH: py1 - py0, strips: nStrips, peakMb: Math.round(peakBytes / 1048576) }); } catch (_) {}
@@ -7861,7 +7871,7 @@ async function loadCanopyForView() {
     const resM = Math.max(WORK_RES_M, (2 * halfWidthM) / MAX_GRID);
     const grid = makeGrid(center.lat, center.lng, halfWidthM, resM);
     try { Diag.note('canopy.start', { z: S.map.getZoom(), cols: grid.cols, rows: grid.rows, halfKm: Math.round(halfWidthM / 100) / 10 }); } catch (_) {}
-    const { canopyFlat, source } = await fetchCanopyRaster(grid);
+    const { canopyFlat, source, tilesFailed, tilesLoaded, tilesTotal } = await fetchCanopyRaster(grid);
     if (!canopyFlat) {
       setStatus('canopyStatus', 'error', source === 'no proxy' ? 'NO PROXY' : 'NO DATA');
       const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = false;
@@ -7873,7 +7883,12 @@ async function loadCanopyForView() {
     S.canopy = { grid, source, canopyFlat }; // retain pixels for GeoTIFF export
     try { Diag.alloc('canopyFlat', canopyFlat.byteLength); Diag.note('canopy.loaded', { src: source }); } catch (_) {}
     const cached = source.includes('cached');
-    setStatus('canopyStatus', cached ? 'cached' : 'live', cached ? 'CACHED' : 'LIVE');
+    if (tilesFailed > 0) {
+      // Some tiles failed even after retries — tell the user coverage is incomplete and why.
+      setStatus('canopyStatus', 'partial', `PARTIAL ${tilesLoaded}/${tilesTotal} TILES`);
+    } else {
+      setStatus('canopyStatus', cached ? 'cached' : 'live', cached ? 'CACHED' : 'LIVE');
+    }
     const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = true;
     buildLayerControl();
   } catch (e) {
