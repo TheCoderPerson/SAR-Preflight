@@ -588,7 +588,10 @@ function cacheSectionalForArea(bounds) {
 // individual trees/buildings; the FAA sectional is only native to z12.
 const MAX_MAP_ZOOM = 18;
 function initMap() {
-  S.map = L.map('map', { center: [38.685, -120.99], zoom: 11, maxZoom: MAX_MAP_ZOOM, bounceAtZoomLimits: false, zoomControl: false, attributionControl: false });
+  // preferCanvas: render vector layers (wires, obstacles, towers, airspace,
+  // ADS-B, etc.) on one GPU canvas instead of per-feature SVG — much smoother
+  // panning at close zoom on high-DPR mobile (the choppiness reported on iPhone).
+  S.map = L.map('map', { center: [38.685, -120.99], zoom: 11, maxZoom: MAX_MAP_ZOOM, bounceAtZoomLimits: false, preferCanvas: true, zoomControl: false, attributionControl: false });
   // Pan/zoom heartbeat — samples heap estimate + DOM/img counts while the user
   // moves the map with overlays on (a primary reported pre-crash activity).
   try { S.map.on('moveend zoomend', () => Diag.noteThrottled('map.move', 2500, Object.assign({ z: S.map.getZoom() }, Diag._domSnapshot()))); } catch (_) {}
