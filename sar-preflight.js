@@ -588,10 +588,13 @@ function cacheSectionalForArea(bounds) {
 // individual trees/buildings; the FAA sectional is only native to z12.
 const MAX_MAP_ZOOM = 18;
 function initMap() {
-  S.map = L.map('map', { center: [38.685, -120.99], zoom: 11, maxZoom: MAX_MAP_ZOOM, zoomControl: false, attributionControl: false });
+  S.map = L.map('map', { center: [38.685, -120.99], zoom: 11, maxZoom: MAX_MAP_ZOOM, bounceAtZoomLimits: false, zoomControl: false, attributionControl: false });
   // Pan/zoom heartbeat — samples heap estimate + DOM/img counts while the user
   // moves the map with overlays on (a primary reported pre-crash activity).
   try { S.map.on('moveend zoomend', () => Diag.noteThrottled('map.move', 2500, Object.assign({ z: S.map.getZoom() }, Diag._domSnapshot()))); } catch (_) {}
+  // Detach stretched canopy/viewshed image overlays during + after zoom so they
+  // never get sized to a huge on-screen pixel area (iOS compositing-memory kill).
+  try { S.map.on('zoomstart', _hideOverlaysForZoom); S.map.on('zoomend', _applyOverlayZoomCap); } catch (_) {}
   // Tracked basemaps so the theme toggle can swap between them (dark default).
   S.mapLayers.basemap_dark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
   S.mapLayers.basemap_light = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
@@ -759,6 +762,7 @@ function clearArea() {
   S.viewsheds = []; S.activeViewshedId = null;
   if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
   if (S.mapLayers.canopy && S.map && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
+  S._overlayWanted = { canopy: false, viewshed: false };
   const _canopyCb = document.getElementById('canopyToggle'); if (_canopyCb) _canopyCb.checked = false;
   const _vsRes = document.getElementById('vsResult'); if (_vsRes) _vsRes.textContent = '';
   S.faaAirspace = null;
@@ -7698,6 +7702,45 @@ async function _cogTileToGrid(tiff, grid) {
 }
 
 // --- Render a computed raster as a semi-transparent image overlay ---
+// --- Raster overlay display-size cap (iOS compositing-memory guard) ---
+// A fixed-bounds L.imageOverlay (canopy/viewshed) is stretched to an enormous
+// on-screen pixel size at deep zoom (a device trace caught 75,119 px at ~z18.7).
+// Leaflet sizes the <img> element to that full projected size, and the
+// backing-store/compositing memory — invisible to the JS heap — was crashing
+// the iOS PWA. We detach the overlay while it would exceed this budget and
+// re-attach it when zoomed back out. The source raster is only ~512 px, so the
+// hidden zoom range showed nothing but upscaled blur anyway.
+const MAX_OVERLAY_DISPLAY_PX = 4096;
+function _overlayDisplayPx(layer) {
+  try {
+    if (!layer || !layer._bounds || !S.map) return 0;
+    const ne = S.map.latLngToContainerPoint(layer._bounds.getNorthEast());
+    const sw = S.map.latLngToContainerPoint(layer._bounds.getSouthWest());
+    return Math.max(Math.abs(ne.x - sw.x), Math.abs(ne.y - sw.y));
+  } catch (_) { return 0; }
+}
+function _applyOverlayZoomCap() {
+  if (!S.map || !S._overlayWanted) return;
+  ['canopy', 'viewshed'].forEach(id => {
+    const layer = S.mapLayers[id];
+    if (!layer || !S._overlayWanted[id]) return;
+    const tooBig = _overlayDisplayPx(layer) > MAX_OVERLAY_DISPLAY_PX;
+    const on = S.map.hasLayer(layer);
+    if (tooBig && on) { S.map.removeLayer(layer); try { Diag.note('overlay.cap.hide', { id }); } catch (_) {} }
+    else if (!tooBig && !on) { layer.addTo(S.map); }
+  });
+}
+// During a zoom gesture Leaflet re-sizes the overlay element to the full
+// projected pixel size before zoomend fires; detach first so that giant element
+// is never created, then re-evaluate once the zoom settles (_applyOverlayZoomCap).
+function _hideOverlaysForZoom() {
+  if (!S.map || !S._overlayWanted) return;
+  ['canopy', 'viewshed'].forEach(id => {
+    const layer = S.mapLayers[id];
+    if (layer && S._overlayWanted[id] && S.map.hasLayer(layer)) S.map.removeLayer(layer);
+  });
+}
+
 function renderRasterOverlay(layerId, rgba, grid, opacity) {
   const canvas = document.createElement('canvas');
   canvas.width = grid.cols; canvas.height = grid.rows;
@@ -7715,7 +7758,9 @@ function renderRasterOverlay(layerId, rgba, grid, opacity) {
     layer = L.imageOverlay(url, bounds, { opacity, interactive: false, className: 'raster-overlay-' + layerId });
     S.mapLayers[layerId] = layer;
   }
-  if (!S.map.hasLayer(layer)) layer.addTo(S.map);
+  if (!S._overlayWanted) S._overlayWanted = {};
+  S._overlayWanted[layerId] = true;
+  _applyOverlayZoomCap(); // adds to the map only if within the display-size budget
   return layer;
 }
 
@@ -7736,6 +7781,7 @@ async function toggleCanopyOverlay() {
   const cb = document.getElementById('canopyToggle');
   const on = cb ? cb.checked : !(S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy));
   if (!on) {
+    if (S._overlayWanted) S._overlayWanted.canopy = false;
     if (S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
     buildLayerControl();
     return;
@@ -7894,6 +7940,7 @@ function _renderActiveViewshed() {
   const rec = S.viewsheds.find(r => r.id === S.activeViewshedId);
   const r = document.getElementById('vsResult');
   if (!rec || !rec.grid || !rec.mask) {
+    if (S._overlayWanted) S._overlayWanted.viewshed = false;
     if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
     if (r) r.textContent = rec ? `${rec.name}: ${rec.computedAt ? 'terrain unavailable — no viewshed' : 'computing…'}` : '';
     buildLayerControl();
@@ -8127,7 +8174,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     getCanopyProxyBase, saveCanopyProxy, fetch3DEPDEM, fetchCanopyRaster,
-    renderRasterOverlay, setCanopyOpacity, setViewshedOpacity,
+    renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,
     startViewshedPick, cancelViewshedPick, onViewshedMapClick, runViewshed, clearAllViewsheds,
     genViewshedId, _ensureObserverLayer, _addObserverMarker, _observerPopupHtml, _toPersistable,
