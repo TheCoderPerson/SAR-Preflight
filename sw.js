@@ -81,6 +81,14 @@ self.addEventListener('fetch', event => {
   // Skip chrome-extension and other non-http(s) URLs
   if (!event.request.url.startsWith('http')) return;
 
+  // Skip byte-range requests (e.g. the canopy COG reads via GeoTIFF.js). They
+  // return 206 Partial Content, which the Cache API cannot store — caching one
+  // throws "Partial response (206) is unsupported" and the failure can corrupt
+  // or drop the range read, producing partial/blank canopy coverage. Let the
+  // browser fetch these straight from the network, uncached. (Canopy rasters
+  // are cached separately in IndexedDB by the app, so offline still works.)
+  if (event.request.headers.has('range')) return;
+
   const url = event.request.url;
 
   // Local chart tiles — always serve from cache only (never fetch from network)
@@ -145,10 +153,13 @@ async function cacheFirst(request) {
   if (cached) return cached;
   try {
     const response = await fetch(request);
-    if (response.ok) {
+    // Only cache full 200 responses — never 206 (partial) or other statuses;
+    // Cache.put() throws on a 206. Suppress any put rejection so it can't
+    // surface as an uncaught error or affect the returned response.
+    if (response.status === 200) {
       const cacheName = getCacheName(request.url);
       const cache = await caches.open(cacheName);
-      cache.put(request, response.clone());
+      cache.put(request, response.clone()).catch(() => {});
     }
     return response;
   } catch (err) {
@@ -160,9 +171,9 @@ async function cacheFirst(request) {
 async function networkFirst(request) {
   try {
     const response = await fetch(request);
-    if (response.ok) {
+    if (response.status === 200) {
       const cache = await caches.open(CACHE_API);
-      cache.put(request, response.clone());
+      cache.put(request, response.clone()).catch(() => {});
     }
     return response;
   } catch (err) {
@@ -194,9 +205,9 @@ async function sectionalTileStrategy(request) {
   if (cached) return cached;
   try {
     const response = await fetch(request);
-    if (response.ok) {
+    if (response.status === 200) {
       const cache = await caches.open(CACHE_SECTIONAL);
-      cache.put(request, response.clone());
+      cache.put(request, response.clone()).catch(() => {});
     }
     return response;
   } catch (err) {
