@@ -581,12 +581,24 @@ function cacheSectionalForArea(bounds) {
 // ============================================================
 // MAP INIT
 // ============================================================
-// Max interactive zoom. Capped at 18 (was effectively 19 via the basemap/
-// satellite layers) because iOS Safari killed the PWA from renderer memory
-// at z19 — heavy ESRI satellite tiles + a stretched viewshed image overlay
-// at sub-meter zoom blow past the per-tab memory ceiling. z18 still shows
-// individual trees/buildings; the FAA sectional is only native to z12.
-const MAX_MAP_ZOOM = 18;
+// Memory-constrained device (iOS Safari/WKWebView, mobile) vs a desktop PC.
+// The iOS PWA has a tight per-tab memory ceiling that desktop browsers don't,
+// so the three memory mitigations — the zoom cap, the canopy-AOI fetch guard,
+// and the overlay display-size cap — apply ONLY here. On PC everything is
+// unrestricted (canopy loads at any zoom and overlays never auto-hide).
+function _isConstrained() {
+  try {
+    if (typeof L !== 'undefined' && L.Browser && L.Browser.mobile) return true;
+    const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+    if (/iP(hone|ad|od)/.test(ua)) return true;
+    // iPadOS in desktop-mode reports as MacIntel with touch support.
+    if (typeof navigator !== 'undefined' && navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) return true;
+    return false;
+  } catch (_) { return false; }
+}
+// Max interactive zoom: 18 on constrained mobile (z19 satellite tiles + a
+// stretched overlay crashed the iOS PWA), full 19 on desktop.
+const MAX_MAP_ZOOM = _isConstrained() ? 18 : 19;
 function initMap() {
   // preferCanvas: render vector layers (wires, obstacles, towers, airspace,
   // ADS-B, etc.) on one GPU canvas instead of per-feature SVG — much smoother
@@ -7747,10 +7759,13 @@ function _overlayDisplayPx(layer) {
 }
 function _applyOverlayZoomCap() {
   if (!S.map || !S._overlayWanted) return;
+  const constrained = _isConstrained();
   ['canopy', 'viewshed'].forEach(id => {
     const layer = S.mapLayers[id];
     if (!layer || !S._overlayWanted[id]) return;
-    const tooBig = _overlayDisplayPx(layer) > MAX_OVERLAY_DISPLAY_PX;
+    // Desktop: never hide for size (no compositing-memory crash risk) — keep the
+    // overlay attached at every zoom. Mobile: detach when stretched too large.
+    const tooBig = constrained && _overlayDisplayPx(layer) > MAX_OVERLAY_DISPLAY_PX;
     const on = S.map.hasLayer(layer);
     if (tooBig && on) { S.map.removeLayer(layer); try { Diag.note('overlay.cap.hide', { id }); } catch (_) {} }
     else if (!tooBig && !on) { layer.addTo(S.map); }
@@ -7760,6 +7775,7 @@ function _applyOverlayZoomCap() {
 // projected pixel size before zoomend fires; detach first so that giant element
 // is never created, then re-evaluate once the zoom settles (_applyOverlayZoomCap).
 function _hideOverlaysForZoom() {
+  if (!_isConstrained()) return; // desktop keeps overlays visible throughout zoom
   if (!S.map || !S._overlayWanted) return;
   ['canopy', 'viewshed'].forEach(id => {
     const layer = S.mapLayers[id];
@@ -7832,9 +7848,10 @@ async function loadCanopyForView() {
       center.distanceTo(L.latLng(center.lat, vb.getWest())),
       center.distanceTo(L.latLng(vb.getNorth(), center.lng))
     );
-    if (halfWidthM > MAX_CANOPY_HALF_M) {
-      // 1 m canopy over a very wide view is hundreds of MB–GB to decode and only
-      // blur at that scale — guide the user to zoom in rather than crash.
+    if (_isConstrained() && halfWidthM > MAX_CANOPY_HALF_M) {
+      // Mobile only: 1 m canopy over a very wide view is hundreds of MB–GB to
+      // decode and only blur at that scale — guide the user to zoom in rather
+      // than crash. On desktop there's no memory ceiling, so we always fetch.
       setStatus('canopyStatus', 'error', 'ZOOM IN');
       try { Diag.note('canopy.skip', { halfKm: Math.round(halfWidthM / 100) / 10 }); } catch (_) {}
       const cbz = document.getElementById('canopyToggle'); if (cbz) cbz.checked = false;
@@ -8209,7 +8226,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     getCanopyProxyBase, saveCanopyProxy, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
-    renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, setCanopyOpacity, setViewshedOpacity,
+    renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, _isConstrained, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,
     startViewshedPick, cancelViewshedPick, onViewshedMapClick, runViewshed, clearAllViewsheds,
     genViewshedId, _ensureObserverLayer, _addObserverMarker, _observerPopupHtml, _toPersistable,

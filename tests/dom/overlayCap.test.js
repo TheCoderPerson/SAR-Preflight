@@ -1,14 +1,14 @@
-// Raster-overlay display-size cap — detaches the canopy/viewshed image overlay
-// when it would be stretched beyond MAX_OVERLAY_DISPLAY_PX on screen (the iOS
-// compositing-memory crash at deep zoom), and re-attaches it when zoomed out.
+// Raster-overlay display-size cap — on memory-constrained mobile it detaches
+// the canopy/viewshed image overlay when stretched beyond MAX_OVERLAY_DISPLAY_PX
+// (the iOS compositing-memory crash at deep zoom) and re-attaches when zoomed
+// out. On desktop it must NOT hide overlays (no memory ceiling).
 const core = require('../../sar-preflight-core.js');
 Object.assign(globalThis, core);
-globalThis.L = { layerGroup: () => ({ addLayer() {}, clearLayers() {}, getLayers: () => [], addTo() { return this; } }) };
+// L.Browser.mobile drives _isConstrained(); default to constrained (mobile).
+globalThis.L = { layerGroup: () => ({ addLayer() {}, clearLayers() {}, getLayers: () => [], addTo() { return this; } }), Browser: { mobile: true } };
 
-const { S, _applyOverlayZoomCap, _hideOverlaysForZoom } = require('../../sar-preflight.js');
+const { S, _applyOverlayZoomCap, _hideOverlaysForZoom, _isConstrained } = require('../../sar-preflight.js');
 
-// A fake Leaflet imageOverlay + map whose latLngToContainerPoint yields a
-// configurable on-screen size (S.map._px) for the overlay bounds.
 function makeOverlay() {
   const o = { _bounds: { getNorthEast: () => ({ __ne: true }), getSouthWest: () => ({ __sw: true }) } };
   o.addTo = (map) => { map._onMap.add(o); return o; };
@@ -16,8 +16,7 @@ function makeOverlay() {
 }
 function makeMap() {
   return {
-    _onMap: new Set(),
-    _px: 0,
+    _onMap: new Set(), _px: 0,
     hasLayer(l) { return this._onMap.has(l); },
     removeLayer(l) { this._onMap.delete(l); },
     addLayer(l) { this._onMap.add(l); },
@@ -25,9 +24,10 @@ function makeMap() {
   };
 }
 
-describe('raster overlay display-size cap', () => {
+describe('raster overlay display-size cap (mobile/constrained)', () => {
   let canopy;
   beforeEach(() => {
+    globalThis.L.Browser.mobile = true; // constrained
     S.map = makeMap();
     S.mapLayers = {};
     canopy = makeOverlay();
@@ -35,33 +35,32 @@ describe('raster overlay display-size cap', () => {
     S._overlayWanted = { canopy: true, viewshed: false };
   });
 
+  it('reports constrained', () => { expect(_isConstrained()).toBe(true); });
+
   it('keeps the overlay attached when within the pixel budget', () => {
-    S.map._px = 1421;            // ~z13, well under 4096
-    S.map._onMap.add(canopy);    // currently shown
+    S.map._px = 1421; S.map._onMap.add(canopy);
     _applyOverlayZoomCap();
     expect(S.map.hasLayer(canopy)).toBe(true);
   });
 
   it('detaches the overlay when stretched beyond the budget', () => {
-    S.map._px = 75119;           // the z18.7 monster from the crash trace
-    S.map._onMap.add(canopy);
+    S.map._px = 75119; S.map._onMap.add(canopy);
     _applyOverlayZoomCap();
     expect(S.map.hasLayer(canopy)).toBe(false);
   });
 
   it('re-attaches when zoomed back within budget', () => {
-    S.map._px = 75119;
-    S.map._onMap.add(canopy);
+    S.map._px = 75119; S.map._onMap.add(canopy);
     _applyOverlayZoomCap();
     expect(S.map.hasLayer(canopy)).toBe(false);
-    S.map._px = 710;             // zoomed back out
+    S.map._px = 710;
     _applyOverlayZoomCap();
     expect(S.map.hasLayer(canopy)).toBe(true);
   });
 
   it('does not touch an overlay the user turned off (not wanted)', () => {
     S._overlayWanted.canopy = false;
-    S.map._px = 710;             // within budget, but not wanted
+    S.map._px = 710;
     _applyOverlayZoomCap();
     expect(S.map.hasLayer(canopy)).toBe(false);
   });
@@ -70,5 +69,31 @@ describe('raster overlay display-size cap', () => {
     S.map._onMap.add(canopy);
     _hideOverlaysForZoom();
     expect(S.map.hasLayer(canopy)).toBe(false);
+  });
+});
+
+describe('raster overlay cap disabled on desktop', () => {
+  let canopy;
+  beforeEach(() => {
+    globalThis.L.Browser.mobile = false; // desktop / unconstrained
+    S.map = makeMap();
+    S.mapLayers = {};
+    canopy = makeOverlay();
+    S.mapLayers.canopy = canopy;
+    S._overlayWanted = { canopy: true, viewshed: false };
+  });
+
+  it('reports not constrained', () => { expect(_isConstrained()).toBe(false); });
+
+  it('does NOT hide an oversized overlay on desktop (stays visible at deep zoom)', () => {
+    S.map._px = 75119; S.map._onMap.add(canopy);
+    _applyOverlayZoomCap();
+    expect(S.map.hasLayer(canopy)).toBe(true);
+  });
+
+  it('_hideOverlaysForZoom is a no-op on desktop', () => {
+    S.map._onMap.add(canopy);
+    _hideOverlaysForZoom();
+    expect(S.map.hasLayer(canopy)).toBe(true);
   });
 });
