@@ -7528,12 +7528,19 @@ const CANOPY_OVERLAY_OPACITY = 0.6;
 const VIEWSHED_OVERLAY_OPACITY = 0.5;
 const CANOPY_MAX_M = 60;        // clamp canopy heights (guards COG fill/nodata artifacts)
 // Cap the per-tile COG window read; a coarser overview is chosen if larger.
-// Lowered 2048→1024 (4x less decode memory: ~16MB→~4MB of Float32 per tile)
-// after an iOS PWA crashed mid canopy fetch — the GeoTIFF decoder's transient
-// buffers, invisible to the JS heap, overran the per-tab memory ceiling. The
-// output is resampled to the grid (<=512 px) anyway, so the visual overlay is
-// effectively unchanged.
+// (Meta canopy COGs turned out to have NO usable overviews, so this rarely
+// helps for them — the real bound is the strip-wise read below.)
 const COG_MAX_READ_PX = 1024;
+// Peak decode budget for the strip-wise COG read (~128 MB at 4 bytes/px).
+// GeoTIFF.js decodes the ENTIRE requested window before downsampling, and the
+// Meta tiles lack overviews, so a wide AOI needs a multi-thousand-px native
+// window — a 22,727×20,756 single read hit ~1.8 GB and crashed the iOS PWA.
+// We read the window in row strips capped to this budget so peak stays bounded.
+const CANOPY_DECODE_BUDGET_PX = 32000000;
+// Skip the canopy overlay when the view half-width exceeds this (~12 km AOI):
+// 1 m canopy over a wider area is hundreds of MB–GB to fetch/decode and is only
+// upscaled blur at that scale, so we tell the user to zoom in instead.
+const MAX_CANOPY_HALF_M = 6000;
 
 function getCanopyProxyBase() {
   try {
@@ -7674,31 +7681,47 @@ async function _cogTileToGrid(tiff, grid) {
   let py0 = Math.max(0, Math.min(h, Math.floor((bbox[3] - ayMax) / resY)));
   let py1 = Math.max(0, Math.min(h, Math.ceil((bbox[3] - ayMin) / resY)));
   if (px1 <= px0 || py1 <= py0) return null;
-  const outW = Math.min(grid.cols, px1 - px0);
-  const outH = Math.min(grid.rows, py1 - py0);
-  // The transient decode buffer scales with the WINDOW (px1-px0)x(py1-py0) at
-  // the chosen overview — this is the canopy memory spike the JS heap can't see.
-  // Crumb it BEFORE the read so a mid-decode kill leaves this as the last trail
-  // entry, and account it as a (freed) allocation so the heap estimate reflects it.
-  const _winW = px1 - px0, _winH = py1 - py0, _decodeBytes = _winW * _winH * 4;
-  try { Diag.note('canopy.read', { winW: _winW, winH: _winH, outW, outH, mb: Math.round(_decodeBytes / 1048576) }); Diag.alloc('canopyDecode', _decodeBytes); } catch (_) {}
-  let rasters;
-  try {
-    rasters = await img.readRasters({ window: [px0, py0, px1, py1], width: outW, height: outH, resampleMethod: 'nearest', samples: [0] });
-  } finally {
-    try { Diag.free('canopyDecode', _decodeBytes); } catch (_) {}
+  // --- Strip-wise read (bounds peak decode memory) ---
+  // GeoTIFF.js decodes the ENTIRE requested window before downsampling, and the
+  // Meta canopy COGs have no usable overviews, so a wide AOI needs a ~22k-px
+  // native window (~1.8 GB) that crashed the iOS PWA. Read the window in row
+  // strips capped to CANOPY_DECODE_BUDGET_PX, resample each onto the grid and
+  // free it, so peak memory stays ~128 MB regardless of AOI size.
+  const winW = px1 - px0;
+  const sampleW = Math.min(winW, 1024);                                  // horizontal downsample of each strip
+  const stripRows = Math.max(1, Math.floor(CANOPY_DECODE_BUDGET_PX / winW)); // native rows per strip within the budget
+  const nStrips = Math.ceil((py1 - py0) / stripRows);
+  const peakBytes = Math.min(py1 - py0, stripRows) * winW * 4;
+  try { Diag.note('canopy.read', { winW, winH: py1 - py0, strips: nStrips, peakMb: Math.round(peakBytes / 1048576) }); } catch (_) {}
+  const out = new Float32Array(grid.rows * grid.cols).fill(NaN);
+  for (let ny = py0; ny < py1; ny += stripRows) {
+    const nyEnd = Math.min(py1, ny + stripRows);
+    const nativeRows = nyEnd - ny;
+    const sampleH = Math.max(1, Math.min(nativeRows, Math.ceil(nativeRows * sampleW / winW)));
+    const stripBytes = nativeRows * winW * 4;
+    let strip;
+    try {
+      try { Diag.alloc('canopyDecode', stripBytes); } catch (_) {}
+      strip = await img.readRasters({ window: [px0, ny, px1, nyEnd], width: sampleW, height: sampleH, resampleMethod: 'nearest', samples: [0] });
+    } finally {
+      try { Diag.free('canopyDecode', stripBytes); } catch (_) {}
+    }
+    const data = strip[0];
+    // Clamp to a sane canopy range (guards COG fill/nodata artifacts).
+    for (let i = 0; i < data.length; i++) {
+      const v = data[i];
+      if (!Number.isFinite(v) || v < 0) data[i] = 0;
+      else if (v > CANOPY_MAX_M) data[i] = CANOPY_MAX_M;
+    }
+    const wMinX = bbox[0] + px0 * resX, wMaxX = bbox[0] + px1 * resX;
+    const wTopY = bbox[3] - ny * resY, wBotY = bbox[3] - nyEnd * resY;
+    const sb = { west: mercXToLng(wMinX), east: mercXToLng(wMaxX), north: mercYToLat(wTopY), south: mercYToLat(wBotY) };
+    const partial = resampleToGrid(grid, { data, srcCols: sampleW, srcRows: sampleH, srcBounds: sb, srcIsMercator: true, nodata: null });
+    for (let i = 0; i < out.length; i++) {
+      if (Number.isNaN(out[i]) && Number.isFinite(partial[i])) out[i] = partial[i];
+    }
   }
-  const data = rasters[0];
-  // Clamp to a sane canopy range (guards COG fill/nodata artifacts).
-  for (let i = 0; i < data.length; i++) {
-    const v = data[i];
-    if (!Number.isFinite(v) || v < 0) data[i] = 0;
-    else if (v > CANOPY_MAX_M) data[i] = CANOPY_MAX_M;
-  }
-  const wMinX = bbox[0] + px0 * resX, wMaxX = bbox[0] + px1 * resX;
-  const wMaxY = bbox[3] - py0 * resY, wMinY = bbox[3] - py1 * resY;
-  const srcBounds = { west: mercXToLng(wMinX), east: mercXToLng(wMaxX), north: mercYToLat(wMaxY), south: mercYToLat(wMinY) };
-  return resampleToGrid(grid, { data, srcCols: outW, srcRows: outH, srcBounds, srcIsMercator: true, nodata: null });
+  return out;
 }
 
 // --- Render a computed raster as a semi-transparent image overlay ---
@@ -7806,6 +7829,15 @@ async function loadCanopyForView() {
       center.distanceTo(L.latLng(center.lat, vb.getWest())),
       center.distanceTo(L.latLng(vb.getNorth(), center.lng))
     );
+    if (halfWidthM > MAX_CANOPY_HALF_M) {
+      // 1 m canopy over a very wide view is hundreds of MB–GB to decode and only
+      // blur at that scale — guide the user to zoom in rather than crash.
+      setStatus('canopyStatus', 'error', 'ZOOM IN');
+      try { Diag.note('canopy.skip', { halfKm: Math.round(halfWidthM / 100) / 10 }); } catch (_) {}
+      const cbz = document.getElementById('canopyToggle'); if (cbz) cbz.checked = false;
+      if (S._overlayWanted) S._overlayWanted.canopy = false;
+      return;
+    }
     const resM = Math.max(WORK_RES_M, (2 * halfWidthM) / MAX_GRID);
     const grid = makeGrid(center.lat, center.lng, halfWidthM, resM);
     try { Diag.note('canopy.start', { z: S.map.getZoom(), cols: grid.cols, rows: grid.rows, halfKm: Math.round(halfWidthM / 100) / 10 }); } catch (_) {}
@@ -8173,7 +8205,7 @@ async function _runViewshedKernel(opts) {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
-    getCanopyProxyBase, saveCanopyProxy, fetch3DEPDEM, fetchCanopyRaster,
+    getCanopyProxyBase, saveCanopyProxy, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
     renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,
     startViewshedPick, cancelViewshedPick, onViewshedMapClick, runViewshed, clearAllViewsheds,
