@@ -21,6 +21,16 @@ const ENDPOINT_TTL = {
   canopytile: 90 * 24 * 60 * 60000, // 90 days — Meta canopy COG byte-range blocks (offline tile cache)
   canopy:     90 * 24 * 60 * 60000, // 90 days — resampled canopy grids per AOI
   dem:        90 * 24 * 60 * 60000, // 90 days — 3DEP DEM rasters per AOI
+  // Ground access / land / water / hospitals — slow-changing infrastructure (30 days)
+  usfs_roads:  30 * 24 * 60 * 60000,
+  usfs_trails: 30 * 24 * 60 * 60000,
+  mvum_roads:  30 * 24 * 60 * 60000,
+  mvum_trails: 30 * 24 * 60 * 60000,
+  blm_gtlf:    30 * 24 * 60 * 60000,
+  public_lands: 30 * 24 * 60 * 60000,
+  nhd_water:   30 * 24 * 60 * 60000,
+  hospitals:   30 * 24 * 60 * 60000,
+  cell_coverage: 180 * 24 * 60 * 60000, // 180 days — bundled FCC LTE, refreshed ~2×/yr
 };
 
 // --- Raster cache (ArrayBuffers / typed arrays — structured-cloneable) ---

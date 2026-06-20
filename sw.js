@@ -244,9 +244,11 @@ async function downloadTiles(config, client) {
     satellite: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     topo: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
     sectional: 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}',
+    hillshade: 'https://server.arcgisonline.com/ArcGIS/rest/services/Elevation/World_Hillshade/MapServer/tile/{z}/{y}/{x}',
+    parcels: 'https://tiles.arcgis.com/tiles/KzeiCaQsMoeCfoCq/arcgis/rest/services/Regrid_Nationwide_Parcel_Boundaries_v1/MapServer/tile/{z}/{y}/{x}',
   };
   // Native zoom limits per provider — out-of-range tiles don't exist (skip them)
-  const providerZoom = { sectional: { min: 8, max: 12 } };
+  const providerZoom = { sectional: { min: 8, max: 12 }, parcels: { min: 0, max: 17 } };
 
   const selectedProviders = providers || ['carto'];
   const tiles = [];

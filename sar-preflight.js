@@ -10,7 +10,7 @@ const S = {
   map: null, drawnItems: null, currentArea: null,
   areaCenter: null, areaBounds: null, areaType: null, areaCoords: [],
   drawHandler: null, panelOpen: true, activeTab: 'wx',
-  mapLayers: {}, apiKeys: {}, wireHazardCounts: {}, faaCharts: {},
+  mapLayers: {}, wireHazardCounts: {}, faaCharts: {},
   // Cached live data
   wx: {}, wind: {}, elev: {}, astro: {}, notams: [],
   nwsAlerts: [],
@@ -621,6 +621,10 @@ function initMap() {
   S.mapLayers.satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19 });
   S.mapLayers.topo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { maxZoom: 17 });
   S.mapLayers.sectional = L.tileLayer(sectionalTileUrl(getStoredSectionalEdition()), { maxNativeZoom: 12, maxZoom: 18, opacity: 1.0, attribution: 'FAA Aeronautical Information Services' });
+  // Terrain hillshade (steepness) — Esri World Hillshade XYZ tiles (free, CORS-OK).
+  S.mapLayers.slope = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Elevation/World_Hillshade/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, opacity: 0.6, attribution: 'USGS 3DEP / Esri' });
+  // ReGrid nationwide parcel boundaries (boundaries only — no ownership). Cached PNG, native z17.
+  S.mapLayers.parcels = L.tileLayer('https://tiles.arcgis.com/tiles/KzeiCaQsMoeCfoCq/arcgis/rest/services/Regrid_Nationwide_Parcel_Boundaries_v1/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 17, maxZoom: 19, opacity: 0.85, attribution: 'Parcels &copy; Regrid' });
   S.drawnItems = new L.FeatureGroup();
   S.map.addLayer(S.drawnItems);
   // Cursor coordinate + elevation display
@@ -895,6 +899,10 @@ async function processArea(layer, type) {
     fetchNearbyAirports(center, bounds),
     fetchProtectedAreas(bounds),
     fetchFireDanger(center.lat, center.lng, bounds),
+    fetchGroundAccess(bounds),
+    fetchPublicLands(bounds),
+    fetchWaterFeatures(bounds),
+    fetchHospitals(bounds),
   ]);
 
   // Start ADS-B polling (needs elevation data for AGL)
@@ -1726,7 +1734,8 @@ async function fetchElevation(center, bounds) {
 
     setText('terrVeg', estimateVegetation(centerElev));
 
-    const cell = estimateCellCoverage(centerElev);
+    const cell = cellCoverageReadout(center.lat, center.lng, centerElev);
+    S.cellStatus = cell;
     setText('terrCell', cell.label);
     setColor('terrCell', cell.level);
 
@@ -3693,6 +3702,423 @@ function renderProtectedAreaLayers() {
 }
 
 // ============================================================
+// GROUND ACCESS, PUBLIC LANDS, WATER & HOSPITALS (free SAR-context overlays)
+// USFS/BLM ArcGIS servers block browser CORS → routed through the data proxy
+// (/usfs/, /blm/); USGS NHD + Overpass are CORS-clean and fetched directly. All
+// new layer groups are created OFF the map (opt-in via the layer control) so they
+// don't clutter the default view; each self-caches to IndexedDB for offline reuse.
+// ============================================================
+
+function _bboxCacheKey(bounds) {
+  const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  return `${sw.lat.toFixed(3)}_${sw.lng.toFixed(3)}_${ne.lat.toFixed(3)}_${ne.lng.toFixed(3)}`;
+}
+function _envelopeGeom(bounds, pad) {
+  const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  pad = (pad == null) ? 0.01 : pad;
+  return `${sw.lng - pad},${sw.lat - pad},${ne.lng + pad},${ne.lat + pad}`;
+}
+// Build an ArcGIS FeatureServer/MapServer GeoJSON query path for a bbox.
+function _arcgisGeoJsonUrl(base, layerId, bounds, outFields, opts) {
+  opts = opts || {};
+  const geom = _envelopeGeom(bounds, opts.pad);
+  const where = encodeURIComponent(opts.where || '1=1');
+  const count = opts.resultRecordCount || 2000;
+  return `${base}/${layerId}/query?where=${where}&geometry=${geom}`
+    + `&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects`
+    + `&outFields=${encodeURIComponent(outFields)}&outSR=4326&f=geojson&resultRecordCount=${count}`;
+}
+// Same, but routed through the data proxy for a self-hosted gov ArcGIS server
+// (returns null when no proxy is configured → callers degrade gracefully).
+function _govArcgisUrl(routePrefix, serviceBase, layerId, bounds, outFields, opts) {
+  return proxiedArcgis(routePrefix, _arcgisGeoJsonUrl(serviceBase, layerId, bounds, outFields, opts));
+}
+// Case-insensitive property lookup with fallbacks (ArcGIS field casing varies).
+function _prop(props, ...names) {
+  if (!props) return undefined;
+  for (const n of names) if (props[n] != null && props[n] !== '') return props[n];
+  const lower = {};
+  for (const k in props) lower[k.toLowerCase()] = props[k];
+  for (const n of names) { const v = lower[String(n).toLowerCase()]; if (v != null && v !== '') return v; }
+  return undefined;
+}
+async function _cachedFeatures(endpoint, cacheKey) {
+  if (typeof getCachedApiResponse !== 'function') return null;
+  try {
+    const c = await getCachedApiResponse(endpoint, cacheKey);
+    if (c && c.data) { const gj = c.data; return { features: (gj && gj.features) ? gj.features : [], fromCache: true, cachedAt: c.timestamp }; }
+  } catch (_) { /* ignore */ }
+  return null;
+}
+// Fetch an ArcGIS GeoJSON query (direct or proxied URL), caching on success and
+// falling back to IndexedDB on error/offline. Returns {features, fromCache, error}.
+async function _fetchGeoJsonLayer(endpoint, cacheKey, url) {
+  const online = (typeof isOnline !== 'function') || isOnline();
+  if (url && online) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const gj = await res.json();
+      const features = (gj && gj.features) ? gj.features : [];
+      if (typeof cacheApiResponse === 'function') cacheApiResponse(endpoint, cacheKey, gj);
+      return { features, fromCache: false, cachedAt: null };
+    } catch (err) {
+      const cached = await _cachedFeatures(endpoint, cacheKey);
+      if (cached) return cached;
+      return { features: null, error: (err && err.message) || String(err) };
+    }
+  }
+  const cached = await _cachedFeatures(endpoint, cacheKey);
+  if (cached) return cached;
+  return { features: null, error: url ? 'offline' : 'no-proxy' };
+}
+// Render polyline/polygon GeoJSON features into an off-map layer group.
+function _renderVectorLayer(mapId, features, styleFor, popupFor) {
+  if (typeof L === 'undefined') return 0;
+  if (S.mapLayers[mapId]) S.mapLayers[mapId].clearLayers();
+  else S.mapLayers[mapId] = L.layerGroup();
+  let n = 0;
+  (features || []).forEach(f => {
+    if (!f || !f.geometry) return;
+    const props = f.properties || {};
+    const style = (typeof styleFor === 'function') ? styleFor(props) : styleFor;
+    const layer = L.geoJSON(f, { style });
+    const html = popupFor ? popupFor(props, f) : '';
+    if (html) layer.bindPopup(html);
+    S.mapLayers[mapId].addLayer(layer);
+    n++;
+  });
+  return n;
+}
+
+// --- Popup/style builders for ground-access layers ---
+function _usfsRoadPopup(p) {
+  const num = _prop(p, 'ID', 'id'), name = _prop(p, 'NAME', 'name');
+  const surf = _prop(p, 'SURFACE_TYPE', 'surface_type');
+  const oml = _prop(p, 'OPER_MAINT_LEVEL', 'operationalmaintlevel', 'oper_maint_level');
+  return `<b style="color:#c98a3a">NFS Road ${[num, name].filter(Boolean).join(' — ') || ''}</b>`
+    + (surf ? `<br>Surface: ${surf}` : '')
+    + (oml ? `<br>Maint level: ${oml}` : '')
+    + `<br><span style="font-size:10px;opacity:0.6">USFS National Forest System road</span>`;
+}
+function _usfsTrailPopup(p) {
+  const name = _prop(p, 'TRAIL_NAME', 'name') || 'NFS Trail';
+  const num = _prop(p, 'TRAIL_NO', 'trailnumber', 'id');
+  return `<b style="color:#8b5a2b">${name}</b>` + (num ? `<br>#${num}` : '')
+    + `<br><span style="font-size:10px;opacity:0.6">USFS National Forest System trail</span>`;
+}
+const MVUM_VEHICLE_FIELDS = [
+  ['passengervehicle', 'Passenger vehicle'], ['highclearancevehicle', 'High-clearance'],
+  ['fourwd_gt50inches', '4WD >50"'], ['twowd_gt50inches', '2WD >50"'],
+  ['atv', 'ATV'], ['motorcycle', 'Motorcycle'],
+  ['other_ohv_lt50inches', 'OHV <50"'], ['other_ohv_gt50inches', 'OHV >50"'],
+  ['tracked_ohv_lt50inches', 'Tracked OHV <50"'], ['tracked_ohv_gt50inches', 'Tracked OHV >50"'],
+];
+function _mvumPopup(p) {
+  const name = _prop(p, 'NAME', 'name', 'ID', 'id') || 'MVUM route';
+  const sym = _prop(p, 'MVUM_SYMBOL_NAME', 'mvum_symbol_name', 'SBS_SYMBOL_NAME');
+  const allowed = [];
+  MVUM_VEHICLE_FIELDS.forEach(([f, label]) => { if (_prop(p, f) != null) allowed.push(label); });
+  const season = _prop(p, 'SEASONAL', 'seasonal');
+  return `<b style="color:#e0a458">${name}</b>`
+    + (sym ? `<br>${sym}` : '')
+    + (allowed.length ? `<br>Open to: ${allowed.join(', ')}` : '')
+    + (season ? `<br>Seasonal: ${season}` : '')
+    + `<br><span style="font-size:10px;opacity:0.6">USFS MVUM — verify current designation on the official map</span>`;
+}
+function _blmGtlfStyle(p) {
+  const d = String(_prop(p, 'PLAN_OHV_ROUTE_DSGNTN', 'dsgntn') || '').toLowerCase();
+  const color = d.includes('closed') ? '#ef4444' : d.includes('limit') ? '#f59e0b' : '#a3e635';
+  return { color, weight: 2, opacity: 0.85 };
+}
+function _blmGtlfPopup(p) {
+  const name = _prop(p, 'RTE_PRMRY_NM', 'PLAN_PRMRY_NM', 'NAME', 'name') || 'BLM route';
+  const dsgn = _prop(p, 'PLAN_OHV_ROUTE_DSGNTN', 'dsgntn');
+  const surf = _prop(p, 'SURF_ACST_TYPE', 'surface');
+  return `<b style="color:#84cc16">${name}</b>`
+    + (dsgn ? `<br>OHV: ${dsgn}` : '')
+    + (surf ? `<br>Surface: ${surf}` : '')
+    + `<br><span style="font-size:10px;opacity:0.6">BLM ground transportation route</span>`;
+}
+
+// Forest roads/trails + MVUM (USFS) and BLM motorized routes — all via the proxy.
+async function fetchGroundAccess(bounds) {
+  trackFetchStart('Ground Access');
+  const cacheKey = _bboxCacheKey(bounds);
+  try {
+    const specs = [
+      { mapId: 'usfs_roads', url: _govArcgisUrl('/usfs/', 'arcx/rest/services/EDW/EDW_RoadBasic_01/MapServer', '0', bounds, '*'),
+        style: { color: '#c98a3a', weight: 2, opacity: 0.85 }, popup: _usfsRoadPopup },
+      { mapId: 'usfs_trails', url: _govArcgisUrl('/usfs/', 'arcx/rest/services/EDW/EDW_TrailNFSPublish_01/MapServer', '0', bounds, '*'),
+        style: { color: '#8b5a2b', weight: 2, dashArray: '5,4', opacity: 0.85 }, popup: _usfsTrailPopup },
+      { mapId: 'mvum_roads', url: _govArcgisUrl('/usfs/', 'arcx/rest/services/EDW/EDW_MVUM_01/MapServer', '1', bounds, '*'),
+        style: { color: '#e0a458', weight: 2, opacity: 0.9 }, popup: _mvumPopup },
+      { mapId: 'mvum_trails', url: _govArcgisUrl('/usfs/', 'arcx/rest/services/EDW/EDW_MVUM_01/MapServer', '2', bounds, '*'),
+        style: { color: '#c97f3a', weight: 2, dashArray: '5,4', opacity: 0.9 }, popup: _mvumPopup },
+    ];
+    const results = await Promise.allSettled(specs.map(s => _fetchGeoJsonLayer(s.mapId, cacheKey, s.url)));
+    specs.forEach((s, i) => {
+      const r = results[i].status === 'fulfilled' ? results[i].value : null;
+      if (r && r.features) _renderVectorLayer(s.mapId, r.features, s.style, s.popup);
+    });
+    // BLM GTLF — motorized roads (layer 0) + trails (layer 2) merged into one layer.
+    const gtlfBase = 'arcgis/rest/services/transportation/BLM_Natl_GTLF_Public_Display/MapServer';
+    const [gr, gt] = await Promise.all([
+      _fetchGeoJsonLayer('blm_gtlf', 'roads_' + cacheKey, _govArcgisUrl('/blm/', gtlfBase, '0', bounds, '*')),
+      _fetchGeoJsonLayer('blm_gtlf', 'trails_' + cacheKey, _govArcgisUrl('/blm/', gtlfBase, '2', bounds, '*')),
+    ]);
+    if ((gr && gr.features) || (gt && gt.features)) {
+      const merged = [].concat((gr && gr.features) || [], (gt && gt.features) || []);
+      _renderVectorLayer('blm_gtlf', merged, _blmGtlfStyle, _blmGtlfPopup);
+    }
+    buildLayerControl();
+  } finally {
+    trackFetchEnd('Ground Access');
+  }
+}
+
+// BLM Surface Management Agency — public/private land + the non-public CAUTION.
+function _renderPublicLands(features) {
+  if (typeof L === 'undefined') return 0;
+  if (S.mapLayers.public_lands) S.mapLayers.public_lands.clearLayers();
+  else S.mapLayers.public_lands = L.layerGroup();
+  let n = 0;
+  (features || []).forEach(f => {
+    if (!f || !f.geometry) return;
+    const info = smaAgencyInfo(_prop(f.properties, 'ADMIN_AGENCY_CODE'));
+    const layer = L.geoJSON(f, { style: { color: info.color, weight: 1, fillColor: info.color, fillOpacity: info.isPublic ? 0.12 : 0.22 } });
+    const unit = _prop(f.properties, 'ADMIN_UNIT_NAME');
+    layer.bindPopup(`<b style="color:${info.color}">${info.label}</b>` + (unit ? `<br>${unit}` : '')
+      + (info.isPublic ? '' : `<br><span style="color:#f59e0b;font-size:10px;font-weight:bold;">Non-public surface — verify landowner permission</span>`));
+    S.mapLayers.public_lands.addLayer(layer);
+    n++;
+  });
+  return n;
+}
+function computeLandStatus(features) {
+  if (!Array.isArray(features) || !features.length) return null;
+  if (typeof currentAreaPolygon !== 'function') return null;
+  const aoi = currentAreaPolygon();
+  if (!aoi || aoi.length < 3) return null;
+  const publicRings = [];
+  features.forEach(f => {
+    if (smaIsPublic(_prop(f.properties, 'ADMIN_AGENCY_CODE'))) {
+      geoJsonOuterRings(f.geometry).forEach(r => publicRings.push(r));
+    }
+  });
+  return classifyAreaPublicPrivate(aoi, publicRings, 11);
+}
+async function fetchPublicLands(bounds) {
+  trackFetchStart('Public Lands');
+  const cacheKey = _bboxCacheKey(bounds);
+  const url = _govArcgisUrl('/blm/', 'arcgis/rest/services/lands/BLM_Natl_SMA_LimitedScale/MapServer', '1', bounds,
+    'ADMIN_AGENCY_CODE,ADMIN_DEPT_CODE,ADMIN_UNIT_NAME', { resultRecordCount: 4000 });
+  try {
+    const r = await _fetchGeoJsonLayer('public_lands', cacheKey, url);
+    if (r && r.features) {
+      S.publicLands = r.features;
+      _renderPublicLands(r.features);
+      S.landStatus = computeLandStatus(r.features);
+    } else {
+      S.publicLands = null; S.landStatus = null;
+    }
+    if (S.currentArea && typeof computeAssessment === 'function') computeAssessment();
+    buildLayerControl();
+  } finally {
+    trackFetchEnd('Public Lands');
+  }
+}
+
+// USGS NHD hydrography — streams/rivers (flowline) + lakes/reservoirs (waterbody).
+async function fetchWaterFeatures(bounds) {
+  trackFetchStart('Water (NHD)');
+  const cacheKey = _bboxCacheKey(bounds);
+  const base = 'https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer';
+  try {
+    const [flow, wb] = await Promise.all([
+      _fetchGeoJsonLayer('nhd_water', 'flow_' + cacheKey, _arcgisGeoJsonUrl(base, '6', bounds, '*', { resultRecordCount: 2000 })),
+      _fetchGeoJsonLayer('nhd_water', 'wb_' + cacheKey, _arcgisGeoJsonUrl(base, '12', bounds, '*', { resultRecordCount: 1000 })),
+    ]);
+    if (typeof L !== 'undefined') {
+      if (S.mapLayers.nhd_water) S.mapLayers.nhd_water.clearLayers();
+      else S.mapLayers.nhd_water = L.layerGroup();
+      const popup = (p) => {
+        const nm = _prop(p, 'gnis_name', 'GNIS_NAME', 'name');
+        const t = _prop(p, 'fcode_description', 'FCODE_DESCRIPTION', 'ftype');
+        return `<b style="color:#3b82f6">${nm || 'Water feature'}</b>` + (t ? `<br>${t}` : '');
+      };
+      ((flow && flow.features) || []).forEach(f => {
+        if (!f.geometry) return;
+        const layer = L.geoJSON(f, { style: { color: '#3b82f6', weight: 1.5, opacity: 0.85 } });
+        const h = popup(f.properties || {}); if (h) layer.bindPopup(h);
+        S.mapLayers.nhd_water.addLayer(layer);
+      });
+      ((wb && wb.features) || []).forEach(f => {
+        if (!f.geometry) return;
+        const layer = L.geoJSON(f, { style: { color: '#2563eb', weight: 1, fillColor: '#3b82f6', fillOpacity: 0.25 } });
+        const h = popup(f.properties || {}); if (h) layer.bindPopup(h);
+        S.mapLayers.nhd_water.addLayer(layer);
+      });
+    }
+    buildLayerControl();
+  } finally {
+    trackFetchEnd('Water (NHD)');
+  }
+}
+
+// Hospitals + helicopter landing sites via Overpass (CORS-clean, no key/token).
+const OVERPASS_MIRRORS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+];
+function _renderHospitals(elements) {
+  if (typeof L === 'undefined') return 0;
+  if (S.mapLayers.hospitals) S.mapLayers.hospitals.clearLayers();
+  else S.mapLayers.hospitals = L.layerGroup();
+  let n = 0;
+  (elements || []).forEach(el => {
+    const lat = el.lat != null ? el.lat : (el.center && el.center.lat);
+    const lng = el.lon != null ? el.lon : (el.center && el.center.lon);
+    if (lat == null || lng == null) return;
+    const t = el.tags || {};
+    const isHeli = t.aeroway === 'helipad' || t.emergency === 'landing_site';
+    const name = t.name || (isHeli ? 'Helipad' : 'Hospital');
+    const color = isHeli ? '#22c55e' : '#ef4444';
+    const glyph = isHeli ? 'H' : '+';
+    const sz = 22;
+    if (typeof L.divIcon !== 'function') return;
+    const icon = L.divIcon({
+      html: `<svg width="${sz}" height="${sz}" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="4" fill="${color}" fill-opacity="0.92" stroke="#fff" stroke-width="1.5"/><text x="12" y="17" text-anchor="middle" fill="#fff" font-size="14" font-weight="bold" font-family="sans-serif">${glyph}</text></svg>`,
+      className: '', iconSize: [sz, sz], iconAnchor: [sz / 2, sz / 2],
+    });
+    const popup = `<b style="color:${color}">${name}</b>`
+      + (isHeli ? '<br>Helicopter landing site' : (t.emergency === 'yes' ? '<br>Emergency department' : ''))
+      + (t['addr:city'] ? `<br>${t['addr:city']}` : '');
+    L.marker([lat, lng], { icon }).bindPopup(popup).addTo(S.mapLayers.hospitals);
+    n++;
+  });
+  return n;
+}
+async function fetchHospitals(bounds) {
+  trackFetchStart('Hospitals');
+  const cacheKey = _bboxCacheKey(bounds);
+  const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  const pad = 0.05; // widen so nearby trauma centers/helipads are included
+  const bbox = `${sw.lat - pad},${sw.lng - pad},${ne.lat + pad},${ne.lng + pad}`;
+  const query = `[out:json][timeout:30];(`
+    + `nwr["amenity"="hospital"](${bbox});`
+    + `nwr["aeroway"="helipad"](${bbox});`
+    + `nwr["emergency"="landing_site"](${bbox});`
+    + `);out center tags;`;
+  let data = null;
+  try {
+    if ((typeof isOnline !== 'function') || isOnline()) {
+      for (const server of OVERPASS_MIRRORS) {
+        try {
+          const res = await fetch(server, { method: 'POST', body: 'data=' + encodeURIComponent(query), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          data = await res.json(); break;
+        } catch (_) { /* try next mirror */ }
+      }
+    }
+    if (data) { if (typeof cacheApiResponse === 'function') cacheApiResponse('hospitals', cacheKey, data); }
+    else if (typeof getCachedApiResponse === 'function') {
+      try { const c = await getCachedApiResponse('hospitals', cacheKey); if (c && c.data) data = c.data; } catch (_) { /* ignore */ }
+    }
+    if (data) _renderHospitals(data.elements || []);
+    buildLayerControl();
+  } finally {
+    trackFetchEnd('Hospitals');
+  }
+}
+
+// ============================================================
+// CELL COVERAGE (per-carrier FCC LTE) — bundled regional overlay
+// FCC mobile LTE coverage has no free live API/tile service, so a one-time build
+// step (tools/cell-coverage) downloads + simplifies the FCC BDC mobile data for the
+// operating region into data/cell/{att,tmobile,verizon}.geojson. Those files load
+// here, render as 3 toggleable layers, and sharpen the cell-service readout. Absent
+// files (build not run) ⇒ layers simply don't appear and the elevation estimate stands.
+// ============================================================
+const CELL_CARRIERS = [
+  { key: 'att', mapId: 'cell_att', label: 'AT&T', color: '#2563eb' },
+  { key: 'tmobile', mapId: 'cell_tmobile', label: 'T-Mobile', color: '#e6007e' },
+  { key: 'verizon', mapId: 'cell_verizon', label: 'Verizon', color: '#cd040b' },
+];
+function _ringsBBox(ringsByCarrier) {
+  let minLat = Infinity, minLng = Infinity, maxLat = -Infinity, maxLng = -Infinity, any = false;
+  ['att', 'tmobile', 'verizon'].forEach(k => {
+    const rings = ringsByCarrier[k];
+    if (!Array.isArray(rings)) return;
+    rings.forEach(ring => ring.forEach(pt => {
+      any = true;
+      if (pt[0] < minLat) minLat = pt[0]; if (pt[0] > maxLat) maxLat = pt[0];
+      if (pt[1] < minLng) minLng = pt[1]; if (pt[1] > maxLng) maxLng = pt[1];
+    }));
+  });
+  return any ? { minLat, minLng, maxLat, maxLng } : null;
+}
+function _pointInRegion(lat, lng, region) {
+  return !!region && lat >= region.minLat && lat <= region.maxLat && lng >= region.minLng && lng <= region.maxLng;
+}
+function _renderCellLayer(mapId, features, color, label) {
+  if (typeof L === 'undefined') return;
+  if (S.mapLayers[mapId]) S.mapLayers[mapId].clearLayers();
+  else S.mapLayers[mapId] = L.layerGroup();
+  (features || []).forEach(f => {
+    if (!f || !f.geometry) return;
+    const layer = L.geoJSON(f, { style: { color, weight: 1, fillColor: color, fillOpacity: 0.18 } });
+    layer.bindPopup(`<b style="color:${color}">${label} LTE coverage</b><br><span style="font-size:10px;opacity:0.6">FCC Broadband Data Collection — modeled coverage, verify on-site</span>`);
+    S.mapLayers[mapId].addLayer(layer);
+  });
+}
+// Load the bundled per-carrier coverage (data/cell/*.geojson), render layers, and
+// cache for offline. No-op per carrier whose file is missing (build not yet run).
+async function loadCellCoverage() {
+  const coverage = { att: [], tmobile: [], verizon: [] };
+  let loadedAny = false;
+  for (const c of CELL_CARRIERS) {
+    let gj = null;
+    try {
+      if ((typeof isOnline !== 'function') || isOnline()) {
+        const res = await fetch(`data/cell/${c.key}.geojson`, { cache: 'force-cache' });
+        if (res.ok) { gj = await res.json(); if (typeof cacheApiResponse === 'function') cacheApiResponse('cell_coverage', c.key, gj); }
+      }
+    } catch (_) { /* offline / missing */ }
+    if (!gj && typeof getCachedApiResponse === 'function') {
+      try { const cc = await getCachedApiResponse('cell_coverage', c.key); if (cc && cc.data) gj = cc.data; } catch (_) { /* ignore */ }
+    }
+    if (gj && gj.features && gj.features.length) {
+      loadedAny = true;
+      _renderCellLayer(c.mapId, gj.features, c.color, c.label);
+      gj.features.forEach(f => geoJsonOuterRings(f.geometry).forEach(r => coverage[c.key].push(r)));
+    }
+  }
+  if (loadedAny) {
+    coverage.region = _ringsBBox(coverage);
+    S.cellCoverage = coverage;
+    if (typeof buildLayerControl === 'function') buildLayerControl();
+    if (S.areaCenter && typeof computeOpsData === 'function') computeOpsData(); // refresh cell readout
+  }
+  return loadedAny;
+}
+// Cell-service readout: prefer the FCC overlay where it exists; else the elevation
+// estimate. Stored in S.cellStatus so computeAssessment can flag a no-coverage area.
+function cellCoverageReadout(lat, lng, centerElevFt) {
+  const cc = S.cellCoverage;
+  if (cc && cc.region && _pointInRegion(lat, lng, cc.region) && typeof cellCoverageAt === 'function') {
+    const r = cellCoverageAt(lat, lng, cc);
+    const names = [r.att && 'AT&T', r.tmobile && 'T-Mobile', r.verizon && 'Verizon'].filter(Boolean);
+    if (r.count >= 2) return { label: `LTE: ${names.join(', ')} (FCC)`, level: 'green', count: r.count, inRegion: true };
+    if (r.count === 1) return { label: `LTE: ${names[0]} only (FCC)`, level: 'amber', count: 1, inRegion: true };
+    return { label: 'No mapped LTE coverage (FCC) — plan for no connectivity', level: 'red', count: 0, inRegion: true };
+  }
+  const est = estimateCellCoverage(centerElevFt);
+  return { label: est.label, level: est.level, count: null, inRegion: false };
+}
+
+// ============================================================
 // API: OVERPASS (OSM) — Wire & Cable Hazards (FREE, no key)
 // ============================================================
 async function fetchWireHazards(bounds) {
@@ -5016,6 +5442,30 @@ function computeAssessment() {
     }
   }
 
+  // Non-public-land CAUTION (BLM Surface Management Agency). Advisory only \u2014 surface
+  // management data is parcel-coarse and "Undetermined" lumps with true-private, so
+  // this prompts verification and is never an auto NO-GO. Suppressed entirely when
+  // SMA returned no features for the area (no coverage \u2260 private).
+  if (S.landStatus && S.landStatus.sampled > 0 && S.landStatus.privateFrac > 0.03 && result.level !== 'NO-GO') {
+    if (result.level === 'GO') result.level = 'CAUTION';
+    result.cautions = result.cautions || [];
+    const pct = Math.round(S.landStatus.privateFrac * 100);
+    const msg = (pct >= 97)
+      ? 'Operating area appears to be entirely on private / non-public land \u2014 verify landowner permission before flight'
+      : `Part of operating area (~${pct}%) is on private / non-public land \u2014 verify landowner permission before flight`;
+    result.cautions.push(msg);
+    if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+  }
+
+  // Cell-coverage CAUTION \u2014 only when the FCC overlay is loaded AND the area center
+  // falls inside the bundled region but no carrier covers it (no data \u2260 no coverage).
+  if (S.cellStatus && S.cellStatus.inRegion && S.cellStatus.count === 0 && result.level !== 'NO-GO') {
+    if (result.level === 'GO') result.level = 'CAUTION';
+    result.cautions = result.cautions || [];
+    result.cautions.push('Area outside all mapped carrier LTE coverage (FCC) \u2014 plan for no cell connectivity');
+    if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+  }
+
   // Integrate FAA DOF obstacles into assessment. CAUTION-only and never an auto
   // NO-GO: this is advisory hazard data and the DOF is not a complete
   // low-altitude inventory, so it must not give false confidence either way.
@@ -5724,6 +6174,21 @@ function switchTab(tab) {
   if (tab === 'notams' && typeof renderAutoCheckStatus === 'function') renderAutoCheckStatus();
 }
 
+// Helpers for the layer-control rows added below (used by the newer overlays).
+function _layerHasFeatures(id) {
+  const g = S.mapLayers[id];
+  return !!(g && g.getLayers && g.getLayers().length > 0);
+}
+function _layerRow(id, color, label) {
+  const g = S.mapLayers[id];
+  const on = g && S.map.hasLayer(g);
+  const count = (g && g.getLayers) ? g.getLayers().length : null;
+  const txt = (count != null && count > 0) ? `${label} (${count})` : label;
+  return `<div class="layer-item${on ? ' active' : ''}" data-layer="${id}" onclick="toggleLayer('${id}',this)">
+    <div class="layer-check"></div><div class="layer-color" style="background:${color}"></div><span>${txt}</span>
+  </div>`;
+}
+
 function buildLayerControl() {
   const baseLayers = [
     { id: 'satellite', name: 'Satellite', color: '#3d8bfd' },
@@ -5749,7 +6214,7 @@ function buildLayerControl() {
   const hasAirports = S.mapLayers.airports && S.mapLayers.airports.getLayers().length > 0;
   const hasTowers = S.mapLayers.cell_towers && S.mapLayers.cell_towers.getLayers().length > 0;
   const hasLZs = S.mapLayers.emergency_lz && S.mapLayers.emergency_lz.getLayers().length > 0;
-  if (hasAirports || hasTowers || hasLZs) {
+  if (hasAirports || hasTowers || hasLZs || _layerHasFeatures('hospitals')) {
     html += `<h4 style="margin-top:10px">Facilities</h4>`;
     if (hasAirports) {
       const airportCount = S.mapLayers.airports.getLayers().length;
@@ -5765,6 +6230,7 @@ function buildLayerControl() {
         <div class="layer-check"></div><div class="layer-color" style="background:#00CCFF"></div><span>Towers (${towerCount})</span>
       </div>`;
     }
+    if (_layerHasFeatures('hospitals')) html += _layerRow('hospitals', '#ef4444', 'Hospitals / LZs');
     // LZ markers removed — elevation grid too coarse for reliable LZ placement.
     // Terrain tab shows suitability assessment instead.
   }
@@ -5937,6 +6403,40 @@ function buildLayerControl() {
       </div>`;
     });
   }
+  // Ground Access section: forest roads/trails, MVUM, BLM routes
+  if (_layerHasFeatures('usfs_roads') || _layerHasFeatures('usfs_trails') || _layerHasFeatures('mvum_roads') || _layerHasFeatures('mvum_trails') || _layerHasFeatures('blm_gtlf')) {
+    html += `<h4 style="margin-top:10px">Ground Access</h4>`;
+    if (_layerHasFeatures('usfs_roads')) html += _layerRow('usfs_roads', '#c98a3a', 'NFS Roads');
+    if (_layerHasFeatures('usfs_trails')) html += _layerRow('usfs_trails', '#8b5a2b', 'NFS Trails');
+    if (_layerHasFeatures('mvum_roads')) html += _layerRow('mvum_roads', '#e0a458', 'MVUM Roads');
+    if (_layerHasFeatures('mvum_trails')) html += _layerRow('mvum_trails', '#c97f3a', 'MVUM Trails');
+    if (_layerHasFeatures('blm_gtlf')) html += _layerRow('blm_gtlf', '#84cc16', 'BLM Routes');
+  }
+
+  // Public Lands (surface management agency) + Water
+  if (_layerHasFeatures('public_lands')) {
+    html += `<h4 style="margin-top:10px">Public Lands</h4>`;
+    html += _layerRow('public_lands', '#2e8b3d', 'Land Ownership');
+  }
+  if (_layerHasFeatures('nhd_water')) {
+    html += `<h4 style="margin-top:10px">Water</h4>`;
+    html += _layerRow('nhd_water', '#3b82f6', 'Streams & Lakes');
+  }
+
+  // Cell Coverage (per-carrier FCC LTE)
+  if (_layerHasFeatures('cell_att') || _layerHasFeatures('cell_tmobile') || _layerHasFeatures('cell_verizon')) {
+    html += `<h4 style="margin-top:10px">Cell Coverage (FCC LTE)</h4>`;
+    if (_layerHasFeatures('cell_att')) html += _layerRow('cell_att', '#2563eb', 'AT&T');
+    if (_layerHasFeatures('cell_tmobile')) html += _layerRow('cell_tmobile', '#e6007e', 'T-Mobile');
+    if (_layerHasFeatures('cell_verizon')) html += _layerRow('cell_verizon', '#cd040b', 'Verizon');
+  }
+
+  // Reference overlays (parcels)
+  if (S.mapLayers.parcels) {
+    html += `<h4 style="margin-top:10px">Reference</h4>`;
+    html += _layerRow('parcels', '#9ca3af', 'Parcels (boundaries only)');
+  }
+
   // Imported FAA charts section
   const chartIds = Object.keys(S.faaCharts || {});
   if (chartIds.length > 0) {
@@ -5949,6 +6449,12 @@ function buildLayerControl() {
         <div class="layer-check"></div><div class="layer-color" style="background:#e879f9"></div><span>${c.chartName}</span>
       </div>`;
     }
+  }
+
+  // Terrain hillshade (always available — a global tile overlay)
+  if (S.mapLayers.slope) {
+    html += `<h4 style="margin-top:10px">Terrain</h4>`;
+    html += _layerRow('slope', '#9ca3af', 'Hillshade (steepness)');
   }
 
   // Analysis overlays: vegetation height + viewshed (each with an opacity slider)
@@ -6024,7 +6530,7 @@ function toggleLayer(id, el) {
     // Play panel is visible only while the radar layer is checked on
     const controls = document.getElementById('radarControls');
     if (controls) controls.style.display = on ? 'flex' : 'none';
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'observers' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_')) && S.mapLayers[id]) {
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'parcels' || id === 'slope' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
     if (id === 'canopy') { const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = on; }
     if (on) S.map.addLayer(S.mapLayers[id]);
     else S.map.removeLayer(S.mapLayers[id]);
@@ -6046,7 +6552,7 @@ function toggleLayer(id, el) {
 // show all matches in one popup with "<- n/N ->" pagination.
 // ============================================================
 const AGG_HIT_PX = 8; // pixel tolerance for line / point hit-testing
-const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed']);
+const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'parcels', 'slope']);
 // Per-layer display label + cycle priority (lower = shown first). Safety-relevant
 // restrictions sort ahead of advisory/terrain features.
 const AGG_LAYER_META = {
@@ -6060,6 +6566,13 @@ const AGG_LAYER_META = {
   cell_towers: { label: 'Tower', pri: 5 }, wilderness: { label: 'Wilderness', pri: 6 },
   national_parks: { label: 'National Park', pri: 6 }, swap_radius: { label: 'Swap Radius', pri: 8 },
   observers: { label: 'Observer', pri: 3 },
+  public_lands: { label: 'Land Status', pri: 6 }, nhd_water: { label: 'Water', pri: 7 },
+  hospitals: { label: 'Hospital/LZ', pri: 4 },
+  usfs_roads: { label: 'NFS Road', pri: 7 }, usfs_trails: { label: 'NFS Trail', pri: 7 },
+  mvum_roads: { label: 'MVUM Road', pri: 7 }, mvum_trails: { label: 'MVUM Trail', pri: 7 },
+  blm_gtlf: { label: 'BLM Route', pri: 7 },
+  cell_att: { label: 'AT&T LTE', pri: 8 }, cell_tmobile: { label: 'T-Mobile LTE', pri: 8 },
+  cell_verizon: { label: 'Verizon LTE', pri: 8 },
 };
 
 function _aggMeta(key) {
@@ -6263,10 +6776,6 @@ function wirePopupAggregation() {
   }
 }
 
-function saveApiKey(svc) {
-  const v = document.getElementById('apiFAA').value.trim();
-  if (v) { try { localStorage.setItem('sar_api_'+svc, v); } catch(e){} S.apiKeys[svc] = v; }
-}
 function saveConfig() {
   const ac = document.getElementById('cfgAircraft').value;
   const maxWind = document.getElementById('cfgMaxWind')?.value;
@@ -6389,8 +6898,11 @@ function startApp() {
       if (event.data?.type === 'CACHE_SIZE') {
         const el = document.getElementById('cacheStatus');
         if (el && event.data.size) {
-          const mb = (event.data.size.usage / 1048576).toFixed(1);
-          el.textContent = `Using ${mb} MB`;
+          const usage = event.data.size.usage || 0, quota = event.data.size.quota || 0;
+          const mb = (usage / 1048576).toFixed(1);
+          el.textContent = quota > 0
+            ? `Using ${mb} MB of ${(quota / 1073741824).toFixed(2)} GB (${Math.round(usage / quota * 100)}%)`
+            : `Using ${mb} MB`;
         }
       }
     });
@@ -6406,6 +6918,8 @@ function startApp() {
   restoreConfig();
   restoreFAACharts();
   setupTfrDropzone();
+  // Load bundled per-carrier cell coverage (no-op if the build hasn't been run)
+  if (typeof loadCellCoverage === 'function') loadCellCoverage();
 
   // Update notification status display
   if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
@@ -6563,7 +7077,59 @@ function getSelectedTileProviders() {
   if (document.getElementById('cfgTileSat')?.checked) providers.push('satellite');
   if (document.getElementById('cfgTileTopo')?.checked) providers.push('topo');
   if (document.getElementById('cfgTileSectional')?.checked) providers.push('sectional');
+  if (document.getElementById('cfgTileHillshade')?.checked) providers.push('hillshade');
+  if (document.getElementById('cfgTileParcels')?.checked) providers.push('parcels');
   return providers;
+}
+
+// Shared view → analysis grid (keeps DEM/canopy cache keys aligned across the
+// pre-cache and live-analysis paths). Mirrors the canopy-analysis grid build.
+function gridForView(bounds) {
+  const center = bounds.getCenter();
+  const halfWidthM = Math.max(
+    center.distanceTo(L.latLng(center.lat, bounds.getWest())),
+    center.distanceTo(L.latLng(bounds.getNorth(), center.lng))
+  );
+  const resM = Math.max(WORK_RES_M, (2 * halfWidthM) / MAX_GRID);
+  return makeGrid(center.lat, center.lng, halfWidthM, resM);
+}
+async function _cacheViewRaster(kind, bounds) {
+  try {
+    const grid = gridForView(bounds);
+    if (kind === 'dem') return await fetch3DEPDEM(grid);
+    if (kind === 'canopy') {
+      if (!getCanopyProxyBase()) return { source: 'no proxy' };
+      return await fetchCanopyRaster(grid);
+    }
+  } catch (e) { return { error: (e && e.message) || String(e) }; }
+}
+// Pre-fetch + cache all vector layers (and optionally DEM/vegetation rasters) for
+// the CURRENT map view so they're available offline — independent of the SW tile
+// flow (which caches base/sat/topo/sectional/hillshade/parcels image tiles).
+async function cacheCurrentView() {
+  if (!S.map) return;
+  const bounds = S.map.getBounds();
+  const center = bounds.getCenter();
+  const btn = document.getElementById('btnCacheView');
+  const prog = document.getElementById('viewCacheProgress');
+  if (btn) btn.setAttribute('disabled', 'true');
+  const jobs = [
+    fetchFAAairspace(bounds), fetchFaaObstacles(bounds), fetchWireHazards(bounds),
+    fetchProtectedAreas(bounds), fetchNearbyAirports(center, bounds),
+    fetchPublicLands(bounds), fetchGroundAccess(bounds), fetchWaterFeatures(bounds),
+    fetchFireDanger(center.lat, center.lng, bounds), fetchHospitals(bounds),
+  ];
+  if (document.getElementById('cfgViewDEM')?.checked) jobs.push(_cacheViewRaster('dem', bounds));
+  if (document.getElementById('cfgViewCanopy')?.checked) jobs.push(_cacheViewRaster('canopy', bounds));
+  const total = jobs.length;
+  let done = 0;
+  if (prog) prog.textContent = `Caching 0/${total}…`;
+  await Promise.all(jobs.map(j => Promise.resolve(j).catch(() => null).then(r => {
+    done++; if (prog) prog.textContent = `Caching ${done}/${total}…`; return r;
+  })));
+  if (prog) prog.textContent = `Cached ${total} data sources for this view ✓ (add base tiles with "Download" above)`;
+  if (btn) btn.removeAttribute('disabled');
+  if (typeof updateCacheStatus === 'function') updateCacheStatus();
 }
 
 function clearAllCaches() {
@@ -6579,6 +7145,24 @@ function updateCacheStatus() {
   if (navigator.serviceWorker?.controller) {
     navigator.serviceWorker.controller.postMessage({ type: 'GET_CACHE_SIZE' });
   }
+  // Request persistent storage (reduces eviction on mobile) + a direct estimate
+  // fallback for when the Service Worker isn't controlling the page yet.
+  try {
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+    if (navigator.storage && navigator.storage.estimate) {
+      navigator.storage.estimate().then(est => {
+        const el = document.getElementById('cacheStatus');
+        if (!el || !est) return;
+        if (!el.textContent || el.textContent === 'Checking...') {
+          const usage = est.usage || 0, quota = est.quota || 0;
+          const mb = (usage / 1048576).toFixed(1);
+          el.textContent = quota > 0
+            ? `Using ${mb} MB of ${(quota / 1073741824).toFixed(2)} GB (${Math.round(usage / quota * 100)}%)`
+            : `Using ${mb} MB`;
+        }
+      }).catch(() => {});
+    }
+  } catch (_) { /* ignore */ }
 }
 
 function enableNotifications() {
@@ -7630,6 +8214,16 @@ function getCanopyProxyBase() {
   } catch (_) { return null; }
 }
 
+// Build a proxied URL for a CORS-blocked self-hosted ArcGIS server (USFS/BLM).
+// routePrefix is a Worker route ('/usfs/' or '/blm/'); upstreamPath is everything
+// after the upstream host (e.g. 'arcx/rest/services/.../query?...'). Returns null
+// when no data proxy is configured, so callers can degrade gracefully.
+function proxiedArcgis(routePrefix, upstreamPath) {
+  const base = getCanopyProxyBase();
+  if (!base) return null;
+  return base + routePrefix + String(upstreamPath || '').replace(/^\/+/, '');
+}
+
 function saveCanopyProxy(url) {
   try {
     const v = (url || '').trim().replace(/\/+$/, '');
@@ -8342,7 +8936,12 @@ if (typeof module !== 'undefined' && module.exports) {
     _exportNotamRecords, _exportTfrRecords, _exportAirportRecords, _exportRasterData,
     collectExportFolderGroups, folderGroupsToKml, folderGroupsToGeoJsonFeatures,
     recordToKml, recordToGeoJsonFeature, _uuid, _areaRingLatLng, _exportSummaryDesc,
-    saveApiKey, saveConfig, updateClock, refreshData,
+    saveConfig, updateClock, refreshData,
+    proxiedArcgis, _arcgisGeoJsonUrl, _govArcgisUrl, _envelopeGeom, _bboxCacheKey, _prop,
+    fetchGroundAccess, fetchPublicLands, fetchWaterFeatures, fetchHospitals,
+    _renderPublicLands, computeLandStatus, _renderHospitals,
+    loadCellCoverage, cellCoverageReadout, _pointInRegion, _ringsBBox,
+    cacheCurrentView, gridForView, _cacheViewRaster, getSelectedTileProviders,
     initMap, startDraw, clearDrawBtns, clearArea, enterCoords,
     getStoredTheme, applyTheme, cycleTheme,
     scrollTabs, updateScrollBtns,

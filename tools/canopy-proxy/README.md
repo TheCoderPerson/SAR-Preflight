@@ -16,6 +16,12 @@ A small CORS+Range proxy so the browser-only app can read CORS-blocked sources:
    increasingly block browser CORS. The `/adsb?lat=&lon=&dist=` route fetches them
    server-side (first success wins), passes the JSON through, and adds CORS (real-time,
    uncached). The served provider is reported in the `X-Adsb-Source` response header.
+5. **USFS roads/trails/MVUM** — the USFS EDW ArcGIS server (`apps.fs.usda.gov`) is
+   self-hosted and blocks browser CORS. Served at the `/usfs/...` route (cached a day;
+   forest roads change slowly). The app appends the full ArcGIS query path after `/usfs/`.
+6. **BLM transport + public-land ownership** — the BLM ArcGIS server (`gis.blm.gov`),
+   also CORS-restricted, for BLM GTLF roads/trails and the National Surface Management
+   Agency (public vs private land) layer. Served at the `/blm/...` route (cached a day).
 
 It only ever forwards those upstreams (it is not a general open proxy; `..` is
 rejected), and it enforces an Origin allowlist (below).
@@ -57,10 +63,10 @@ Three things keep the proxy from being misused:
    If the ~100,000 requests/day limit is ever hit, the Worker just returns errors
    until the next UTC day — it cannot cost you money. (Real SAR usage is a few
    hundred requests/day, nowhere near the limit.)
-2. **Not an open proxy.** The Worker only ever forwards the Meta canopy prefix
-   (`forests/v1/alsgedi_global_v6_float/…`) and rejects `..`, so the worst anyone
-   could do is fetch the same public canopy tiles — it can't be repurposed to
-   proxy arbitrary URLs.
+2. **Not an open proxy.** The Worker only ever forwards a fixed set of upstreams (the
+   Meta canopy bucket, the FAA TFR/NOTAM hosts, the ADS-B providers, and the USFS/BLM
+   ArcGIS servers) and rejects `..`, so the worst anyone could do is fetch the same
+   public data — it can't be repurposed to proxy arbitrary URLs.
 3. **Origin allowlist.** `worker.js` rejects (HTTP 403) any request whose
    `Origin`/`Referer` isn't in `ALLOWED_ORIGINS`, so other websites can't hot-link
    it from a browser. **Edit `ALLOWED_ORIGINS`** to match where you host the app

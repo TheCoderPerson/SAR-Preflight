@@ -1154,16 +1154,6 @@ select.api-input { cursor: pointer; }
           <p style="font-size:11px;color:var(--text-muted);margin-bottom:8px;line-height:1.5;">
             <strong style="color:var(--accent-green);">FREE — No key needed:</strong> Open-Meteo (weather, wind, AQI), Open-Elevation, Sunrise-Sunset.org
           </p>
-          <p style="font-size:11px;color:var(--text-muted);margin-bottom:12px;line-height:1.5;">
-            <strong style="color:var(--accent-amber);">Optional API keys</strong> for enhanced data:
-          </p>
-          <div class="api-config">
-            <div class="data-label">FAA NOTAM API Key (api.faa.gov) — legacy/optional; live NOTAMs use the Data proxy</div>
-            <form class="api-input-group" autocomplete="off" onsubmit="return false">
-              <input class="api-input" id="apiFAA" type="password" autocomplete="off" placeholder="client_id:client_secret" />
-              <button class="btn btn-ghost" type="button" onclick="saveApiKey('faa')">Save</button>
-            </form>
-          </div>
           <div class="api-config">
             <div class="data-label">Auto-Refresh Interval</div>
             <select class="api-input" id="cfgRefreshInterval" onchange="setAutoRefresh()">
@@ -1191,7 +1181,7 @@ select.api-input { cursor: pointer; }
               <input class="api-input" id="cfgCanopyProxy" type="text" placeholder="https://sar-canopy-proxy.you.workers.dev" onchange="saveCanopyProxy(this.value)" />
               <button class="btn btn-ghost" onclick="saveCanopyProxy(document.getElementById('cfgCanopyProxy').value)">Save</button>
             </div>
-            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">One self-hosted proxy serves CORS-blocked sources: Meta/WRI 1&nbsp;m canopy tiles (vegetation overlay &amp; viewshed), the FAA TFR GeoServer (live TFRs), and the FAA NOTAM Search backend (live NOTAMs) — TFRs/NOTAMs auto-fetched per area. NOTAMs come from an unofficial endpoint: treat as advisory and verify officially. Terrain (3DEP) works without the proxy; canopy is cached for offline use, live TFR/NOTAM need a connection. Don't have one? <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Set up your own free Cloudflare Worker ↗</a> (step-by-step instructions &amp; code).</div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">One self-hosted proxy serves CORS-blocked sources: Meta/WRI 1&nbsp;m canopy tiles (vegetation overlay &amp; viewshed), the FAA TFR GeoServer (live TFRs), the FAA NOTAM Search backend (live NOTAMs), and the USFS/BLM ArcGIS servers (forest roads/trails/MVUM, BLM transport &amp; public-land ownership) — TFRs/NOTAMs auto-fetched per area. NOTAMs come from an unofficial endpoint: treat as advisory and verify officially. Terrain (3DEP), water, fire, hospitals &amp; cell coverage work without the proxy; canopy is cached for offline use, live TFR/NOTAM and USFS/BLM layers need the proxy. Don't have one? <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Set up your own free Cloudflare Worker ↗</a> (step-by-step instructions &amp; code).</div>
           </div>
         </div>
         <div class="data-section">
@@ -1247,13 +1237,25 @@ select.api-input { cursor: pointer; }
               </select>
               <button class="btn btn-primary" id="btnDownloadTiles" onclick="downloadTilesForView()" style="padding:5px 12px;font-size:11px;">Download</button>
             </div>
-            <div style="display:flex;gap:12px;margin-top:6px;font-size:11px;color:var(--text-secondary);">
+            <div style="display:flex;gap:12px;margin-top:6px;font-size:11px;color:var(--text-secondary);flex-wrap:wrap;">
               <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileSat"> Satellite</label>
               <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileTopo"> Topo</label>
               <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileSectional" checked> FAA Sectional</label>
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileHillshade"> Hillshade</label>
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileParcels"> Parcels</label>
             </div>
             <div class="risk-bar" style="margin-top:8px;"><div class="risk-fill" id="tileProgressBar" style="width:0;background:var(--accent-cyan);"></div></div>
             <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:4px;" id="tileProgressText"></div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Cache Data for Current View (offline)</div>
+            <div style="font-size:10px;color:var(--text-muted);margin:4px 0 6px;line-height:1.4;">Pre-fetches airspace, obstacles, wires, ground access (roads/trails/MVUM), public lands, water, fire, hospitals &amp; airports for the current map view into the offline cache. Optionally include terrain DEM &amp; vegetation rasters.</div>
+            <div style="display:flex;gap:12px;margin-bottom:6px;font-size:11px;color:var(--text-secondary);">
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgViewDEM"> Terrain DEM</label>
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgViewCanopy"> Vegetation</label>
+            </div>
+            <button class="btn btn-primary" id="btnCacheView" onclick="cacheCurrentView()" style="padding:5px 12px;font-size:11px;">Cache Data for Current View</button>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:6px;" id="viewCacheProgress"></div>
           </div>
           <div class="api-config">
             <div class="data-label">Cache Status</div>

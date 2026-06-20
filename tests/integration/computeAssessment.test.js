@@ -391,4 +391,64 @@ describe('computeAssessment()', () => {
       expect(document.getElementById('assessBadge').textContent).toBe('GO');
     });
   });
+
+  describe('non-public-land caution (BLM SMA)', () => {
+    afterEach(() => { S.landStatus = null; });
+
+    it('adds a CAUTION when part of the area is private', () => {
+      S.landStatus = { sampled: 100, privateCount: 40, privateFrac: 0.4, anyPublic: true };
+      computeAssessment();
+      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessText').textContent.toLowerCase()).toContain('private');
+      expect(document.getElementById('assessText').textContent).toContain('40%');
+    });
+
+    it('uses the "entirely" wording at ~100% private', () => {
+      S.landStatus = { sampled: 100, privateCount: 100, privateFrac: 1, anyPublic: false };
+      computeAssessment();
+      expect(document.getElementById('assessText').textContent).toContain('entirely');
+    });
+
+    it('stays GO when the area is fully public', () => {
+      S.landStatus = { sampled: 100, privateCount: 0, privateFrac: 0, anyPublic: true };
+      computeAssessment();
+      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+    });
+
+    it('is suppressed when SMA returned no coverage (sampled 0)', () => {
+      S.landStatus = { sampled: 0, privateCount: 0, privateFrac: 0, anyPublic: false };
+      computeAssessment();
+      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+    });
+
+    it('does not downgrade an existing NO-GO and is advisory only', () => {
+      S.wind = { maxWind: 40, maxGust: 50 }; // wind NO-GO
+      S.landStatus = { sampled: 100, privateCount: 60, privateFrac: 0.6, anyPublic: true };
+      computeAssessment();
+      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+    });
+  });
+
+  describe('cell-coverage caution (FCC)', () => {
+    afterEach(() => { S.cellStatus = null; });
+
+    it('adds a CAUTION when in-region with zero carrier coverage', () => {
+      S.cellStatus = { inRegion: true, count: 0, level: 'red' };
+      computeAssessment();
+      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessText').textContent.toLowerCase()).toContain('cell');
+    });
+
+    it('stays GO when carriers cover the area', () => {
+      S.cellStatus = { inRegion: true, count: 2, level: 'green' };
+      computeAssessment();
+      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+    });
+
+    it('does not fire when outside the bundled region (no data ≠ no coverage)', () => {
+      S.cellStatus = { inRegion: false, count: null, level: 'green' };
+      computeAssessment();
+      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+    });
+  });
 });

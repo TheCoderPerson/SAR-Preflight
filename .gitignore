@@ -4,3 +4,5 @@ dist/
 !README.md
 !CHANGELOG.md
 .claude/
+# Cell-coverage build inputs (raw FCC downloads — large, regenerable scratch)
+tools/cell-coverage/input/

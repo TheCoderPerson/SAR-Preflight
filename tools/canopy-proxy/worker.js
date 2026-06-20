@@ -6,6 +6,8 @@
 //   • /chm/{quadkey}.tif , /tiles.geojson  → Meta/WRI 1 m canopy COG tiles
 //       (public S3 bucket that serves Range but sends NO CORS headers)
 //   • /tfr/...                              → FAA TFR GeoServer (live TFR polygons)
+//   • /usfs/...                             → USFS EDW ArcGIS (roads/trails/MVUM)
+//   • /blm/...                              → BLM ArcGIS (GTLF transport, surface mgmt agency)
 //
 // Abuse protection (see README):
 //   • Only the two upstreams above are reachable (never an open proxy; `..` rejected).
@@ -40,6 +42,11 @@ const ADSB_UPSTREAMS = [
 // and time-sensitive, so it is cached for only a few seconds.
 const ROUTES = [
   { prefix: '/tfr/', upstream: 'https://tfr.faa.gov/', cacheTtl: 30 },
+  // Self-hosted gov ArcGIS servers that block browser CORS. Static-ish vector data
+  // (forest roads/trails/MVUM, BLM transport + surface-management-agency polygons),
+  // so cache for a day. Closed-proxy model is preserved: fixed upstream, `..` rejected.
+  { prefix: '/usfs/', upstream: 'https://apps.fs.usda.gov/', cacheTtl: 86400 },
+  { prefix: '/blm/',  upstream: 'https://gis.blm.gov/',      cacheTtl: 86400 },
 ];
 
 // Only these origins may use the proxy. Add your dev origin while testing.

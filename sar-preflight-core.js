@@ -19,6 +19,18 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.06.20-f',
+    date: '2026-06-20',
+    changes: [
+      'New map overlays for mission planning: forest roads, trails & Motor Vehicle Use Map (MVUM) routes, BLM routes, public-land ownership, water (streams & lakes), hospitals & helicopter landing zones, terrain hillshade, parcel boundaries, and per-carrier cell coverage.',
+      'New CAUTION when part of your operating area is on private / non-public land (verify landowner permission) — based on the BLM Surface Management Agency layer.',
+      'Per-carrier (AT&T / T-Mobile / Verizon) FCC LTE/5G cell coverage now drives the cell-service readout and a "no coverage" caution. Requires a one-time data build (see tools/cell-coverage) and ships with no data by default.',
+      'Added "Cache Data for Current View" to pre-download all data layers (plus optional terrain DEM & vegetation) for offline use; cache status now shows storage used vs. quota, and Hillshade/Parcels were added to the map-tile download.',
+      'Removed the unused "Optional API keys" field from Config (live NOTAMs/TFRs use the data proxy).',
+      'Forest-service & BLM layers load through the data proxy — redeploy your Cloudflare Worker (tools/canopy-proxy) to enable them.',
+    ],
+  },
+  {
     version: '2026.06.20-e',
     date: '2026-06-20',
     changes: [
@@ -966,6 +978,94 @@ function distPointToSegment(px, py, ax, ay, bx, by) {
   let t = ((px - ax) * dx + (py - ay) * dy) / l2;
   t = Math.max(0, Math.min(1, t));
   return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+// ============================================================
+// PUBLIC vs PRIVATE LAND (BLM Surface Management Agency classification)
+// The BLM National SMA layer assigns every surface a managing-agency code.
+// PVT (private) and UND (undetermined) are the only non-public codes; everything
+// else (BLM/USFS/NPS/FWS, state, local, tribal, military, other federal) is
+// public/managed land. Used to flag when an operating area is partly on private
+// land (advisory — "verify landowner permission", never an auto NO-GO).
+// ============================================================
+
+const SMA_NONPUBLIC_CODES = new Set(['PVT', 'UND', '']);
+
+// Map an SMA ADMIN_AGENCY_CODE to a display label, map color, and public flag.
+function smaAgencyInfo(code) {
+  const c = String(code == null ? '' : code).toUpperCase().trim();
+  const PUB = {
+    BLM: ['Bureau of Land Management', '#f4a460'], USFS: ['US Forest Service', '#2e8b3d'],
+    USDA: ['USDA', '#2e8b3d'], NPS: ['National Park Service', '#5b8c3e'],
+    FWS: ['US Fish & Wildlife', '#3aa17e'], USBR: ['Bureau of Reclamation', '#4682b4'],
+    USACE: ['Army Corps of Engineers', '#4f7fb5'], DOE: ['Dept. of Energy', '#5f9ea0'],
+    DOD: ['Dept. of Defense', '#6b8e9e'], ARMY: ['US Army', '#6b8e9e'],
+    NAVY: ['US Navy', '#6b8e9e'], USAF: ['US Air Force', '#6b8e9e'],
+    USMC: ['US Marine Corps', '#6b8e9e'], USCG: ['US Coast Guard', '#6b8e9e'],
+    BIA: ['Bureau of Indian Affairs', '#cd853f'], NTVALL: ['Tribal Land', '#cd853f'],
+    NTVPIC: ['Tribal Land', '#cd853f'], ST: ['State', '#9370db'],
+    LG: ['Local Government', '#7b68ee'], VA: ['Veterans Affairs', '#5f9ea0'],
+    DOI: ['Dept. of Interior', '#5f9ea0'], DOT: ['Dept. of Transportation', '#5f9ea0'],
+    FAA: ['FAA', '#5f9ea0'], GSA: ['General Services Admin', '#5f9ea0'],
+    BPA: ['Bonneville Power', '#5f9ea0'], BOP: ['Bureau of Prisons', '#5f9ea0'],
+    NOAA: ['NOAA', '#5f9ea0'], USPS: ['US Postal Service', '#5f9ea0'],
+    HHS: ['Health & Human Svcs', '#5f9ea0'], OTHFE: ['Other Federal', '#5f9ea0'],
+    FHA: ['Federal Highway', '#5f9ea0'],
+  };
+  if (PUB[c]) return { code: c, label: PUB[c][0], color: PUB[c][1], isPublic: true };
+  if (c === 'PVT') return { code: 'PVT', label: 'Private', color: '#b04a4a', isPublic: false };
+  if (c === 'UND' || c === '') return { code: 'UND', label: 'Undetermined', color: '#8a8a8a', isPublic: false };
+  // Unknown future code: treat as managed unless it's an explicit non-public code.
+  return { code: c, label: c, color: '#6b9e8e', isPublic: !SMA_NONPUBLIC_CODES.has(c) };
+}
+
+function smaIsPublic(code) { return smaAgencyInfo(code).isPublic; }
+
+// What fraction of an operating area falls on non-public land.
+// aoiRing: closed ring of [lat,lng]; publicRings: flat array of public-land rings
+// ([lat,lng] each). Lays an n×n lattice over the AOI bbox, keeps the points inside
+// the AOI, and counts a point private when it is inside ZERO public rings. Callers
+// should suppress the caution when there was no public data at all (no coverage ≠
+// private) — check `anyPublic`/the feature count before trusting privateFrac.
+function classifyAreaPublicPrivate(aoiRing, publicRings, n) {
+  n = n || 11;
+  const res = { sampled: 0, privateCount: 0, privateFrac: 0, anyPublic: !!(publicRings && publicRings.length) };
+  if (!aoiRing || aoiRing.length < 3) return res;
+  const bb = polygonBBox(aoiRing);
+  const span = (n > 1) ? (n - 1) : 1;
+  const latStep = (bb.maxLat - bb.minLat) / span;
+  const lngStep = (bb.maxLng - bb.minLng) / span;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      const lat = bb.minLat + i * latStep;
+      const lng = bb.minLng + j * lngStep;
+      if (!pointInPolygon(lat, lng, aoiRing)) continue;
+      res.sampled++;
+      let isPublic = false;
+      for (const ring of (publicRings || [])) {
+        if (pointInPolygon(lat, lng, ring)) { isPublic = true; break; }
+      }
+      if (!isPublic) res.privateCount++;
+    }
+  }
+  res.privateFrac = res.sampled ? res.privateCount / res.sampled : 0;
+  return res;
+}
+
+// Per-carrier LTE coverage at a point. `carriers` is { att, tmobile, verizon },
+// each a flat array of coverage rings ([lat,lng]). Returns booleans + a count.
+function cellCoverageAt(lat, lng, carriers) {
+  const out = { att: false, tmobile: false, verizon: false, count: 0, anyCovered: false };
+  if (!carriers) return out;
+  ['att', 'tmobile', 'verizon'].forEach(k => {
+    const rings = carriers[k];
+    if (rings && rings.length) {
+      for (const ring of rings) { if (pointInPolygon(lat, lng, ring)) { out[k] = true; break; } }
+    }
+    if (out[k]) out.count++;
+  });
+  out.anyCovered = out.count > 0;
+  return out;
 }
 
 // --- Coordinate parsing ---
@@ -2236,6 +2336,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcDensityAltitude, calcBatteryDerating, assessPropIcing, assessRisk,
     DEFAULT_THRESHOLDS,
     classifyTerrain, estimateVegetation, estimateCellCoverage,
+    SMA_NONPUBLIC_CODES, smaAgencyInfo, smaIsPublic, classifyAreaPublicPrivate, cellCoverageAt,
     filterAirportsByDistance, classifyAirspace,
     calcGustFactor, calcWindShear,
     generateElevationGrid, calcSlopeFromGrid, calcAspect,
