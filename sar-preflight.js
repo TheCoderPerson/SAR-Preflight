@@ -26,8 +26,6 @@ const S = {
   _activeFetches: {},
   // SOP Risk Profile
   activeProfile: null,
-  // Training mode flag
-  _trainingMode: false,
   // ADS-B live traffic
   adsbAircraft: [],
   adsbTrails: {},
@@ -757,7 +755,6 @@ function clearArea() {
   hideTimeBar();
   if (S.mapLayers.emergency_lz) S.mapLayers.emergency_lz.clearLayers();
   if (S.mapLayers.swap_radius) S.mapLayers.swap_radius.clearLayers();
-  if (S.mapLayers.flight_plan) S.mapLayers.flight_plan.clearLayers();
   if (S.mapLayers.faa_class_airspace) S.mapLayers.faa_class_airspace.clearLayers();
   if (S.mapLayers.faa_sua) S.mapLayers.faa_sua.clearLayers();
   if (S.mapLayers.faa_tfr) S.mapLayers.faa_tfr.clearLayers();
@@ -874,7 +871,6 @@ async function processArea(layer, type) {
   // Re-hydrate this area's saved observer viewsheds (markers + active overlay) from IndexedDB.
   if (typeof restoreViewsheds === 'function') restoreViewsheds();
 
-  if (typeof logAudit === 'function') logAudit('area_defined', { center: { lat: center.lat, lng: center.lng }, type: S.areaType, size: document.getElementById('areaSize')?.textContent });
   document.getElementById('areaPerimeter').textContent = `${perimKm.toFixed(2)} km`;
   document.getElementById('areaMaxDim').textContent = `${maxDimKm.toFixed(2)} km`;
 
@@ -995,7 +991,6 @@ function showDataSourceStatus() {
 }
 
 function refreshData() {
-  if (typeof logAudit === 'function') logAudit('data_refreshed');
   if (S.areaCenter) processArea(S.currentArea, S.areaType.toLowerCase());
 }
 
@@ -1146,7 +1141,6 @@ async function updateSection(key) {
   if (meta.loading) return; // re-entrancy guard
   meta.loading = true;
   renderSectionMeta(key);
-  try { if (typeof logAudit === 'function') logAudit('section_update', { section: key }); } catch (_) {}
   try {
     await def.fetch(S.areaCenter, S.areaBounds); // fetch's own branches mark live/cached/error
     if (def.computes === 'ops' || def.computes === 'both') { if (typeof computeOpsData === 'function') computeOpsData(); }
@@ -2412,7 +2406,6 @@ function _focusFeature(f) {
 // --- Import handling ---
 
 function importFaaFile() {
-  if (typeof logAudit === 'function') logAudit('tfr_imported');
   const input = document.getElementById('faaFileInput');
   if (input) { input.value = ''; input.click(); }
 }
@@ -4732,55 +4725,6 @@ function renderLZMarkers(lzs) {
   }
 }
 
-function generateAndRenderFlightPlan() {
-  if (!S.areaBounds || !S.areaCenter) return;
-
-  const patternType = document.getElementById('cfgSearchPattern')?.value || 'parallel';
-  const trackSpacing = parseInt(document.getElementById('cfgTrackSpacing')?.value) || 100;
-  const windDir = S.wx.wind_direction_10m ?? 0;
-
-  if (typeof generateSearchPattern !== 'function') {
-    setText('opsPlanDist', 'N/A');
-    setText('opsPlanLegs', 'N/A');
-    return;
-  }
-
-  const ne = S.areaBounds.getNorthEast();
-  const sw = S.areaBounds.getSouthWest();
-  const bounds = {
-    north: ne.lat,
-    south: sw.lat,
-    east: ne.lng,
-    west: sw.lng,
-  };
-
-  const result = generateSearchPattern(bounds, windDir, patternType, trackSpacing);
-
-  // Render polyline on map (guard for test env without full Leaflet)
-  if (typeof L !== 'undefined' && typeof L.layerGroup === 'function') {
-    if (S.mapLayers.flight_plan) {
-      S.mapLayers.flight_plan.clearLayers();
-    } else {
-      S.mapLayers.flight_plan = L.layerGroup();
-    }
-
-    if (result.waypoints && result.waypoints.length > 1 && typeof L.polyline === 'function') {
-      const polyline = L.polyline(result.waypoints, {
-        color: '#06b6d4', // cyan
-        weight: 2,
-        opacity: 0.8,
-        dashArray: '8,6',
-      });
-      S.mapLayers.flight_plan.addLayer(polyline);
-      if (S.map) S.mapLayers.flight_plan.addTo(S.map);
-    }
-  }
-
-  setText('opsPlanDist', `${result.estimatedDistanceKm} km`);
-  setText('opsPlanLegs', `${result.legs}`);
-  buildLayerControl();
-}
-
 // ============================================================
 // DERIVED COMPUTATIONS
 // ============================================================
@@ -5139,7 +5083,6 @@ function computeAssessment() {
   badge.className = 'assessment-badge ' + (result.level === 'GO' ? 'go' : result.level === 'CAUTION' ? 'caution' : 'nogo');
   document.getElementById('assessText').textContent = result.text;
 
-  if (typeof logAudit === 'function') logAudit('assessment_computed', { level: result.level, text: result.text });
 }
 
 // ============================================================
@@ -5184,7 +5127,7 @@ function _exportStyleForLayer(key) {
     fire_perimeters: 'fire', faa_sua: 'sua', faa_class_airspace: 'airspace', faa_laanc: 'airspace',
     faa_obstacles: 'obstacle', airports: 'airport', cell_towers: 'tower', dams: 'dam',
     adsb_aircraft: 'aircraft', wilderness: 'protected', national_parks: 'protected',
-    emergency_lz: 'protected', swap_radius: 'opsArea', flight_plan: 'opsArea', observers: 'observer',
+    emergency_lz: 'protected', swap_radius: 'opsArea', observers: 'observer',
   };
   return m[key] || 'generic';
 }
@@ -5527,7 +5470,6 @@ function exportRasterGeoTiff(layerId, ref) {
     const buf = encodeGeoTiffRGBA(merc.rgba, merc.width, merc.height, merc.bounds, { epsg: 3857 });
     const fname = name ? `SAR_Viewshed_${viewshedFilenameSlug(name)}_${ts}.tif` : `SAR_${label}_${ts}.tif`;
     downloadBlob(new Blob([buf], { type: 'image/tiff' }), fname);
-    if (typeof logAudit === 'function') logAudit('geotiff_exported', { layer: layerId });
   } catch (e) {
     console.error('GeoTIFF export error:', e);
     alert('Could not export ' + r.label + ' GeoTIFF: ' + (e && e.message || e));
@@ -5563,7 +5505,6 @@ function exportRasterKmz(layerId, ref) {
     ]);
     const fname = name ? `SAR_Viewshed_${viewshedFilenameSlug(name)}_${ts}.kmz` : `SAR_${label}_${ts}.kmz`;
     downloadBlob(new Blob([kmz], { type: 'application/vnd.google-earth.kmz' }), fname);
-    if (typeof logAudit === 'function') logAudit('kmz_overlay_exported', { layer: layerId });
   } catch (e) {
     console.error('KMZ overlay export error:', e);
     alert('Could not export ' + r.label + ' KMZ overlay: ' + (e && e.message || e));
@@ -5665,7 +5606,6 @@ function doExport() {
   if (document.getElementById('expViewshedTiff')?.checked) exportAllViewshedGeoTiffs();
 
   closeExport();
-  if (typeof logAudit === 'function') logAudit('kml_exported');
 }
 
 // Export the same vector content as CalTopo-native GeoJSON, which preserves the
@@ -5713,7 +5653,6 @@ function doExportGeoJson() {
   if (document.getElementById('expViewshedTiff')?.checked) exportAllViewshedGeoTiffs();
 
   closeExport();
-  if (typeof logAudit === 'function') logAudit('geojson_exported');
 }
 
 function getKMLCoords() {
@@ -5847,23 +5786,14 @@ function buildLayerControl() {
     }
   }
 
-  // Ops overlays: swap radius, flight plan
+  // Ops overlays: swap radius
   const hasSwap = S.mapLayers.swap_radius && S.mapLayers.swap_radius.getLayers().length > 0;
-  const hasPlan = S.mapLayers.flight_plan && S.mapLayers.flight_plan.getLayers().length > 0;
-  if (hasSwap || hasPlan) {
+  if (hasSwap) {
     html += `<h4 style="margin-top:10px">Operations</h4>`;
-    if (hasSwap) {
-      const on = S.map.hasLayer(S.mapLayers.swap_radius);
-      html += `<div class="layer-item${on ? ' active' : ''}" data-layer="swap_radius" onclick="toggleLayer('swap_radius',this)">
-        <div class="layer-check"></div><div class="layer-color" style="background:#f59e0b"></div><span>Swap Radius</span>
-      </div>`;
-    }
-    if (hasPlan) {
-      const on = S.map.hasLayer(S.mapLayers.flight_plan);
-      html += `<div class="layer-item${on ? ' active' : ''}" data-layer="flight_plan" onclick="toggleLayer('flight_plan',this)">
-        <div class="layer-check"></div><div class="layer-color" style="background:#06b6d4"></div><span>Flight Plan</span>
-      </div>`;
-    }
+    const on = S.map.hasLayer(S.mapLayers.swap_radius);
+    html += `<div class="layer-item${on ? ' active' : ''}" data-layer="swap_radius" onclick="toggleLayer('swap_radius',this)">
+      <div class="layer-check"></div><div class="layer-color" style="background:#f59e0b"></div><span>Swap Radius</span>
+    </div>`;
   }
 
   // NWS Alerts section
@@ -6091,7 +6021,7 @@ function toggleLayer(id, el) {
     // Play panel is visible only while the radar layer is checked on
     const controls = document.getElementById('radarControls');
     if (controls) controls.style.display = on ? 'flex' : 'none';
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'flight_plan' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'observers' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_')) && S.mapLayers[id]) {
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'observers' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_')) && S.mapLayers[id]) {
     if (id === 'canopy') { const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = on; }
     if (on) S.map.addLayer(S.mapLayers[id]);
     else S.map.removeLayer(S.mapLayers[id]);
@@ -6126,7 +6056,7 @@ const AGG_LAYER_META = {
   faa_obstacles: { label: 'Obstacle', pri: 4 }, dams: { label: 'Dam', pri: 4 },
   cell_towers: { label: 'Tower', pri: 5 }, wilderness: { label: 'Wilderness', pri: 6 },
   national_parks: { label: 'National Park', pri: 6 }, swap_radius: { label: 'Swap Radius', pri: 8 },
-  flight_plan: { label: 'Flight Plan', pri: 8 }, observers: { label: 'Observer', pri: 3 },
+  observers: { label: 'Observer', pri: 3 },
 };
 
 function _aggMeta(key) {
@@ -6341,7 +6271,6 @@ function saveConfig() {
   if (times[ac]) document.getElementById('cfgFlightTime').value = times[ac];
   if (typeof saveAppState === 'function') saveAppState('cfgAircraft', ac);
   if (S.currentArea) { computeOpsData(); computeAssessment(); }
-  if (typeof logAudit === 'function') logAudit('config_changed', { aircraft: ac, maxWind: maxWind });
 }
 
 let _metaTick = 0;
@@ -6473,9 +6402,6 @@ function startApp() {
   restoreConfig();
   restoreFAACharts();
   setupTfrDropzone();
-
-  // Populate training scenarios dropdown
-  populateTrainingScenarios();
 
   // Update notification status display
   if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
@@ -6620,7 +6546,6 @@ async function restoreConfig() {
 // KML/KMZ IMPORT
 // ============================================================
 function importKML() {
-  if (typeof logAudit === 'function') logAudit('kml_imported');
   const input = document.getElementById('kmlFileInput');
   if (input) { input.value = ''; input.click(); }
 }
@@ -6802,7 +6727,6 @@ function buildBriefingText() {
 
 function copyBriefing() {
   if (!S.currentArea) return;
-  if (typeof logAudit === 'function') logAudit('briefing_copied');
   const text = buildBriefingText();
   navigator.clipboard.writeText(text).then(() => {
     const btn = document.getElementById('btnCopy');
@@ -6830,7 +6754,6 @@ function generatePDFBriefing() {
     return alert('jsPDF library not loaded. Check your internet connection.');
   }
 
-  if (typeof logAudit === 'function') logAudit('pdf_exported');
 
   const btn = document.getElementById('btnPDF');
   if (btn) btn.textContent = 'GENERATING...';
@@ -7061,7 +6984,6 @@ function _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic
 // ============================================================
 function shareBriefingEmail() {
   if (!S.currentArea) return alert('Draw an operational area first.');
-  if (typeof logAudit === 'function') logAudit('email_shared');
 
   // Use cached map image from PDF, or capture fresh via composite method
   if (S._lastMapImage) {
@@ -7191,7 +7113,6 @@ async function loadFAAChart(input) {
     buildLayerControl();
     updateChartList();
     if (text) text.textContent = `${result.chartName}: ${result.tileCount} tiles cached (z=${result.zoomRange[0]}-${result.zoomRange[1]})`;
-    if (typeof logAudit === 'function') logAudit('chart_imported', { name: result.chartName, tiles: result.tileCount });
     _saveFaaChartsState();
   } catch (err) {
     console.error('FAA chart import error:', err);
@@ -7407,7 +7328,6 @@ async function loadSopProfile(name) {
     updateSopThresholdFields();
     if (typeof saveAppState === 'function') saveAppState('activeProfile', '');
     if (S.currentArea) computeAssessment();
-    if (typeof logAudit === 'function') logAudit('sop_profile_changed', { name: 'Default' });
     return;
   }
   if (typeof getSopProfile === 'function') {
@@ -7417,7 +7337,6 @@ async function loadSopProfile(name) {
       updateSopThresholdFields();
       if (typeof saveAppState === 'function') saveAppState('activeProfile', name);
       if (S.currentArea) computeAssessment();
-      if (typeof logAudit === 'function') logAudit('sop_profile_changed', { name: name });
     }
   }
 }
@@ -7531,7 +7450,6 @@ async function logMission() {
     await saveMissionLog(entry);
     const btn = document.getElementById('btnLog');
     if (btn) { btn.textContent = 'LOGGED'; setTimeout(() => { btn.textContent = 'LOG'; }, 1500); }
-    if (typeof logAudit === 'function') logAudit('mission_logged', { areaCenter: entry.areaCenter, assessment: entry.assessment.level });
   }
 }
 
@@ -7600,155 +7518,6 @@ async function exportMissionLogsAsCSV() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a'); a.href = url; a.download = `SAR_Mission_Logs_${new Date().toISOString().split('T')[0]}.csv`; a.click();
   URL.revokeObjectURL(url);
-}
-
-// ============================================================
-// TRAINING MODE
-// ============================================================
-function enterTrainingMode(index) {
-  if (typeof TRAINING_SCENARIOS === 'undefined' || !TRAINING_SCENARIOS) return;
-  const scenario = TRAINING_SCENARIOS[index];
-  if (!scenario) return;
-  S._trainingMode = true;
-  S.wx = { ...scenario.wx };
-  S.wind = { ...scenario.wind };
-  S.elev = { ...scenario.elev };
-  // Set area center on map
-  if (S.map) {
-    S.areaCenter = { lat: scenario.center.lat, lng: scenario.center.lng };
-    S.areaType = 'CIRCLE';
-    S.currentArea = true; // Mark as having an area for assessment
-    S.map.setView([scenario.center.lat, scenario.center.lng], 12);
-    // Show panels
-    document.getElementById('noAreaOverlay').style.display = 'none';
-    document.getElementById('assessmentBanner').style.display = 'flex';
-    document.getElementById('areaInfoBar').style.display = 'flex';
-    document.getElementById('noAreaState').style.display = 'none';
-    switchTab(S.activeTab);
-    // Update area info
-    setText('areaCenter', `${scenario.center.lat.toFixed(4)}, ${scenario.center.lng.toFixed(4)}`);
-    setText('areaType', 'TRAINING');
-    setText('areaSize', 'N/A');
-    setText('areaPerimeter', 'N/A');
-    setText('areaMaxDim', 'N/A');
-  }
-  // Render weather data to DOM
-  if (scenario.wx) {
-    const c = scenario.wx;
-    setText('wxTemp', c.temperature_2m !== undefined ? `${Math.round(c.temperature_2m)}°F` : '--');
-    setText('wxHumidity', c.relative_humidity_2m !== undefined ? `${Math.round(c.relative_humidity_2m)}%` : '--');
-    const visMi = c.visibility !== undefined ? (c.visibility / 1609.34).toFixed(1) : '--';
-    setText('wxVis', visMi !== '--' ? `${visMi} mi` : '--');
-    setText('wxPrecip', c.precipitation_probability !== undefined ? `${c.precipitation_probability}%` : '--');
-    setText('wxConditions', c.weather_code !== undefined && typeof wmoCodeToText === 'function' ? wmoCodeToText(c.weather_code) : '--');
-  }
-  // Render wind data
-  if (scenario.wind) {
-    setText('windMax', scenario.wind.maxWind !== undefined ? `${scenario.wind.maxWind} mph` : '--');
-    setText('windGustMax', scenario.wind.maxGust !== undefined ? `${scenario.wind.maxGust} mph` : '--');
-  }
-  // Render elevation data
-  if (scenario.elev) {
-    setText('terrMin', scenario.elev.min !== undefined ? `${scenario.elev.min} ft` : '--');
-    setText('terrMax', scenario.elev.max !== undefined ? `${scenario.elev.max} ft` : '--');
-    setText('terrRange', scenario.elev.range !== undefined ? `${scenario.elev.range} ft` : '--');
-  }
-  computeOpsData();
-  computeAssessment();
-  // Show training banner
-  const banner = document.getElementById('trainingBanner');
-  if (banner) banner.style.display = 'flex';
-  const nameEl = document.getElementById('trainingScenarioName');
-  if (nameEl) nameEl.textContent = scenario.name || 'Scenario ' + (index + 1);
-  if (typeof logAudit === 'function') logAudit('training_entered', { scenario: scenario.name });
-}
-
-function exitTrainingMode() {
-  S._trainingMode = false;
-  S.wx = {}; S.wind = {}; S.elev = {};
-  S.currentArea = null; S.areaCenter = null;
-  const banner = document.getElementById('trainingBanner');
-  if (banner) banner.style.display = 'none';
-  document.getElementById('noAreaOverlay').style.display = '';
-  document.getElementById('assessmentBanner').style.display = 'none';
-  document.getElementById('areaInfoBar').style.display = 'none';
-  document.getElementById('noAreaState').style.display = '';
-  document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
-  if (typeof logAudit === 'function') logAudit('training_exited');
-}
-
-function populateTrainingScenarios() {
-  if (typeof TRAINING_SCENARIOS === 'undefined' || !TRAINING_SCENARIOS) return;
-  const dd = document.getElementById('cfgTrainingScenario');
-  if (!dd) return;
-  dd.innerHTML = '';
-  TRAINING_SCENARIOS.forEach((s, i) => {
-    const opt = document.createElement('option');
-    opt.value = i;
-    opt.textContent = s.name || `Scenario ${i + 1}`;
-    dd.appendChild(opt);
-  });
-}
-
-// ============================================================
-// AUDIT TRAIL UI
-// ============================================================
-async function showAuditTrail() {
-  if (typeof getAuditTrail !== 'function') return;
-  const trail = await getAuditTrail();
-  const list = document.getElementById('auditTrailList');
-  if (!list) return;
-  if (!trail || trail.length === 0) {
-    list.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted);font-family:var(--font-mono);font-size:12px;">No audit trail entries.</div>';
-  } else {
-    let html = '<table style="width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:11px;">';
-    html += '<tr style="border-bottom:1px solid var(--border);color:var(--text-muted);font-size:9px;text-transform:uppercase;letter-spacing:1px;">' +
-      '<th style="padding:6px;text-align:left;">Time</th><th style="padding:6px;text-align:left;">Action</th>' +
-      '<th style="padding:6px;text-align:left;">Details</th></tr>';
-    const sorted = trail.slice().sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-    sorted.forEach(entry => {
-      const time = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '--';
-      const date = entry.timestamp ? new Date(entry.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
-      const details = entry.details ? JSON.stringify(entry.details).substring(0, 80) : '';
-      html += `<tr style="border-bottom:1px solid var(--border);">` +
-        `<td style="padding:6px;color:var(--text-muted);white-space:nowrap;">${date} ${time}</td>` +
-        `<td style="padding:6px;color:var(--accent-cyan);">${entry.action || '--'}</td>` +
-        `<td style="padding:6px;color:var(--text-secondary);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${details.replace(/"/g, '&quot;')}">${details}</td></tr>`;
-    });
-    html += '</table>';
-    list.innerHTML = html;
-  }
-  document.getElementById('auditTrailModal').classList.add('active');
-}
-
-function closeAuditTrailModal() {
-  document.getElementById('auditTrailModal').classList.remove('active');
-}
-
-async function exportAuditTrailAsCSV() {
-  if (typeof getAuditTrail !== 'function') return;
-  const trail = await getAuditTrail();
-  if (!trail || trail.length === 0) return alert('No audit trail to export.');
-  const headers = ['Timestamp', 'Action', 'Details'];
-  const rows = trail.map(e => [
-    e.timestamp ? new Date(e.timestamp).toISOString() : '',
-    e.action || '',
-    e.details ? JSON.stringify(e.details).replace(/"/g, '""') : '',
-  ]);
-  let csv = headers.join(',') + '\n';
-  rows.forEach(r => { csv += r.map(v => `"${v}"`).join(',') + '\n'; });
-  const blob = new Blob([csv], { type: 'text/csv' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url; a.download = `SAR_Audit_Trail_${new Date().toISOString().split('T')[0]}.csv`; a.click();
-  URL.revokeObjectURL(url);
-}
-
-async function clearAuditTrailUI() {
-  if (!confirm('Clear entire audit trail? This cannot be undone.')) return;
-  if (typeof clearAuditTrail === 'function') {
-    await clearAuditTrail();
-    alert('Audit trail cleared.');
-  }
 }
 
 // ============================================================
@@ -8509,12 +8278,10 @@ if (typeof module !== 'undefined' && module.exports) {
     fetchFireDanger, renderFirePerimeters, renderFireDangerCard,
     fetchNearbyAirports,
     initTimeBar, hideTimeBar,
-    renderTerrainFeatures, renderLZMarkers, generateAndRenderFlightPlan,
-    // Phase 6: SOP Profiles, Mission Logging, Training Mode, Audit Trail
+    renderTerrainFeatures, renderLZMarkers,
+    // Phase 6: SOP Profiles, Mission Logging
     loadSopProfile, saveSopProfileFromUI, deleteSopProfileFromUI, populateSopDropdown, updateSopThresholdFields,
     logMission, showMissionLogs, closeMissionLogModal, deleteMissionLogEntry, exportMissionLogsAsCSV,
-    enterTrainingMode, exitTrainingMode, populateTrainingScenarios,
-    showAuditTrail, closeAuditTrailModal, exportAuditTrailAsCSV, clearAuditTrailUI,
     // ADS-B
     ADSB_APIS, fetchAdsb, _adsbAttemptUrls, updateAdsbTrails, renderAdsbMap, renderAdsbTab,
     startAdsbPolling, stopAdsbPolling, toggleAdsbPolling, adsbAglColor,

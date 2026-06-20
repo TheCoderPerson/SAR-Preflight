@@ -61,11 +61,6 @@ function openDB() {
         ml.createIndex('timestamp', 'timestamp', { unique: false });
         ml.createIndex('areaKey', 'areaKey', { unique: false });
       }
-      if (!db.objectStoreNames.contains('auditTrail')) {
-        const at = db.createObjectStore('auditTrail', { keyPath: 'id', autoIncrement: true });
-        at.createIndex('timestamp', 'timestamp', { unique: false });
-        at.createIndex('action', 'action', { unique: false });
-      }
       // Version 3 store: saved observer viewsheds (mask + grid), scoped per area.
       if (!db.objectStoreNames.contains('viewsheds')) {
         const vs = db.createObjectStore('viewsheds', { keyPath: 'id' });
@@ -443,46 +438,6 @@ async function deleteMissionLog(id) {
   }
 }
 
-// --- Audit Trail ---
-
-function logAudit(action, details) {
-  openDB().then(db => {
-    const tx = db.transaction('auditTrail', 'readwrite');
-    tx.objectStore('auditTrail').add({ action, details, timestamp: Date.now() });
-  }).catch(e => {
-    console.warn('Audit log failed:', e);
-  });
-}
-
-async function getAuditTrail(limit) {
-  try {
-    const db = await openDB();
-    const tx = db.transaction('auditTrail', 'readonly');
-    const req = tx.objectStore('auditTrail').getAll();
-    return new Promise((resolve, reject) => {
-      req.onsuccess = () => {
-        const results = (req.result || []).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-        resolve(limit ? results.slice(0, limit) : results);
-      };
-      req.onerror = () => reject(req.error);
-    });
-  } catch (e) {
-    console.warn('Audit trail get failed:', e);
-    return [];
-  }
-}
-
-async function clearAuditTrail() {
-  try {
-    const db = await openDB();
-    const tx = db.transaction('auditTrail', 'readwrite');
-    tx.objectStore('auditTrail').clear();
-    return new Promise(resolve => { tx.oncomplete = resolve; });
-  } catch (e) {
-    console.warn('Audit trail clear failed:', e);
-  }
-}
-
 // --- Viewshed CRUD (saved observer viewsheds, keyPath 'id', area-scoped) ---
 
 async function saveViewshed(record) {
@@ -576,7 +531,6 @@ if (typeof module !== 'undefined' && module.exports) {
     requestNotificationPermission, checkAndNotify,
     saveSopProfile, getSopProfile, getAllSopProfiles, deleteSopProfile,
     saveMissionLog, getMissionLogs, getMissionLog, deleteMissionLog,
-    logAudit, getAuditTrail, clearAuditTrail,
     saveViewshed, getViewshed, getAllViewsheds, deleteViewshed, clearViewsheds,
   };
 }

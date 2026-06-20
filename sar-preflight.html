@@ -616,10 +616,6 @@ select.api-input { cursor: pointer; }
 </div>
 
 <div class="main">
-  <div id="trainingBanner" style="display:none;background:var(--accent-amber);color:#111;padding:6px 16px;font-family:var(--font-mono);font-size:12px;font-weight:700;text-align:center;letter-spacing:2px;z-index:1001;">
-    TRAINING MODE — <span id="trainingScenarioName"></span>
-    <button class="btn btn-ghost" onclick="exitTrainingMode()" style="margin-left:12px;padding:2px 8px;font-size:10px;color:#111;border-color:#111;">EXIT</button>
-  </div>
   <div class="map-container">
     <div id="map"></div>
     <div class="draw-toolbar" id="drawToolbar">
@@ -1114,13 +1110,6 @@ select.api-input { cursor: pointer; }
           </div>
         </div>
         <div class="data-section">
-          <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Other Aircraft</div>
-          <div class="data-grid">
-            <div class="data-cell full"><div class="data-label">Manned SAR Assets</div><div class="data-value sm" id="opsAircraft">Check with IC / dispatch</div></div>
-            <div class="data-cell full"><div class="data-label">Air Ambulance Corridors</div><div class="data-value sm" id="opsAmbulance">Verify with dispatch / AirComm</div></div>
-          </div>
-        </div>
-        <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>Wildlife Hazards</div>
           <div class="data-grid">
             <div class="data-cell full"><div class="data-label">Bird Strike Risk</div><div class="data-value" id="opsBirdRisk">--</div></div>
@@ -1137,28 +1126,6 @@ select.api-input { cursor: pointer; }
             <div class="data-cell"><div class="data-label">Swap At</div><div class="data-value" id="opsSwapTime">--</div></div>
             <div class="data-cell"><div class="data-label">Max Radius</div><div class="data-value" id="opsSwapRadius">--</div></div>
             <div class="data-cell full"><div class="data-label">Nearest LZ</div><div class="data-value sm" id="opsSwapLZ">--</div></div>
-          </div>
-        </div>
-        <div class="data-section">
-          <div class="data-section-title"><div class="indicator" style="background:var(--accent-blue)"></div>Flight Plan Suggestion</div>
-          <div class="data-grid">
-            <div class="data-cell">
-              <div class="data-label">Pattern</div>
-              <select class="api-input" id="cfgSearchPattern" style="font-size:11px;padding:4px;">
-                <option value="parallel">Parallel Track</option>
-                <option value="expanding_square">Expanding Square</option>
-                <option value="sector">Sector Search</option>
-              </select>
-            </div>
-            <div class="data-cell">
-              <div class="data-label">Track Spacing (m)</div>
-              <input class="api-input" id="cfgTrackSpacing" type="number" value="100" style="font-size:11px;padding:4px;">
-            </div>
-            <div class="data-cell full">
-              <button class="btn btn-primary" onclick="generateAndRenderFlightPlan()" style="width:100%;padding:5px;font-size:11px;">Generate Flight Plan</button>
-            </div>
-            <div class="data-cell"><div class="data-label">Distance</div><div class="data-value sm" id="opsPlanDist">--</div></div>
-            <div class="data-cell"><div class="data-label">Legs</div><div class="data-value sm" id="opsPlanLegs">--</div></div>
           </div>
         </div>
       </div>
@@ -1329,26 +1296,6 @@ select.api-input { cursor: pointer; }
             </div>
           </div>
         </div>
-        <div class="data-section">
-          <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Training Mode</div>
-          <div class="api-config">
-            <div class="data-label">Load Scenario</div>
-            <div style="display:flex;gap:6px;margin-top:6px;">
-              <select class="api-input" id="cfgTrainingScenario" style="flex:1;"></select>
-              <button class="btn btn-primary" onclick="enterTrainingMode(document.getElementById('cfgTrainingScenario').selectedIndex)" style="padding:4px 10px;font-size:10px;">Load</button>
-            </div>
-          </div>
-        </div>
-        <div class="data-section">
-          <div class="data-section-title"><div class="indicator" style="background:var(--text-muted)"></div>Audit Trail</div>
-          <div class="api-config">
-            <div style="display:flex;gap:6px;">
-              <button class="btn btn-ghost" onclick="showAuditTrail()">View Trail</button>
-              <button class="btn btn-ghost" onclick="exportAuditTrailAsCSV()">Export CSV</button>
-              <button class="btn btn-ghost" onclick="clearAuditTrailUI()" style="color:var(--accent-red);">Clear</button>
-            </div>
-          </div>
-        </div>
       </div>
     </div>
   </div>
@@ -1395,16 +1342,6 @@ select.api-input { cursor: pointer; }
     <div class="modal-actions">
       <button class="btn btn-primary" onclick="exportMissionLogsAsCSV()">Export CSV</button>
       <button class="btn btn-ghost" onclick="closeMissionLogModal()">Close</button>
-    </div>
-  </div>
-</div>
-
-<div class="modal-overlay" id="auditTrailModal">
-  <div class="modal" style="width:600px;max-height:85vh;">
-    <h3>Audit Trail</h3>
-    <div id="auditTrailList" style="overflow-y:auto;max-height:60vh;"></div>
-    <div class="modal-actions">
-      <button class="btn btn-ghost" onclick="closeAuditTrailModal()">Close</button>
     </div>
   </div>
 </div>
