@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.06.20-e — 2026-06-20
+
+- Added a "setup guide" link in Config → Data Sources → Data proxy URL that opens step-by-step instructions and code on GitHub for deploying your own free Cloudflare Worker data proxy.
+
 ## v2026.06.20-d — 2026-06-20
 
 - Added an in-app changelog: a "What's New" dialog now appears the first time you open the app after an update, with a link to the full changelog on GitHub.

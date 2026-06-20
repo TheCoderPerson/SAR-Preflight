@@ -19,6 +19,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.06.20-e',
+    date: '2026-06-20',
+    changes: [
+      'Added a "setup guide" link in Config → Data Sources → Data proxy URL that opens step-by-step instructions and code on GitHub for deploying your own free Cloudflare Worker data proxy.',
+    ],
+  },
+  {
     version: '2026.06.20-d',
     date: '2026-06-20',
     changes: [

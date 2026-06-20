@@ -1186,12 +1186,12 @@ select.api-input { cursor: pointer; }
             </div>
           </div>
           <div class="api-config">
-            <div class="data-label">Data proxy URL — canopy + live TFR/NOTAM (Cloudflare Worker — see tools/canopy-proxy)</div>
+            <div class="data-label">Data proxy URL — canopy + live TFR/NOTAM (Cloudflare Worker — <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">setup guide ↗</a>)</div>
             <div class="api-input-group">
               <input class="api-input" id="cfgCanopyProxy" type="text" placeholder="https://sar-canopy-proxy.you.workers.dev" onchange="saveCanopyProxy(this.value)" />
               <button class="btn btn-ghost" onclick="saveCanopyProxy(document.getElementById('cfgCanopyProxy').value)">Save</button>
             </div>
-            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">One self-hosted proxy serves CORS-blocked sources: Meta/WRI 1&nbsp;m canopy tiles (vegetation overlay &amp; viewshed), the FAA TFR GeoServer (live TFRs), and the FAA NOTAM Search backend (live NOTAMs) — TFRs/NOTAMs auto-fetched per area. NOTAMs come from an unofficial endpoint: treat as advisory and verify officially. Terrain (3DEP) works without the proxy; canopy is cached for offline use, live TFR/NOTAM need a connection.</div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">One self-hosted proxy serves CORS-blocked sources: Meta/WRI 1&nbsp;m canopy tiles (vegetation overlay &amp; viewshed), the FAA TFR GeoServer (live TFRs), and the FAA NOTAM Search backend (live NOTAMs) — TFRs/NOTAMs auto-fetched per area. NOTAMs come from an unofficial endpoint: treat as advisory and verify officially. Terrain (3DEP) works without the proxy; canopy is cached for offline use, live TFR/NOTAM need a connection. Don't have one? <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Set up your own free Cloudflare Worker ↗</a> (step-by-step instructions &amp; code).</div>
           </div>
         </div>
         <div class="data-section">

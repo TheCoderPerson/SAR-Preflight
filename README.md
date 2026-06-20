@@ -93,6 +93,51 @@ All data is fetched from free, public APIs. No API keys are required.
 - **Vegetation / viewshed:** the USGS 3DEP terrain DEM is read directly in-browser (CORS-enabled), so the viewshed works "bare-earth" with no setup. The Meta 1 m canopy tiles, however, are served from an AWS bucket that sends no CORS headers, so the canopy overlay and vegetation-aware viewshed require a small **self-hosted Cloudflare Worker** proxy (free tier; one-time setup — see [`tools/canopy-proxy/README.md`](tools/canopy-proxy/README.md)) whose URL is set in the Config tab. Viewed areas are cached in IndexedDB for offline use. The viewshed is a **modeled** line-of-sight from terrain + canopy and is not a substitute for legal VLOS or on-scene judgment.
 - **ADS-B traffic altitude:** each aircraft's AGL is its reported altitude minus the ground elevation *under the aircraft*, from USGS 3DEP (no proxy needed — 3DEP is CORS-enabled). A single coarse DEM (~110–360 m/cell, sized to the 15–50 NM traffic search radius) is fetched once per area and cached in IndexedDB for offline reuse; aircraft that are both low and close (below 1,500 ft AGL within 5 NM — the deconfliction-relevant set) are additionally refined to 3DEP's native resolution via a batched `getSamples` point query and tagged "(3DEP point)" in the popup. **Caveats:** the displayed **MSL is the raw barometric altitude** reported by the aircraft (referenced to the standard 29.92 inHg datum, *not* local pressure, so it can differ from true MSL on a non-standard-pressure day), and AGL over distant terrain is only as precise as the coarse cell. Treat traffic altitudes as advisory situational awareness, not deconfliction-grade values.
 
+## Data proxy setup (Cloudflare Worker)
+
+A few of the app's data sources can't be read directly from a browser — they either block cross-origin (CORS) requests or have to be driven server-side. A tiny, free **Cloudflare Worker** stands in front of them as a CORS proxy so the app can use them:
+
+- **Vegetation / canopy height** (Meta/WRI 1 m tiles) — powers the canopy overlay and the vegetation-aware viewshed
+- **Live TFRs** (FAA TFR GeoServer) — auto-fetched per operational area
+- **Live NOTAMs** (FAA NOTAM Search backend — *unofficial, advisory*) — auto-fetched per area
+- **Live ADS-B traffic** — routed through the proxy when configured, since the public providers increasingly block browser CORS
+
+The proxy is **optional**. Without it the terrain viewshed (USGS 3DEP) still works, and TFRs/NOTAMs fall back to deep-links + in-app file/paste import. It runs on Cloudflare's **free** Workers plan, which has **no usage-based billing** — if the daily request limit is ever hit it simply returns errors until the next day, so it can never run up a bill. Real SAR usage is a few hundred requests/day, far below the limit.
+
+The Worker source is **[`tools/canopy-proxy/worker.js`](tools/canopy-proxy/worker.js)**. Set it up one of two ways.
+
+### Option A — Cloudflare dashboard (no tools, ~5 min)
+
+1. Create a free Cloudflare account at [dash.cloudflare.com](https://dash.cloudflare.com).
+2. Go to **Workers & Pages → Create application → Create Worker.** Give it a name (e.g. `sar-canopy-proxy`), click **Deploy** to create the starter, then **Edit code**.
+3. Open **[`tools/canopy-proxy/worker.js`](tools/canopy-proxy/worker.js)** here on GitHub, click **Raw**, and copy the whole file. Paste it into the Worker editor, replacing the starter code.
+4. **Edit the `ALLOWED_ORIGINS` list** near the top so it includes the site you load the app from. The production GitHub Pages origin is already listed; add your own host (or `http://localhost:8000` for local testing) if you self-host. The Worker returns `403` to any other origin, so this step isn't optional when you host the app yourself.
+5. Click **Deploy**. Copy the Worker URL it shows — `https://sar-canopy-proxy.<your-subdomain>.workers.dev`.
+6. In the app, open **Config → Data Sources → Data proxy URL**, paste that URL, and click **Save**.
+
+### Option B — Wrangler CLI
+
+If you'd rather deploy from a terminal (and have Node installed):
+
+```bash
+npm i -g wrangler          # one-time
+wrangler login             # one-time, opens a browser
+cd tools/canopy-proxy
+wrangler deploy
+```
+
+`wrangler deploy` prints the Worker URL — paste it into **Config → Data Sources → Data proxy URL** in the app. Edit `ALLOWED_ORIGINS` in `worker.js` first if you host the app somewhere other than the preconfigured origins, then re-run `wrangler deploy`.
+
+### Security & abuse protection
+
+The Worker is locked down so it can't be misused or cost you money:
+
+- **Not an open proxy** — it only ever forwards the specific upstreams listed above (and rejects `..`), so it can't be repurposed to fetch arbitrary URLs.
+- **Origin allowlist** — requests whose `Origin`/`Referer` isn't in `ALLOWED_ORIGINS` get a `403`, so other sites can't hot-link it and burn your quota.
+- **No overage billing** — the free Workers plan has no usage-based charges (see above).
+
+For an extra layer you can add a **Rate limiting rule** in the Cloudflare dashboard (Security → WAF → Rate limiting rules) to cap requests per IP. Full details and a route-by-route breakdown are in **[`tools/canopy-proxy/README.md`](tools/canopy-proxy/README.md)**.
+
 ## Offline Use
 
 The app uses a service worker to cache resources for offline use. You can pre-download map tiles for your area of operations via the Settings tab. Previously fetched API data is cached in IndexedDB with configurable TTLs.
