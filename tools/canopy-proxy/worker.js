@@ -49,13 +49,15 @@ const ROUTES = [
   { prefix: '/blm/',  upstream: 'https://gis.blm.gov/',      cacheTtl: 86400 },
 ];
 
-// Only these origins may use the proxy. Add your dev origin while testing.
+// Only these origins may use the proxy. Add your production origin here if it
+// differs. Any localhost / 127.0.0.1 port is auto-allowed for local dev (see
+// isAllowedOrigin below), so you don't need to list local test ports.
 // NOTE: the offline single-file (opened via file://) sends no Origin and relies
 // on the IndexedDB cache, so it does not need to be listed.
 const ALLOWED_ORIGINS = new Set([
   'https://thecoderperson.github.io',    // GitHub Pages deployment (production)
   'https://sar-preflight-dev.pages.dev', // Cloudflare Pages (dev branch)
-  'http://localhost:8000',               // local testing (python -m http.server 8000)
+  'http://localhost:8000',               // (any localhost port is allowed anyway)
   'http://127.0.0.1:8000',
 ]);
 
@@ -65,7 +67,12 @@ const ALLOWED_ORIGINS = new Set([
 function isAllowedOrigin(origin) {
   if (ALLOWED_ORIGINS.has(origin)) return true;
   try {
-    const host = new URL(origin).host;
+    const url = new URL(origin);
+    // Local development on ANY port. A remote site cannot forge Origin: localhost
+    // (the browser always sets Origin to the real page origin), so this can't be
+    // hot-linked from another website — it only allows pages you serve locally.
+    if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') return true;
+    const host = url.host;
     if (host === 'sar-preflight-dev.pages.dev' || host.endsWith('.sar-preflight-dev.pages.dev')) return true;
   } catch (_) { /* ignore */ }
   return false;
