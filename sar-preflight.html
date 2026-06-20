@@ -1142,6 +1142,11 @@ select.api-input { cursor: pointer; }
             <button class="btn btn-primary" id="btnCheckUpdates" onclick="checkForUpdates()" style="padding:5px 12px;font-size:11px;">Check for Updates</button>
             <div id="updateCheckStatus" style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:6px;min-height:12px;">—</div>
           </div>
+          <div class="api-config">
+            <div class="data-label">Diagnostics</div>
+            <button class="btn btn-ghost" id="btnDiagnostics" onclick="showDiagnostics()" style="padding:5px 12px;font-size:11px;margin-top:4px;">View Diagnostics Report</button>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:6px;">Crash trace, breadcrumbs &amp; memory estimate — for troubleshooting.</div>
+          </div>
         </div>
         <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-cyan)"></div>Data Sources</div>

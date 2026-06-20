@@ -392,6 +392,9 @@ const Diag = {
 };
 try { if (typeof window !== 'undefined') window.SARDiag = Diag; } catch (_) {}
 
+// Open the diagnostics panel on demand (wired to the Config → App Version button).
+function showDiagnostics() { try { Diag.showPanel(); } catch (_) {} }
+
 const ADSB_APIS = [
   { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
   { name: 'airplanes.live', url: (lat, lon, dist) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${dist}` },
@@ -6310,7 +6313,7 @@ function acceptDisclaimer() {
 function startApp() {
   // Crash tracing must run as early as possible so the "did the previous
   // session exit cleanly?" check sees the prior flag before anything resets it.
-  try { Diag.init(); Diag.bindTrigger(); Diag.maybeAutoShow(); } catch (_) {}
+  try { Diag.init(); Diag.bindTrigger(); } catch (_) {}
   checkDisclaimer();
   initMap();
   resolveSectionalEdition();
