@@ -60,6 +60,27 @@ fs.copyFileSync(path.join(dir, 'manifest.json'), path.join(outDir, 'manifest.jso
 fs.copyFileSync(path.join(dir, 'icons', 'icon-192.svg'), path.join(iconsDir, 'icon-192.svg'));
 fs.copyFileSync(path.join(dir, 'icons', 'icon-512.svg'), path.join(iconsDir, 'icon-512.svg'));
 
+// Regenerate CHANGELOG.md from the single source of truth (CHANGELOG_ENTRIES in core.js)
+try {
+  const { CHANGELOG_ENTRIES } = require('./sar-preflight-core.js');
+  const md = [
+    '# Changelog', '',
+    'All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.',
+    '',
+    '> Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.',
+    '',
+  ];
+  for (const e of CHANGELOG_ENTRIES) {
+    md.push(`## v${e.version} — ${e.date}`, '');
+    for (const c of e.changes) md.push(`- ${c}`);
+    md.push('');
+  }
+  fs.writeFileSync(path.join(dir, 'CHANGELOG.md'), md.join('\n'), 'utf8');
+  console.log(`Regenerated CHANGELOG.md (${CHANGELOG_ENTRIES.length} versions)`);
+} catch (e) {
+  console.warn('CHANGELOG.md generation skipped:', e.message);
+}
+
 const htmlSize = Math.round(fs.statSync(path.join(outDir, 'sar-preflight.html')).size / 1024);
 const swSize = Math.round(fs.statSync(path.join(outDir, 'sw.js')).size / 1024);
 console.log(`Built dist/sar-preflight.html (${htmlSize} KB) + sw.js (${swSize} KB) + manifest.json + icons`);

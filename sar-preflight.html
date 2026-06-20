@@ -1137,6 +1137,7 @@ select.api-input { cursor: pointer; }
           <div class="api-config">
             <div class="data-label">Installed Version</div>
             <div id="appVersionDisplay" style="font-family:var(--font-mono);font-size:13px;color:var(--accent-cyan);margin-top:4px;">—</div>
+            <button class="btn btn-ghost" onclick="showChangelog(false)" style="padding:4px 10px;font-size:10px;margin-top:6px;">What's New / Changelog</button>
           </div>
           <div class="api-config">
             <button class="btn btn-primary" id="btnCheckUpdates" onclick="checkForUpdates()" style="padding:5px 12px;font-size:11px;">Check for Updates</button>
@@ -1362,6 +1363,17 @@ select.api-input { cursor: pointer; }
     </div>
     <div class="modal-actions" style="margin-top:16px;">
       <button class="btn btn-primary" onclick="acceptDisclaimer()">I Understand</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="changelogModal">
+  <div class="modal" style="width:560px;max-height:85vh;">
+    <h3 id="changelogTitle">Changelog</h3>
+    <div id="changelogBody" style="overflow-y:auto;max-height:55vh;margin-top:4px;"></div>
+    <div class="modal-actions" style="margin-top:16px;">
+      <a id="changelogGithubLink" href="https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md" target="_blank" rel="noopener" class="btn btn-ghost" style="text-decoration:none;">Full changelog on GitHub ↗</a>
+      <button class="btn btn-primary" onclick="closeChangelog()">Close</button>
     </div>
   </div>
 </div>

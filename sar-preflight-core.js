@@ -12,6 +12,37 @@ const WIRE_CATEGORIES = {
   aerialway:        { label: 'Aerialways',           color: '#AA00AA', weight: 3 },
 };
 
+// --- Changelog (single source of truth) ---
+// Newest first. The app renders the latest entry in a "What's New" dialog after an
+// update, and build.js regenerates CHANGELOG.md from this list for the GitHub page.
+// Keep CHANGELOG_ENTRIES[0].version in sync with SAR_VERSION in version.js.
+const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
+const CHANGELOG_ENTRIES = [
+  {
+    version: '2026.06.20-d',
+    date: '2026-06-20',
+    changes: [
+      'Added an in-app changelog: a "What\'s New" dialog now appears the first time you open the app after an update, with a link to the full changelog on GitHub.',
+      'Fixed "Check for Updates" so it accurately detects a newer version and prompts you to reload, instead of always reporting "up to date".',
+    ],
+  },
+  {
+    version: '2026.06.20-c',
+    date: '2026-06-20',
+    changes: [
+      'Moved the diagnostics report from an automatic popup to a "View Diagnostics Report" button in Config → App Version.',
+    ],
+  },
+  {
+    version: '2026.06.20-b',
+    date: '2026-06-20',
+    changes: [
+      'Removed the Flight Plan Suggestion and Other Aircraft sections from the Ops tab.',
+      'Removed the Training Mode and Audit Trail sections from the Config tab.',
+    ],
+  },
+];
+
 // --- Math Utilities ---
 
 function lerp(a, b, t) { return a + (b - a) * t; }
@@ -2190,7 +2221,7 @@ function metaToneClass(tone) {
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    WIRE_CATEGORIES, lerp, degToCompass, haversine, wmoCodeToText,
+    WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,
     calcSunPosition, calcMoonPhase, wireHazardName,
     DOF_LIGHTING, obstacleLighting, obstacleMarkerColor, obstacleLabel,

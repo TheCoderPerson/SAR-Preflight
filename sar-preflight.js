@@ -6308,6 +6308,7 @@ function checkDisclaimer() {
 function acceptDisclaimer() {
   localStorage.setItem('sar_disclaimer_version', APP_VERSION);
   document.getElementById('disclaimerModal')?.classList.remove('active');
+  if (S._pendingWhatsNew) { S._pendingWhatsNew = false; try { showChangelog(true); } catch (_) {} }
 }
 
 function startApp() {
@@ -6411,6 +6412,9 @@ function startApp() {
     const el = document.getElementById('notifyStatus');
     if (el) el.textContent = 'Enabled';
   }
+  // Show "What's New" if the running version changed since the last visit.
+  maybeShowWhatsNew();
+
   // App version labels are populated by version.js directly on DOMContentLoaded
   // so the display survives any earlier failure in startApp.
 }
@@ -6426,32 +6430,48 @@ function showUpdateBanner() {
   banner.parentElement.insertBefore(div, banner);
 }
 
+// Fetch the server's current version.js, bypassing the SW cache. The cache-busting
+// query makes the SW's cache-first match miss, so the request passes through to the
+// network and returns the *deployed* version (what a reload would actually load).
+async function fetchLatestVersion() {
+  try {
+    const r = await fetch('version.js?cb=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) return null;
+    const m = (await r.text()).match(/SAR_VERSION\s*=\s*'([^']+)'/);
+    return m ? m[1] : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function checkForUpdates() {
   const btn = document.getElementById('btnCheckUpdates');
   const status = document.getElementById('updateCheckStatus');
   if (!status) return;
 
-  if (!('serviceWorker' in navigator) || !S._swReg) {
-    status.textContent = 'Service worker not available';
-    status.style.color = 'var(--accent-amber)';
-    return;
-  }
-
   if (btn) btn.disabled = true;
   status.textContent = 'Checking…';
   status.style.color = 'var(--text-muted)';
 
+  const current = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : null;
   try {
-    await S._swReg.update();
-    // Give the browser a moment to start installing if there's an update
-    await new Promise(r => setTimeout(r, 1500));
+    // Nudge the service worker to fetch/install any new version so the reload is
+    // instant and works offline. We do NOT gate the result on reg.waiting/installing:
+    // the SW uses skipWaiting + clients.claim, so a new worker activates immediately
+    // and those go null — comparing versions is the only reliable signal.
+    if (S._swReg && S._swReg.update) { try { await S._swReg.update(); } catch (_) {} }
 
-    if (S._swReg.installing || S._swReg.waiting) {
-      status.textContent = 'Update found — installing. Reload banner will appear.';
+    const latest = await fetchLatestVersion();
+    if (!latest) {
+      status.textContent = 'Couldn’t reach the server — check your connection.';
+      status.style.color = 'var(--accent-amber)';
+    } else if (current && latest !== current) {
+      status.innerHTML = 'Update available: v' + latest +
+        ' — <a href="#" onclick="location.reload();return false;" style="color:var(--accent-cyan);text-decoration:underline;">reload to update</a>';
       status.style.color = 'var(--accent-cyan)';
+      showUpdateBanner();
     } else {
-      const ver = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : 'unknown';
-      status.textContent = `Up to date (v${ver})`;
+      status.textContent = 'Up to date (v' + (current || latest) + ')';
       status.style.color = 'var(--accent-green)';
     }
   } catch (err) {
@@ -6460,6 +6480,59 @@ async function checkForUpdates() {
   } finally {
     if (btn) btn.disabled = false;
   }
+}
+
+// Render the changelog modal. whatsNew=true titles it "What's New — v<current>"
+// (shown automatically after an update); false is the on-demand "Changelog" view.
+function showChangelog(whatsNew) {
+  const modal = document.getElementById('changelogModal');
+  const body = document.getElementById('changelogBody');
+  if (!modal || !body) return;
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const entries = (typeof CHANGELOG_ENTRIES !== 'undefined' && Array.isArray(CHANGELOG_ENTRIES)) ? CHANGELOG_ENTRIES : [];
+  const cur = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : '';
+  const title = document.getElementById('changelogTitle');
+  if (title) title.textContent = whatsNew ? ('What\'s New — v' + cur) : 'Changelog';
+  if (!entries.length) {
+    body.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">No changelog available.</div>';
+  } else {
+    body.innerHTML = entries.map(function (e) {
+      const isCur = e.version === cur;
+      const items = (e.changes || []).map(function (c) { return '<li style="margin-bottom:3px;">' + esc(c) + '</li>'; }).join('');
+      return '<div style="margin-bottom:14px;">' +
+        '<div style="font-family:var(--font-mono);font-size:12px;font-weight:700;color:' + (isCur ? 'var(--accent-cyan)' : 'var(--text-secondary)') + ';">' +
+        'v' + esc(e.version) + (isCur ? ' — current' : '') +
+        ' <span style="color:var(--text-muted);font-weight:400;">' + esc(e.date || '') + '</span></div>' +
+        '<ul style="margin:6px 0 0 0;padding-left:18px;font-size:12px;line-height:1.5;color:var(--text-secondary);">' + items + '</ul>' +
+        '</div>';
+    }).join('');
+  }
+  const link = document.getElementById('changelogGithubLink');
+  if (link && typeof CHANGELOG_URL !== 'undefined' && CHANGELOG_URL) link.href = CHANGELOG_URL;
+  modal.classList.add('active');
+}
+
+function closeChangelog() {
+  document.getElementById('changelogModal')?.classList.remove('active');
+}
+
+// Show "What's New" once, on the first load after the running version changes.
+// Skips the first-ever install (no prior version stored) and defers behind the
+// disclaimer modal if that's showing.
+function maybeShowWhatsNew() {
+  try {
+    const cur = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : null;
+    if (!cur) return;
+    const last = localStorage.getItem('sar_last_seen_version');
+    localStorage.setItem('sar_last_seen_version', cur);
+    if (!last || last === cur) return;
+    const disc = document.getElementById('disclaimerModal');
+    if (disc && disc.classList.contains('active')) {
+      S._pendingWhatsNew = true;
+    } else {
+      showChangelog(true);
+    }
+  } catch (_) {}
 }
 
 function downloadTilesForView() {
