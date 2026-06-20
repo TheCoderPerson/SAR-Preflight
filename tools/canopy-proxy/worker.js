@@ -46,17 +46,30 @@ const ROUTES = [
 // NOTE: the offline single-file (opened via file://) sends no Origin and relies
 // on the IndexedDB cache, so it does not need to be listed.
 const ALLOWED_ORIGINS = new Set([
-  'https://thecoderperson.github.io', // GitHub Pages deployment
-  'http://localhost:8000',            // local testing (python -m http.server 8000)
+  'https://thecoderperson.github.io',    // GitHub Pages deployment (production)
+  'https://sar-preflight-dev.pages.dev', // Cloudflare Pages (dev branch)
+  'http://localhost:8000',               // local testing (python -m http.server 8000)
   'http://127.0.0.1:8000',
 ]);
 
+// Cloudflare Pages serves the dev project at a stable URL plus a per-commit
+// preview subdomain (https://<hash>.sar-preflight-dev.pages.dev) — allow both.
+// NOTE: if your Pages project name differs, change the host string below.
+function isAllowedOrigin(origin) {
+  if (ALLOWED_ORIGINS.has(origin)) return true;
+  try {
+    const host = new URL(origin).host;
+    if (host === 'sar-preflight-dev.pages.dev' || host.endsWith('.sar-preflight-dev.pages.dev')) return true;
+  } catch (_) { /* ignore */ }
+  return false;
+}
+
 function allowedOriginFor(req) {
   const origin = req.headers.get('Origin');
-  if (origin && ALLOWED_ORIGINS.has(origin)) return origin;
+  if (origin && isAllowedOrigin(origin)) return origin;
   const ref = req.headers.get('Referer');
   if (ref) {
-    try { const o = new URL(ref).origin; if (ALLOWED_ORIGINS.has(o)) return o; } catch (_) { /* ignore */ }
+    try { const o = new URL(ref).origin; if (isAllowedOrigin(o)) return o; } catch (_) { /* ignore */ }
   }
   return null;
 }
