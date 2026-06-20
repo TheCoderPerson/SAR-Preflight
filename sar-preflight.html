@@ -472,6 +472,26 @@ select.api-input { cursor: pointer; }
 .fetch-status.partial { background: rgba(245,158,11,0.15); color: var(--accent-amber); }
 .fetch-status.expired { background: rgba(239,68,68,0.15); color: var(--accent-red); animation: pulse 1.5s infinite; }
 
+/* Per-section freshness line ("last updated · UPDATE") under each data header */
+.section-meta {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.5px;
+  color: var(--text-muted); margin: -4px 0 8px 14px; min-height: 16px;
+}
+.section-meta:empty { display: none; }
+.section-meta .section-updated { flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.section-meta.section-meta-live    .section-updated { color: var(--text-secondary); }
+.section-meta.section-meta-cached  .section-updated { color: var(--accent-amber); }
+.section-meta.section-meta-error   .section-updated { color: var(--accent-red); }
+.section-meta .section-update {
+  flex: 0 0 auto; padding: 2px 8px; font-family: var(--font-mono); font-size: 9px;
+  letter-spacing: 1px; text-transform: uppercase; border: 1px solid var(--border);
+  border-radius: 4px; background: transparent; color: var(--accent-cyan);
+  cursor: pointer; transition: all 0.15s;
+}
+.section-meta .section-update:hover:not(:disabled) { border-color: var(--accent-cyan); background: rgba(6,182,212,0.10); }
+.section-meta .section-update:disabled { opacity: 0.4; cursor: default; }
+
 /* ADS-B Traffic */
 .adsb-row { cursor: pointer; transition: background 0.15s; }
 .adsb-row:hover td { background: var(--bg-elevated) !important; }
@@ -716,6 +736,7 @@ select.api-input { cursor: pointer; }
             <div class="indicator" style="background:var(--accent-red)"></div>Active Weather Alerts
             <span class="fetch-status" id="alertStatus"></span>
           </div>
+          <div class="section-meta" id="meta_alerts"></div>
           <div id="alertList"></div>
         </div>
         <div class="data-section">
@@ -723,6 +744,7 @@ select.api-input { cursor: pointer; }
             <div class="indicator" style="background:var(--accent-cyan)"></div>Current Conditions
             <span class="fetch-status" id="wxStatus"></span>
           </div>
+          <div class="section-meta" id="meta_wx"></div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">Temperature</div><div class="data-value" id="wxTemp">--°F</div></div>
             <div class="data-cell"><div class="data-label">Feels Like</div><div class="data-value" id="wxFeels">--°F</div></div>
@@ -734,6 +756,7 @@ select.api-input { cursor: pointer; }
         </div>
         <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>Visibility &amp; Clouds</div>
+          <div class="section-meta" id="meta_vis"></div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">Visibility</div><div class="data-value" id="wxVis">-- mi</div></div>
             <div class="data-cell"><div class="data-label">Cloud Cover</div><div class="data-value" id="wxCloud">--%</div></div>
@@ -743,6 +766,7 @@ select.api-input { cursor: pointer; }
         </div>
         <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Precipitation &amp; Hazards</div>
+          <div class="section-meta" id="meta_precip"></div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">Precip Prob</div><div class="data-value" id="wxPrecip">--%</div></div>
             <div class="data-cell"><div class="data-label">Lightning Risk</div><div class="data-value" id="wxLightning">--</div></div>
@@ -754,6 +778,7 @@ select.api-input { cursor: pointer; }
         </div>
         <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-purple)"></div>Air Quality</div>
+          <div class="section-meta" id="meta_aqi"></div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">AQI (US)</div><div class="data-value" id="wxAQI">--</div></div>
             <div class="data-cell"><div class="data-label">PM2.5</div><div class="data-value sm" id="wxPM25">--</div></div>
@@ -763,6 +788,7 @@ select.api-input { cursor: pointer; }
         </div>
         <div class="data-section" id="forecastSection" style="display:none;">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-blue)"></div>24-Hour Forecast</div>
+          <div class="section-meta" id="meta_forecast"></div>
           <div id="forecastChart" style="width:100%;overflow-x:auto;"></div>
         </div>
       </div>
@@ -774,6 +800,7 @@ select.api-input { cursor: pointer; }
             <div class="indicator" style="background:var(--accent-cyan)"></div>Wind Profile by Altitude
             <span class="fetch-status" id="windStatus"></span>
           </div>
+          <div class="section-meta" id="meta_wind"></div>
           <table class="wind-table"><thead><tr><th>Altitude</th><th>Speed</th><th>Gusts</th><th>Direction</th></tr></thead>
             <tbody id="windTableBody">
               <tr><td>Ground</td><td>--</td><td>--</td><td>--</td></tr>
@@ -802,6 +829,7 @@ select.api-input { cursor: pointer; }
       <div id="tab-airspace" class="tab-panel" style="display:none;">
         <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-blue)"></div>Airspace Classification <span class="fetch-status" id="faaAirspaceStatus"></span></div>
+          <div class="section-meta" id="meta_airspace"></div>
           <div class="data-grid">
             <div class="data-cell full"><div class="data-label">Primary Airspace</div><div class="data-value" id="airClass">--</div></div>
             <div class="data-cell"><div class="data-label">LAANC Available</div><div class="data-value" id="airLAANC">--</div></div>
@@ -812,6 +840,7 @@ select.api-input { cursor: pointer; }
         </div>
         <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>Special Use Airspace</div>
+          <div class="section-meta" id="meta_sua"></div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">MOA</div><div class="data-value sm" id="airMOA">None</div></div>
             <div class="data-cell"><div class="data-label">Restricted</div><div class="data-value sm" id="airRestricted">None</div></div>
@@ -830,6 +859,7 @@ select.api-input { cursor: pointer; }
             <div class="indicator" style="background:var(--accent-cyan)"></div>Live ADS-B Traffic
             <span class="fetch-status" id="adsbStatus"></span>
           </div>
+          <div class="section-meta" id="meta_adsb"></div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">Aircraft Tracked</div><div class="data-value" id="adsbCount">--</div></div>
             <div class="data-cell"><div class="data-label">Search Radius</div><div class="data-value sm" id="adsbRadius">-- nm</div></div>
@@ -856,6 +886,7 @@ select.api-input { cursor: pointer; }
             <div class="indicator" style="background:var(--accent-green)"></div>Elevation Profile
             <span class="fetch-status" id="elevStatus"></span>
           </div>
+          <div class="section-meta" id="meta_elev"></div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">Min Elevation</div><div class="data-value" id="terrMin">-- ft</div></div>
             <div class="data-cell"><div class="data-label">Max Elevation</div><div class="data-value" id="terrMax">-- ft</div></div>
@@ -872,6 +903,7 @@ select.api-input { cursor: pointer; }
         </div>
         <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>Obstacles &amp; Hazards <span class="fetch-status" id="wireStatus"></span> <span class="fetch-status" id="obstacleStatus"></span> <span class="fetch-status" id="protectedAreasStatus"></span></div>
+          <div class="section-meta" id="meta_obstacles"></div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">Power Lines</div><div class="data-value sm" id="terrPower">Check imagery</div></div>
             <div class="data-cell"><div class="data-label">Cell Towers</div><div class="data-value sm" id="terrTowers">Check FAA OE</div></div>
@@ -891,6 +923,7 @@ select.api-input { cursor: pointer; }
         </div>
         <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>Canopy &amp; Visibility <span class="fetch-status" id="canopyStatus"></span></div>
+          <div class="section-meta" id="meta_canopy"></div>
           <div class="api-config">
             <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--text-secondary);">
               <input type="checkbox" id="canopyToggle" onchange="toggleCanopyOverlay()"> Vegetation height overlay (Meta 1&nbsp;m)
@@ -934,6 +967,7 @@ select.api-input { cursor: pointer; }
             <div class="indicator" style="background:var(--accent-amber)"></div>Solar
             <span class="fetch-status" id="astroStatus"></span>
           </div>
+          <div class="section-meta" id="meta_solar"></div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">Sunrise</div><div class="data-value" id="astSunrise">--</div></div>
             <div class="data-cell"><div class="data-label">Sunset</div><div class="data-value" id="astSunset">--</div></div>
@@ -979,6 +1013,7 @@ select.api-input { cursor: pointer; }
         </div>
         <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Space Weather</div>
+          <div class="section-meta" id="meta_spacewx"></div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">Kp Index</div><div class="data-value" id="satKp">--</div></div>
             <div class="data-cell"><div class="data-label">GPS Accuracy</div><div class="data-value sm" id="satAccuracy">--</div></div>
@@ -1055,7 +1090,11 @@ select.api-input { cursor: pointer; }
         </div>
 
         <!-- Fire danger cards render here (populated by fetchFireDanger) -->
-        <div id="fireDangerCards"></div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Fire Danger &amp; Active Fires</div>
+          <div class="section-meta" id="meta_fire"></div>
+          <div id="fireDangerCards"></div>
+        </div>
       </div>
 
       <!-- Ops Tab -->

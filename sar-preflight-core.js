@@ -2302,6 +2302,126 @@ function geojsonFeatureCollection(features) {
   return { type: 'FeatureCollection', features: (features || []).filter(Boolean) };
 }
 
+// ============================================================
+// SECTION FRESHNESS — pure helpers for the per-section
+// "last updated / cached / error" line + UPDATE button state.
+// All DOM-free and time-injected (nowMs / tz) so they unit-test
+// deterministically. Consumed by renderSectionMeta() in the app.
+// ============================================================
+
+// Absolute local time, e.g. "Jun 20, 10:45 AM". Returns an em-dash for
+// missing/invalid input. `tz` is an IANA zone (e.g. "America/Los_Angeles").
+function formatStamp(ms, nowMs, tz) {
+  if (ms == null || isNaN(ms)) return '—';
+  const opts = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
+  if (tz) opts.timeZone = tz;
+  try {
+    return new Date(ms).toLocaleString('en-US', opts);
+  } catch (e) {
+    // Bad/unknown tz — fall back to the host zone rather than throwing.
+    delete opts.timeZone;
+    return new Date(ms).toLocaleString('en-US', opts);
+  }
+}
+
+// Relative age bucket ("<1m" / "5m" / "2h" / "3d"). Mirrors offline.js
+// formatAge but takes explicit (ms, nowMs) so it stays pure. Empty string
+// for missing/future timestamps.
+function relAge(ms, nowMs) {
+  if (ms == null) return '';
+  const d = (nowMs == null ? 0 : nowMs) - ms;
+  if (!isFinite(d) || d < 0) return '';
+  if (d < 60000) return '<1m';
+  if (d < 3600000) return Math.round(d / 60000) + 'm';
+  if (d < 86400000) return Math.round(d / 3600000) + 'h';
+  return Math.round(d / 86400000) + 'd';
+}
+
+// Build the freshness line for one section.
+// meta: { status:'never'|'live'|'cached'|'error', updatedAt, cachedAt, error, errorAt, loading }
+// Returns { state, tone, text, ageText, title, canUpdate }.
+// Precedence: loading -> error -> cached -> live -> never.
+function buildSectionMetaLine(meta, nowMs, tz) {
+  meta = meta || {};
+  if (meta.loading) {
+    return { state: 'loading', tone: 'muted', text: 'Updating…', ageText: '', title: '', canUpdate: false };
+  }
+  const status = meta.status || 'never';
+  const upd = meta.updatedAt, cab = meta.cachedAt;
+  if (status === 'error') {
+    const at = meta.errorAt != null ? meta.errorAt : (upd != null ? upd : cab);
+    const failAge = relAge(at, nowMs);
+    const failFrag = failAge ? ' (' + failAge + ' ago)' : '';
+    const prior = upd != null ? upd : cab;
+    const text = prior != null
+      ? '⚠ Update failed' + failFrag + ' — showing ' + formatStamp(prior, nowMs, tz) + ' data'
+      : '⚠ Update failed' + failFrag + ' — no data';
+    return { state: 'error', tone: 'error', text, ageText: '', title: meta.error || '', canUpdate: true };
+  }
+  if (status === 'cached' && cab != null) {
+    const age = relAge(cab, nowMs);
+    const ageText = age ? '(' + age + ' ago)' : '';
+    const text = 'Cached ' + formatStamp(cab, nowMs, tz) + (ageText ? ' ' + ageText : '');
+    return { state: 'cached', tone: 'cached', text, ageText, title: meta.error || '', canUpdate: true };
+  }
+  if (upd != null) {
+    const age = relAge(upd, nowMs);
+    const ageText = age ? '(' + age + ' ago)' : '';
+    const text = 'Updated ' + formatStamp(upd, nowMs, tz) + (ageText ? ' ' + ageText : '');
+    return { state: 'live', tone: 'live', text, ageText, title: '', canUpdate: true };
+  }
+  return { state: 'never', tone: 'muted', text: 'Not loaded', ageText: '', title: '', canUpdate: false };
+}
+
+// Roll up several sub-source metas (e.g. Obstacles = wire+DOF+protected,
+// Airspace = FAA+airports) into one meta-shaped object that
+// buildSectionMetaLine can consume. Worst-of tone (error > cached > live),
+// oldest timestamp so the header reflects its stalest piece. Adds `.detail`.
+function rollupSources(sources, nowMs) {
+  const names = Object.keys(sources || {});
+  if (!names.length) return { status: 'never' };
+  let anyError = false, anyCached = false, allLive = true;
+  let oldestUpdated = null, oldestCached = null, latestError = null, errMsg = null;
+  const detail = [];
+  for (const name of names) {
+    const s = sources[name] || {};
+    const st = s.status || 'never';
+    if (st === 'error') {
+      anyError = true; allLive = false;
+      if (s.errorAt != null && (latestError == null || s.errorAt > latestError)) latestError = s.errorAt;
+      errMsg = errMsg || s.error;
+    } else if (st === 'cached') {
+      anyCached = true; allLive = false;
+      if (s.cachedAt != null && (oldestCached == null || s.cachedAt < oldestCached)) oldestCached = s.cachedAt;
+    } else if (st === 'live') {
+      if (s.updatedAt != null && (oldestUpdated == null || s.updatedAt < oldestUpdated)) oldestUpdated = s.updatedAt;
+    } else {
+      allLive = false;
+    }
+    detail.push(name + ' ' + st);
+  }
+  let status = 'never';
+  if (anyError) status = 'error';
+  else if (anyCached) status = 'cached';
+  else if (allLive) status = 'live';
+  return {
+    status,
+    updatedAt: oldestUpdated,
+    cachedAt: oldestCached,
+    error: errMsg,
+    errorAt: latestError,
+    detail: detail.join(' · '),
+  };
+}
+
+// Tone -> CSS class for the freshness line.
+function metaToneClass(tone) {
+  if (tone === 'live') return 'section-meta-live';
+  if (tone === 'cached') return 'section-meta-cached';
+  if (tone === 'error') return 'section-meta-error';
+  return 'section-meta-muted';
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -2335,5 +2455,6 @@ if (typeof module !== 'undefined' && module.exports) {
     sunArrowsKml, windArrowsKml,
     KML_ICON_BASE, kmlColorToRgba, caltopoStyleProps, geojsonFolderFeature, geojsonMarkerFeature,
     geojsonShapeFeature, geojsonLineGeometry, geojsonPolygonGeometry, geojsonFeatureCollection,
+    formatStamp, relAge, buildSectionMetaLine, rollupSources, metaToneClass,
   };
 }

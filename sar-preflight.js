@@ -52,6 +52,9 @@ const S = {
   _viewshedPicking: false,
   // Automatic FAA TFR/NOTAM check status (for the NOTAMs-tab indicator)
   autoCheck: { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 },
+  // Per-section data freshness, keyed by SECTION_DEFS key:
+  // { status:'never'|'live'|'cached'|'error', updatedAt, cachedAt, error, errorAt, loading, sources? }
+  sectionMeta: {},
 };
 
 // ============================================================
@@ -903,6 +906,7 @@ async function processArea(layer, type) {
   computeOpsData();
   computeAssessment();
   showDataSourceStatus();
+  renderAllSectionMeta();
 
   // Background-cache the current FAA sectional for this area so it's available offline
   cacheSectionalForArea(bounds);
@@ -993,6 +997,167 @@ function showDataSourceStatus() {
 function refreshData() {
   if (typeof logAudit === 'function') logAudit('data_refreshed');
   if (S.areaCenter) processArea(S.currentArea, S.areaType.toLowerCase());
+}
+
+// ============================================================
+// PER-SECTION DATA FRESHNESS — "last updated / cached / error"
+// line + UPDATE button under each data-retrieving header.
+// State lives in S.sectionMeta[key]; the visible copy + button
+// state come from the pure builders in sar-preflight-core.js
+// (buildSectionMetaLine / rollupSources / metaToneClass).
+// ------------------------------------------------------------
+// `lines` lists the DOM containers (#meta_*) that show this
+// section's freshness. `button:true` adds an UPDATE button there
+// (once per fetch; a fetch shown in two tabs gets a button in
+// each). Siblings sharing a fetch read the same S.sectionMeta key
+// so their timestamps always agree.
+// ============================================================
+const SECTION_DEFS = {
+  weather: {
+    label: 'Weather', computes: 'both',
+    fetch: (c, b) => fetchWeather(c.lat, c.lng),
+    lines: [{ id: 'meta_wx', button: true }, { id: 'meta_vis' }, { id: 'meta_precip' },
+            { id: 'meta_forecast' }, { id: 'meta_wind', button: true }],
+  },
+  airQuality: {
+    label: 'Air Quality', computes: 'both',
+    fetch: (c, b) => fetchWeather(c.lat, c.lng), // AQI is bundled in the weather fetch
+    lines: [{ id: 'meta_aqi', button: true }],
+  },
+  spaceWx: {
+    label: 'Space Weather', computes: 'assessment',
+    fetch: () => fetchKpIndex(),
+    lines: [{ id: 'meta_spacewx', button: true }],
+  },
+  alerts: {
+    label: 'Weather Alerts', computes: 'assessment',
+    fetch: (c, b) => fetchNWSAlerts(c.lat, c.lng),
+    lines: [{ id: 'meta_alerts', button: true }],
+  },
+  airspace: {
+    label: 'Airspace', computes: 'assessment',
+    fetch: (c, b) => Promise.allSettled([fetchFAAairspace(b), fetchNearbyAirports(c, b)]),
+    lines: [{ id: 'meta_airspace', button: true }, { id: 'meta_sua' }],
+  },
+  elevation: {
+    label: 'Elevation', computes: 'both',
+    fetch: (c, b) => fetchElevation(c, b),
+    lines: [{ id: 'meta_elev', button: true }],
+  },
+  obstacles: {
+    label: 'Obstacles & Hazards', computes: 'ops',
+    fetch: (c, b) => Promise.allSettled([fetchWireHazards(b), fetchFaaObstacles(b), fetchProtectedAreas(b)]),
+    lines: [{ id: 'meta_obstacles', button: true }],
+  },
+  canopy: {
+    label: 'Canopy', computes: null, viewBased: true,
+    fetch: () => loadCanopyForView(),
+    lines: [{ id: 'meta_canopy', button: true }],
+  },
+  solar: {
+    label: 'Solar', computes: null,
+    fetch: (c, b) => fetchSunMoon(c.lat, c.lng),
+    lines: [{ id: 'meta_solar', button: true }],
+  },
+  adsb: {
+    label: 'ADS-B Traffic', computes: null, autoPoll: true,
+    fetch: () => fetchAdsb(),
+    lines: [{ id: 'meta_adsb', button: true }],
+  },
+  fireDanger: {
+    label: 'Fire Danger', computes: 'assessment',
+    fetch: (c, b) => fetchFireDanger(c.lat, c.lng, b),
+    lines: [{ id: 'meta_fire', button: true }],
+  },
+};
+
+// Can this section be refreshed right now? View-based layers (canopy) need a
+// map view; everything else needs an operational area drawn.
+function _sectionUpdatable(def) {
+  if (!def) return false;
+  if (def.viewBased) return !!S.map;
+  return !!S.areaCenter;
+}
+
+// Record a section's outcome. Fetches call this in each branch:
+//   success:  markSection(key, { status:'live', updatedAt: Date.now(), error: null })
+//   cached:   markSection(key, { status:'cached', cachedAt: rec.timestamp, error: msg })
+//   error:    markSection(key, { status:'error', error: msg })
+// Pass { source:'wire'|'dof'|... } to record one sub-source of a rollup header.
+function markSection(key, patch) {
+  patch = patch || {};
+  if (patch.status === 'error' && patch.errorAt == null) patch.errorAt = Date.now();
+  const cur = S.sectionMeta[key] || { status: 'never', updatedAt: null, cachedAt: null, error: null, errorAt: null };
+  if (patch.source) {
+    const src = patch.source;
+    const sub = Object.assign({}, patch); delete sub.source;
+    cur.sources = cur.sources || {};
+    cur.sources[src] = Object.assign(cur.sources[src] || {}, sub);
+  } else {
+    Object.assign(cur, patch);
+  }
+  S.sectionMeta[key] = cur;
+  if (typeof document !== 'undefined') renderSectionMeta(key);
+}
+
+// Paint the freshness line(s) + UPDATE button for one section.
+function renderSectionMeta(key) {
+  if (typeof document === 'undefined') return;
+  const def = SECTION_DEFS[key]; if (!def) return;
+  const meta = S.sectionMeta[key] || { status: 'never' };
+  const now = Date.now();
+  const tz = (typeof _localTZ === 'function') ? _localTZ() : undefined;
+  const source = meta.sources ? rollupSources(meta.sources, now) : meta;
+  if (meta.loading) source.loading = true;
+  const parts = buildSectionMetaLine(source, now, tz);
+  const enable = parts.canUpdate && _sectionUpdatable(def) && !meta.loading;
+  (def.lines || []).forEach(line => {
+    const el = document.getElementById(line.id);
+    if (!el) return;
+    el.className = 'section-meta ' + metaToneClass(parts.tone);
+    el.textContent = '';
+    const span = document.createElement('span');
+    span.className = 'section-updated';
+    span.textContent = parts.text;
+    if (parts.title) span.title = parts.title;
+    el.appendChild(span);
+    if (line.button) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'section-update';
+      btn.textContent = meta.loading ? '…' : 'UPDATE';
+      btn.disabled = !enable;
+      btn.addEventListener('click', () => updateSection(key));
+      el.appendChild(btn);
+    }
+  });
+}
+
+function renderAllSectionMeta() {
+  if (typeof document === 'undefined') return;
+  Object.keys(SECTION_DEFS).forEach(renderSectionMeta);
+}
+
+// UPDATE-button handler: re-fetch just this section's data.
+async function updateSection(key) {
+  const def = SECTION_DEFS[key]; if (!def) return;
+  if (!_sectionUpdatable(def)) return;
+  const meta = S.sectionMeta[key] || (S.sectionMeta[key] = { status: 'never' });
+  if (meta.loading) return; // re-entrancy guard
+  meta.loading = true;
+  renderSectionMeta(key);
+  try { if (typeof logAudit === 'function') logAudit('section_update', { section: key }); } catch (_) {}
+  try {
+    await def.fetch(S.areaCenter, S.areaBounds); // fetch's own branches mark live/cached/error
+    if (def.computes === 'ops' || def.computes === 'both') { if (typeof computeOpsData === 'function') computeOpsData(); }
+    if (def.computes === 'assessment' || def.computes === 'both') { if (typeof computeAssessment === 'function') computeAssessment(); }
+  } catch (e) {
+    markSection(key, { status: 'error', error: e && e.message ? e.message : String(e) });
+  } finally {
+    if (S.sectionMeta[key]) S.sectionMeta[key].loading = false;
+    renderSectionMeta(key);
+    if (typeof showDataSourceStatus === 'function') showDataSourceStatus();
+  }
 }
 
 // ============================================================
@@ -1116,6 +1281,7 @@ async function fetchWeather(lat, lng) {
       setStatus('wxStatus', 'live', 'LIVE');
       setStatus('windStatus', 'live', 'LIVE');
       clearDataSourceError('Weather');
+      markSection('weather', { status: 'live', updatedAt: Date.now(), error: null });
     }
 
     // Store hourly forecast data
@@ -1142,6 +1308,7 @@ async function fetchWeather(lat, lng) {
       setText('wxPM25', `${aqi.current.pm2_5?.toFixed(1)} µg/m³`);
       setText('wxPM10', `${aqi.current.pm10?.toFixed(1) ?? '--'} µg/m³`);
       setText('wxOzone', `${aqi.current.ozone?.toFixed(1) ?? '--'} µg/m³`);
+      markSection('airQuality', { status: 'live', updatedAt: Date.now(), error: null });
     }
 
     // Cache weather and AQI data to IndexedDB
@@ -1157,6 +1324,9 @@ async function fetchWeather(lat, lng) {
   } catch (err) {
     console.error('Weather fetch error:', err);
     recordDataSourceError('Weather', err);
+    const _wxErrMsg = err && err.message ? err.message : String(err);
+    markSection('weather', { status: 'error', error: _wxErrMsg });
+    markSection('airQuality', { status: 'error', error: _wxErrMsg });
     // Try cached weather data before showing ERROR
     if (typeof getCachedApiResponse === 'function') {
       try {
@@ -1181,6 +1351,7 @@ async function fetchWeather(lat, lng) {
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
           setStatus('wxStatus', badge, label);
           setStatus('windStatus', badge, label);
+          markSection('weather', { status: 'cached', cachedAt: cachedWx.timestamp, error: _wxErrMsg });
         } else {
           setStatus('wxStatus', 'error', 'ERROR');
           setStatus('windStatus', 'error', 'ERROR');
@@ -1189,6 +1360,7 @@ async function fetchWeather(lat, lng) {
         if (cachedAqi && cachedAqi.data && cachedAqi.data.current) {
           setText('wxAQI', `${cachedAqi.data.current.us_aqi}`);
           setColor('wxAQI', cachedAqi.data.current.us_aqi < 50 ? 'green' : cachedAqi.data.current.us_aqi < 100 ? 'amber' : 'red');
+          markSection('airQuality', { status: 'cached', cachedAt: cachedAqi.timestamp, error: _wxErrMsg });
         }
       } catch (cacheErr) {
         console.warn('Weather cache fallback failed:', cacheErr);
@@ -1250,8 +1422,11 @@ async function fetchKpIndex() {
     // Cache Kp data
     if (typeof cacheApiResponse === 'function') cacheApiResponse('kp', 'global', data);
     if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+    markSection('spaceWx', { status: 'live', updatedAt: Date.now(), error: null });
   } catch(e) {
     console.warn('Kp fetch failed', e);
+    const _kpErrMsg = e && e.message ? e.message : String(e);
+    markSection('spaceWx', { status: 'error', error: _kpErrMsg });
     // Try cached Kp data
     if (typeof getCachedApiResponse === 'function') {
       try {
@@ -1264,6 +1439,7 @@ async function fetchKpIndex() {
           setColor('satKp', kp <= 3 ? 'green' : kp <= 5 ? 'amber' : 'red');
           setText('satAccuracy', kp <= 3 ? '< 2m horizontal' : '2-5m horizontal');
           setText('satAssessment', kp <= 3 ? 'Nominal — good GNSS conditions' : kp <= 5 ? 'Marginal — monitor positioning' : 'Degraded — expect position errors');
+          markSection('spaceWx', { status: 'cached', cachedAt: cached.timestamp, error: _kpErrMsg });
         }
       } catch (cacheErr) { console.warn('Kp cache fallback failed:', cacheErr); }
     }
@@ -1577,9 +1753,12 @@ async function fetchElevation(center, bounds) {
 
     setStatus('elevStatus', 'live', 'LIVE');
     clearDataSourceError('Elevation');
+    markSection('elevation', { status: 'live', updatedAt: Date.now(), error: null });
   } catch (err) {
     console.error('Elevation fetch error:', err);
     recordDataSourceError('Elevation', err);
+    const _elevErrMsg = err && err.message ? err.message : String(err);
+    markSection('elevation', { status: 'error', error: _elevErrMsg });
     // Try cached elevation data
     if (typeof getCachedApiResponse === 'function') {
       try {
@@ -1601,6 +1780,7 @@ async function fetchElevation(center, bounds) {
           const badge = cached.status === 'stale' ? 'cached' : 'expired';
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
           setStatus('elevStatus', badge, label);
+          markSection('elevation', { status: 'cached', cachedAt: cached.timestamp, error: _elevErrMsg });
         } else {
           setStatus('elevStatus', 'error', 'ERROR');
         }
@@ -1675,10 +1855,13 @@ async function fetchSunMoon(lat, lng) {
 
       setStatus('astroStatus', 'live', 'LIVE');
       clearDataSourceError('Sun/Moon');
+      markSection('solar', { status: 'live', updatedAt: Date.now(), error: null });
     }
   } catch (err) {
     console.error('Sun/Moon fetch error:', err);
     recordDataSourceError('Sun/Moon', err);
+    const _astroErrMsg = err && err.message ? err.message : String(err);
+    markSection('solar', { status: 'error', error: _astroErrMsg });
     // Try cached sunrise data
     if (typeof getCachedApiResponse === 'function') {
       try {
@@ -1697,6 +1880,7 @@ async function fetchSunMoon(lat, lng) {
           const badge = cached.status === 'stale' ? 'cached' : 'expired';
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
           setStatus('astroStatus', badge, label);
+          markSection('solar', { status: 'cached', cachedAt: cached.timestamp, error: _astroErrMsg });
         } else {
           setStatus('astroStatus', 'error', 'ERROR');
         }
@@ -2471,9 +2655,11 @@ async function fetchFireDanger(lat, lng, bounds) {
     renderFireDangerCard(fires, fireDanger, lat, lng);
 
     clearDataSourceError('Fire Danger');
+    markSection('fireDanger', { status: 'live', updatedAt: Date.now(), error: null });
   } catch (err) {
     console.warn('Fire danger fetch failed:', err);
     recordDataSourceError('Fire Danger', err);
+    markSection('fireDanger', { status: 'error', error: err && err.message ? err.message : String(err) });
   } finally {
     trackFetchEnd('Fire Danger');
   }
@@ -2722,6 +2908,10 @@ async function fetchNearbyAirports(center, bounds) {
         renderAirportMarkers(center.lat, center.lng);
         computeAirspace(center.lat, center.lng);
         clearDataSourceError('Airports');
+        const _aptFresh = cached.status === 'fresh';
+        markSection('airspace', _aptFresh
+          ? { source: 'airports', status: 'live', updatedAt: cached.timestamp, error: null }
+          : { source: 'airports', status: 'cached', cachedAt: cached.timestamp, error: null });
         trackFetchEnd('Airports');
         return;
       }
@@ -2762,9 +2952,11 @@ async function fetchNearbyAirports(center, bounds) {
     renderAirportMarkers(center.lat, center.lng);
     computeAirspace(center.lat, center.lng);
     clearDataSourceError('Airports');
+    markSection('airspace', { source: 'airports', status: 'live', updatedAt: Date.now(), error: null });
   } catch (err) {
     console.warn('Airport fetch failed:', err);
     recordDataSourceError('Airports', err);
+    markSection('airspace', { source: 'airports', status: 'error', error: err && err.message ? err.message : String(err) });
     S.nearbyAirports = [];
   } finally {
     trackFetchEnd('Airports');
@@ -2926,9 +3118,12 @@ async function fetchNWSAlerts(lat, lng) {
     } else {
       setStatus('alertStatus', 'live', 'CLEAR');
     }
+    markSection('alerts', { status: 'live', updatedAt: Date.now(), error: null });
   } catch (err) {
     console.error('NWS Alerts fetch error:', err);
     recordDataSourceError('NWS Alerts', err);
+    const _alertErrMsg = err && err.message ? err.message : String(err);
+    markSection('alerts', { status: 'error', error: _alertErrMsg });
     // Try cached NWS alerts data
     if (typeof getCachedApiResponse === 'function') {
       try {
@@ -2953,6 +3148,7 @@ async function fetchNWSAlerts(lat, lng) {
           const badge = cached.status === 'stale' ? 'cached' : 'expired';
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
           setStatus('alertStatus', badge, label);
+          markSection('alerts', { status: 'cached', cachedAt: cached.timestamp, error: _alertErrMsg });
         } else {
           S.nwsAlerts = [];
           renderNWSAlertCards();
@@ -3078,9 +3274,12 @@ async function fetchFAAairspace(bounds) {
     clearDataSourceError('FAA Airspace');
     setStatus('faaAirspaceStatus', 'live', 'LIVE');
     buildLayerControl();
+    markSection('airspace', { source: 'faa', status: 'live', updatedAt: Date.now(), error: null });
   } catch (err) {
     console.error('FAA Airspace fetch error:', err);
     recordDataSourceError('FAA Airspace', err);
+    const _airErrMsg = err && err.message ? err.message : String(err);
+    markSection('airspace', { source: 'faa', status: 'error', error: _airErrMsg });
     // Try cached data
     if (typeof getCachedApiResponse === 'function') {
       try {
@@ -3093,6 +3292,7 @@ async function fetchFAAairspace(bounds) {
           const age = Date.now() - cached.timestamp;
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
           setStatus('faaAirspaceStatus', 'cached', label);
+          markSection('airspace', { source: 'faa', status: 'cached', cachedAt: cached.timestamp, error: _airErrMsg });
         } else {
           setStatus('faaAirspaceStatus', 'error', 'ERROR');
         }
@@ -3265,9 +3465,12 @@ async function fetchFaaObstacles(bounds) {
     // maxRecordCount on the service is 2000; flag if a large AO was clipped.
     setStatus('obstacleStatus', 'live', n >= 2000 ? '2000+ (clipped)' : `${n}`);
     buildLayerControl();
+    markSection('obstacles', { source: 'dof', status: 'live', updatedAt: Date.now(), error: null });
   } catch (err) {
     console.error('FAA Obstacles fetch error:', err);
     recordDataSourceError('FAA Obstacles', err);
+    const _dofErrMsg = err && err.message ? err.message : String(err);
+    markSection('obstacles', { source: 'dof', status: 'error', error: _dofErrMsg });
     if (typeof getCachedApiResponse === 'function') {
       try {
         const cached = await getCachedApiResponse('faa_obstacles', cacheKey);
@@ -3280,6 +3483,7 @@ async function fetchFaaObstacles(bounds) {
           const age = Date.now() - cached.timestamp;
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
           setStatus('obstacleStatus', 'cached', label);
+          markSection('obstacles', { source: 'dof', status: 'cached', cachedAt: cached.timestamp, error: _dofErrMsg });
         } else {
           setStatus('obstacleStatus', 'error', 'ERROR');
         }
@@ -3389,9 +3593,12 @@ async function fetchProtectedAreas(bounds) {
     const total = data.dams.length + data.wilderness.length + data.nationalParks.length;
     setStatus('protectedAreasStatus', 'live', total > 0 ? `${total} FOUND` : 'CLEAR');
     buildLayerControl();
+    markSection('obstacles', { source: 'protected', status: 'live', updatedAt: Date.now(), error: null });
   } catch (err) {
     console.error('Protected Areas fetch error:', err);
     recordDataSourceError('Protected Areas', err);
+    const _protErrMsg = err && err.message ? err.message : String(err);
+    markSection('obstacles', { source: 'protected', status: 'error', error: _protErrMsg });
     // Try cached data
     if (typeof getCachedApiResponse === 'function') {
       try {
@@ -3406,6 +3613,7 @@ async function fetchProtectedAreas(bounds) {
           const age = Date.now() - cached.timestamp;
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
           setStatus('protectedAreasStatus', 'cached', label);
+          markSection('obstacles', { source: 'protected', status: 'cached', cachedAt: cached.timestamp, error: _protErrMsg });
         } else {
           setStatus('protectedAreasStatus', 'error', 'ERROR');
         }
@@ -3650,9 +3858,12 @@ async function fetchWireHazards(bounds) {
 
     setStatus('wireStatus', 'live', `${total + towerCount} FEATURES`);
     clearDataSourceError('Wire Hazards');
+    markSection('obstacles', { source: 'wire', status: 'live', updatedAt: Date.now(), error: null });
   } catch (err) {
     console.error('Wire hazard fetch error:', err);
     recordDataSourceError('Wire Hazards', err);
+    const _wireErrMsg = err && err.message ? err.message : String(err);
+    markSection('obstacles', { source: 'wire', status: 'error', error: _wireErrMsg });
     // Try cached overpass data
     if (typeof getCachedApiResponse === 'function') {
       try {
@@ -3683,6 +3894,7 @@ async function fetchWireHazards(bounds) {
           const badge = cached.status === 'stale' ? 'cached' : 'expired';
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
           setStatus('wireStatus', badge, `${total} FEAT ${label}`);
+          markSection('obstacles', { source: 'wire', status: 'cached', cachedAt: cached.timestamp, error: _wireErrMsg });
         } else {
           setStatus('wireStatus', 'error', 'ERROR');
         }
@@ -4047,6 +4259,7 @@ async function fetchAdsb() {
     renderAdsbTab(usedApi);
     refineLowCloseAdsbAgl(); // sharpen AGL for low+close traffic via 3DEP point sampling (non-blocking)
     clearDataSourceError('ADS-B');
+    markSection('adsb', { status: 'live', updatedAt: S._adsbLastFetch, error: null });
     const now = new Date();
     const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: _localTZ() });
     setStatus('adsbStatus', 'live', aircraft.length + ' AIRCRAFT \u2022 ' + timeStr);
@@ -4054,6 +4267,7 @@ async function fetchAdsb() {
     if (pollEl) pollEl.textContent = 'Updated ' + timeStr;
   } catch (err) {
     recordDataSourceError('ADS-B', err);
+    markSection('adsb', { status: 'error', error: err && err.message ? err.message : String(err) });
     // Both the proxy /adsb route and the direct providers are unreachable
     // (CORS / upstream 5xx). Polling continues, so it will retry automatically.
     setStatus('adsbStatus', 'error', 'UNAVAILABLE — RETRYING');
@@ -6130,11 +6344,14 @@ function saveConfig() {
   if (typeof logAudit === 'function') logAudit('config_changed', { aircraft: ac, maxWind: maxWind });
 }
 
+let _metaTick = 0;
 function updateClock() {
   const now = new Date();
   const local = now.toLocaleTimeString('en-US', { hour12: false, timeZone: _localTZ() });
   const utc = now.toISOString().substr(11, 8);
   document.getElementById('clockDisplay').textContent = `${local} L / ${utc} Z`;
+  // Refresh the per-section "(Xm ago)" ages every ~30s (cheap; text only).
+  if ((++_metaTick % 30) === 0 && typeof renderAllSectionMeta === 'function') renderAllSectionMeta();
 }
 
 // ============================================================
@@ -6170,6 +6387,7 @@ function startApp() {
   resolveSectionalEdition();
   updateClock();
   setInterval(updateClock, 1000);
+  renderAllSectionMeta(); // show "Not loaded" freshness lines before an area is drawn
   const tabNav = document.getElementById('tabNav');
   tabNav.addEventListener('scroll', updateScrollBtns);
   setTimeout(updateScrollBtns, 100);
@@ -7863,6 +8081,7 @@ async function loadCanopyForView() {
       // decode and only blur at that scale — guide the user to zoom in rather
       // than crash. On desktop there's no memory ceiling, so we always fetch.
       setStatus('canopyStatus', 'error', 'ZOOM IN');
+      markSection('canopy', { status: 'error', error: 'Zoom in to load 1 m canopy for this view' });
       try { Diag.note('canopy.skip', { halfKm: Math.round(halfWidthM / 100) / 10 }); } catch (_) {}
       const cbz = document.getElementById('canopyToggle'); if (cbz) cbz.checked = false;
       if (S._overlayWanted) S._overlayWanted.canopy = false;
@@ -7874,6 +8093,7 @@ async function loadCanopyForView() {
     const { canopyFlat, source, tilesFailed, tilesLoaded, tilesTotal } = await fetchCanopyRaster(grid);
     if (!canopyFlat) {
       setStatus('canopyStatus', 'error', source === 'no proxy' ? 'NO PROXY' : 'NO DATA');
+      markSection('canopy', { status: 'error', error: source === 'no proxy' ? 'No canopy proxy configured' : 'No canopy data for this view' });
       const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = false;
       return;
     }
@@ -7889,12 +8109,15 @@ async function loadCanopyForView() {
     } else {
       setStatus('canopyStatus', cached ? 'cached' : 'live', cached ? 'CACHED' : 'LIVE');
     }
+    // Canopy is view-based; record when this view's overlay was loaded.
+    markSection('canopy', { status: 'live', updatedAt: Date.now(), error: null });
     const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = true;
     buildLayerControl();
   } catch (e) {
     console.error('Canopy overlay error:', e);
     recordDataSourceError('Canopy', e);
     setStatus('canopyStatus', 'error', 'ERROR');
+    markSection('canopy', { status: 'error', error: e && e.message ? e.message : String(e) });
   } finally {
     trackFetchEnd('Canopy');
   }
@@ -8297,5 +8520,7 @@ if (typeof module !== 'undefined' && module.exports) {
     startAdsbPolling, stopAdsbPolling, toggleAdsbPolling, adsbAglColor,
     ensureAdsbDem, adsbGroundElevFnFt, _adsbToRaw,
     refineLowCloseAdsbAgl, fetch3DEPPointElevations, _parseGetSamples, _adsbHiresKey, _isAdsbLowClose,
+    // Per-section data freshness
+    SECTION_DEFS, markSection, renderSectionMeta, renderAllSectionMeta, updateSection, _sectionUpdatable,
   };
 }
