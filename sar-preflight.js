@@ -1075,6 +1075,26 @@ const SECTION_DEFS = {
     fetch: (c, b) => fetchFireDanger(c.lat, c.lng, b),
     lines: [{ id: 'meta_fire', button: true }],
   },
+  groundAccess: {
+    label: 'Ground Access', computes: null,
+    fetch: (c, b) => fetchGroundAccess(b),
+    lines: [{ id: 'meta_ground', button: true }],
+  },
+  publicLands: {
+    label: 'Land Ownership', computes: 'assessment',
+    fetch: (c, b) => fetchPublicLands(b),
+    lines: [{ id: 'meta_land', button: true }],
+  },
+  water: {
+    label: 'Water', computes: null,
+    fetch: (c, b) => fetchWaterFeatures(b),
+    lines: [{ id: 'meta_water', button: true }],
+  },
+  hospitals: {
+    label: 'Hospitals & LZs', computes: null,
+    fetch: (c, b) => fetchHospitals(b),
+    lines: [{ id: 'meta_hospitals', button: true }],
+  },
 };
 
 // Can this section be refreshed right now? View-based layers (canopy) need a
@@ -3791,6 +3811,31 @@ function _renderVectorLayer(mapId, features, styleFor, popupFor) {
   return n;
 }
 
+// Derive a section-meta status from a set of _fetchGeoJsonLayer results + record it.
+function _markSectionFromResults(key, results, noProxyMsg) {
+  let live = false, cached = false, cachedAt = null, err = null, noProxy = false;
+  (results || []).forEach(r => {
+    if (!r) return;
+    if (r.features && !r.fromCache) live = true;
+    else if (r.features && r.fromCache) { cached = true; if (r.cachedAt) cachedAt = cachedAt ? Math.min(cachedAt, r.cachedAt) : r.cachedAt; }
+    if (r.error === 'no-proxy') noProxy = true;
+    else if (r.error) err = r.error;
+  });
+  if (typeof markSection !== 'function') return;
+  if (live) markSection(key, { status: 'live', updatedAt: Date.now(), error: null });
+  else if (cached) markSection(key, { status: 'cached', cachedAt: cachedAt || Date.now(), error: null });
+  else if (noProxy) markSection(key, { status: 'error', error: noProxyMsg || 'Needs data proxy (Config)' });
+  else markSection(key, { status: 'error', error: err || 'No data' });
+}
+// Mirror a section's recorded status onto its title fetch-status pill.
+function _syncStatusFromMeta(statusId, key) {
+  const m = S.sectionMeta && S.sectionMeta[key];
+  if (!m) return;
+  const map = { live: ['live', 'LIVE'], cached: ['cached', 'CACHED'], error: ['error', 'ERROR'], never: ['', ''] };
+  const [cls, txt] = map[m.status] || map.never;
+  setStatus(statusId, cls, txt);
+}
+
 // --- Popup/style builders for ground-access layers ---
 function _usfsRoadPopup(p) {
   const num = _prop(p, 'ID', 'id'), name = _prop(p, 'NAME', 'name');
@@ -3844,7 +3889,9 @@ function _blmGtlfPopup(p) {
 // Forest roads/trails + MVUM (USFS) and BLM motorized routes — all via the proxy.
 async function fetchGroundAccess(bounds) {
   trackFetchStart('Ground Access');
+  setStatus('groundAccessStatus', 'loading', 'Fetching...');
   const cacheKey = _bboxCacheKey(bounds);
+  const allResults = [];
   try {
     const specs = [
       { mapId: 'usfs_roads', url: _govArcgisUrl('/usfs/', 'arcx/rest/services/EDW/EDW_RoadBasic_01/MapServer', '0', bounds, '*'),
@@ -3859,6 +3906,7 @@ async function fetchGroundAccess(bounds) {
     const results = await Promise.allSettled(specs.map(s => _fetchGeoJsonLayer(s.mapId, cacheKey, s.url)));
     specs.forEach((s, i) => {
       const r = results[i].status === 'fulfilled' ? results[i].value : null;
+      allResults.push(r);
       if (r && r.features) _renderVectorLayer(s.mapId, r.features, s.style, s.popup);
     });
     // BLM GTLF — motorized roads (layer 0) + trails (layer 2) merged into one layer.
@@ -3867,10 +3915,20 @@ async function fetchGroundAccess(bounds) {
       _fetchGeoJsonLayer('blm_gtlf', 'roads_' + cacheKey, _govArcgisUrl('/blm/', gtlfBase, '0', bounds, '*')),
       _fetchGeoJsonLayer('blm_gtlf', 'trails_' + cacheKey, _govArcgisUrl('/blm/', gtlfBase, '2', bounds, '*')),
     ]);
+    allResults.push(gr, gt);
     if ((gr && gr.features) || (gt && gt.features)) {
       const merged = [].concat((gr && gr.features) || [], (gt && gt.features) || []);
       _renderVectorLayer('blm_gtlf', merged, _blmGtlfStyle, _blmGtlfPopup);
     }
+    // Readout + freshness
+    const cnt = id => (S.mapLayers[id] && S.mapLayers[id].getLayers) ? S.mapLayers[id].getLayers().length : 0;
+    const roads = cnt('usfs_roads'), trails = cnt('usfs_trails'), mvum = cnt('mvum_roads') + cnt('mvum_trails'), blm = cnt('blm_gtlf');
+    const total = roads + trails + mvum + blm;
+    setText('terrGroundAccess', total
+      ? `Roads ${roads} · Trails ${trails} · MVUM ${mvum} · BLM ${blm}`
+      : (getCanopyProxyBase() ? 'None found in area' : 'Needs data proxy (set in Config)'));
+    _markSectionFromResults('groundAccess', allResults);
+    _syncStatusFromMeta('groundAccessStatus', 'groundAccess');
     buildLayerControl();
   } finally {
     trackFetchEnd('Ground Access');
@@ -3910,6 +3968,7 @@ function computeLandStatus(features) {
 }
 async function fetchPublicLands(bounds) {
   trackFetchStart('Public Lands');
+  setStatus('publicLandsStatus', 'loading', 'Fetching...');
   const cacheKey = _bboxCacheKey(bounds);
   const url = _govArcgisUrl('/blm/', 'arcgis/rest/services/lands/BLM_Natl_SMA_LimitedScale/MapServer', '1', bounds,
     'ADMIN_AGENCY_CODE,ADMIN_DEPT_CODE,ADMIN_UNIT_NAME', { resultRecordCount: 4000 });
@@ -3922,6 +3981,15 @@ async function fetchPublicLands(bounds) {
     } else {
       S.publicLands = null; S.landStatus = null;
     }
+    if (S.landStatus && S.landStatus.sampled > 0) {
+      const pub = Math.round((1 - S.landStatus.privateFrac) * 100);
+      setText('terrLandOwnership', `Public ~${pub}% · Private ~${100 - pub}%`);
+    } else {
+      setText('terrLandOwnership', (r && r.features) ? 'No private land detected'
+        : (getCanopyProxyBase() ? 'No surface-mgmt data in area' : 'Needs data proxy (set in Config)'));
+    }
+    _markSectionFromResults('publicLands', [r]);
+    _syncStatusFromMeta('publicLandsStatus', 'publicLands');
     if (S.currentArea && typeof computeAssessment === 'function') computeAssessment();
     buildLayerControl();
   } finally {
@@ -3932,6 +4000,7 @@ async function fetchPublicLands(bounds) {
 // USGS NHD hydrography — streams/rivers (flowline) + lakes/reservoirs (waterbody).
 async function fetchWaterFeatures(bounds) {
   trackFetchStart('Water (NHD)');
+  setStatus('waterStatus', 'loading', 'Fetching...');
   const cacheKey = _bboxCacheKey(bounds);
   const base = 'https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer';
   try {
@@ -3960,6 +4029,10 @@ async function fetchWaterFeatures(bounds) {
         S.mapLayers.nhd_water.addLayer(layer);
       });
     }
+    const n = (S.mapLayers.nhd_water && S.mapLayers.nhd_water.getLayers) ? S.mapLayers.nhd_water.getLayers().length : 0;
+    setText('terrWater', n ? `${n} water features` : 'None found in area');
+    _markSectionFromResults('water', [flow, wb]);
+    _syncStatusFromMeta('waterStatus', 'water');
     buildLayerControl();
   } finally {
     trackFetchEnd('Water (NHD)');
@@ -3973,10 +4046,10 @@ const OVERPASS_MIRRORS = [
   'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ];
 function _renderHospitals(elements) {
-  if (typeof L === 'undefined') return 0;
+  if (typeof L === 'undefined') return { total: 0, hospitals: 0, helipads: 0 };
   if (S.mapLayers.hospitals) S.mapLayers.hospitals.clearLayers();
   else S.mapLayers.hospitals = L.layerGroup();
-  let n = 0;
+  let nH = 0, nL = 0;
   (elements || []).forEach(el => {
     const lat = el.lat != null ? el.lat : (el.center && el.center.lat);
     const lng = el.lon != null ? el.lon : (el.center && el.center.lon);
@@ -3996,12 +4069,13 @@ function _renderHospitals(elements) {
       + (isHeli ? '<br>Helicopter landing site' : (t.emergency === 'yes' ? '<br>Emergency department' : ''))
       + (t['addr:city'] ? `<br>${t['addr:city']}` : '');
     L.marker([lat, lng], { icon }).bindPopup(popup).addTo(S.mapLayers.hospitals);
-    n++;
+    if (isHeli) nL++; else nH++;
   });
-  return n;
+  return { total: nH + nL, hospitals: nH, helipads: nL };
 }
 async function fetchHospitals(bounds) {
   trackFetchStart('Hospitals');
+  setStatus('hospitalsStatus', 'loading', 'Fetching...');
   const cacheKey = _bboxCacheKey(bounds);
   const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
   const pad = 0.05; // widen so nearby trauma centers/helipads are included
@@ -4011,7 +4085,7 @@ async function fetchHospitals(bounds) {
     + `nwr["aeroway"="helipad"](${bbox});`
     + `nwr["emergency"="landing_site"](${bbox});`
     + `);out center tags;`;
-  let data = null;
+  let data = null, fromCache = false, cachedAt = null;
   try {
     if ((typeof isOnline !== 'function') || isOnline()) {
       for (const server of OVERPASS_MIRRORS) {
@@ -4024,9 +4098,19 @@ async function fetchHospitals(bounds) {
     }
     if (data) { if (typeof cacheApiResponse === 'function') cacheApiResponse('hospitals', cacheKey, data); }
     else if (typeof getCachedApiResponse === 'function') {
-      try { const c = await getCachedApiResponse('hospitals', cacheKey); if (c && c.data) data = c.data; } catch (_) { /* ignore */ }
+      try { const c = await getCachedApiResponse('hospitals', cacheKey); if (c && c.data) { data = c.data; fromCache = true; cachedAt = c.timestamp; } } catch (_) { /* ignore */ }
     }
-    if (data) _renderHospitals(data.elements || []);
+    let counts = { total: 0, hospitals: 0, helipads: 0 };
+    if (data) counts = _renderHospitals(data.elements || []);
+    setText('terrHospitals', data
+      ? (counts.total ? `${counts.hospitals} hospitals · ${counts.helipads} helipads` : 'None found in area')
+      : 'Unavailable (offline, no cache)');
+    if (typeof markSection === 'function') {
+      if (data && !fromCache) markSection('hospitals', { status: 'live', updatedAt: Date.now(), error: null });
+      else if (data && fromCache) markSection('hospitals', { status: 'cached', cachedAt: cachedAt || Date.now(), error: null });
+      else markSection('hospitals', { status: 'error', error: 'No data' });
+    }
+    _syncStatusFromMeta('hospitalsStatus', 'hospitals');
     buildLayerControl();
   } finally {
     trackFetchEnd('Hospitals');
@@ -8940,6 +9024,7 @@ if (typeof module !== 'undefined' && module.exports) {
     proxiedArcgis, _arcgisGeoJsonUrl, _govArcgisUrl, _envelopeGeom, _bboxCacheKey, _prop,
     fetchGroundAccess, fetchPublicLands, fetchWaterFeatures, fetchHospitals,
     _renderPublicLands, computeLandStatus, _renderHospitals,
+    _markSectionFromResults, _syncStatusFromMeta,
     loadCellCoverage, cellCoverageReadout, _pointInRegion, _ringsBBox,
     cacheCurrentView, gridForView, _cacheViewRaster, getSelectedTileProviders,
     initMap, startDraw, clearDrawBtns, clearArea, enterCoords,

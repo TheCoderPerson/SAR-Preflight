@@ -911,6 +911,35 @@ select.api-input { cursor: pointer; }
           </div>
         </div>
         <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-amber)"></div>Ground Access <span class="fetch-status" id="groundAccessStatus"></span></div>
+          <div class="section-meta" id="meta_ground"></div>
+          <div class="data-grid">
+            <div class="data-cell full"><div class="data-label">Roads / Trails / MVUM / BLM</div><div class="data-value sm" id="terrGroundAccess">Draw area to load</div></div>
+            <div class="data-cell full" style="padding-top:2px"><div class="data-value sm" style="font-size:10px;opacity:0.6;line-height:1.3">USFS forest roads/trails + Motor Vehicle Use Map &amp; BLM routes (via data proxy). Verify current designations on the official map.</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>Land Ownership <span class="fetch-status" id="publicLandsStatus"></span></div>
+          <div class="section-meta" id="meta_land"></div>
+          <div class="data-grid">
+            <div class="data-cell full"><div class="data-label">Surface Management (public vs private)</div><div class="data-value sm" id="terrLandOwnership">Draw area to load</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-blue)"></div>Water (Hydrography) <span class="fetch-status" id="waterStatus"></span></div>
+          <div class="section-meta" id="meta_water"></div>
+          <div class="data-grid">
+            <div class="data-cell full"><div class="data-label">Streams &amp; Lakes (USGS NHD)</div><div class="data-value sm" id="terrWater">Draw area to load</div></div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>Hospitals &amp; Landing Zones <span class="fetch-status" id="hospitalsStatus"></span></div>
+          <div class="section-meta" id="meta_hospitals"></div>
+          <div class="data-grid">
+            <div class="data-cell full"><div class="data-label">Trauma centers &amp; helipads (OSM)</div><div class="data-value sm" id="terrHospitals">Draw area to load</div></div>
+          </div>
+        </div>
+        <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-purple)"></div>Comms &amp; Connectivity</div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">Cell Coverage</div><div class="data-value sm" id="terrCell">--</div></div>
