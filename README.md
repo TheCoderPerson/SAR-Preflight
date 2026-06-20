@@ -14,6 +14,10 @@ The data displayed in this application may be incomplete, inaccurate, outdated, 
 
 https://thecoderperson.github.io/SAR-Preflight/sar-preflight.html
 
+## Changelog
+
+Version history is in [CHANGELOG.md](CHANGELOG.md). In the app, a **What's New** dialog appears after each update, and a **What's New / Changelog** button lives in Config → App Version.
+
 ## How to Use
 
 1. **Open the app** in a browser (desktop or mobile)
