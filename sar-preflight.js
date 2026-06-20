@@ -7013,6 +7013,10 @@ function startApp() {
   // Show "What's New" if the running version changed since the last visit.
   maybeShowWhatsNew();
 
+  // Anonymous, cookieless, country-level usage analytics (no-op until a token
+  // is set, offline, on file://, or when the user has opted out / set DNT).
+  initUsageAnalytics();
+
   // App version labels are populated by version.js directly on DOMContentLoaded
   // so the display survives any earlier failure in startApp.
 }
@@ -7284,6 +7288,18 @@ async function restoreConfig() {
   const proxyEl = document.getElementById('cfgCanopyProxy');
   if (proxyEl) proxyEl.value = getCanopyProxyBase() || '';
   if (typeof saveCanopyProxy === 'function') saveCanopyProxy(getCanopyProxyBase() || '');
+  // Reflect the analytics opt-out toggle (also shows DNT/GPC as opted-out).
+  // If the browser forces opt-out via DNT/GPC, lock the checkbox so unchecking
+  // it isn't a silent no-op.
+  const optOutEl = document.getElementById('cfgAnalyticsOptOut');
+  if (optOutEl && typeof analyticsOptedOut === 'function') {
+    optOutEl.checked = analyticsOptedOut();
+    let flagSet = false;
+    try { flagSet = localStorage.getItem('sar_analytics_optout') === '1'; } catch (_) {}
+    const forcedByBrowser = optOutEl.checked && !flagSet;
+    optOutEl.disabled = forcedByBrowser;
+    optOutEl.title = forcedByBrowser ? 'Forced off by your browser’s Do-Not-Track / Global Privacy Control setting' : '';
+  }
 }
 
 // ============================================================
@@ -8291,6 +8307,90 @@ const CANOPY_DECODE_BUDGET_PX = 32000000;
 const MAX_CANOPY_HALF_M = 6000;
 const CANOPY_TILE_ATTEMPTS = 4; // retry a tile this many times (with backoff) on transient proxy/S3 5xx before skipping it
 
+// ============================================================
+// ANONYMOUS USAGE ANALYTICS (Cloudflare Web Analytics)
+// ============================================================
+// Privacy-first and SAR-safe by design:
+//   • Cookieless, no personal data, no persistent ID, no fingerprinting.
+//   • Country-level geography only (Cloudflare reports nothing finer); the raw
+//     IP is never stored by us — it is used by Cloudflare only to derive the
+//     country, then discarded.
+//   • NOTHING from the map is ever sent: no GPS, no drawn operational area, no
+//     observer/viewshed coordinates, no query strings. Only that the page was
+//     opened.
+//   • Loads only when served online over http(s). The offline single-file field
+//     build (file://) and any offline session never phone home.
+//   • Honors Do-Not-Track, Global Privacy Control, and the in-app opt-out.
+//
+// To ACTIVATE (one-time, free): in the Cloudflare dashboard go to
+// Analytics & Logs → Web Analytics → "Add a site", enter the deployed hostname
+// (e.g. thecoderperson.github.io). Cloudflare generates a snippet containing
+//   <script ... data-cf-beacon='{"token":"<32-hex>"}'></script>
+// Copy that token and paste it below. Until a token is set this is a no-op, so
+// nothing is collected. One token works for both the GitHub Pages and
+// Cloudflare Pages hosts (filter by "Host" in the dashboard). The token is a
+// public client-side beacon id (visible in page source on any analytics site),
+// not a secret — safe to commit.
+const CF_ANALYTICS_TOKEN = 'a0f745c3968b4e97a7cedecda692bee7';
+
+// User has opted out (in-app toggle) or signaled Do-Not-Track / Global Privacy
+// Control via the browser. Honored before any beacon is loaded.
+function analyticsOptedOut() {
+  try {
+    if (localStorage.getItem('sar_analytics_optout') === '1') return true;
+  } catch (_) {}
+  try {
+    const dnt = (typeof navigator !== 'undefined' && (navigator.doNotTrack || navigator.msDoNotTrack)) ||
+                (typeof window !== 'undefined' && window.doNotTrack);
+    if (dnt === '1' || dnt === 'yes') return true;
+    if (typeof navigator !== 'undefined' && navigator.globalPrivacyControl === true) return true;
+  } catch (_) {}
+  return false;
+}
+
+// Pure decision: given a token and an environment snapshot, should the beacon
+// load? Kept side-effect-free so the privacy guards are unit-testable.
+//   env = { protocol, hostname, online, optedOut }
+function _shouldLoadAnalytics(token, env) {
+  if (!token) return false;                                // not configured
+  env = env || {};
+  // file:// (offline single-file field build) → never phone home
+  if (env.protocol !== 'http:' && env.protocol !== 'https:') return false;
+  // Keep local dev out of the real numbers
+  const h = env.hostname || '';
+  if (h === 'localhost' || h === '127.0.0.1' || h === '0.0.0.0' ||
+      h === '::1' || h === '[::1]' || h.endsWith('.local')) return false;
+  if (env.online === false) return false;                  // offline
+  if (env.optedOut) return false;                          // user opt-out / DNT / GPC
+  return true;
+}
+
+function initUsageAnalytics() {
+  try {
+    if (typeof location === 'undefined' || typeof document === 'undefined') return;
+    const ok = _shouldLoadAnalytics(CF_ANALYTICS_TOKEN, {
+      protocol: location.protocol,
+      hostname: location.hostname,
+      online: (typeof navigator !== 'undefined') ? navigator.onLine : true,
+      optedOut: analyticsOptedOut(),
+    });
+    if (!ok) return;
+    const s = document.createElement('script');
+    s.defer = true;
+    s.src = 'https://static.cloudflareinsights.com/beacon.min.js';
+    s.setAttribute('data-cf-beacon', JSON.stringify({ token: CF_ANALYTICS_TOKEN }));
+    (document.head || document.documentElement).appendChild(s);
+  } catch (_) { /* analytics must never break the app */ }
+}
+
+// Persist the in-app opt-out toggle (Config tab). Takes effect on next load.
+function setAnalyticsOptOut(optOut) {
+  try {
+    if (optOut) localStorage.setItem('sar_analytics_optout', '1');
+    else localStorage.removeItem('sar_analytics_optout');
+  } catch (_) {}
+}
+
 function getCanopyProxyBase() {
   try {
     const v = localStorage.getItem('sar_canopy_proxy');
@@ -8987,6 +9087,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     getCanopyProxyBase, saveCanopyProxy, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
+    analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
     renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, _isConstrained, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,
     startViewshedPick, cancelViewshedPick, onViewshedMapClick, runViewshed, clearAllViewsheds,

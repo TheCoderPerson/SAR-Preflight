@@ -1177,6 +1177,17 @@ select.api-input { cursor: pointer; }
             <button class="btn btn-ghost" id="btnDiagnostics" onclick="showDiagnostics()" style="padding:5px 12px;font-size:11px;margin-top:4px;">View Diagnostics Report</button>
             <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:6px;">Crash trace, breadcrumbs &amp; memory estimate — for troubleshooting.</div>
           </div>
+          <div class="api-config">
+            <div class="data-label">Privacy &amp; Usage Analytics</div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.5;">
+              This tool counts anonymous page opens and your approximate <strong>country</strong> (no finer) to gauge usage and prioritize features. It is cookieless and stores <strong>no</strong> precise location, IP address, mission area, or personal data — nothing from your map is ever sent, and analytics never run offline.
+            </div>
+            <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:11px;color:var(--text-secondary);cursor:pointer;">
+              <input type="checkbox" id="cfgAnalyticsOptOut" onchange="setAnalyticsOptOut(this.checked)">
+              Opt out of anonymous usage analytics
+            </label>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:4px;">Browser Do-Not-Track / Global Privacy Control is honored automatically. Takes effect on next reload.</div>
+          </div>
         </div>
         <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-cyan)"></div>Data Sources</div>

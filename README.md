@@ -141,4 +141,11 @@ For an extra layer you can add a **Rate limiting rule** in the Cloudflare dashbo
 ## Offline Use
 
 The app uses a service worker to cache resources for offline use. You can pre-download map tiles for your area of operations via the Settings tab. Previously fetched API data is cached in IndexedDB with configurable TTLs.
+
+## Privacy & Usage Analytics
+
+When deployed with analytics enabled, the tool counts **anonymous page opens** and your **approximate country** (no finer geography) using [Cloudflare Web Analytics](https://www.cloudflare.com/web-analytics/) — solely to gauge how often the tool is used and to prioritize features. It is **cookieless** and stores **no** precise location, IP address, mission area, or personal data; **nothing from your map** (GPS, drawn operational area, observer/viewshed points) is ever transmitted, and analytics **never run offline** or in the single-file field build. Browser Do-Not-Track / Global Privacy Control is honored, and you can opt out anytime in the **Config** tab. Analytics activate when a Cloudflare Web Analytics token is set (`CF_ANALYTICS_TOKEN` in `sar-preflight.js`) and stay disabled on localhost, offline, and in the single-file field build.
+
+---
+
 This software is not certified by the FAA or any aviation authority. Use at your own risk. The developers assume no liability for decisions made based on information provided by this tool.

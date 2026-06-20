@@ -81,6 +81,11 @@ self.addEventListener('fetch', event => {
   // Skip chrome-extension and other non-http(s) URLs
   if (!event.request.url.startsWith('http')) return;
 
+  // Never touch usage-analytics traffic: let the Cloudflare Web Analytics beacon
+  // (static.cloudflareinsights.com) and its RUM endpoint go straight to network,
+  // uncached — so analytics is never served from cache and never runs offline.
+  if (event.request.url.includes('cloudflareinsights.com')) return;
+
   // Skip byte-range requests (e.g. the canopy COG reads via GeoTIFF.js). They
   // return 206 Partial Content, which the Cache API cannot store — caching one
   // throws "Partial response (206) is unsupported" and the failure can corrupt
