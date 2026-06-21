@@ -1328,6 +1328,7 @@ async function fetchWeather(lat, lng) {
 
     // AQI
     if (aqi.current) {
+      S.aqi = aqi.current.us_aqi;  // expose for the risk assessment (AQI gate)
       setText('wxAQI', `${aqi.current.us_aqi}`);
       setColor('wxAQI', aqi.current.us_aqi < 50 ? 'green' : aqi.current.us_aqi < 100 ? 'amber' : 'red');
       setText('wxPM25', `${aqi.current.pm2_5?.toFixed(1)} µg/m³`);
@@ -1383,6 +1384,7 @@ async function fetchWeather(lat, lng) {
         }
         const cachedAqi = await getCachedApiResponse('aqi', k);
         if (cachedAqi && cachedAqi.data && cachedAqi.data.current) {
+          S.aqi = cachedAqi.data.current.us_aqi;  // expose for the risk assessment (AQI gate)
           setText('wxAQI', `${cachedAqi.data.current.us_aqi}`);
           setColor('wxAQI', cachedAqi.data.current.us_aqi < 50 ? 'green' : cachedAqi.data.current.us_aqi < 100 ? 'amber' : 'red');
           markSection('airQuality', { status: 'cached', cachedAt: cachedAqi.timestamp, error: _wxErrMsg });
@@ -1415,6 +1417,7 @@ async function fetchKpIndex() {
       const diff = Math.abs(now - t);
       if (diff < bestDiff) { bestDiff = diff; kp = parseFloat(data[i][1]) || 2; }
     }
+    S.kp = kp;  // expose for the risk assessment (Kp caution gate)
     setText('wxKp', kp.toFixed(1));
     setColor('wxKp', kp <= 3 ? 'green' : kp <= 5 ? 'amber' : 'red');
     setText('satKp', kp.toFixed(1));
@@ -1458,6 +1461,7 @@ async function fetchKpIndex() {
         const cached = await getCachedApiResponse('kp', 'global');
         if (cached && cached.data) {
           const kp = parseFloat(cached.data[1]?.[1]) || 2;
+          S.kp = kp;  // expose for the risk assessment (Kp caution gate)
           setText('wxKp', kp.toFixed(1));
           setColor('wxKp', kp <= 3 ? 'green' : kp <= 5 ? 'amber' : 'red');
           setText('satKp', kp.toFixed(1));
@@ -5241,11 +5245,65 @@ function renderLZMarkers(lzs) {
 // ============================================================
 // DERIVED COMPUTATIONS
 // ============================================================
+// Maps each threshold input id (in the Config "Aircraft & SOP Profile" grid) to its
+// key in the threshold object. Single source of truth for read/populate/save.
+const THRESHOLD_FIELDS = [
+  ['cfgMaxWind', 'maxWindTol'],
+  ['sopWindCaution', 'windCaution'],
+  ['sopGustMargin', 'gustMargin'],
+  ['cfgFlightTime', 'flightTime'],
+  ['sopServiceCeiling', 'serviceCeiling'],
+  ['sopMaxSpeed', 'maxSpeed'],
+  ['sopVisCaution', 'visCaution'],
+  ['sopVisNoGo', 'visNoGo'],
+  ['sopPrecipCaution', 'precipCaution'],
+  ['sopPrecipNoGo', 'precipNoGo'],
+  ['sopTempCaution', 'tempCaution'],
+  ['sopTempColdNoGo', 'tempColdNoGo'],
+  ['sopTempHotCaution', 'tempHotCaution'],
+  ['sopTempHotNoGo', 'tempHotNoGo'],
+  ['sopWxCodeNoGo', 'weatherCodeNoGo'],
+  ['sopElevCaution', 'elevCaution'],
+  ['sopDensAltCaution', 'densAltCaution'],
+  ['sopDensAltNoGo', 'densAltNoGo'],
+  ['cfgMaxAlt', 'maxAltAGL'],
+  ['sopCeilingMargin', 'ceilingMarginFt'],
+  ['sopKpCaution', 'kpCaution'],
+  ['sopAqiCaution', 'aqiCaution'],
+  ['sopAqiNoGo', 'aqiNoGo'],
+  ['sopFireCautionNm', 'fireCautionNm'],
+  ['sopFireNoGoNm', 'fireNoGoNm'],
+];
+
+// The live, effective thresholds: DEFAULT_THRESHOLDS < active profile < any value
+// currently in the inputs. Null-safe so missing inputs (e.g. minimal test DOM or
+// before the UI exists) simply fall back to defaults.
+function readActiveThresholds() {
+  const base = (typeof DEFAULT_THRESHOLDS !== 'undefined') ? DEFAULT_THRESHOLDS : {};
+  const out = Object.assign({}, base, S.activeProfile || {});
+  if (typeof document !== 'undefined') {
+    THRESHOLD_FIELDS.forEach(([id, key]) => {
+      const el = document.getElementById(id);
+      if (el && el.value !== '' && el.value != null) {
+        const n = parseFloat(el.value);
+        if (!Number.isNaN(n)) out[key] = n;
+      }
+    });
+  }
+  return out;
+}
+
+// Live recompute when the operator edits any threshold field directly.
+function onThresholdEdit() {
+  if (S.currentArea) { computeOpsData(); computeAssessment(); }
+}
+
 function computeOpsData() {
+  const _t = readActiveThresholds();
   const temp = S.wx.temperature_2m ?? 65;
   const elev = S.elev.center ?? 1500;
   const maxWind = S.wind.maxWind ?? 5;
-  const nomTime = parseInt(document.getElementById('cfgFlightTime').value) || 38;
+  const nomTime = _t.flightTime || 38;
 
   // Uses extracted core function
   const d = calcBatteryDerating(temp, elev, maxWind);
@@ -5319,7 +5377,7 @@ function computeOpsData() {
 
   // Altitude factor (0-2 points) — most bird strikes below 500 ft AGL
   let altText, altLevel;
-  const opAlt = parseInt(document.getElementById('cfgMaxAlt')?.value) || 400;
+  const opAlt = _t.maxAltAGL || 400;
   if (opAlt <= 200) {
     birdScore += 2; altText = '\u2264200 ft AGL — high strike zone'; altLevel = 'red';
     factors.push('Low altitude ops');
@@ -5380,11 +5438,9 @@ function computeOpsData() {
 }
 
 function computeAssessment() {
-  const maxWindTol = parseInt(document.getElementById('cfgMaxWind').value) || 27;
-
-  // Uses extracted core function with optional SOP thresholds
-  const thresholds = S.activeProfile || (typeof DEFAULT_THRESHOLDS !== 'undefined' ? DEFAULT_THRESHOLDS : null);
-  const result = assessRisk(S.wx, S.wind, S.elev, maxWindTol, thresholds);
+  // Live, effective thresholds (defaults < active profile < edited inputs).
+  const thresholds = readActiveThresholds();
+  const result = assessRisk(S.wx, S.wind, S.elev, thresholds.maxWindTol, thresholds);
 
   // Integrate NWS severe weather alerts into assessment
   if (S.nwsAlerts && S.nwsAlerts.length > 0) {
@@ -5563,18 +5619,20 @@ function computeAssessment() {
     }
   }
 
-  // Integrate fire danger into assessment
+  // Integrate fire danger into assessment (NO-GO / CAUTION distances configurable)
   if (S.activeFires && S.activeFires.length > 0) {
-    const nearFires = S.activeFires.filter(f => parseFloat(f.distNm) < 10);
+    const fireNoGoNm = thresholds.fireNoGoNm ?? 10;
+    const fireCautionNm = thresholds.fireCautionNm ?? 30;
+    const nearFires = S.activeFires.filter(f => parseFloat(f.distNm) < fireNoGoNm);
     if (nearFires.length > 0) {
       result.level = 'NO-GO';
       result.issues = result.issues || [];
-      result.issues.push('Active fire within 10nm: ' + nearFires.map(f => f.name).join(', '));
+      result.issues.push(`Active fire within ${fireNoGoNm}nm: ` + nearFires.map(f => f.name).join(', '));
       result.text = result.issues.join(' \u2022 ');
     } else if (result.level !== 'NO-GO') {
       if (result.level === 'GO') result.level = 'CAUTION';
       result.cautions = result.cautions || [];
-      result.cautions.push('Active fire within 30nm \u2014 monitor for TFRs');
+      result.cautions.push(`Active fire within ${fireCautionNm}nm \u2014 monitor for TFRs`);
       if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
     }
   }
@@ -5603,6 +5661,29 @@ function computeAssessment() {
       result.cautions = result.cautions || [];
       result.cautions.push(lowClose.length + ' aircraft below 500ft AGL within 3nm');
       if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+    }
+  }
+
+  // Geomagnetic (Kp) CAUTION — elevated Kp degrades GNSS positioning
+  if (S.kp != null && thresholds.kpCaution != null && S.kp >= thresholds.kpCaution && result.level !== 'NO-GO') {
+    if (result.level === 'GO') result.level = 'CAUTION';
+    result.cautions = result.cautions || [];
+    result.cautions.push(`Geomagnetic Kp ${S.kp} — GNSS accuracy may degrade`);
+    if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
+  }
+
+  // Air quality — hazardous AQI (often wildfire smoke) is NO-GO; unhealthy is CAUTION
+  if (S.aqi != null) {
+    if (thresholds.aqiNoGo != null && S.aqi >= thresholds.aqiNoGo) {
+      result.level = 'NO-GO';
+      result.issues = result.issues || [];
+      result.issues.push(`Hazardous air quality (AQI ${S.aqi})`);
+      result.text = result.issues.join(' • ');
+    } else if (thresholds.aqiCaution != null && S.aqi >= thresholds.aqiCaution && result.level !== 'NO-GO') {
+      if (result.level === 'GO') result.level = 'CAUTION';
+      result.cautions = result.cautions || [];
+      result.cautions.push(`Unhealthy air quality / smoke (AQI ${S.aqi})`);
+      if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
     }
   }
 
@@ -6860,14 +6941,9 @@ function wirePopupAggregation() {
   }
 }
 
-function saveConfig() {
-  const ac = document.getElementById('cfgAircraft').value;
-  const maxWind = document.getElementById('cfgMaxWind')?.value;
-  const times = { m4t:38, m30t:41, m300:55, m350:55, mavic3t:45, skydio_x10:40, custom:38 };
-  if (times[ac]) document.getElementById('cfgFlightTime').value = times[ac];
-  if (typeof saveAppState === 'function') saveAppState('cfgAircraft', ac);
-  if (S.currentArea) { computeOpsData(); computeAssessment(); }
-}
+// Back-compat shim: aircraft selection + per-threshold values now live in the
+// unified "Aircraft & SOP Profile" picker; any config edit just recomputes.
+function saveConfig() { onThresholdEdit(); }
 
 let _metaTick = 0;
 function updateClock() {
@@ -7264,11 +7340,6 @@ function enableNotifications() {
 
 async function restoreConfig() {
   if (typeof getAppState !== 'function') return;
-  const aircraft = await getAppState('cfgAircraft');
-  if (aircraft) {
-    const el = document.getElementById('cfgAircraft');
-    if (el) { el.value = aircraft; saveConfig(); }
-  }
   const rpic = await getAppState('cfgRPIC');
   if (rpic) {
     const el = document.getElementById('cfgRPIC');
@@ -7279,11 +7350,16 @@ async function restoreConfig() {
     const el = document.getElementById('cfgRefreshInterval');
     if (el) { el.value = refreshInterval; setAutoRefresh(); }
   }
-  // Restore active SOP profile
-  const profileName = await getAppState('activeProfile');
+  // Restore active profile. Migrate the legacy aircraft-dropdown selection to its
+  // matching built-in profile for users upgrading from before the merge.
+  let profileName = await getAppState('activeProfile');
+  if (!profileName) {
+    const legacy = await getAppState('cfgAircraft');
+    if (legacy && LEGACY_AIRCRAFT_PROFILE[legacy]) profileName = LEGACY_AIRCRAFT_PROFILE[legacy];
+  }
+  // Populate the dropdown first so loadSopProfile can select the restored option.
+  await populateSopDropdown();
   if (profileName) loadSopProfile(profileName);
-  // Populate SOP dropdown
-  populateSopDropdown();
   // Restore canopy proxy URL (localStorage) + hint
   const proxyEl = document.getElementById('cfgCanopyProxy');
   if (proxyEl) proxyEl.value = getCanopyProxyBase() || '';
@@ -7519,7 +7595,7 @@ function generatePDFBriefing() {
   if (btn) btn.textContent = 'GENERATING...';
 
   const rpic = document.getElementById('cfgRPIC')?.value || 'Not specified';
-  const aircraft = document.getElementById('cfgAircraft')?.value?.toUpperCase() || '--';
+  const aircraft = (S.activeProfile && (S.activeProfile.model || S.activeProfile.name)) || 'Default';
   const assessBadge = document.getElementById('assessBadge')?.textContent || '--';
   const assessText = document.getElementById('assessText')?.textContent || '';
   const now = new Date();
@@ -7766,7 +7842,7 @@ function _openEmailBriefingWindow(mapDataUrl) {
   const assessText = document.getElementById('assessText')?.textContent || '';
   const badgeColor = assessBadge === 'GO' ? '#22c55e' : assessBadge === 'CAUTION' ? '#f59e0b' : '#ef4444';
   const rpic = document.getElementById('cfgRPIC')?.value || 'Not specified';
-  const aircraft = document.getElementById('cfgAircraft')?.value?.toUpperCase() || '--';
+  const aircraft = (S.activeProfile && (S.activeProfile.model || S.activeProfile.name)) || 'Default';
   const now = new Date();
   const dateStr = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
   const timeStr = now.toLocaleTimeString('en-US', { hour12: false, timeZone: _localTZ() });
@@ -8082,39 +8158,45 @@ function setAutoRefresh() {
 // ============================================================
 // SOP RISK PROFILES
 // ============================================================
+// Map from the legacy aircraft-dropdown codes to the new built-in profile names,
+// so users who had selected an aircraft before this change keep it on upgrade.
+const LEGACY_AIRCRAFT_PROFILE = {
+  m4t: 'DJI Matrice 4T', m30t: 'DJI Matrice 30T', m300: 'DJI Matrice 300 RTK',
+  m350: 'DJI Matrice 350 RTK', mavic3t: 'DJI Mavic 3T', skydio_x10: 'Skydio X10',
+};
+
 async function loadSopProfile(name) {
+  const dd = document.getElementById('cfgSopProfile');
   if (!name) {
     S.activeProfile = null;
+    if (dd) dd.value = '';
     updateSopThresholdFields();
     if (typeof saveAppState === 'function') saveAppState('activeProfile', '');
-    if (S.currentArea) computeAssessment();
+    if (S.currentArea) { computeOpsData(); computeAssessment(); }
     return;
   }
-  if (typeof getSopProfile === 'function') {
-    const profile = await getSopProfile(name);
-    if (profile) {
-      S.activeProfile = profile;
-      updateSopThresholdFields();
-      if (typeof saveAppState === 'function') saveAppState('activeProfile', name);
-      if (S.currentArea) computeAssessment();
-    }
+  // Built-in aircraft profiles take precedence over a saved custom of the same name.
+  let profile = (typeof DRONE_PROFILES !== 'undefined') ? DRONE_PROFILES.find(p => p.name === name) : null;
+  if (!profile && typeof getSopProfile === 'function') {
+    profile = await getSopProfile(name);
+  }
+  if (profile) {
+    S.activeProfile = profile;
+    if (dd) dd.value = name;
+    updateSopThresholdFields();
+    if (typeof saveAppState === 'function') saveAppState('activeProfile', name);
+    if (S.currentArea) { computeOpsData(); computeAssessment(); }
   }
 }
 
 async function saveSopProfileFromUI() {
   const name = document.getElementById('sopProfileName')?.value?.trim();
   if (!name) return alert('Enter a profile name.');
-  const profile = {
-    name: name,
-    visNoGo: parseFloat(document.getElementById('sopVisNoGo')?.value) || 1,
-    visCaution: parseFloat(document.getElementById('sopVisCaution')?.value) || 5,
-    precipNoGo: parseFloat(document.getElementById('sopPrecipNoGo')?.value) || 60,
-    precipCaution: parseFloat(document.getElementById('sopPrecipCaution')?.value) || 30,
-    windCaution: parseFloat(document.getElementById('sopWindCaution')?.value) || 15,
-    tempCaution: parseFloat(document.getElementById('sopTempCaution')?.value) || 35,
-    elevCaution: parseFloat(document.getElementById('sopElevCaution')?.value) || 6000,
-    wxCodeNoGo: parseFloat(document.getElementById('sopWxCodeNoGo')?.value) || 95,
-  };
+  if (typeof DRONE_PROFILES !== 'undefined' && DRONE_PROFILES.some(p => p.name === name)) {
+    return alert('That name is a built-in aircraft profile — choose a different name for your custom profile.');
+  }
+  // Capture the full live threshold set (defaults + any edits) under this name.
+  const profile = Object.assign({}, readActiveThresholds(), { name, model: name });
   if (typeof saveSopProfile === 'function') {
     await saveSopProfile(profile);
     await populateSopDropdown();
@@ -8122,7 +8204,7 @@ async function saveSopProfileFromUI() {
     if (dd) dd.value = name;
     S.activeProfile = profile;
     if (typeof saveAppState === 'function') saveAppState('activeProfile', name);
-    if (S.currentArea) computeAssessment();
+    if (S.currentArea) { computeOpsData(); computeAssessment(); }
   }
 }
 
@@ -8130,48 +8212,64 @@ async function deleteSopProfileFromUI() {
   const dd = document.getElementById('cfgSopProfile');
   const name = dd?.value;
   if (!name) return;
+  if (typeof DRONE_PROFILES !== 'undefined' && DRONE_PROFILES.some(p => p.name === name)) {
+    return alert('Built-in aircraft profiles cannot be deleted.');
+  }
   if (!confirm(`Delete profile "${name}"?`)) return;
   if (typeof deleteSopProfile === 'function') {
     await deleteSopProfile(name);
     S.activeProfile = null;
     if (typeof saveAppState === 'function') saveAppState('activeProfile', '');
     await populateSopDropdown();
+    const dd2 = document.getElementById('cfgSopProfile');
+    if (dd2) dd2.value = '';
     updateSopThresholdFields();
-    if (S.currentArea) computeAssessment();
+    if (S.currentArea) { computeOpsData(); computeAssessment(); }
   }
 }
 
 async function populateSopDropdown() {
   const dd = document.getElementById('cfgSopProfile');
   if (!dd) return;
-  // Keep only the default option
+  const current = dd.value;
   dd.innerHTML = '<option value="">Default</option>';
-  if (typeof getAllSopProfiles === 'function') {
-    const profiles = await getAllSopProfiles();
-    profiles.forEach(p => {
+  // Built-in aircraft profiles
+  if (typeof DRONE_PROFILES !== 'undefined' && DRONE_PROFILES.length) {
+    const og = document.createElement('optgroup');
+    og.label = 'Aircraft';
+    DRONE_PROFILES.forEach(p => {
       const opt = document.createElement('option');
       opt.value = p.name;
       opt.textContent = p.name;
-      dd.appendChild(opt);
+      og.appendChild(opt);
     });
+    dd.appendChild(og);
   }
+  // User-saved custom profiles
+  if (typeof getAllSopProfiles === 'function') {
+    const profiles = await getAllSopProfiles();
+    if (profiles && profiles.length) {
+      const og = document.createElement('optgroup');
+      og.label = 'Custom';
+      profiles.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.name;
+        opt.textContent = p.name;
+        og.appendChild(opt);
+      });
+      dd.appendChild(og);
+    }
+  }
+  if (current) dd.value = current;
 }
 
 function updateSopThresholdFields() {
-  const defaults = (typeof DEFAULT_THRESHOLDS !== 'undefined') ? DEFAULT_THRESHOLDS : {
-    visNoGo: 1, visCaution: 5, precipNoGo: 60, precipCaution: 30,
-    windCaution: 15, tempCaution: 35, elevCaution: 6000, wxCodeNoGo: 95,
-  };
-  const src = S.activeProfile || defaults;
-  const setVal = (id, key) => { const el = document.getElementById(id); if (el && src[key] !== undefined) el.value = src[key]; };
-  setVal('sopVisNoGo', 'visNoGo');
-  setVal('sopVisCaution', 'visCaution');
-  setVal('sopPrecipNoGo', 'precipNoGo');
-  setVal('sopPrecipCaution', 'precipCaution');
-  setVal('sopWindCaution', 'windCaution');
-  setVal('sopTempCaution', 'tempCaution');
-  setVal('sopElevCaution', 'elevCaution');
-  setVal('sopWxCodeNoGo', 'wxCodeNoGo');
+  const defaults = (typeof DEFAULT_THRESHOLDS !== 'undefined') ? DEFAULT_THRESHOLDS : {};
+  const src = Object.assign({}, defaults, S.activeProfile || {});
+  THRESHOLD_FIELDS.forEach(([id, key]) => {
+    const el = document.getElementById(id);
+    if (el && src[key] !== undefined) el.value = src[key];
+  });
 }
 
 // ============================================================
@@ -8183,7 +8281,7 @@ async function logMission() {
   const entry = {
     timestamp: Date.now(),
     rpic: document.getElementById('cfgRPIC')?.value || '',
-    aircraft: document.getElementById('cfgAircraft')?.value || '',
+    aircraft: (S.activeProfile && (S.activeProfile.model || S.activeProfile.name)) || 'Default',
     areaCenter: S.areaCenter ? { lat: S.areaCenter.lat, lng: S.areaCenter.lng } : null,
     areaType: S.areaType,
     assessment: {
@@ -9098,6 +9196,8 @@ if (typeof module !== 'undefined' && module.exports) {
     openAggregatePopup, aggPopupStep, renderAggregatePopup, collectFeaturesAt,
     wirePopupAggregation, eachPopupLayer, _aggFeatureClick,
     computeAirspace, computeOpsData, computeAssessment,
+    THRESHOLD_FIELDS, readActiveThresholds, onThresholdEdit,
+    loadSopProfile, saveSopProfileFromUI, deleteSopProfileFromUI, populateSopDropdown, updateSopThresholdFields,
     fetchWeather, fetchKpIndex, fetchElevation, fetchSunMoon,
     renderNotamsTab, fetchWireHazards, processArea,
     tfrGeoJsonUrlForBounds, fetchLiveTFRs, fetchNotams, fetchLiveRestrictions,

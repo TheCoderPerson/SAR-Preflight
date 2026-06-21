@@ -1225,30 +1225,10 @@ select.api-input { cursor: pointer; }
           </div>
         </div>
         <div class="data-section">
-          <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>Aircraft Profile</div>
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>Pilot</div>
           <div class="api-config">
             <div class="data-label">RPIC Name (for PDF briefing)</div>
             <input class="api-input" id="cfgRPIC" type="text" placeholder="Enter RPIC name" onchange="if(typeof saveAppState==='function')saveAppState('cfgRPIC',this.value)" />
-          </div>
-          <div class="api-config">
-            <div class="data-label">Aircraft Type</div>
-            <select class="api-input" id="cfgAircraft" onchange="saveConfig()">
-              <option value="m4t">DJI Matrice 4T</option>
-              <option value="m30t">DJI Matrice 30T</option>
-              <option value="m300">DJI Matrice 300 RTK</option>
-              <option value="m350">DJI Matrice 350 RTK</option>
-              <option value="mavic3t">DJI Mavic 3T</option>
-              <option value="skydio_x10">Skydio X10</option>
-              <option value="custom">Custom</option>
-            </select>
-          </div>
-          <div class="api-config">
-            <div class="data-label">Max Flight Time (min, nominal)</div>
-            <input class="api-input" id="cfgFlightTime" type="number" value="38" onchange="saveConfig()" />
-          </div>
-          <div class="api-config">
-            <div class="data-label">Max Wind Tolerance (mph)</div>
-            <input class="api-input" id="cfgMaxWind" type="number" value="27" onchange="saveConfig()" />
           </div>
         </div>
         <div class="data-section">
@@ -1314,32 +1294,65 @@ select.api-input { cursor: pointer; }
           </div>
         </div>
         <div class="data-section">
-          <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>SOP Risk Profiles</div>
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-red)"></div>Aircraft &amp; SOP Profile</div>
           <div class="api-config">
-            <div class="data-label">Active Profile</div>
+            <div class="data-label">Active Profile (aircraft &amp; thresholds)</div>
             <div style="display:flex;gap:6px;margin-top:6px;">
               <select class="api-input" id="cfgSopProfile" onchange="loadSopProfile(this.value)" style="flex:1;">
                 <option value="">Default</option>
               </select>
               <button class="btn btn-ghost" onclick="deleteSopProfileFromUI()" style="padding:4px 8px;font-size:10px;">Delete</button>
             </div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">Pick a built-in aircraft to set every threshold (wind, flight time, ceiling, operating-temp limits) from its specs, or a saved custom profile. Editing any value below recomputes the assessment live; <b>Save Profile</b> stores the current values under a name. Aircraft specs are best-available manufacturer figures — verify before flight.</div>
           </div>
           <div class="api-config">
-            <div class="data-label">Thresholds</div>
+            <div class="data-label">Aircraft</div>
             <div class="data-grid" style="margin-top:6px;">
-              <div class="data-cell"><div class="data-label">Vis NO-GO (mi)</div><input class="api-input" id="sopVisNoGo" type="number" value="1" step="0.5" style="font-size:11px;padding:3px;"></div>
-              <div class="data-cell"><div class="data-label">Vis CAUTION (mi)</div><input class="api-input" id="sopVisCaution" type="number" value="5" step="0.5" style="font-size:11px;padding:3px;"></div>
-              <div class="data-cell"><div class="data-label">Precip NO-GO (%)</div><input class="api-input" id="sopPrecipNoGo" type="number" value="60" style="font-size:11px;padding:3px;"></div>
-              <div class="data-cell"><div class="data-label">Precip CAUTION (%)</div><input class="api-input" id="sopPrecipCaution" type="number" value="30" style="font-size:11px;padding:3px;"></div>
-              <div class="data-cell"><div class="data-label">Wind CAUTION (mph)</div><input class="api-input" id="sopWindCaution" type="number" value="15" style="font-size:11px;padding:3px;"></div>
-              <div class="data-cell"><div class="data-label">Temp CAUTION (°F)</div><input class="api-input" id="sopTempCaution" type="number" value="35" style="font-size:11px;padding:3px;"></div>
-              <div class="data-cell"><div class="data-label">Elev CAUTION (ft)</div><input class="api-input" id="sopElevCaution" type="number" value="6000" style="font-size:11px;padding:3px;"></div>
-              <div class="data-cell"><div class="data-label">Wx Code NO-GO</div><input class="api-input" id="sopWxCodeNoGo" type="number" value="95" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Wind NO-GO (mph)</div><input class="api-input" id="cfgMaxWind" type="number" value="27" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Wind CAUTION (mph)</div><input class="api-input" id="sopWindCaution" type="number" value="15" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Gust margin (mph)</div><input class="api-input" id="sopGustMargin" type="number" value="5" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Flight time (min)</div><input class="api-input" id="cfgFlightTime" type="number" value="38" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Service ceiling (ft)</div><input class="api-input" id="sopServiceCeiling" type="number" value="16404" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Max speed (mph)</div><input class="api-input" id="sopMaxSpeed" type="number" value="47" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+            </div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Weather</div>
+            <div class="data-grid" style="margin-top:6px;">
+              <div class="data-cell"><div class="data-label">Vis CAUTION (mi)</div><input class="api-input" id="sopVisCaution" type="number" value="5" step="0.5" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Vis NO-GO (mi)</div><input class="api-input" id="sopVisNoGo" type="number" value="1" step="0.5" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Precip CAUTION (%)</div><input class="api-input" id="sopPrecipCaution" type="number" value="30" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Precip NO-GO (%)</div><input class="api-input" id="sopPrecipNoGo" type="number" value="60" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Temp cold CAUT (°F)</div><input class="api-input" id="sopTempCaution" type="number" value="35" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Temp cold NO-GO (°F)</div><input class="api-input" id="sopTempColdNoGo" type="number" value="14" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Temp hot CAUT (°F)</div><input class="api-input" id="sopTempHotCaution" type="number" value="95" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Temp hot NO-GO (°F)</div><input class="api-input" id="sopTempHotNoGo" type="number" value="104" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Wx Code NO-GO</div><input class="api-input" id="sopWxCodeNoGo" type="number" value="95" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+            </div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Terrain &amp; Ops</div>
+            <div class="data-grid" style="margin-top:6px;">
+              <div class="data-cell"><div class="data-label">Elev CAUTION (ft)</div><input class="api-input" id="sopElevCaution" type="number" value="6000" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Dens-alt CAUT (ft)</div><input class="api-input" id="sopDensAltCaution" type="number" value="5000" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Dens-alt NO-GO (ft)</div><input class="api-input" id="sopDensAltNoGo" type="number" value="9000" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Max AGL (ft, Part 107)</div><input class="api-input" id="cfgMaxAlt" type="number" value="400" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Ceiling margin (ft)</div><input class="api-input" id="sopCeilingMargin" type="number" value="1500" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+            </div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">GNSS, Air Quality &amp; Fire</div>
+            <div class="data-grid" style="margin-top:6px;">
+              <div class="data-cell"><div class="data-label">Kp CAUTION</div><input class="api-input" id="sopKpCaution" type="number" value="5" step="0.1" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">AQI CAUTION</div><input class="api-input" id="sopAqiCaution" type="number" value="150" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">AQI NO-GO</div><input class="api-input" id="sopAqiNoGo" type="number" value="250" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Fire CAUTION (nm)</div><input class="api-input" id="sopFireCautionNm" type="number" value="30" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Fire NO-GO (nm)</div><input class="api-input" id="sopFireNoGoNm" type="number" value="10" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
             </div>
           </div>
           <div class="api-config">
             <div style="display:flex;gap:6px;">
-              <input class="api-input" id="sopProfileName" placeholder="Profile name" style="flex:1;">
+              <input class="api-input" id="sopProfileName" placeholder="Save current values as…" style="flex:1;">
               <button class="btn btn-primary" onclick="saveSopProfileFromUI()" style="padding:4px 10px;font-size:10px;">Save Profile</button>
             </div>
           </div>

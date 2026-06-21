@@ -4,6 +4,13 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.06.20-i — 2026-06-20
+
+- Aircraft profiles are now built in: pick your drone (DJI Matrice 300/350 RTK, 30T, 4T, 4TD, Mavic 3T, Skydio X10, Neo, Avata/Avata 2, Mini 3/4/5 Pro and more) in Config → Aircraft & SOP Profile and every threshold — max wind, flight time, service ceiling, and operating-temperature limits — is set from that airframe's published specs. Wind NO-GO uses the rated max wind resistance with a CAUTION at ~65% of it.
+- The old separate "Aircraft Profile" section is merged into the profile picker, so loading a profile sets the aircraft AND all risk thresholds at once. Editing any value recalculates the GO/CAUTION/NO-GO assessment live; "Save Profile" stores your own custom set.
+- Many more Part 107 / safety thresholds are now editable: gust margin, hot & cold temperature limits, density altitude (caution & NO-GO), the Part 107 400 ft AGL ceiling, service-ceiling proximity, Kp geomagnetic index, air-quality (AQI) caution & NO-GO, and active-fire caution/NO-GO distances.
+- New automatic flags: out-of-spec heat or cold for the selected aircraft, high density altitude, launching near/above the aircraft's service ceiling, elevated Kp (GNSS degradation), and hazardous air quality / wildfire smoke.
+
 ## v2026.06.20-h — 2026-06-20
 
 - Added privacy-first anonymous usage analytics (Cloudflare Web Analytics) so the team can gauge how often the tool is used. It is cookieless and country-level only: nothing from your map (GPS, drawn operational area, observer/viewshed coordinates) is ever sent, no precise location or IP is stored, and analytics never run offline or in the single-file field build. Browser Do-Not-Track / Global Privacy Control is honored, and you can opt out anytime in Config → Privacy.

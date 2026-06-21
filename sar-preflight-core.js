@@ -19,6 +19,16 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.06.20-i',
+    date: '2026-06-20',
+    changes: [
+      'Aircraft profiles are now built in: pick your drone (DJI Matrice 300/350 RTK, 30T, 4T, 4TD, Mavic 3T, Skydio X10, Neo, Avata/Avata 2, Mini 3/4/5 Pro and more) in Config → Aircraft & SOP Profile and every threshold — max wind, flight time, service ceiling, and operating-temperature limits — is set from that airframe\'s published specs. Wind NO-GO uses the rated max wind resistance with a CAUTION at ~65% of it.',
+      'The old separate "Aircraft Profile" section is merged into the profile picker, so loading a profile sets the aircraft AND all risk thresholds at once. Editing any value recalculates the GO/CAUTION/NO-GO assessment live; "Save Profile" stores your own custom set.',
+      'Many more Part 107 / safety thresholds are now editable: gust margin, hot & cold temperature limits, density altitude (caution & NO-GO), the Part 107 400 ft AGL ceiling, service-ceiling proximity, Kp geomagnetic index, air-quality (AQI) caution & NO-GO, and active-fire caution/NO-GO distances.',
+      'New automatic flags: out-of-spec heat or cold for the selected aircraft, high density altitude, launching near/above the aircraft\'s service ceiling, elevated Kp (GNSS degradation), and hazardous air quality / wildfire smoke.',
+    ],
+  },
+  {
     version: '2026.06.20-h',
     date: '2026-06-20',
     changes: [
@@ -237,17 +247,68 @@ function obstacleHazardLevel(summary) {
 
 // --- Default Risk Thresholds ---
 
+// A profile is one flat object holding BOTH the aircraft specs and the
+// environmental gates, so picking a drone profile sets every threshold at once.
+// Existing keys keep their names/defaults (back-compat with saved profiles & tests);
+// new keys are additive and default to current behavior when absent.
 const DEFAULT_THRESHOLDS = {
-  visNoGo: 1,           // statute miles — below this = NO-GO
-  visCaution: 5,        // statute miles — below this = CAUTION
-  precipNoGo: 60,       // percent — above this = NO-GO
-  precipCaution: 30,    // percent — above this = CAUTION
-  windCaution: 15,      // mph — above this (but below maxWindTol) = CAUTION
-  tempCaution: 35,      // °F — below this = CAUTION
-  elevCaution: 6000,    // feet — above this = CAUTION
-  weatherCodeNoGo: 95,  // WMO code — at or above = NO-GO (thunderstorm)
   name: 'Default',
+  model: 'Default / generic',
+  // --- Aircraft (overridden per drone profile) ---
+  maxWindTol: 27,        // mph — sustained-wind NO-GO (airframe rated max wind resistance)
+  windCaution: 15,       // mph — sustained-wind CAUTION (drone profiles use ~0.65× rated)
+  gustMargin: 5,         // mph — gust NO-GO = maxWindTol + this
+  flightTime: 38,        // min — nominal endurance (battery-derating baseline)
+  serviceCeiling: 16404, // ft MSL — max takeoff altitude (info + approaching-ceiling gate)
+  maxSpeed: 47,          // mph — airframe max horizontal speed (info vs Part 107 100 mph)
+  // --- Weather (Part 107 / SOP) ---
+  visNoGo: 1,            // statute miles — below this = NO-GO
+  visCaution: 5,         // statute miles — below this = CAUTION (Part 107 §107.51 min is 3 sm)
+  precipNoGo: 60,        // percent — above this = NO-GO
+  precipCaution: 30,     // percent — above this = CAUTION
+  tempCaution: 35,       // °F — below this = CAUTION (cold-battery margin)
+  tempColdNoGo: 14,      // °F — below this = NO-GO (airframe operating minimum)
+  tempHotCaution: 95,    // °F — above this = CAUTION (heat stress)
+  tempHotNoGo: 104,      // °F — above this = NO-GO (airframe operating maximum)
+  weatherCodeNoGo: 95,   // WMO code — at or above = NO-GO (thunderstorm)
+  // --- Terrain / Ops ---
+  elevCaution: 6000,     // ft MSL — terrain elevation CAUTION
+  densAltCaution: 5000,  // ft — density altitude CAUTION
+  densAltNoGo: 9000,     // ft — density altitude NO-GO
+  ceilingMarginFt: 1500, // ft — CAUTION when takeoff elev within this of serviceCeiling
+  maxAltAGL: 400,        // ft AGL — Part 107 §107.51(b) operating ceiling
+  // --- GNSS / Air quality / Fire ---
+  kpCaution: 5,          // Kp index — at or above = CAUTION (GNSS degradation)
+  aqiCaution: 150,       // US AQI — at or above = CAUTION (unhealthy / wildfire smoke)
+  aqiNoGo: 250,          // US AQI — at or above = NO-GO (hazardous)
+  fireCautionNm: 30,     // nm — active fire within this = CAUTION
+  fireNoGoNm: 10,        // nm — active fire within this = NO-GO
 };
+
+// Built-in aircraft profiles for the EDSAR fleet + commonly-flown DJI airframes.
+// Wind NO-GO (maxWindTol) = manufacturer rated max wind resistance (mph);
+// Wind CAUTION (windCaution) = round(0.65 × rated). tempColdNoGo / tempHotNoGo =
+// published operating-temperature range. serviceCeiling = manufacturer max takeoff
+// altitude (ft MSL). Environmental gates inherit DEFAULT_THRESHOLDS. Numbers are
+// from manufacturer spec pages (researched 2026-06; see CLAUDE.md history) — verify
+// against the current spec sheet before relying on them operationally.
+const DRONE_PROFILES = [
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Matrice 300 RTK', model: 'DJI Matrice 300 RTK', maxWindTol: 27, windCaution: 17, flightTime: 55, serviceCeiling: 22966, maxSpeed: 51, tempColdNoGo: -4, tempHotNoGo: 122 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Matrice 350 RTK', model: 'DJI Matrice 350 RTK', maxWindTol: 27, windCaution: 17, flightTime: 55, serviceCeiling: 22966, maxSpeed: 51, tempColdNoGo: -4, tempHotNoGo: 122 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Matrice 30T', model: 'DJI Matrice 30T', maxWindTol: 27, windCaution: 17, flightTime: 41, serviceCeiling: 22966, maxSpeed: 51, tempColdNoGo: -4, tempHotNoGo: 122 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Matrice 4T', model: 'DJI Matrice 4T', maxWindTol: 27, windCaution: 17, flightTime: 49, serviceCeiling: 19686, maxSpeed: 47, tempColdNoGo: 14, tempHotNoGo: 104 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Matrice 4TD', model: 'DJI Matrice 4TD', maxWindTol: 27, windCaution: 17, flightTime: 54, serviceCeiling: 21326, maxSpeed: 47, tempColdNoGo: -4, tempHotNoGo: 122 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Mavic 3T', model: 'DJI Mavic 3T', maxWindTol: 27, windCaution: 17, flightTime: 45, serviceCeiling: 19685, maxSpeed: 47, tempColdNoGo: 14, tempHotNoGo: 104 },
+  { ...DEFAULT_THRESHOLDS, name: 'Skydio X10', model: 'Skydio X10', maxWindTol: 28, windCaution: 18, flightTime: 40, serviceCeiling: 15000, maxSpeed: 45, tempColdNoGo: -4, tempHotNoGo: 113 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Neo', model: 'DJI Neo', maxWindTol: 18, windCaution: 12, flightTime: 18, serviceCeiling: 6562, maxSpeed: 36, tempColdNoGo: 14, tempHotNoGo: 104 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Neo 2 (unreleased — uses DJI Neo specs)', model: 'DJI Neo 2', maxWindTol: 18, windCaution: 12, flightTime: 18, serviceCeiling: 6562, maxSpeed: 36, tempColdNoGo: 14, tempHotNoGo: 104 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Avata', model: 'DJI Avata', maxWindTol: 24, windCaution: 16, flightTime: 18, serviceCeiling: 16404, maxSpeed: 60, tempColdNoGo: 14, tempHotNoGo: 104 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Avata 2', model: 'DJI Avata 2', maxWindTol: 24, windCaution: 16, flightTime: 23, serviceCeiling: 16404, maxSpeed: 60, tempColdNoGo: 14, tempHotNoGo: 104 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Avata 360 (unreleased — uses Avata 2 specs)', model: 'DJI Avata 360', maxWindTol: 24, windCaution: 16, flightTime: 23, serviceCeiling: 16404, maxSpeed: 60, tempColdNoGo: 14, tempHotNoGo: 104 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Mini 3 Pro', model: 'DJI Mini 3 Pro', maxWindTol: 24, windCaution: 16, flightTime: 34, serviceCeiling: 13124, maxSpeed: 36, tempColdNoGo: 14, tempHotNoGo: 104 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Mini 4 Pro', model: 'DJI Mini 4 Pro', maxWindTol: 24, windCaution: 16, flightTime: 34, serviceCeiling: 13123, maxSpeed: 36, tempColdNoGo: 14, tempHotNoGo: 104 },
+  { ...DEFAULT_THRESHOLDS, name: 'DJI Mini 5 Pro', model: 'DJI Mini 5 Pro', maxWindTol: 27, windCaution: 17, flightTime: 36, serviceCeiling: 19685, maxSpeed: 40, tempColdNoGo: 14, tempHotNoGo: 104 },
+];
 
 // --- Density Altitude ---
 
@@ -293,6 +354,9 @@ function assessPropIcing(tempF, dewF) {
 
 function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
   const t = thresholds || DEFAULT_THRESHOLDS;
+  // maxWindTol arg kept for back-compat; fall back to the profile value when omitted.
+  const windTol = (maxWindTol != null) ? maxWindTol : (t.maxWindTol ?? 27);
+  const gustMargin = t.gustMargin ?? 5;
   const maxWind = wind.maxWind ?? 0;
   const maxGust = wind.maxGust ?? 0;
   const vis = wx.visibility ? wx.visibility / 1609.34 : 99;
@@ -302,17 +366,32 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
   const centerElev = elev.center ?? 0;
 
   const issues = [];
-  if (maxWind > maxWindTol || maxGust > maxWindTol + 5) { issues.push(`Wind ${maxWind}/${maxGust}g exceeds limits`); }
+  if (maxWind > windTol || maxGust > windTol + gustMargin) { issues.push(`Wind ${maxWind}/${maxGust}g exceeds limits`); }
   if (vis < t.visNoGo) { issues.push(`Visibility ${vis.toFixed(1)} mi`); }
   if (precip > t.precipNoGo) { issues.push(`Precip ${precip}%`); }
   if (weatherCode >= t.weatherCodeNoGo) { issues.push('Thunderstorm activity'); }
+  if (t.tempColdNoGo != null && wx.temperature_2m != null && temp < t.tempColdNoGo) { issues.push(`Temp ${Math.round(temp)}°F below aircraft limit`); }
+  if (t.tempHotNoGo != null && temp > t.tempHotNoGo) { issues.push(`Temp ${Math.round(temp)}°F above aircraft limit`); }
+  if (t.serviceCeiling != null && centerElev > t.serviceCeiling) { issues.push(`Launch elev ${Math.round(centerElev)} ft above aircraft ceiling`); }
 
   const cautions = [];
-  if (maxWind > t.windCaution && maxWind <= maxWindTol) { cautions.push('Elevated winds'); }
+  if (maxWind > t.windCaution && maxWind <= windTol) { cautions.push('Elevated winds'); }
   if (vis >= t.visNoGo && vis < t.visCaution) { cautions.push('Reduced visibility'); }
   if (precip > t.precipCaution && precip <= t.precipNoGo) { cautions.push(`Precip ${precip}%`); }
-  if (temp < t.tempCaution) { cautions.push('Cold — battery impact'); }
+  if (temp < t.tempCaution && !(t.tempColdNoGo != null && temp < t.tempColdNoGo)) { cautions.push('Cold — battery impact'); }
+  if (t.tempHotCaution != null && temp > t.tempHotCaution && !(t.tempHotNoGo != null && temp > t.tempHotNoGo)) { cautions.push('Heat — battery/motor stress'); }
   if (centerElev > t.elevCaution) { cautions.push('High elevation'); }
+  // Approaching the airframe's max takeoff altitude (e.g. small drones in high terrain)
+  if (t.serviceCeiling != null && t.ceilingMarginFt != null &&
+      centerElev <= t.serviceCeiling && centerElev > t.serviceCeiling - t.ceilingMarginFt) {
+    cautions.push('Near aircraft service ceiling');
+  }
+  // Density altitude (only when pressure is available so it stays inert in unit tests)
+  if (wx.surface_pressure != null && wx.temperature_2m != null && typeof calcDensityAltitude === 'function') {
+    const densAlt = calcDensityAltitude(temp, wx.surface_pressure);
+    if (t.densAltNoGo != null && densAlt > t.densAltNoGo) { issues.push(`Density altitude ${densAlt} ft`); }
+    else if (t.densAltCaution != null && densAlt > t.densAltCaution) { cautions.push(`High density altitude (${densAlt} ft)`); }
+  }
 
   const icing = assessPropIcing(wx.temperature_2m, wx.dew_point_2m);
   if (icing.severity === 'nogo') { issues.push(`Prop icing — ${icing.reason}`); }
@@ -2348,7 +2427,7 @@ if (typeof module !== 'undefined' && module.exports) {
     DOF_LIGHTING, obstacleLighting, obstacleMarkerColor, obstacleLabel,
     summarizeObstacles, obstacleHazardLevel,
     calcDensityAltitude, calcBatteryDerating, assessPropIcing, assessRisk,
-    DEFAULT_THRESHOLDS,
+    DEFAULT_THRESHOLDS, DRONE_PROFILES,
     classifyTerrain, estimateVegetation, estimateCellCoverage,
     SMA_NONPUBLIC_CODES, smaAgencyInfo, smaIsPublic, classifyAreaPublicPrivate, cellCoverageAt,
     filterAirportsByDistance, classifyAirspace,
