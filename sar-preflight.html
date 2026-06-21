@@ -413,6 +413,13 @@ body {
 .assessment-badge.go { background: rgba(34,197,94,0.15); color: var(--accent-green); }
 .assessment-badge.caution { background: rgba(245,158,11,0.15); color: var(--accent-amber); }
 .assessment-badge.nogo { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+/* "Viewing a forecast hour, not NOW" banner above the data panel. */
+.time-context-banner {
+  padding: 7px 16px; border-bottom: 1px solid var(--border);
+  background: rgba(61,139,253,0.14); color: var(--text-primary);
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.4;
+}
+.time-context-banner strong { color: #3d8bfd; letter-spacing: 0.5px; }
 
 /* Area Info Bar */
 .area-info-bar {
@@ -692,6 +699,7 @@ select.api-input { cursor: pointer; }
       <span class="assessment-badge go" id="assessBadge">GO</span>
       <span id="assessText">All conditions nominal</span>
     </div>
+    <div class="time-context-banner" id="panelTimeContext" style="display:none;"></div>
     <div class="area-info-bar" id="areaInfoBar" style="display:none;">
       <div class="area-info-item">CENTER: <strong id="areaCenter">--</strong></div>
       <div class="area-info-item">AREA: <strong id="areaSize">--</strong></div>

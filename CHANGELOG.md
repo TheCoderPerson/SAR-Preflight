@@ -4,6 +4,13 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.06.20-j — 2026-06-20
+
+- The 24-hour timeline now drives the entire data panel, not just the sun & wind arrows: drag it and the weather, wind-by-altitude profile, ops/battery estimates, GNSS outlook and the overall GO/CAUTION/NO-GO all update to the selected forecast hour, so you can scrub to find the best launch window. A "FORECAST +Xh" banner makes clear when you are viewing a future hour, and notes that airspace, TFRs, fire and live traffic remain current-time.
+- Weather radar now uses the traditional NWS color scale (green → yellow → orange → red → magenta, with blue for snow) instead of the previous blue-heavy palette, so heavy rain no longer shows as blue.
+- CalTopo export now includes the LAANC ceiling grid (even when it is hidden on the map) and disclaimer-flagged emergency-LZ terrain estimates.
+- CalTopo export no longer includes layers CalTopo already provides natively and that would be stale by the time the file is imported: ADS-B aircraft, MVUM roads & trails, USFS trails, cell coverage & towers, land ownership, dams and parcels. These layers still appear and remain clickable on the map.
+
 ## v2026.06.20-i — 2026-06-20
 
 - Aircraft profiles are now built in: pick your drone (DJI Matrice 300/350 RTK, 30T, 4T, 4TD, Mavic 3T, Skydio X10, Neo, Avata/Avata 2, Mini 3/4/5 Pro and more) in Config → Aircraft & SOP Profile and every threshold — max wind, flight time, service ceiling, and operating-temperature limits — is set from that airframe's published specs. Wind NO-GO uses the rated max wind resistance with a CAUTION at ~65% of it.

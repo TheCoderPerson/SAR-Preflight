@@ -13,6 +13,8 @@ const S = {
   mapLayers: {}, wireHazardCounts: {}, faaCharts: {},
   // Cached live data
   wx: {}, wind: {}, elev: {}, astro: {}, notams: [],
+  // Selected timeline hour for the data panel (0 = NOW). Set by _updateTimeBar.
+  timeIdx: 0,
   nwsAlerts: [],
   faaAirspace: null,
   faaObstacles: null,
@@ -1186,6 +1188,156 @@ async function updateSection(key) {
 }
 
 // ============================================================
+// TIME-AWARE DATA PANEL
+// The 24 h timeline scrollbar selects an hour (S.timeIdx, 0 = NOW). The weather,
+// wind, ops and assessment readouts all render from a per-hour SNAPSHOT shaped like
+// the Open-Meteo `current` object (wxAtHour in core.js), so scrubbing the timeline
+// re-renders the whole panel for the selected forecast hour.
+// ============================================================
+
+// Per-hour weather snapshot from the stored hourly arrays (falls back to S.wx when
+// no hourly data is loaded — keeps no-arg/test callers working).
+function snapshotAtIdx(idx) {
+  return wxAtHour(S.wx && S.wx.hourly, idx, S.wx || {});
+}
+
+// Render the Weather tab from a snapshot (defaults to the selected hour).
+function renderWeather(snap) {
+  snap = snap || snapshotAtIdx(S.timeIdx || 0);
+  if (snap.temperature_2m != null) setText('wxTemp', `${Math.round(snap.temperature_2m)}°F`);
+  if (snap.apparent_temperature != null) setText('wxFeels', `${Math.round(snap.apparent_temperature)}°F`);
+  if (snap.dew_point_2m != null) setText('wxDew', `${Math.round(snap.dew_point_2m)}°F`);
+  if (snap.relative_humidity_2m != null) setText('wxHumidity', `${Math.round(snap.relative_humidity_2m)}%`);
+
+  if (snap.surface_pressure != null) setText('wxPressure', `${(snap.surface_pressure * 0.02953).toFixed(2)} inHg`);
+
+  // Density altitude — calcDensityAltitude is 2-arg (station pressure already
+  // encodes elevation); the elevFt below is intentionally ignored by core.
+  const elevFt = S.elev.center || 1500;
+  if (snap.temperature_2m != null && snap.surface_pressure != null) {
+    const densAlt = calcDensityAltitude(snap.temperature_2m, snap.surface_pressure, elevFt);
+    setText('wxDensity', `${densAlt.toLocaleString()} ft`);
+    setColor('wxDensity', densAlt < 5000 ? 'green' : densAlt < 7500 ? 'amber' : 'red');
+  }
+
+  if (snap.visibility != null) {
+    const visMi = (snap.visibility / 1609.34).toFixed(1);
+    setText('wxVis', `${visMi} mi`);
+    setColor('wxVis', visMi > 5 ? 'green' : visMi > 3 ? 'amber' : 'red');
+  }
+
+  if (snap.cloud_cover != null) {
+    setText('wxCloud', `${snap.cloud_cover}%`);
+    const ceilFt = snap.cloud_cover < 10 ? 'CLR' : snap.cloud_cover < 30 ? '15,000+ ft' : snap.cloud_cover < 70 ? '5,000-15,000 ft' : '< 5,000 ft';
+    setText('wxCeiling', ceilFt);
+  }
+  if (snap.weather_code != null) setText('wxConditions', wmoCodeToText(snap.weather_code));
+
+  const precip = snap.precipitation_probability ?? 0;
+  setText('wxPrecip', `${precip}%`);
+  setColor('wxPrecip', precip < 20 ? 'green' : precip < 50 ? 'amber' : 'red');
+  setText('wxLightning', snap.weather_code >= 95 ? 'Active' : precip > 40 ? 'Possible' : 'None');
+  setColor('wxLightning', snap.weather_code >= 95 ? 'red' : precip > 40 ? 'amber' : 'green');
+  setText('wxUV', snap.uv_index?.toFixed(1) ?? '--');
+
+  const icing = assessPropIcing(snap.temperature_2m, snap.dew_point_2m);
+  setText('wxIcing', icing.reason ? `${icing.risk} — ${icing.reason}` : icing.risk);
+  setColor('wxIcing', icing.level);
+
+  if (snap.relative_humidity_2m != null) {
+    const rh = snap.relative_humidity_2m;
+    const fireDanger = rh < 20 ? 'Very High' : rh < 30 ? 'High' : rh < 45 ? 'Moderate' : 'Low';
+    setText('wxFire', fireDanger);
+    setColor('wxFire', rh < 20 ? 'red' : rh < 30 ? 'red' : rh < 45 ? 'amber' : 'green');
+  }
+}
+
+// Render the Wind tab from a snapshot (defaults to the selected hour). Rebuilds
+// S.wind so downstream computeOpsData/computeAssessment see the same hour.
+function renderWind(snap) {
+  snap = snap || snapshotAtIdx(S.timeIdx || 0);
+  const groundWind = Math.round(snap.wind_speed_10m);
+  const groundGust = Math.round(snap.wind_gusts_10m);
+  const groundDir = Math.round(snap.wind_direction_10m);
+
+  const w80 = Math.round(snap.wind_speed_80m ?? groundWind * 1.3);
+  const w120 = Math.round(snap.wind_speed_120m ?? groundWind * 1.5);
+  const w180 = Math.round(snap.wind_speed_180m ?? groundWind * 1.7);
+  const d80 = Math.round(snap.wind_direction_80m ?? groundDir);
+  const d120 = Math.round(snap.wind_direction_120m ?? groundDir);
+  const d180 = Math.round(snap.wind_direction_180m ?? groundDir);
+
+  const windProfile = [
+    { alt: 'Ground (10m)', speed: groundWind, gust: groundGust, dir: groundDir },
+    { alt: '100 ft AGL', speed: Math.round(lerp(groundWind, w80, 0.37)), gust: Math.round(groundGust * 1.1), dir: Math.round(lerp(groundDir, d80, 0.37)) },
+    { alt: '200 ft AGL', speed: Math.round(lerp(groundWind, w80, 0.74)), gust: Math.round(groundGust * 1.2), dir: Math.round(lerp(groundDir, d80, 0.74)) },
+    { alt: '300 ft AGL', speed: Math.round(lerp(w80, w120, 0.5)), gust: Math.round(groundGust * 1.3), dir: Math.round(lerp(d80, d120, 0.5)) },
+    { alt: '400 ft AGL', speed: w120, gust: Math.round(groundGust * 1.4), dir: d120 },
+  ];
+  S.wind = { profile: windProfile, maxWind: Math.max(...windProfile.map(w => w.speed)), maxGust: Math.max(...windProfile.map(w => w.gust)) };
+
+  document.getElementById('windTableBody').innerHTML = windProfile.map(w =>
+    `<tr><td>${w.alt}</td><td>${w.speed} mph</td><td>${w.gust} mph</td><td>${w.dir}° (${degToCompass(w.dir)})</td></tr>`
+  ).join('');
+
+  setText('windMax', `${S.wind.maxWind} mph`);
+  setColor('windMax', S.wind.maxWind < 15 ? 'green' : S.wind.maxWind < 25 ? 'amber' : 'red');
+  setText('windGustMax', `${S.wind.maxGust} mph`);
+  setColor('windGustMax', S.wind.maxGust < 20 ? 'green' : S.wind.maxGust < 30 ? 'amber' : 'red');
+  setText('windDir', `${groundDir}° (${degToCompass(groundDir)})`);
+  setText('windImpact', S.wind.maxWind < 10 ? 'Minimal — full flight time' : S.wind.maxWind < 20 ? 'Moderate — ~15% battery penalty' : 'Significant — ~30% battery penalty');
+
+  const gustFactor = calcGustFactor(S.wind.maxGust, S.wind.maxWind);
+  setText('windGustFactor', gustFactor > 0 ? `${gustFactor.toFixed(1)}x` : '--');
+  setColor('windGustFactor', gustFactor < 1.5 ? 'green' : gustFactor <= 2.0 ? 'amber' : 'red');
+
+  const shear = calcWindShear(windProfile);
+  setText('windShear', `${shear.maxSpeedChange}mph / ${shear.maxDirChange}°`);
+  setColor('windShear', shear.level);
+
+  if (S.elev.points && typeof assessTerrainTurbulence === 'function') {
+    const elevFtArray = S.elev.points.map(p => p.elevFt);
+    const turbulence = assessTerrainTurbulence(elevFtArray, S.elev.gridSize, S.elev.range, groundDir, groundWind);
+    const factorText = turbulence.factors.join('; ');
+    setText('windTurbulence', `${turbulence.risk.toUpperCase()} — ${factorText}`);
+    setColor('windTurbulence', turbulence.level);
+  }
+}
+
+// Re-render the whole data panel for the currently-selected timeline hour.
+function refreshPanelForHour() {
+  if (!S.wx || !S.wx.hourly) return;
+  const snap = snapshotAtIdx(S.timeIdx || 0);
+  renderWeather(snap);
+  renderWind(snap);
+  // Kp / GNSS for the selected hour (SWPC 3-hourly forecast). Update S.kp BEFORE
+  // the assessment so the Kp caution gate reflects the selected hour too.
+  if (S.kpForecast && S.kpForecast.length && snap._time && typeof kpAtTime === 'function') {
+    const kp = kpAtTime(S.kpForecast, new Date(snap._time).getTime());
+    if (kp != null) { S.kp = kp; renderKp(kp); }
+  }
+  if (S.currentArea) { computeOpsData(snap); computeAssessment(snap); }
+  updateTimeContextBanner();
+}
+
+// Show/hide the "viewing a forecast hour, not NOW" banner above the data panel.
+function updateTimeContextBanner() {
+  const el = document.getElementById('panelTimeContext');
+  if (!el) return;
+  const idx = S.timeIdx || 0;
+  const hourly = S.wx && S.wx.hourly;
+  if (!idx || !hourly || !hourly.time || !hourly.time[idx]) {
+    el.style.display = 'none';
+    el.innerHTML = '';
+    return;
+  }
+  const tstr = new Date(hourly.time[idx]).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: _localTZ() });
+  el.style.display = 'block';
+  el.innerHTML = `<strong>FORECAST +${idx}h — ${tstr}</strong> (not current). ` +
+    `Airspace, TFRs, fire &amp; live traffic shown are current-time and may change.`;
+}
+
+// ============================================================
 // API: OPEN-METEO — Weather + Wind + AQI (FREE, no key)
 // ============================================================
 async function fetchWeather(lat, lng) {
@@ -1199,6 +1351,7 @@ async function fetchWeather(lat, lng) {
       `weather_code,uv_index,is_day` +
       `&hourly=wind_speed_80m,wind_speed_120m,wind_speed_180m,wind_direction_80m,wind_direction_120m,wind_direction_180m` +
       `,temperature_2m,dew_point_2m,precipitation_probability,wind_speed_10m,wind_direction_10m,wind_gusts_10m,cloud_cover,weather_code` +
+      `,relative_humidity_2m,apparent_temperature,surface_pressure,visibility,uv_index,is_day` +
       `&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto` +
       `&forecast_hours=24`;
 
@@ -1210,98 +1363,45 @@ async function fetchWeather(lat, lng) {
     const aqi = await aqiRes.json();
 
     if (wx.current) {
-      const c = wx.current;
-      S.wx = c;
+      S.wx = wx.current;
+    }
 
-      setText('wxTemp', `${Math.round(c.temperature_2m)}°F`);
-      setText('wxFeels', `${Math.round(c.apparent_temperature)}°F`);
-      setText('wxDew', `${Math.round(c.dew_point_2m)}°F`);
-      setText('wxHumidity', `${Math.round(c.relative_humidity_2m)}%`);
+    // Store hourly forecast arrays BEFORE rendering so the panel can render any
+    // selected timeline hour via snapshotAtIdx(). Includes upper winds (80/120/180m
+    // — previously fetched then discarded) and the fields needed for a fully
+    // time-aware panel (humidity, apparent temp, pressure, visibility, UV).
+    if (wx.hourly && wx.hourly.time) {
+      S.wx.hourly = {
+        time: wx.hourly.time,
+        temperature_2m: wx.hourly.temperature_2m,
+        dew_point_2m: wx.hourly.dew_point_2m,
+        apparent_temperature: wx.hourly.apparent_temperature,
+        relative_humidity_2m: wx.hourly.relative_humidity_2m,
+        surface_pressure: wx.hourly.surface_pressure,
+        visibility: wx.hourly.visibility,
+        uv_index: wx.hourly.uv_index,
+        precipitation_probability: wx.hourly.precipitation_probability,
+        wind_speed_10m: wx.hourly.wind_speed_10m,
+        wind_direction_10m: wx.hourly.wind_direction_10m,
+        wind_gusts_10m: wx.hourly.wind_gusts_10m,
+        wind_speed_80m: wx.hourly.wind_speed_80m,
+        wind_speed_120m: wx.hourly.wind_speed_120m,
+        wind_speed_180m: wx.hourly.wind_speed_180m,
+        wind_direction_80m: wx.hourly.wind_direction_80m,
+        wind_direction_120m: wx.hourly.wind_direction_120m,
+        wind_direction_180m: wx.hourly.wind_direction_180m,
+        cloud_cover: wx.hourly.cloud_cover,
+        weather_code: wx.hourly.weather_code,
+        is_day: wx.hourly.is_day,
+      };
+    }
 
-      const inHg = (c.surface_pressure * 0.02953).toFixed(2);
-      setText('wxPressure', `${inHg} inHg`);
-
-      // Density altitude — uses extracted core function
-      const elevFt = S.elev.center || 1500;
-      const densAlt = calcDensityAltitude(c.temperature_2m, c.surface_pressure, elevFt);
-      setText('wxDensity', `${densAlt.toLocaleString()} ft`);
-      setColor('wxDensity', densAlt < 5000 ? 'green' : densAlt < 7500 ? 'amber' : 'red');
-
-      const visMi = (c.visibility / 1609.34).toFixed(1);
-      setText('wxVis', `${visMi} mi`);
-      setColor('wxVis', visMi > 5 ? 'green' : visMi > 3 ? 'amber' : 'red');
-
-      setText('wxCloud', `${c.cloud_cover}%`);
-      const ceilFt = c.cloud_cover < 10 ? 'CLR' : c.cloud_cover < 30 ? '15,000+ ft' : c.cloud_cover < 70 ? '5,000-15,000 ft' : '< 5,000 ft';
-      setText('wxCeiling', ceilFt);
-      setText('wxConditions', wmoCodeToText(c.weather_code));
-
-      const precip = c.precipitation_probability ?? 0;
-      setText('wxPrecip', `${precip}%`);
-      setColor('wxPrecip', precip < 20 ? 'green' : precip < 50 ? 'amber' : 'red');
-      setText('wxLightning', c.weather_code >= 95 ? 'Active' : precip > 40 ? 'Possible' : 'None');
-      setColor('wxLightning', c.weather_code >= 95 ? 'red' : precip > 40 ? 'amber' : 'green');
-      setText('wxUV', c.uv_index?.toFixed(1) ?? '--');
-
-      const icing = assessPropIcing(c.temperature_2m, c.dew_point_2m);
-      setText('wxIcing', icing.reason ? `${icing.risk} — ${icing.reason}` : icing.risk);
-      setColor('wxIcing', icing.level);
-
-      const fireDanger = c.relative_humidity_2m < 20 ? 'Very High' : c.relative_humidity_2m < 30 ? 'High' : c.relative_humidity_2m < 45 ? 'Moderate' : 'Low';
-      setText('wxFire', fireDanger);
-      setColor('wxFire', c.relative_humidity_2m < 20 ? 'red' : c.relative_humidity_2m < 30 ? 'red' : c.relative_humidity_2m < 45 ? 'amber' : 'green');
-
-      // ---- WIND ----
-      const groundWind = Math.round(c.wind_speed_10m);
-      const groundGust = Math.round(c.wind_gusts_10m);
-      const groundDir = Math.round(c.wind_direction_10m);
-
-      const h = wx.hourly || {};
-      const w80 = Math.round(h.wind_speed_80m?.[0] ?? groundWind * 1.3);
-      const w120 = Math.round(h.wind_speed_120m?.[0] ?? groundWind * 1.5);
-      const w180 = Math.round(h.wind_speed_180m?.[0] ?? groundWind * 1.7);
-      const d80 = Math.round(h.wind_direction_80m?.[0] ?? groundDir);
-      const d120 = Math.round(h.wind_direction_120m?.[0] ?? groundDir);
-      const d180 = Math.round(h.wind_direction_180m?.[0] ?? groundDir);
-
-      const windProfile = [
-        { alt: 'Ground (10m)', speed: groundWind, gust: groundGust, dir: groundDir },
-        { alt: '100 ft AGL', speed: Math.round(lerp(groundWind, w80, 0.37)), gust: Math.round(groundGust * 1.1), dir: Math.round(lerp(groundDir, d80, 0.37)) },
-        { alt: '200 ft AGL', speed: Math.round(lerp(groundWind, w80, 0.74)), gust: Math.round(groundGust * 1.2), dir: Math.round(lerp(groundDir, d80, 0.74)) },
-        { alt: '300 ft AGL', speed: Math.round(lerp(w80, w120, 0.5)), gust: Math.round(groundGust * 1.3), dir: Math.round(lerp(d80, d120, 0.5)) },
-        { alt: '400 ft AGL', speed: w120, gust: Math.round(groundGust * 1.4), dir: d120 },
-      ];
-      S.wind = { profile: windProfile, maxWind: Math.max(...windProfile.map(w => w.speed)), maxGust: Math.max(...windProfile.map(w => w.gust)) };
-
-      document.getElementById('windTableBody').innerHTML = windProfile.map(w =>
-        `<tr><td>${w.alt}</td><td>${w.speed} mph</td><td>${w.gust} mph</td><td>${w.dir}° (${degToCompass(w.dir)})</td></tr>`
-      ).join('');
-
-      setText('windMax', `${S.wind.maxWind} mph`);
-      setColor('windMax', S.wind.maxWind < 15 ? 'green' : S.wind.maxWind < 25 ? 'amber' : 'red');
-      setText('windGustMax', `${S.wind.maxGust} mph`);
-      setColor('windGustMax', S.wind.maxGust < 20 ? 'green' : S.wind.maxGust < 30 ? 'amber' : 'red');
-      setText('windDir', `${groundDir}° (${degToCompass(groundDir)})`);
-      setText('windImpact', S.wind.maxWind < 10 ? 'Minimal — full flight time' : S.wind.maxWind < 20 ? 'Moderate — ~15% battery penalty' : 'Significant — ~30% battery penalty');
-
-      // Gust Factor
-      const gustFactor = calcGustFactor(S.wind.maxGust, S.wind.maxWind);
-      setText('windGustFactor', gustFactor > 0 ? `${gustFactor.toFixed(1)}x` : '--');
-      setColor('windGustFactor', gustFactor < 1.5 ? 'green' : gustFactor <= 2.0 ? 'amber' : 'red');
-
-      // Wind Shear
-      const shear = calcWindShear(windProfile);
-      setText('windShear', `${shear.maxSpeedChange}mph / ${shear.maxDirChange}°`);
-      setColor('windShear', shear.level);
-
-      // Terrain Turbulence — requires elevation data
-      if (S.elev.points && typeof assessTerrainTurbulence === 'function') {
-        const elevFtArray = S.elev.points.map(p => p.elevFt);
-        const turbulence = assessTerrainTurbulence(elevFtArray, S.elev.gridSize, S.elev.range, groundDir, groundWind);
-        const factorText = turbulence.factors.join('; ');
-        setText('windTurbulence', `${turbulence.risk.toUpperCase()} — ${factorText}`);
-        setColor('windTurbulence', turbulence.level);
-      }
+    if (wx.current) {
+      // New data → reset the timeline to NOW and render hour 0 into the panel.
+      S.timeIdx = 0;
+      const snap = snapshotAtIdx(0);
+      renderWeather(snap);
+      renderWind(snap);
 
       setStatus('wxStatus', 'live', 'LIVE');
       setStatus('windStatus', 'live', 'LIVE');
@@ -1309,21 +1409,10 @@ async function fetchWeather(lat, lng) {
       markSection('weather', { status: 'live', updatedAt: Date.now(), error: null });
     }
 
-    // Store hourly forecast data
     if (wx.hourly && wx.hourly.time) {
-      S.wx.hourly = {
-        time: wx.hourly.time,
-        temperature_2m: wx.hourly.temperature_2m,
-        dew_point_2m: wx.hourly.dew_point_2m,
-        precipitation_probability: wx.hourly.precipitation_probability,
-        wind_speed_10m: wx.hourly.wind_speed_10m,
-        wind_direction_10m: wx.hourly.wind_direction_10m,
-        wind_gusts_10m: wx.hourly.wind_gusts_10m,
-        cloud_cover: wx.hourly.cloud_cover,
-        weather_code: wx.hourly.weather_code,
-      };
       renderForecastChart(S.wx.hourly);
       initTimeBar();
+      updateTimeContextBanner();
     }
 
     // AQI
@@ -1403,49 +1492,63 @@ async function fetchWeather(lat, lng) {
   }
 }
 
+// Render the Kp / GNSS readouts (wxKp, satKp, accuracy, assessment, sat table) for
+// a given Kp value. Called for NOW by fetchKpIndex and for the selected timeline
+// hour by refreshPanelForHour (the SWPC forecast is genuinely time-varying).
+function renderKp(kp) {
+  setText('wxKp', kp.toFixed(1));
+  setColor('wxKp', kp <= 3 ? 'green' : kp <= 5 ? 'amber' : 'red');
+  setText('satKp', kp.toFixed(1));
+  setColor('satKp', kp <= 3 ? 'green' : kp <= 5 ? 'amber' : 'red');
+  setText('satAccuracy', kp <= 3 ? '< 2m horizontal' : '2-5m horizontal');
+  setText('satAssessment', kp <= 3 ? 'Nominal — good GNSS conditions' : kp <= 5 ? 'Marginal — monitor positioning' : 'Degraded — expect position errors');
+
+  const baseSats = kp <= 3 ? 20 : kp <= 5 ? 16 : 12;
+
+  // GPS Terrain Masking — adjust sat count if terrain data available
+  let skyVisPct = 100;
+  if (S.elev.points && typeof analyzeGPSMasking === 'function') {
+    const masking = analyzeGPSMasking(S.elev.center, S.elev.points, S.elev.gridSize, 400);
+    skyVisPct = masking.skyVisibilityPct;
+    setText('satSkyVis', `${skyVisPct}%`);
+    setColor('satSkyVis', skyVisPct > 80 ? 'green' : skyVisPct > 60 ? 'amber' : 'red');
+    setText('satMasked', masking.maskedDirections.length > 0 ? masking.maskedDirections.join(', ') : 'None');
+    setColor('satMasked', masking.maskedDirections.length === 0 ? 'green' : masking.maskedDirections.length <= 2 ? 'amber' : 'red');
+  }
+
+  const tbody = document.getElementById('satTableBody');
+  if (tbody) tbody.innerHTML = [100,200,300,400].map(alt => {
+    const rawSats = baseSats + Math.round(alt/200);
+    const sats = Math.round(rawSats * skyVisPct / 100);
+    const pdop = (1.0 + kp * 0.3 - alt/1000).toFixed(1);
+    const q = sats > 16 ? 'Excellent' : sats > 12 ? 'Good' : 'Fair';
+    const qColor = sats > 16 ? 'var(--accent-green)' : sats > 12 ? 'var(--accent-amber)' : 'var(--accent-red)';
+    return `<tr><td>Below ${alt} ft</td><td>${sats} sats</td><td>${pdop}</td><td style="color:${qColor}">${q}</td></tr>`;
+  }).join('');
+}
+
+// Parse the SWPC forecast JSON (row 0 is headers) into [{t, kp}] (t in ms).
+function _parseKpForecast(data) {
+  const rows = [];
+  if (!Array.isArray(data)) return rows;
+  for (let i = 1; i < data.length; i++) {
+    const t = new Date(data[i][0] + ' UTC').getTime();
+    const kpv = parseFloat(data[i][1]);
+    if (!isNaN(t) && !isNaN(kpv)) rows.push({ t, kp: kpv });
+  }
+  return rows;
+}
+
 async function fetchKpIndex() {
   trackFetchStart('Kp Index');
   try {
     const res = await fetch('https://services.swpc.noaa.gov/products/noaa-planetary-k-index-forecast.json');
     const data = await res.json();
-    // Find the entry closest to current time (row 0 is headers)
-    const now = Date.now();
-    let kp = 2;
-    let bestDiff = Infinity;
-    for (let i = 1; i < data.length; i++) {
-      const t = new Date(data[i][0] + ' UTC').getTime();
-      const diff = Math.abs(now - t);
-      if (diff < bestDiff) { bestDiff = diff; kp = parseFloat(data[i][1]) || 2; }
-    }
+    // Keep the whole 3-hourly forecast so the timeline can show Kp per selected hour.
+    S.kpForecast = _parseKpForecast(data);
+    const kp = kpAtTime(S.kpForecast, Date.now()) ?? 2;
     S.kp = kp;  // expose for the risk assessment (Kp caution gate)
-    setText('wxKp', kp.toFixed(1));
-    setColor('wxKp', kp <= 3 ? 'green' : kp <= 5 ? 'amber' : 'red');
-    setText('satKp', kp.toFixed(1));
-    setColor('satKp', kp <= 3 ? 'green' : kp <= 5 ? 'amber' : 'red');
-    setText('satAccuracy', kp <= 3 ? '< 2m horizontal' : '2-5m horizontal');
-    setText('satAssessment', kp <= 3 ? 'Nominal — good GNSS conditions' : kp <= 5 ? 'Marginal — monitor positioning' : 'Degraded — expect position errors');
-
-    const baseSats = kp <= 3 ? 20 : kp <= 5 ? 16 : 12;
-
-    // GPS Terrain Masking — adjust sat count if terrain data available
-    let skyVisPct = 100;
-    if (S.elev.points && typeof analyzeGPSMasking === 'function') {
-      const masking = analyzeGPSMasking(S.elev.center, S.elev.points, S.elev.gridSize, 400);
-      skyVisPct = masking.skyVisibilityPct;
-      setText('satSkyVis', `${skyVisPct}%`);
-      setColor('satSkyVis', skyVisPct > 80 ? 'green' : skyVisPct > 60 ? 'amber' : 'red');
-      setText('satMasked', masking.maskedDirections.length > 0 ? masking.maskedDirections.join(', ') : 'None');
-      setColor('satMasked', masking.maskedDirections.length === 0 ? 'green' : masking.maskedDirections.length <= 2 ? 'amber' : 'red');
-    }
-
-    document.getElementById('satTableBody').innerHTML = [100,200,300,400].map(alt => {
-      const rawSats = baseSats + Math.round(alt/200);
-      const sats = Math.round(rawSats * skyVisPct / 100);
-      const pdop = (1.0 + kp * 0.3 - alt/1000).toFixed(1);
-      const q = sats > 16 ? 'Excellent' : sats > 12 ? 'Good' : 'Fair';
-      const qColor = sats > 16 ? 'var(--accent-green)' : sats > 12 ? 'var(--accent-amber)' : 'var(--accent-red)';
-      return `<tr><td>Below ${alt} ft</td><td>${sats} sats</td><td>${pdop}</td><td style="color:${qColor}">${q}</td></tr>`;
-    }).join('');
+    renderKp(kp);
 
     // Cache Kp data
     if (typeof cacheApiResponse === 'function') cacheApiResponse('kp', 'global', data);
@@ -1460,14 +1563,10 @@ async function fetchKpIndex() {
       try {
         const cached = await getCachedApiResponse('kp', 'global');
         if (cached && cached.data) {
-          const kp = parseFloat(cached.data[1]?.[1]) || 2;
+          S.kpForecast = _parseKpForecast(cached.data);
+          const kp = kpAtTime(S.kpForecast, Date.now()) ?? (parseFloat(cached.data[1]?.[1]) || 2);
           S.kp = kp;  // expose for the risk assessment (Kp caution gate)
-          setText('wxKp', kp.toFixed(1));
-          setColor('wxKp', kp <= 3 ? 'green' : kp <= 5 ? 'amber' : 'red');
-          setText('satKp', kp.toFixed(1));
-          setColor('satKp', kp <= 3 ? 'green' : kp <= 5 ? 'amber' : 'red');
-          setText('satAccuracy', kp <= 3 ? '< 2m horizontal' : '2-5m horizontal');
-          setText('satAssessment', kp <= 3 ? 'Nominal — good GNSS conditions' : kp <= 5 ? 'Marginal — monitor positioning' : 'Degraded — expect position errors');
+          renderKp(kp);
           markSection('spaceWx', { status: 'cached', cachedAt: cached.timestamp, error: _kpErrMsg });
         }
       } catch (cacheErr) { console.warn('Kp cache fallback failed:', cacheErr); }
@@ -4458,8 +4557,11 @@ async function fetchRadar() {
     const frames = (data.radar && data.radar.past) ? data.radar.past : [];
     if (frames.length === 0) return;
 
+    // Color scheme 6 = NEXRAD Level III (traditional NWS look: green->yellow->
+    // orange->red->magenta, blue reserved for snow). Trailing 1_1 = smoothing on,
+    // snow on (appropriate for mountain SAR).
     const layers = frames.map(frame =>
-      L.tileLayer(`https://tilecache.rainviewer.com${frame.path}/256/{z}/{x}/{y}/2/1_1.png`, {
+      L.tileLayer(`https://tilecache.rainviewer.com${frame.path}/256/{z}/{x}/{y}/6/1_1.png`, {
         opacity: 0, maxNativeZoom: 7, maxZoom: 18, zIndex: 500,
       })
     );
@@ -5075,6 +5177,7 @@ function _updateTimeBar(frac) {
   if (!hourly || !hourly.time?.length || !S.areaCenter) return;
   const n = Math.min(hourly.time.length, 24);
   const idx = Math.max(0, Math.min(n - 1, Math.round(frac * (n - 1))));
+  S.timeIdx = idx;
 
   // Update scrubber position
   const pct = (idx / (n - 1)) * 100;
@@ -5104,6 +5207,9 @@ function _updateTimeBar(frac) {
   // Update map arrows
   _updateWindArrow(windDir, windSpd);
   _updateSunArrow(sunPos);
+
+  // Re-render the data panel (weather / wind / ops / assessment) for this hour.
+  refreshPanelForHour();
 }
 
 // --- Wind direction arrow (blue) on map ---
@@ -5168,6 +5274,9 @@ function hideTimeBar() {
   if (bar) bar.style.display = 'none';
   if (S._windArrow) { S.map.removeLayer(S._windArrow); S._windArrow = null; }
   if (S._sunArrow) { S.map.removeLayer(S._sunArrow); S._sunArrow = null; }
+  // Return the panel to NOW when the area / timeline is cleared.
+  S.timeIdx = 0;
+  updateTimeContextBanner();
 }
 
 // ============================================================
@@ -5298,9 +5407,10 @@ function onThresholdEdit() {
   if (S.currentArea) { computeOpsData(); computeAssessment(); }
 }
 
-function computeOpsData() {
+function computeOpsData(snap) {
+  snap = snap || snapshotAtIdx(S.timeIdx || 0);
   const _t = readActiveThresholds();
-  const temp = S.wx.temperature_2m ?? 65;
+  const temp = snap.temperature_2m ?? 65;
   const elev = S.elev.center ?? 1500;
   const maxWind = S.wind.maxWind ?? 5;
   const nomTime = _t.flightTime || 38;
@@ -5323,10 +5433,11 @@ function computeOpsData() {
   bar.style.width = `${capacity}%`;
   bar.style.background = capacity > 85 ? 'var(--accent-green)' : capacity > 70 ? 'var(--accent-amber)' : 'var(--accent-red)';
 
-  // Multi-factor bird strike risk assessment
-  const now = new Date();
-  const month = now.getMonth();
-  const hour = now.getHours();
+  // Multi-factor bird strike risk assessment (follows the selected timeline hour
+  // when one is set; falls back to the real clock for no-arg/test callers).
+  const when = snap._time ? new Date(snap._time) : new Date();
+  const month = when.getMonth();
+  const hour = when.getHours();
   let birdScore = 0;
   const factors = [];
 
@@ -5437,10 +5548,14 @@ function computeOpsData() {
   }
 }
 
-function computeAssessment() {
+function computeAssessment(snap) {
+  snap = snap || snapshotAtIdx(S.timeIdx || 0);
   // Live, effective thresholds (defaults < active profile < edited inputs).
   const thresholds = readActiveThresholds();
-  const result = assessRisk(S.wx, S.wind, S.elev, thresholds.maxWindTol, thresholds);
+  // Weather-driven gates use the selected-hour snapshot; the overlays below
+  // (NWS/TFR/NOTAM/airspace/fire/ADS-B/Kp/AQI) remain current-time — the
+  // timeline banner notes this when a forecast hour is selected.
+  const result = assessRisk(snap, S.wind, S.elev, thresholds.maxWindTol, thresholds);
 
   // Integrate NWS severe weather alerts into assessment
   if (S.nwsAlerts && S.nwsAlerts.length > 0) {
@@ -5711,7 +5826,7 @@ const EXPORT_DISCLAIMER = 'Advisory only \u2014 NOT a complete inventory. Wires,
   'NOTAMs from these public datasets are frequently incomplete. Verify against official FAA sources ' +
   '(B4UFLY / LAANC, current sectional, FAA TFR & NOTAM search) and a visual scan of the area before flight.';
 // Keys whose folder carries the disclaimer (wire_* handled by prefix).
-const EXPORT_DISCLAIMER_KEYS = new Set(['faa_tfr', 'tfr_imported', 'notam_imported', 'faa_obstacles']);
+const EXPORT_DISCLAIMER_KEYS = new Set(['faa_tfr', 'tfr_imported', 'notam_imported', 'faa_obstacles', 'emergency_lz']);
 
 function _exportNeedsDisclaimer(key) {
   return key.indexOf('wire_') === 0 || EXPORT_DISCLAIMER_KEYS.has(key);
@@ -5894,6 +6009,34 @@ function _exportObserverRecords() {
   return recs;
 }
 
+// Emergency LZ points — a SYNTHETIC source. The emergency_lz map layer is left
+// empty on purpose (see renderLZMarkers): these are terrain-suitability estimates
+// from a coarse 25-point elevation grid, NOT verified landing zones. So we harvest
+// directly from S.lzs, take only the top few by score, drop clearly-too-steep ones,
+// and lead every record with a strong disclaimer (the folder also carries
+// EXPORT_DISCLAIMER via EXPORT_DISCLAIMER_KEYS).
+const EXPORT_LZ_MAX = 5;         // top candidates by score
+const EXPORT_LZ_MAX_SLOPE = 15;  // deg; skip candidates clearly too steep to be useful
+function _exportLZRecords() {
+  const lzs = (S.lzs || [])
+    .filter(lz => lz && lz.lat != null && lz.lng != null &&
+      (lz.slopeDeg == null || lz.slopeDeg <= EXPORT_LZ_MAX_SLOPE))
+    .slice(0, EXPORT_LZ_MAX);  // S.lzs is pre-sorted by score (findEmergencyLZs)
+  return lzs.map((lz, i) => {
+    const scorePct = lz.score != null ? Math.round(lz.score * 100) : null;
+    const description = [
+      'TERRAIN ESTIMATE ONLY — NOT a verified landing zone.',
+      'Derived from a coarse 25-point elevation grid; confirm on satellite imagery and by visual scan before any use.',
+      '',
+      scorePct != null ? `Suitability score: ${scorePct}%` : '',
+      lz.slopeDeg != null ? `Approx. slope: ${lz.slopeDeg.toFixed(1)}°` : '',
+      `Coordinates: ${lz.lat.toFixed(5)}, ${lz.lng.toFixed(5)}`,
+    ].filter(Boolean).join('\n');
+    const name = `Emergency LZ #${i + 1}${scorePct != null ? ` (score ${scorePct}%)` : ''}`;
+    return { kind: 'point', name, styleId: 'protected', description, lat: lz.lat, lng: lz.lng };
+  });
+}
+
 // Group every currently-visible map overlay into ordered folder groups of records.
 // `selectedKeys` (a Set of layer keys) optionally restricts which layers are
 // included; null = all visible. Returns [{ label, disclaim, features:[record,...] }].
@@ -5901,7 +6044,10 @@ function collectExportFolderGroups(selectedKeys) {
   const groups = [];
   if (!S.map || !S.mapLayers) return groups;
   const keys = Object.keys(S.mapLayers).filter(k =>
-    !AGG_SKIP_LAYERS.has(k) && S.mapLayers[k] && S.map.hasLayer(S.mapLayers[k]));
+    !EXPORT_SKIP_LAYERS.has(k) && S.mapLayers[k] &&
+    (S.map.hasLayer(S.mapLayers[k]) || EXPORT_HIDDEN_OK.has(k)));
+  // Emergency LZ is a synthetic source (its map layer is intentionally empty).
+  if (S.lzs && S.lzs.length && !keys.includes('emergency_lz')) keys.push('emergency_lz');
   keys.sort((a, b) => _aggMeta(a).pri - _aggMeta(b).pri); // safety layers first
   const byLabel = {};
   keys.forEach(k => {
@@ -5913,6 +6059,7 @@ function collectExportFolderGroups(selectedKeys) {
     else if (k === 'tfr_imported') recs = _exportTfrRecords();
     else if (k === 'airports') recs = _exportAirportRecords();
     else if (k === 'observers') recs = _exportObserverRecords();
+    else if (k === 'emergency_lz') recs = _exportLZRecords();
     else recs = _exportLayerRecords(k, S.mapLayers[k]);
     if (!recs || !recs.length) return;
     const label = _aggMeta(k).label || 'Other';
@@ -6152,11 +6299,17 @@ function populateExportModal() {
   const list = document.getElementById('exportLayerList');
   if (list) {
     const keys = (S.map && S.mapLayers) ? Object.keys(S.mapLayers).filter(k =>
-      !AGG_SKIP_LAYERS.has(k) && S.mapLayers[k] && S.map.hasLayer(S.mapLayers[k])) : [];
+      !EXPORT_SKIP_LAYERS.has(k) && S.mapLayers[k] &&
+      (S.map.hasLayer(S.mapLayers[k]) || EXPORT_HIDDEN_OK.has(k))) : [];
+    // Emergency LZ is a synthetic source (its map layer is intentionally empty).
+    if (S.lzs && S.lzs.length && !keys.includes('emergency_lz')) keys.push('emergency_lz');
     keys.sort((a, b) => _aggMeta(a).pri - _aggMeta(b).pri);
     const byLabel = {}; const order = [];
     keys.forEach(k => {
-      let n = 0; eachPopupLayer(S.mapLayers[k], () => { n++; });
+      // Count features; emergency_lz comes from S.lzs, not the (empty) layer.
+      let n;
+      if (k === 'emergency_lz') n = _exportLZRecords().length;
+      else { n = 0; eachPopupLayer(S.mapLayers[k], () => { n++; }); }
       if (!n) return;
       const label = _aggMeta(k).label || 'Other';
       if (!byLabel[label]) { byLabel[label] = { keys: [], count: 0 }; order.push(label); }
@@ -6718,6 +6871,22 @@ function toggleLayer(id, el) {
 // ============================================================
 const AGG_HIT_PX = 8; // pixel tolerance for line / point hit-testing
 const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'parcels', 'slope']);
+// Export-only exclusion set. Extends the popup-skip set (so basemaps / parcels /
+// rasters stay out of the vector export) and adds layers CalTopo already provides
+// natively and that would be stale by import time. These layers remain visible and
+// clickable on the map — this set is used ONLY by the export paths, never by popup
+// aggregation. (Canopy & viewshed are excluded here but still export as GeoTIFF/KMZ
+// via the raster rows.)
+const EXPORT_SKIP_LAYERS = new Set([
+  ...AGG_SKIP_LAYERS,
+  'adsb_aircraft', 'mvum_roads', 'mvum_trails', 'usfs_trails',
+  'cell_att', 'cell_tmobile', 'cell_verizon',  // FCC LTE coverage polygons
+  'public_lands',                              // land ownership
+  'cell_towers', 'dams',                       // user-requested additions
+]);
+// Layers that may be exported even when hidden on the map, provided they are built
+// and populated (e.g. LAANC is built unconditionally but off by default).
+const EXPORT_HIDDEN_OK = new Set(['faa_laanc']);
 // Per-layer display label + cycle priority (lower = shown first). Safety-relevant
 // restrictions sort ahead of advisory/terrain features.
 const AGG_LAYER_META = {
@@ -6732,7 +6901,7 @@ const AGG_LAYER_META = {
   national_parks: { label: 'National Park', pri: 6 }, swap_radius: { label: 'Swap Radius', pri: 8 },
   observers: { label: 'Observer', pri: 3 },
   public_lands: { label: 'Land Status', pri: 6 }, nhd_water: { label: 'Water', pri: 7 },
-  hospitals: { label: 'Hospital/LZ', pri: 4 },
+  hospitals: { label: 'Hospital/LZ', pri: 4 }, emergency_lz: { label: 'Emergency LZ', pri: 4 },
   usfs_roads: { label: 'NFS Road', pri: 7 }, usfs_trails: { label: 'NFS Trail', pri: 7 },
   mvum_roads: { label: 'MVUM Road', pri: 7 }, mvum_trails: { label: 'MVUM Trail', pri: 7 },
   blm_gtlf: { label: 'BLM Route', pri: 7 },
@@ -9196,6 +9365,8 @@ if (typeof module !== 'undefined' && module.exports) {
     openAggregatePopup, aggPopupStep, renderAggregatePopup, collectFeaturesAt,
     wirePopupAggregation, eachPopupLayer, _aggFeatureClick,
     computeAirspace, computeOpsData, computeAssessment,
+    snapshotAtIdx, renderWeather, renderWind, refreshPanelForHour, updateTimeContextBanner,
+    renderKp, _parseKpForecast,
     THRESHOLD_FIELDS, readActiveThresholds, onThresholdEdit,
     loadSopProfile, saveSopProfileFromUI, deleteSopProfileFromUI, populateSopDropdown, updateSopThresholdFields,
     fetchWeather, fetchKpIndex, fetchElevation, fetchSunMoon,
@@ -9218,7 +9389,7 @@ if (typeof module !== 'undefined' && module.exports) {
     exportAllViewshedGeoTiffs, exportAllViewshedKmz, _exportObserverRecords,
     _exportLayerRecords, _polyRingsGroups, _exportStyleForLayer, _exportNeedsDisclaimer,
     _exportSelectedLayerKeys, _exportArrowLengthM, EXPORT_DISCLAIMER, EXPORT_SUMMARY_SECTIONS,
-    _exportNotamRecords, _exportTfrRecords, _exportAirportRecords, _exportRasterData,
+    _exportNotamRecords, _exportTfrRecords, _exportAirportRecords, _exportLZRecords, _exportRasterData,
     collectExportFolderGroups, folderGroupsToKml, folderGroupsToGeoJsonFeatures,
     recordToKml, recordToGeoJsonFeature, _uuid, _areaRingLatLng, _exportSummaryDesc,
     saveConfig, updateClock, refreshData,

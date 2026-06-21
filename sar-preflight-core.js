@@ -19,6 +19,16 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.06.20-j',
+    date: '2026-06-20',
+    changes: [
+      'The 24-hour timeline now drives the entire data panel, not just the sun & wind arrows: drag it and the weather, wind-by-altitude profile, ops/battery estimates, GNSS outlook and the overall GO/CAUTION/NO-GO all update to the selected forecast hour, so you can scrub to find the best launch window. A "FORECAST +Xh" banner makes clear when you are viewing a future hour, and notes that airspace, TFRs, fire and live traffic remain current-time.',
+      'Weather radar now uses the traditional NWS color scale (green → yellow → orange → red → magenta, with blue for snow) instead of the previous blue-heavy palette, so heavy rain no longer shows as blue.',
+      'CalTopo export now includes the LAANC ceiling grid (even when it is hidden on the map) and disclaimer-flagged emergency-LZ terrain estimates.',
+      'CalTopo export no longer includes layers CalTopo already provides natively and that would be stale by the time the file is imported: ADS-B aircraft, MVUM roads & trails, USFS trails, cell coverage & towers, land ownership, dams and parcels. These layers still appear and remain clickable on the map.',
+    ],
+  },
+  {
     version: '2026.06.20-i',
     date: '2026-06-20',
     changes: [
@@ -309,6 +319,52 @@ const DRONE_PROFILES = [
   { ...DEFAULT_THRESHOLDS, name: 'DJI Mini 4 Pro', model: 'DJI Mini 4 Pro', maxWindTol: 24, windCaution: 16, flightTime: 34, serviceCeiling: 13123, maxSpeed: 36, tempColdNoGo: 14, tempHotNoGo: 104 },
   { ...DEFAULT_THRESHOLDS, name: 'DJI Mini 5 Pro', model: 'DJI Mini 5 Pro', maxWindTol: 27, windCaution: 17, flightTime: 36, serviceCeiling: 19685, maxSpeed: 40, tempColdNoGo: 14, tempHotNoGo: 104 },
 ];
+
+// --- Hourly weather snapshot ---
+// Build a weather object shaped like the Open-Meteo `current` object but for a
+// chosen forecast hour, so the data panel can render any timeline hour with the
+// same render/compute functions. Starts from `current` (so non-hourly scalars are
+// always present) and overrides every field that has an hourly array at idx.
+// Returns the live `current` object when no hourly data is available. idx is
+// clamped to [0, min(24, time.length)-1]. Adds _idx / _isNow / _time metadata.
+const WX_HOURLY_FIELDS = [
+  'temperature_2m', 'dew_point_2m', 'apparent_temperature', 'relative_humidity_2m',
+  'surface_pressure', 'visibility', 'uv_index', 'cloud_cover', 'weather_code',
+  'precipitation_probability', 'wind_speed_10m', 'wind_direction_10m', 'wind_gusts_10m',
+  'wind_speed_80m', 'wind_speed_120m', 'wind_speed_180m',
+  'wind_direction_80m', 'wind_direction_120m', 'wind_direction_180m', 'is_day',
+];
+function wxAtHour(hourly, idx, current) {
+  current = current || {};
+  if (!hourly || !hourly.time || !hourly.time.length) {
+    return Object.assign({}, current, { _idx: 0, _isNow: true, _time: null });
+  }
+  const n = Math.min(24, hourly.time.length);
+  const i = Math.max(0, Math.min(n - 1, Math.round(Number(idx) || 0)));
+  const snap = Object.assign({}, current);
+  WX_HOURLY_FIELDS.forEach(f => {
+    const arr = hourly[f];
+    if (Array.isArray(arr) && arr[i] != null) snap[f] = arr[i];
+  });
+  snap._idx = i;
+  snap._isNow = (i === 0);
+  snap._time = hourly.time[i];
+  return snap;
+}
+
+// Kp index for a given time from the SWPC 3-hourly forecast rows [{t, kp}] (t in
+// ms epoch). Returns the kp of the row nearest in time (matching the app's
+// "closest to now" selection); null when there are no rows.
+function kpAtTime(rows, dateMs) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  let best = null, bestDiff = Infinity;
+  for (const r of rows) {
+    if (!r || r.t == null || r.kp == null) continue;
+    const diff = Math.abs(dateMs - r.t);
+    if (diff < bestDiff) { bestDiff = diff; best = r; }
+  }
+  return best ? best.kp : null;
+}
 
 // --- Density Altitude ---
 
@@ -2426,7 +2482,7 @@ if (typeof module !== 'undefined' && module.exports) {
     calcSunPosition, calcMoonPhase, wireHazardName,
     DOF_LIGHTING, obstacleLighting, obstacleMarkerColor, obstacleLabel,
     summarizeObstacles, obstacleHazardLevel,
-    calcDensityAltitude, calcBatteryDerating, assessPropIcing, assessRisk,
+    wxAtHour, kpAtTime, calcDensityAltitude, calcBatteryDerating, assessPropIcing, assessRisk,
     DEFAULT_THRESHOLDS, DRONE_PROFILES,
     classifyTerrain, estimateVegetation, estimateCellCoverage,
     SMA_NONPUBLIC_CODES, smaAgencyInfo, smaIsPublic, classifyAreaPublicPrivate, cellCoverageAt,
