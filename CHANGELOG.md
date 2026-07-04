@@ -4,6 +4,18 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.03-b — 2026-07-03
+
+- New GOES-East GeoColor cloud layer (Map Layers → Weather Imagery): near-real-time geostationary satellite imagery (true-color by day, IR at night) via NASA GIBS — see cloud decks and storm systems approaching your area, complementing the precipitation radar.
+- New GOES GLM lightning layer (Map Layers → Weather Imagery): near-real-time lightning strike density from NOAA nowCOAST for at-a-glance thunderstorm situational awareness. Both new imagery layers are off by default.
+
+## v2026.07.03-a — 2026-07-03
+
+- New Flight Category & cloud ceiling: the Weather tab now shows the observed ceiling and VFR/MVFR/IFR/LIFR flight category from the nearest reporting station (FAA aviationweather.gov METAR), and a Part 107 §107.51(c) cloud-clearance gate flags CAUTION/NO-GO when the ceiling can't keep you 500 ft below clouds or visibility is below the 3 sm minimum. The required cloud clearance is an editable threshold (Config → Weather).
+- New Freezing Level readout (Open-Meteo 0 °C isotherm): flags a CAUTION for icing aloft when the freezing level sits within your flight envelope (launch elevation up to launch + max AGL).
+- New NOAA HMS wildfire-smoke layer: toggle current-day satellite smoke plumes (Light / Medium / Heavy) under Map Layers → Smoke. A Medium/Heavy plume over your area raises a reduced-visibility/VLOS CAUTION.
+- New optional Winter Ops layer group: avalanche danger zones (avalanche.org, danger 1–5 with active-warning flags) and NOHRSC SNODAS snow-depth. A Considerable-or-higher danger level or warning over the launch point raises a ground-team-hazard CAUTION. Both layers are off by default.
+
 ## v2026.06.20-j — 2026-06-20
 
 - The 24-hour timeline now drives the entire data panel, not just the sun & wind arrows: drag it and the weather, wind-by-altitude profile, ops/battery estimates, GNSS outlook and the overall GO/CAUTION/NO-GO all update to the selected forecast hour, so you can scrub to find the best launch window. A "FORECAST +Xh" banner makes clear when you are viewing a future hour, and notes that airspace, TFRs, fire and live traffic remain current-time.
