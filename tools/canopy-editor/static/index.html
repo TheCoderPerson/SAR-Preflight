@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Canopy Update Tool — SAR Preflight</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="sidebar">
+  <h1>Canopy Update Tool</h1>
+  <p class="hint">Fix the Meta/WRI canopy layer where logging or wildfire has cleared vegetation, then export for SAR&nbsp;Preflight.</p>
+
+  <details open id="panel-aoi">
+    <summary>1 · Area of interest</summary>
+    <button id="btn-draw-aoi">Draw AOI rectangle</button>
+    <div class="row">
+      <input id="bbox-input" placeholder="or paste: west,south,east,north">
+      <button id="btn-bbox">Load</button>
+    </div>
+    <div id="aoi-status" class="status"></div>
+  </details>
+
+  <details id="panel-layers">
+    <summary>2 · Layers</summary>
+    <label class="layer-row"><input type="checkbox" id="lyr-canopy" checked> Canopy
+      <select id="canopy-which"><option value="1">edited</option><option value="0">original</option></select>
+      <input type="range" id="op-canopy" min="0" max="100" value="70">
+    </label>
+    <label class="layer-row"><input type="checkbox" id="lyr-s2"> Sentinel-2 scene
+      <input type="range" id="op-s2" min="0" max="100" value="100">
+    </label>
+    <label class="layer-row"><input type="checkbox" id="lyr-ndvi"> NDVI mask
+      <input type="range" id="op-ndvi" min="0" max="100" value="80">
+    </label>
+    <div class="row indent">
+      <label>NDVI threshold <span id="ndvi-val">0.40</span></label>
+      <input type="range" id="ndvi-threshold" min="0" max="0.9" step="0.05" value="0.4">
+    </div>
+    <label class="layer-row"><input type="checkbox" id="lyr-goes"> GOES GeoColor
+      <select id="goes-sat"><option value="GOES-West">GOES-West</option><option value="GOES-East">GOES-East</option></select>
+    </label>
+    <label class="layer-row"><input type="checkbox" id="lyr-goes-fire"> GOES fire temperature</label>
+    <div class="row indent">
+      <label>GOES time</label>
+      <select id="goes-time"></select>
+    </div>
+    <p class="hint">GOES (~0.5–2 km) is situational context only — it shows <em>that</em> a fire is burning. Use a post-event Sentinel-2 scene (10 m) to see <em>where</em> canopy is gone.</p>
+  </details>
+
+  <details id="panel-scenes">
+    <summary>3 · Sentinel-2 scenes</summary>
+    <div class="row">
+      <input type="date" id="s2-start"> <input type="date" id="s2-end">
+    </div>
+    <div class="row">
+      <label>max cloud % <input type="number" id="s2-cloud" value="30" min="0" max="100" style="width:4em"></label>
+      <button id="btn-scenes">Search</button>
+    </div>
+    <div id="scene-list"></div>
+  </details>
+
+  <details id="panel-edits">
+    <summary>4 · Edits</summary>
+    <div class="row">
+      <select id="edit-mode">
+        <option value="clear">clear — zero all canopy in polygon</option>
+        <option value="clear_nonveg">clear non-vegetated (NDVI) only</option>
+        <option value="set_height">set constant height</option>
+      </select>
+    </div>
+    <div class="row" id="height-row" style="display:none">
+      <label>height (m) <input type="number" id="edit-height" value="0" min="0" max="60" step="0.5" style="width:5em"></label>
+    </div>
+    <button id="btn-draw-poly">Draw edit polygon</button>
+    <button id="btn-undo">Undo last</button>
+    <div id="op-list"></div>
+  </details>
+
+  <details id="panel-shadow">
+    <summary>5 · Shadow height</summary>
+    <p class="hint">Pick a Sentinel-2 scene, then draw a line from a tree's base along its shadow to the tip. Height = length × tan(sun elevation).</p>
+    <button id="btn-draw-shadow">Draw shadow line</button>
+    <div class="row">
+      <label>or UTC time <input id="shadow-time" placeholder="2026-07-04T18:30Z" style="width:11em"></label>
+    </div>
+    <div id="shadow-result" class="status"></div>
+  </details>
+
+  <details id="panel-export">
+    <summary>6 · Export</summary>
+    <label><input type="checkbox" id="exp-quadkey"> also write per-quadkey tiles (Meta layout — downloads each touched source tile once; can be hundreds of MB per tile)</label>
+    <button id="btn-export">Export edited canopy</button>
+    <div id="export-result" class="status"></div>
+    <p class="hint">Serve mode: after a per-quadkey export, paste this server's URL into SAR&nbsp;Preflight → Config → Data&nbsp;proxy&nbsp;URL and the app loads your edited canopy via its normal fetcher.</p>
+  </details>
+
+  <div id="toast"></div>
+</div>
+<div id="map"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

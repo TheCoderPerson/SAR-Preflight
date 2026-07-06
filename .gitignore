@@ -6,3 +6,8 @@ dist/
 .claude/
 # Cell-coverage build inputs (raw FCC downloads — large, regenerable scratch)
 tools/cell-coverage/input/
+# Canopy-editor working data (downloaded rasters + exports — large, regenerable)
+tools/canopy-editor/cache/
+tools/canopy-editor/output/
+__pycache__/
+.pytest_cache/
