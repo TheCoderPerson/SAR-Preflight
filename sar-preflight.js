@@ -7346,9 +7346,18 @@ function toggleLayer(id, el) {
     const layer = ensureGlmLayer();
     if (layer) { if (on) S.map.addLayer(layer); else S.map.removeLayer(layer); }
   } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'parcels' || id === 'slope' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
+    if (id === 'canopy' || id === 'viewshed') {
+      // Keep the zoom-cap's "wanted" flag in sync — otherwise _applyOverlayZoomCap
+      // re-adds the overlay on the next zoomend after it was unchecked here.
+      if (!S._overlayWanted) S._overlayWanted = {};
+      S._overlayWanted[id] = on;
+    }
     if (id === 'canopy') { const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = on; }
-    if (on) S.map.addLayer(S.mapLayers[id]);
-    else S.map.removeLayer(S.mapLayers[id]);
+    if (on) {
+      // Raster overlays go through the zoom cap so the mobile display-size budget still applies
+      if (id === 'canopy' || id === 'viewshed') _applyOverlayZoomCap();
+      else S.map.addLayer(S.mapLayers[id]);
+    } else S.map.removeLayer(S.mapLayers[id]);
     // Toggling aircraft also toggles trails
     if (id === 'adsb_aircraft' && S.mapLayers.adsb_trails) {
       if (on) S.map.addLayer(S.mapLayers.adsb_trails);
