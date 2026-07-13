@@ -29,7 +29,7 @@ Version history is in [CHANGELOG.md](CHANGELOG.md). In the app, a **What's New**
 7. **Export** a pre-flight briefing as PDF, email, clipboard text, or KML. The KML export captures **every currently-visible map layer** as real geometry — airspace, TFRs, NOTAMs, obstacles, wires, airports, towers, fires, NWS alerts, ADS-B, etc. — with plain-text descriptions, category icons (plane for airports, circle-H for heliports), and NOTAM/TFR folders that lead with a plain-English summary before the raw text. It also adds **hourly sun & wind bearing lines** (24 h, time-slider animation; sun omitted while below the horizon, wind drawn downwind). Canopy and viewshed overlays export as **georeferenced GeoTIFFs in Web Mercator (EPSG:3857)** — the projection CalTopo's *Map Sheet* import expects — and, optionally, as **KMZ GroundOverlays** for Google Earth. Wire, obstacle, NOTAM and TFR folders carry a *"verify independently — not a complete inventory"* note
 
 ### Map Features
-- Toggle map layers (satellite, topo, FAA sectional, weather radar, GOES cloud imagery + GLM lightning, airspace, LAANC grid, FAA obstacles, towers, wire hazards, dams, fire perimeters, wildfire smoke plumes, live aircraft traffic, and an optional **Winter Ops** group — avalanche danger zones + SNODAS snow depth) via the **Map Layers** control
+- Toggle map layers (satellite, topo, FAA sectional, weather radar, GOES cloud imagery + lightning strike density, airspace, LAANC grid, FAA obstacles, towers, wire hazards, dams, fire perimeters, wildfire smoke plumes, live aircraft traffic, and an optional **Winter Ops** group — avalanche danger zones + SNODAS snow depth) via the **Map Layers** control
 - **Click any point to inspect overlapping features.** A single click hit-tests every visible layer and shows all matches in one popup with `← n/N →` pagination, so overlapping airspace, an obstacle, a LAANC cell, and a NOTAM at the same spot can all be read without toggling layers off
 - The **FAA Obstacles (DOF)** layer plots verified man-made obstacles color-coded by height (red ≥ 200 ft AGL, amber 100–199, yellow < 100); popups show AGL/AMSL height, lighting, and marking status
 - The **FAA Sectional** layer streams the current official FAA VFR sectional (56-day cycle); drawing an operational area auto-caches its tiles for offline use, and the cached edition is shown / refreshed when a newer one is published
@@ -65,7 +65,7 @@ All data is fetched from free, public APIs. No API keys are required.
 | NWS severe weather alerts | [NWS Weather API](https://www.weather.gov/documentation/services-web-api) | ~15 min |
 | Weather radar animation | [RainViewer](https://www.rainviewer.com/) | ~10 min |
 | GOES-East GeoColor cloud imagery (Weather Imagery layer) | [NASA GIBS](https://nasa-gibs.github.io/gibs-api-docs/) / NOAA GOES-East | ~10 min |
-| GOES GLM lightning strike density (Weather Imagery layer) | [NOAA nowCOAST](https://nowcoast.noaa.gov/) via WMS | ~15 min |
+| Lightning strike density (Weather Imagery layer) | [NOAA nowCOAST](https://nowcoast.noaa.gov/) via WMS | ~15 min |
 | Class B/C/D/E airspace boundaries | [FAA UDDS](https://udds.faa.gov/) via ArcGIS | Static |
 | Special use airspace (MOAs, restricted, prohibited) | [FAA UDDS](https://udds.faa.gov/) via ArcGIS | Static |
 | TFR areas (national defense) | [FAA UDDS](https://udds.faa.gov/) via ArcGIS | Static |

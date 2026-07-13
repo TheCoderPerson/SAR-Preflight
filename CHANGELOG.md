@@ -4,6 +4,16 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.13-f — 2026-07-13
+
+- Lightning layer fixed and renamed: the Weather Imagery lightning layer now requests the correct NOAA nowCOAST GeoServer layer (lightning_detection:ldn_lightning_strike_density) — the previous endpoint returned errors, so the layer always rendered blank. Renamed from “Lightning (GOES GLM)” to “Lightning strike density (NOAA)”: the nowCOAST product is 15-minute strike density from ground-based lightning detection networks, not GOES GLM satellite data.
+- GOES GeoColor cloud layer fixed: the WMS request no longer computes a “now minus 30 minutes” TIME value — GIBS ingest lag regularly exceeds that buffer (2+ hours observed), which made every tile come back blank. TIME is now omitted so GIBS always serves its latest available frame.
+- NWS alert details: alert cards now show the full hazard description (wind gusts, hail size, flooding, etc.) and safety instructions instead of only the one-line headline, and map polygon popups include the description too — a Special Weather Statement now tells you what the weather actually is.
+- GOES Clouds layer now shows its frame time and age (e.g. “frame 22:40Z (2h 05m old)”) in the Map Layers control, refreshed each time the layer is enabled, so users know how current the satellite imagery actually is.
+- Aviation weather source switched to NWS api.weather.gov station observations: aviationweather.gov’s API does not allow cross-origin browser requests, so the METAR fetch always failed with a NetworkError and the Flight Category / cloud-ceiling readout never populated. The app now resolves the nearest reporting stations via api.weather.gov (CORS-enabled, includes the raw METAR) and skips automated stations that report no ceiling or visibility.
+- SNODAS snow-depth layer fixed: the WMS request asked for sublayer 3 (a boundary outline) instead of sublayer 5 (the snow-depth image), and used EPSG:3857 coordinates the NOHRSC ArcGIS server does not support — both meant the layer never showed snow. Now requests sublayer 5 in EPSG:4326.
+- Fire danger nationwide: outside California the fire-danger card now pulls NFDRS from the nearest RAWS station via the USDA FEMS API (current ERC/BI and fuel moistures, with percentile colors computed against that station’s own climatological thresholds). Previously the danger indices only populated inside California (CA_NFDRS); active-fire perimeters were already nationwide.
+
 ## v2026.07.03-b — 2026-07-03
 
 - New GOES-East GeoColor cloud layer (Map Layers → Weather Imagery): near-real-time geostationary satellite imagery (true-color by day, IR at night) via NASA GIBS — see cloud decks and storm systems approaching your area, complementing the precipitation radar.
