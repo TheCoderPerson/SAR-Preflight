@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.13-g — 2026-07-13
+
+- Vegetation Height and Viewshed overlays no longer reappear after zooming when their Map Layers checkbox is off: unchecking them in the layer control now clears the internal “overlay wanted” flag that the zoom handler (which re-attaches overlays after the mobile display-size cap) was still honoring. Re-checking them also goes through that size cap, so the mobile memory protection still applies.
+
 ## v2026.07.13-f — 2026-07-13
 
 - Lightning layer fixed and renamed: the Weather Imagery lightning layer now requests the correct NOAA nowCOAST GeoServer layer (lightning_detection:ldn_lightning_strike_density) — the previous endpoint returned errors, so the layer always rendered blank. Renamed from “Lightning (GOES GLM)” to “Lightning strike density (NOAA)”: the nowCOAST product is 15-minute strike density from ground-based lightning detection networks, not GOES GLM satellite data.
