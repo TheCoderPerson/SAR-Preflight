@@ -254,8 +254,13 @@ async function downloadTiles(config, client) {
     streets_roads: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}',
     streets_labels: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
   };
-  // Native zoom limits per provider — out-of-range tiles don't exist (skip them)
-  const providerZoom = { sectional: { min: 8, max: 12 }, parcels: { min: 0, max: 17 } };
+  // Native zoom limits per provider — out-of-range tiles don't exist (skip them).
+  // Streets capped at 15: past that the service draws labels only (no road
+  // lines), so the app upscales z15 tiles and never requests deeper ones.
+  const providerZoom = {
+    sectional: { min: 8, max: 12 }, parcels: { min: 0, max: 17 },
+    streets_roads: { min: 0, max: 15 }, streets_labels: { min: 0, max: 15 },
+  };
 
   const selectedProviders = providers || ['carto'];
   const tiles = [];

@@ -631,9 +631,12 @@ function initMap() {
   // street names + town/place labels), meant for draping over World Imagery.
   // zIndex 250: above base tiles (which re-stack by DOM order on every base
   // toggle, so an explicit zIndex is required), below radar frames (zIndex 500).
+  // maxNativeZoom 15: past z15 the service stops drawing road LINES and renders
+  // labels only (it assumes the imagery shows the road), so upscale the z15
+  // tiles instead — road geometry stays visible at close zoom.
   S.mapLayers.streets = L.layerGroup([
-    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, zIndex: 250, attribution: 'Esri' }),
-    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, zIndex: 250 }),
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 15, maxZoom: 19, zIndex: 250, attribution: 'Esri' }),
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 15, maxZoom: 19, zIndex: 250 }),
   ]);
   S.drawnItems = new L.FeatureGroup();
   S.map.addLayer(S.drawnItems);
