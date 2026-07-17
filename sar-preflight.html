@@ -1452,6 +1452,18 @@ select.api-input { cursor: pointer; }
   </div>
 </div>
 
+<div class="modal-overlay" id="updateModal">
+  <div class="modal" style="width:560px;max-height:85vh;">
+    <h3 style="color:var(--accent-cyan);">Update Available</h3>
+    <div id="updateModalSub" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:2px;"></div>
+    <div id="updateModalBody" style="overflow-y:auto;max-height:50vh;margin-top:10px;"></div>
+    <div class="modal-actions" style="margin-top:16px;">
+      <button class="btn btn-ghost" onclick="dismissUpdateModal()">Later</button>
+      <button class="btn btn-primary" onclick="applyUpdate()">Reload &amp; Update</button>
+    </div>
+  </div>
+</div>
+
 <input type="file" id="kmlFileInput" accept=".kml,.kmz" style="display:none" onchange="handleKMLFile(this)">
 
 <script src="version.js"></script>

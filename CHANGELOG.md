@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.17-c — 2026-07-17
+
+- New "Update Available" modal: when the app discovers a newly deployed version (on load, when returning to the app, or via Config → Check for Updates), a modal now pops up showing exactly what changed in the update, with a "Reload & Update" button and a "Later" option. Dismissing it keeps the small update banner at the top as a reminder, so updates are never missed but never forced.
+
 ## v2026.07.17-b — 2026-07-17
 
 - Streets/Labels overlay: road lines now stay visible when zoomed in close. The Esri street tiles stop drawing road geometry past zoom 15 (labels only), so the app now upscales the zoom-15 tiles at closer zooms — lines and names get slightly softer the further you zoom, but the road vector no longer disappears.

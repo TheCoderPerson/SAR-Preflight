@@ -19,6 +19,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.17-c',
+    date: '2026-07-17',
+    changes: [
+      'New "Update Available" modal: when the app discovers a newly deployed version (on load, when returning to the app, or via Config → Check for Updates), a modal now pops up showing exactly what changed in the update, with a "Reload & Update" button and a "Later" option. Dismissing it keeps the small update banner at the top as a reminder, so updates are never missed but never forced.',
+    ],
+  },
+  {
     version: '2026.07.17-b',
     date: '2026-07-17',
     changes: [
@@ -232,6 +239,29 @@ function wireHazardName(tags, cat) {
     return tags.name ? `${tags.name} (${type})` : type || 'Aerialway';
   }
   return '';
+}
+
+// --- Changelog markdown parser (update-available modal) ---
+// Parses the CHANGELOG.md that build.js generates (`## v<version> — <date>`
+// headers with `- <change>` items) back into entry objects. Used to show the
+// DEPLOYED version's release notes before reloading — the running app's own
+// CHANGELOG_ENTRIES are stale by definition when an update is available.
+// Returns entries newer than sinceVersion (stops when it reaches it).
+function parseChangelogMd(md, sinceVersion) {
+  const entries = [];
+  let cur = null;
+  for (const raw of String(md || '').split(/\r?\n/)) {
+    const h = raw.match(/^##\s+v(\S+)(?:\s+—\s+(\S+))?\s*$/);
+    if (h) {
+      if (sinceVersion && h[1] === sinceVersion) break;
+      cur = { version: h[1], date: h[2] || '', changes: [] };
+      entries.push(cur);
+      continue;
+    }
+    const item = raw.match(/^-\s+(.*\S)\s*$/);
+    if (item && cur) cur.changes.push(item[1]);
+  }
+  return entries;
 }
 
 // --- OSM Named Trails (Overpass) ---
@@ -2668,6 +2698,7 @@ if (typeof module !== 'undefined' && module.exports) {
     WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,
     calcSunPosition, calcMoonPhase, wireHazardName,
+    parseChangelogMd,
     TRAIL_HIGHWAY_TYPES, buildTrailsOverpassQuery, parseOverpassTrails, trailTypeLabel,
     DOF_LIGHTING, obstacleLighting, obstacleMarkerColor, obstacleLabel,
     summarizeObstacles, obstacleHazardLevel,
