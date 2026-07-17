@@ -3,7 +3,7 @@ Object.assign(globalThis, core);
 globalThis.L = { layerGroup: () => ({ addLayer() {}, clearLayers() {}, getLayers: () => [], addTo() { return this; } }) };
 globalThis.SAR_VERSION = '2026.07.17-b';
 
-const { S, showUpdateModal, dismissUpdateModal, acceptDisclaimer } = require('../../sar-preflight.js');
+const { S, showUpdateModal, dismissUpdateModal, acceptDisclaimer, checkDeployedVersion, fetchLatestVersion } = require('../../sar-preflight.js');
 
 const NEW_MD = [
   '# Changelog', '',
@@ -93,5 +93,41 @@ describe('showUpdateModal', () => {
     acceptDisclaimer();
     await new Promise(r => setTimeout(r, 0)); // let the deferred async modal render
     expect(document.getElementById('updateModal').classList.contains('active')).toBe(true);
+  });
+});
+
+describe('checkDeployedVersion (active check — catches version.js-only deploys)', () => {
+  beforeEach(() => {
+    setBody(false);
+    S._updateModalShown = false;
+    S._pendingUpdateModal = false;
+    S._lastVersionCheck = 0;
+    mockFetch();
+  });
+  afterEach(() => { document.body.innerHTML = ''; delete globalThis.fetch; });
+
+  it('shows the update modal when the deployed version differs from the running one', async () => {
+    await checkDeployedVersion();
+    expect(document.getElementById('updateModal').classList.contains('active')).toBe(true);
+  });
+
+  it('does nothing when the deployed version matches', async () => {
+    globalThis.fetch = vi.fn(async () => ({ ok: true, text: async () => "var SAR_VERSION = '2026.07.17-b';" }));
+    await checkDeployedVersion();
+    expect(document.getElementById('updateModal').classList.contains('active')).toBe(false);
+    expect(document.getElementById('swUpdateBanner')).toBeFalsy();
+  });
+
+  it('does nothing when the version fetch fails (offline)', async () => {
+    globalThis.fetch = vi.fn(async () => { throw new Error('offline'); });
+    await checkDeployedVersion();
+    expect(document.getElementById('updateModal').classList.contains('active')).toBe(false);
+  });
+
+  it('throttles repeat checks within the session window', async () => {
+    await checkDeployedVersion();
+    const calls = globalThis.fetch.mock.calls.length;
+    await checkDeployedVersion(); // within throttle window — no new fetch
+    expect(globalThis.fetch.mock.calls.length).toBe(calls);
   });
 });

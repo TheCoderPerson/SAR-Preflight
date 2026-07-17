@@ -7806,8 +7806,13 @@ function startApp() {
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible' && S._swReg) {
           S._swReg.update().catch(() => {});
+          checkDeployedVersion();
         }
       });
+
+      // The SW byte-compare misses version.js-only deploys — actively compare
+      // the deployed version once at startup too.
+      checkDeployedVersion();
     }).catch(err => console.warn('SW registration failed:', err));
 
     // Listen for tile download progress from SW
@@ -7877,7 +7882,7 @@ function showUpdateBanner() {
   const div = document.createElement('div');
   div.id = 'swUpdateBanner';
   div.style.cssText = 'padding:8px 16px;background:var(--bg-tertiary);border-bottom:1px solid var(--accent-cyan);font-family:var(--font-mono);font-size:11px;color:var(--accent-cyan);display:flex;align-items:center;gap:8px;';
-  div.innerHTML = 'Update available <button class="btn btn-primary" style="padding:3px 10px;font-size:10px;" onclick="location.reload()">Reload</button>';
+  div.innerHTML = 'Update available <button class="btn btn-primary" style="padding:3px 10px;font-size:10px;" onclick="applyUpdate()">Reload</button>';
   banner.parentElement.insertBefore(div, banner);
 }
 
@@ -7918,7 +7923,7 @@ async function checkForUpdates() {
       status.style.color = 'var(--accent-amber)';
     } else if (current && latest !== current) {
       status.innerHTML = 'Update available: v' + latest +
-        ' — <a href="#" onclick="location.reload();return false;" style="color:var(--accent-cyan);text-decoration:underline;">reload to update</a>';
+        ' — <a href="#" onclick="applyUpdate();return false;" style="color:var(--accent-cyan);text-decoration:underline;">reload to update</a>';
       status.style.color = 'var(--accent-cyan)';
       showUpdateModal(true);
     } else {
@@ -8002,6 +8007,40 @@ async function showUpdateModal(force) {
 
 function dismissUpdateModal() {
   document.getElementById('updateModal')?.classList.remove('active');
+}
+
+// Active deployed-version check. The browser's SW update byte-compare does NOT
+// notice deploys that only change version.js (an imported script) — verified in
+// Chrome even with updateViaCache:'none' — so releases that don't touch sw.js
+// itself would never fire update discovery. This compares the deployed
+// version.js (cache-busted network fetch) against the running version instead.
+// Throttled; called at startup and whenever the app regains visibility.
+async function checkDeployedVersion() {
+  try {
+    if (typeof isOnline === 'function' && !isOnline()) return;
+    const now = Date.now();
+    if (S._lastVersionCheck && now - S._lastVersionCheck < 10 * 60 * 1000) return;
+    S._lastVersionCheck = now;
+    const cur = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : null;
+    const latest = await fetchLatestVersion();
+    if (cur && latest && latest !== cur) await showUpdateModal();
+  } catch (_) { /* offline / transient — next visibility change retries */ }
+}
+
+// Apply a discovered update. When the SW has the new version waiting/installing,
+// a plain reload activates it (skipWaiting + clients.claim). But when discovery
+// came from the version check above, the SW never installed anything new and a
+// plain reload would re-serve the OLD cached shell — so drop the registration
+// first (online only; offline keeps the working copy) and let the reload fetch
+// the new shell from the network and register a fresh SW.
+async function applyUpdate() {
+  try {
+    const reg = S._swReg;
+    const swHasUpdate = !!(reg && (reg.waiting || reg.installing));
+    const online = (typeof isOnline !== 'function') || isOnline();
+    if (reg && !swHasUpdate && online) { try { await reg.unregister(); } catch (_) {} }
+  } catch (_) {}
+  location.reload();
 }
 
 function closeChangelog() {
@@ -10001,6 +10040,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer,
+    checkDeployedVersion, applyUpdate, fetchLatestVersion,
     getCanopyProxyBase, saveCanopyProxy, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
     renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, _isConstrained, setCanopyOpacity, setViewshedOpacity,
