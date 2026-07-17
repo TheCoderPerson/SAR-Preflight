@@ -7742,7 +7742,15 @@ function checkDisclaimer() {
 function acceptDisclaimer() {
   localStorage.setItem('sar_disclaimer_version', APP_VERSION);
   document.getElementById('disclaimerModal')?.classList.remove('active');
-  if (S._pendingWhatsNew) { S._pendingWhatsNew = false; try { showChangelog(true); } catch (_) {} }
+  // A pending update supersedes What's New: the update modal shows the NEWER
+  // version's notes, so showing last update's notes too would just stack modals.
+  if (S._pendingUpdateModal) {
+    S._pendingUpdateModal = false; S._pendingWhatsNew = false;
+    try { showUpdateModal(); } catch (_) {}
+  } else if (S._pendingWhatsNew) {
+    S._pendingWhatsNew = false;
+    try { showChangelog(true); } catch (_) {}
+  }
 }
 
 function startApp() {
@@ -7767,11 +7775,11 @@ function startApp() {
   if ('serviceWorker' in navigator) {
     const trackInstallingSW = (sw) => {
       sw.addEventListener('statechange', () => {
-        // Fire the banner once the new SW is installed (before activation).
+        // Fire the update modal once the new SW is installed (before activation).
         // On an update, navigator.serviceWorker.controller is already set by
         // the old SW, so this distinguishes "update" from "first install".
         if (sw.state === 'installed' && navigator.serviceWorker.controller) {
-          showUpdateBanner();
+          showUpdateModal();
         }
       });
     };
@@ -7782,7 +7790,7 @@ function startApp() {
       // Cover three cases missed by a naked updatefound listener:
       // 1. An update is already waiting from a previous session
       if (reg.waiting && navigator.serviceWorker.controller) {
-        showUpdateBanner();
+        showUpdateModal();
       }
       // 2. An update is currently installing (race: install may start before listener attaches)
       if (reg.installing) {
@@ -7912,7 +7920,7 @@ async function checkForUpdates() {
       status.innerHTML = 'Update available: v' + latest +
         ' — <a href="#" onclick="location.reload();return false;" style="color:var(--accent-cyan);text-decoration:underline;">reload to update</a>';
       status.style.color = 'var(--accent-cyan)';
-      showUpdateBanner();
+      showUpdateModal(true);
     } else {
       status.textContent = 'Up to date (v' + (current || latest) + ')';
       status.style.color = 'var(--accent-green)';
@@ -7925,34 +7933,75 @@ async function checkForUpdates() {
   }
 }
 
+// Shared renderer for a list of changelog entries. `cur` (optional) highlights
+// that version and tags it "— current".
+function _changelogEntriesHtml(entries, cur) {
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return (entries || []).map(function (e) {
+    const isCur = cur && e.version === cur;
+    const items = (e.changes || []).map(function (c) { return '<li style="margin-bottom:3px;">' + esc(c) + '</li>'; }).join('');
+    return '<div style="margin-bottom:14px;">' +
+      '<div style="font-family:var(--font-mono);font-size:12px;font-weight:700;color:' + (isCur ? 'var(--accent-cyan)' : 'var(--text-secondary)') + ';">' +
+      'v' + esc(e.version) + (isCur ? ' — current' : '') +
+      ' <span style="color:var(--text-muted);font-weight:400;">' + esc(e.date || '') + '</span></div>' +
+      '<ul style="margin:6px 0 0 0;padding-left:18px;font-size:12px;line-height:1.5;color:var(--text-secondary);">' + items + '</ul>' +
+      '</div>';
+  }).join('');
+}
+
 // Render the changelog modal. whatsNew=true titles it "What's New — v<current>"
 // (shown automatically after an update); false is the on-demand "Changelog" view.
 function showChangelog(whatsNew) {
   const modal = document.getElementById('changelogModal');
   const body = document.getElementById('changelogBody');
   if (!modal || !body) return;
-  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const entries = (typeof CHANGELOG_ENTRIES !== 'undefined' && Array.isArray(CHANGELOG_ENTRIES)) ? CHANGELOG_ENTRIES : [];
   const cur = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : '';
   const title = document.getElementById('changelogTitle');
   if (title) title.textContent = whatsNew ? ('What\'s New — v' + cur) : 'Changelog';
-  if (!entries.length) {
-    body.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">No changelog available.</div>';
-  } else {
-    body.innerHTML = entries.map(function (e) {
-      const isCur = e.version === cur;
-      const items = (e.changes || []).map(function (c) { return '<li style="margin-bottom:3px;">' + esc(c) + '</li>'; }).join('');
-      return '<div style="margin-bottom:14px;">' +
-        '<div style="font-family:var(--font-mono);font-size:12px;font-weight:700;color:' + (isCur ? 'var(--accent-cyan)' : 'var(--text-secondary)') + ';">' +
-        'v' + esc(e.version) + (isCur ? ' — current' : '') +
-        ' <span style="color:var(--text-muted);font-weight:400;">' + esc(e.date || '') + '</span></div>' +
-        '<ul style="margin:6px 0 0 0;padding-left:18px;font-size:12px;line-height:1.5;color:var(--text-secondary);">' + items + '</ul>' +
-        '</div>';
-    }).join('');
-  }
+  body.innerHTML = entries.length ? _changelogEntriesHtml(entries, cur)
+    : '<div style="color:var(--text-muted);font-size:12px;">No changelog available.</div>';
   const link = document.getElementById('changelogGithubLink');
   if (link && typeof CHANGELOG_URL !== 'undefined' && CHANGELOG_URL) link.href = CHANGELOG_URL;
   modal.classList.add('active');
+}
+
+// "Update Available" modal — shown when the SW discovers a newly deployed
+// version (or a manual check finds one). Fetches the DEPLOYED changelog +
+// version (cache-busted, so the SW cache is bypassed) to show what the update
+// contains before the user reloads; "Later" dismisses it, leaving the thin
+// update banner as a persistent reminder. Auto-discovery paths show it once
+// per session (`force` bypasses that for the manual Config check).
+async function showUpdateModal(force) {
+  showUpdateBanner(); // persistent fallback reminder if the modal is dismissed
+  if (S._updateModalShown && !force) return;
+  // Never cover the (legally required) disclaimer — defer like What's New.
+  const disc = document.getElementById('disclaimerModal');
+  if (disc && disc.classList.contains('active')) { S._pendingUpdateModal = true; return; }
+  const modal = document.getElementById('updateModal');
+  const body = document.getElementById('updateModalBody');
+  if (!modal || !body) return;
+  S._updateModalShown = true;
+  const cur = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : null;
+  const latest = await fetchLatestVersion();
+  let entries = [];
+  try {
+    const r = await fetch('CHANGELOG.md?cb=' + Date.now(), { cache: 'no-store' });
+    if (r.ok && typeof parseChangelogMd === 'function') entries = parseChangelogMd(await r.text(), cur);
+  } catch (_) { /* offline — show the modal without details */ }
+  const sub = document.getElementById('updateModalSub');
+  if (sub) {
+    sub.textContent = (latest && cur && latest !== cur)
+      ? ('v' + cur + '  →  v' + latest)
+      : ('A newer version than v' + (cur || '?') + ' is ready');
+  }
+  body.innerHTML = entries.length ? _changelogEntriesHtml(entries, null)
+    : '<div style="color:var(--text-muted);font-size:12px;">Change details unavailable (offline?) — reload to apply the update, or check the changelog afterwards.</div>';
+  modal.classList.add('active');
+}
+
+function dismissUpdateModal() {
+  document.getElementById('updateModal')?.classList.remove('active');
 }
 
 function closeChangelog() {
@@ -9951,6 +10000,7 @@ async function _runViewshedKernel(opts) {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
+    showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer,
     getCanopyProxyBase, saveCanopyProxy, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
     renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, _isConstrained, setCanopyOpacity, setViewshedOpacity,
