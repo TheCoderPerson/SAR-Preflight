@@ -13,6 +13,8 @@ const S = {
   mapLayers: {}, wireHazardCounts: {}, faaCharts: {},
   // Cached live data
   wx: {}, wind: {}, elev: {}, astro: {}, notams: [],
+  metar: null,              // observed aviation weather (ceiling / vis / flight category)
+  hmsSmoke: [], avalanche: [], // NOAA HMS smoke plumes + avalanche.org danger zones
   // Selected timeline hour for the data panel (0 = NOW). Set by _updateTimeBar.
   timeIdx: 0,
   nwsAlerts: [],
@@ -900,6 +902,7 @@ async function processArea(layer, type) {
   // Fetch all data in parallel (airports are now dynamic via Overpass)
   await Promise.allSettled([
     fetchWeather(center.lat, center.lng),
+    fetchAviationWeather(center, bounds),
     fetchElevation(center, bounds),
     fetchSunMoon(center.lat, center.lng),
     renderNotamsTab(center.lat, center.lng),
@@ -912,6 +915,8 @@ async function processArea(layer, type) {
     fetchNearbyAirports(center, bounds),
     fetchProtectedAreas(bounds),
     fetchFireDanger(center.lat, center.lng, bounds),
+    fetchHMSSmoke(bounds),
+    fetchAvalanche(bounds),
     fetchGroundAccess(bounds),
     fetchPublicLands(bounds),
     fetchWaterFeatures(bounds),
@@ -951,6 +956,7 @@ async function retryFailedSource(source) {
   const bounds = S.areaBounds;
   const retryMap = {
     'Weather': () => fetchWeather(lat, lng),
+    'Aviation Wx': () => fetchAviationWeather(S.areaCenter, bounds),
     'Elevation': () => fetchElevation(S.areaCenter, bounds),
     'Sun/Moon': () => fetchSunMoon(lat, lng),
     'Wire Hazards': () => fetchWireHazards(bounds),
@@ -960,6 +966,8 @@ async function retryFailedSource(source) {
     'FAA Obstacles': () => fetchFaaObstacles(bounds),
     'Protected Areas': () => fetchProtectedAreas(bounds),
     'Fire Danger': () => fetchFireDanger(lat, lng, bounds),
+    'Smoke': () => fetchHMSSmoke(bounds),
+    'Avalanche': () => fetchAvalanche(bounds),
     'Airports': () => fetchNearbyAirports(S.areaCenter, bounds),
     'ADS-B': () => fetchAdsb(),
   };
@@ -1243,10 +1251,29 @@ function renderWeather(snap) {
     setColor('wxVis', visMi > 5 ? 'green' : visMi > 3 ? 'amber' : 'red');
   }
 
-  if (snap.cloud_cover != null) {
-    setText('wxCloud', `${snap.cloud_cover}%`);
-    const ceilFt = snap.cloud_cover < 10 ? 'CLR' : snap.cloud_cover < 30 ? '15,000+ ft' : snap.cloud_cover < 70 ? '5,000-15,000 ft' : '< 5,000 ft';
-    setText('wxCeiling', ceilFt);
+  if (snap.cloud_cover != null) setText('wxCloud', `${snap.cloud_cover}%`);
+  // Cloud ceiling — the observed METAR at NOW (authoritative), else a coarse estimate
+  // from cloud cover for forecast hours. Flight category (VFR/MVFR/IFR/LIFR) is shown
+  // only from the observed METAR; it is not inferred from modeled cloud cover.
+  {
+    const haveMetar = snap._isNow && S.metar && S.metar.ok;
+    if (haveMetar) {
+      const cf = S.metar.ceilingFt;
+      setText('wxCeiling', (cf == null ? 'Unlimited' : `${cf.toLocaleString()} ft`) + ` (${S.metar.station})`);
+      setColor('wxCeiling', (cf == null || cf >= 3000) ? 'green' : cf >= 1000 ? 'amber' : 'red');
+      const fc = S.metar.fltCat || flightCategory(cf, S.metar.visSm);
+      setText('wxFlightCat', fc);
+      setColor('wxFlightCat', fc === 'VFR' ? 'green' : fc === 'MVFR' ? 'amber' : 'red');
+    } else {
+      if (snap.cloud_cover != null) {
+        const cc = snap.cloud_cover;
+        setText('wxCeiling', cc < 10 ? 'CLR (est)' : cc < 30 ? '15,000+ ft (est)' : cc < 70 ? '5,000-15,000 ft (est)' : '< 5,000 ft (est)');
+        setColor('wxCeiling', cc < 70 ? 'green' : 'amber');
+      }
+      setText('wxFlightCat', snap._isNow ? '--' : '— (obs)');
+      const fcEl = document.getElementById('wxFlightCat');
+      if (fcEl) fcEl.classList.remove('green', 'amber', 'red', 'cyan');
+    }
   }
   if (snap.weather_code != null) setText('wxConditions', wmoCodeToText(snap.weather_code));
 
@@ -1260,6 +1287,15 @@ function renderWeather(snap) {
   const icing = assessPropIcing(snap.temperature_2m, snap.dew_point_2m);
   setText('wxIcing', icing.reason ? `${icing.risk} — ${icing.reason}` : icing.risk);
   setColor('wxIcing', icing.level);
+
+  // Freezing level (0°C isotherm, MSL). Amber when it sits within the flight
+  // envelope (launch elevation up to launch + max AGL) — icing risk aloft.
+  if (snap.freezing_level_height != null) {
+    const fzFt = Math.round(snap.freezing_level_height * 3.28084);
+    setText('wxFreezing', `${fzFt.toLocaleString()} ft MSL`);
+    const topFt = (S.elev.center ?? 0) + 400;
+    setColor('wxFreezing', fzFt > topFt ? 'green' : 'amber');
+  }
 
   if (snap.relative_humidity_2m != null) {
     const rh = snap.relative_humidity_2m;
@@ -1367,7 +1403,7 @@ async function fetchWeather(lat, lng) {
       `cloud_cover,visibility,wind_speed_10m,wind_direction_10m,wind_gusts_10m,precipitation_probability,` +
       `weather_code,uv_index,is_day` +
       `&hourly=wind_speed_80m,wind_speed_120m,wind_speed_180m,wind_direction_80m,wind_direction_120m,wind_direction_180m` +
-      `,temperature_2m,dew_point_2m,precipitation_probability,wind_speed_10m,wind_direction_10m,wind_gusts_10m,cloud_cover,weather_code` +
+      `,temperature_2m,dew_point_2m,precipitation_probability,wind_speed_10m,wind_direction_10m,wind_gusts_10m,cloud_cover,weather_code,freezing_level_height` +
       `,relative_humidity_2m,apparent_temperature,surface_pressure,visibility,uv_index,is_day` +
       `&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto` +
       `&forecast_hours=24`;
@@ -1409,6 +1445,7 @@ async function fetchWeather(lat, lng) {
         wind_direction_180m: wx.hourly.wind_direction_180m,
         cloud_cover: wx.hourly.cloud_cover,
         weather_code: wx.hourly.weather_code,
+        freezing_level_height: wx.hourly.freezing_level_height,
         is_day: wx.hourly.is_day,
       };
     }
@@ -1507,6 +1544,83 @@ async function fetchWeather(lat, lng) {
   } finally {
     trackFetchEnd('Weather');
   }
+}
+
+// ============================================================
+// API: AVIATION WEATHER — observed METAR (ceiling / visibility / flight category)
+// Feeds the Part 107 \u00a7107.51(c) cloud-clearance gate and the Flight Category readout.
+// Source: NWS api.weather.gov station observations (CORS-enabled). aviationweather.gov's
+// API does NOT send CORS headers, so a browser fetch to it always fails with a
+// NetworkError — verified 2026-07-12. The NWS observation includes the raw METAR text.
+// The feature stays dormant (no hard error, just no observed ceiling) on any failure.
+// ============================================================
+async function fetchAviationWeather(center, bounds) {
+  const c = center || S.areaCenter;
+  if (!c) return;
+  try {
+    const pr = await fetch(`https://api.weather.gov/points/${c.lat.toFixed(4)},${c.lng.toFixed(4)}`);
+    if (!pr.ok) throw new Error('NWS points HTTP ' + pr.status);
+    const pj = await pr.json();
+    const stationsUrl = pj.properties && pj.properties.observationStations;
+    if (!stationsUrl) throw new Error('NWS points: no observationStations');
+    const sr = await fetch(stationsUrl);
+    if (!sr.ok) throw new Error('NWS stations HTTP ' + sr.status);
+    const sj = await sr.json();
+    // Stations arrive nearest-first, but the closest are often AUTO sites reporting
+    // no ceiling/visibility (e.g. 'KBQP ... PWINO') — walk the list until one is usable.
+    let metar = null;
+    for (const st of (sj.features || []).slice(0, 4)) {
+      metar = await _fetchStationObservation(st, c.lat, c.lng);
+      if (metar) break;
+    }
+    S.metar = metar;
+    if (metar) { renderAviationWx(); clearDataSourceError('Aviation Wx'); }
+  } catch (e) {
+    S.metar = null;
+    recordDataSourceError('Aviation Wx', e);
+  }
+}
+
+// Fetch one station's latest observation and normalize it to the S.metar shape.
+// Returns null when the station has nothing usable (offline, or no cloud/visibility
+// data at all), so the caller can try the next-nearest station.
+async function _fetchStationObservation(st, lat, lng) {
+  try {
+    const id = st && st.properties && st.properties.stationIdentifier;
+    if (!id) return null;
+    const r = await fetch(`https://api.weather.gov/stations/${id}/observations/latest`);
+    if (!r.ok) return null;
+    const p = (await r.json()).properties || {};
+    const clouds = (p.cloudLayers || [])
+      .filter(cl => cl && cl.base && cl.base.value != null)
+      .map(cl => ({ cover: cl.amount, base: Math.round(cl.base.value * 3.28084) })); // m \u2192 ft
+    const visSm = (p.visibility && p.visibility.value != null)
+      ? p.visibility.value / 1609.344 : null; // m \u2192 statute miles
+    if (!clouds.length && visSm == null) return null; // nothing usable \u2014 try next station
+    const ceilingFt = metarCeilingFt(clouds);
+    const co = st.geometry && st.geometry.coordinates; // [lon, lat]
+    const dKm = co ? haversine(lat, lng, co[1], co[0]) : null;
+    return {
+      ok: true,
+      station: id,
+      name: (st.properties && st.properties.name) || '',
+      distNm: dKm != null ? dKm * 0.539957 : null,
+      ceilingFt,
+      visSm,
+      fltCat: flightCategory(ceilingFt, visSm),
+      obsTime: p.timestamp ? Date.parse(p.timestamp) : null,
+      raw: p.rawMessage || '',
+      lat: co ? co[1] : null, lon: co ? co[0] : null,
+    };
+  } catch (e) { return null; }
+}
+
+// Refresh the panel + assessment after a new observation lands (the Flight Category
+// and observed ceiling render inside renderWeather when NOW is the selected hour).
+function renderAviationWx() {
+  const snap = snapshotAtIdx(S.timeIdx || 0);
+  renderWeather(snap);
+  if (S.currentArea) computeAssessment(snap);
 }
 
 // Render the Kp / GNSS readouts (wxKp, satKp, accuracy, assessment, sat table) for
@@ -2723,6 +2837,72 @@ function clearImportedNotams() {
 
 // Fire danger renders into #fireDangerCards (a static element in the NOTAMs tab).
 
+// National NFDRS via the nearest RAWS station: NIFC's station layer (ArcGIS, CORS OK)
+// supplies WIMS station ids; FEMS (fems.fs2c.usda.gov GraphQL, CORS OK - verified
+// 2026-07-13) supplies current ERC/BI/fuel-moisture observations plus station-specific
+// climatological percentile thresholds, so the card's percentile colors and adjective
+// mean the same thing here as in the CA_NFDRS path. Returns a fireDanger object or null.
+async function _fetchNationalNFDRS(lat, lng) {
+  try {
+    // 1) nearest RAWS stations from NIFC (bbox, widen once if empty)
+    let stations = [];
+    for (const pad of [0.7, 1.5]) {
+      const u = 'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/NFDRS_ERC_and_BI_Percentiles_and_Trends/FeatureServer/0/query'
+        + `?where=1=1&geometry=${lng - pad},${lat - pad},${lng + pad},${lat + pad}&geometryType=esriGeometryEnvelope&inSR=4326`
+        + '&outFields=Station_ID,Station_Name,Latitude,Longitude,PSA,Display&returnGeometry=false&f=json';
+      const res = await fetch(u);
+      if (!res.ok) return null;
+      stations = ((await res.json()).features || []).map(f => f.attributes);
+      if (stations.length) break;
+    }
+    if (!stations.length) return null;
+    const displayed = stations.filter(st => st.Display === 1);
+    const pick = (displayed.length ? displayed : stations)
+      .map(st => Object.assign({}, st, { distKm: haversine(lat, lng, st.Latitude, st.Longitude) }))
+      .sort((a, b) => a.distKm - b.distKm)[0];
+
+    // 2) current observation + percentile thresholds from FEMS (parallel)
+    const gql = q => fetch('https://fems.fs2c.usda.gov/api/climatology/graphql/', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: q }),
+    }).then(r => r.json());
+    const d0 = new Date(Date.now() - 3 * 86400e3).toISOString().slice(0, 10);
+    const d1 = new Date(Date.now() + 86400e3).toISOString().slice(0, 10);
+    const obsQ = '{ nfdrsObs(stationIds: "' + pick.Station_ID + '", fuelModels: "Y", startDateRange: "' + d0 + '", endDateRange: "' + d1 + '") { data { nfdr_date nfdr_time nfdr_type energy_release_component burning_index hun_hr_tl_fuel_moisture thou_hr_tl_fuel_moisture } } }';
+    const pctQ = '{ percentileLevels(stationIds: "' + pick.Station_ID + '", fuelModel: Y, percentileLevels: "50,70,90,97") { data { energy_release_component burning_index } } }';
+    const [obsRes, pctRes] = await Promise.allSettled([gql(obsQ), gql(pctQ)]);
+    const rows = (obsRes.status === 'fulfilled' && obsRes.value && obsRes.value.data && obsRes.value.data.nfdrsObs && obsRes.value.data.nfdrsObs.data) || [];
+    if (!rows.length) return null;
+    // latest observed row; fall back to the newest row of any type (e.g. forecast)
+    const obs = rows.slice().reverse().find(r => r.nfdr_type === 'O') || rows[rows.length - 1];
+    const levels = (pctRes.status === 'fulfilled' && pctRes.value && pctRes.value.data && pctRes.value.data.percentileLevels && pctRes.value.data.percentileLevels.data && pctRes.value.data.percentileLevels.data[0]) || null;
+
+    return {
+      psa: pick.Station_Name + ' RAWS · ' + (pick.distKm * 0.539957).toFixed(0) + ' nm' + (pick.PSA ? ' · ' + pick.PSA : ''),
+      bi: obs.burning_index, biPct: _nfdrsPercentile(obs.burning_index, levels && levels.burning_index),
+      erc: obs.energy_release_component, ercPct: _nfdrsPercentile(obs.energy_release_component, levels && levels.energy_release_component),
+      fm100: obs.hun_hr_tl_fuel_moisture, fm1000: obs.thou_hr_tl_fuel_moisture,
+    };
+  } catch (e) { return null; }
+}
+
+// Approximate a value's climatological percentile from FEMS threshold values at the
+// 50/70/90/97th levels (piecewise-linear, clamped to 1-99). Null when unavailable.
+function _nfdrsPercentile(value, thresholds) {
+  if (value == null || !thresholds) return null;
+  const pts = [[Number(thresholds['50th']), 50], [Number(thresholds['70th']), 70],
+               [Number(thresholds['90th']), 90], [Number(thresholds['97th']), 97]]
+    .filter(p => Number.isFinite(p[0]));
+  if (!pts.length) return null;
+  if (value <= pts[0][0]) return Math.max(1, Math.round(50 * value / (pts[0][0] || 1)));
+  for (let i = 1; i < pts.length; i++) {
+    if (value <= pts[i][0]) {
+      const v0 = pts[i - 1][0], p0 = pts[i - 1][1], v1 = pts[i][0], p1 = pts[i][1];
+      return Math.round(p0 + (p1 - p0) * (value - v0) / ((v1 - v0) || 1));
+    }
+  }
+  return 99;
+}
+
 // ============================================================
 // API: NIFC ACTIVE FIRES + CA NFDRS FIRE DANGER
 // ============================================================
@@ -2747,6 +2927,8 @@ async function fetchFireDanger(lat, lng, bounds) {
         + `&outFields=PSAName,Avg_BI,Avg_BI_Pct,Avg_ERC,Avg_ERC_Pct,Avg_FM100Hr,Avg_FM1000Hr`
         + `&outSR=4326&f=geojson&resultRecordCount=1`));
     }
+    // Outside California, resolve NFDRS from the nearest RAWS station via FEMS (national).
+    const nationalNfdrs = isCA ? null : _fetchNationalNFDRS(lat, lng).catch(() => null);
     const [firesRes, nfdrsRes] = await Promise.allSettled(fetches);
 
     // Process active fires
@@ -2789,6 +2971,8 @@ async function fetchFireDanger(lat, lng, bounds) {
         };
       }
     }
+
+    if (!fireDanger && nationalNfdrs) fireDanger = await nationalNfdrs;
 
     S.fireDanger = fireDanger;
     S.activeFires = fires;
@@ -3339,14 +3523,17 @@ function renderNWSAlertCards() {
       ? 'rgba(245,158,11,0.15)' : 'rgba(6,182,212,0.15)';
     const onset = a.onset ? new Date(a.onset).toLocaleString('en-US', { timeZone: _localTZ(), month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
     const expires = a.expires ? new Date(a.expires).toLocaleString('en-US', { timeZone: _localTZ(), month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
-    const desc = (a.description || '').substring(0, 300) + ((a.description || '').length > 300 ? '...' : '');
+    // Show the full hazard detail (HAZARD/SOURCE/IMPACT block), not just the headline —
+    // for e.g. a Special Weather Statement the headline alone says nothing about wind/hail/flood.
+    const desc = ((a.description || '').substring(0, 600) + ((a.description || '').length > 600 ? '...' : '')).replace(/\n{2,}/g, '<br><br>').replace(/\n/g, ' ');
+    const instr = ((a.instruction || '').substring(0, 300) + ((a.instruction || '').length > 300 ? '...' : '')).replace(/\n+/g, ' ');
 
     return `<div class="notam-card" style="border-left:3px solid ${sevColor};">
       <div class="notam-header">
         <span class="notam-id" style="color:${sevColor};">${a.event}</span>
         <span class="notam-type" style="background:${sevBg};color:${sevColor};">${a.severity}</span>
       </div>
-      <div class="notam-body">${a.headline || desc}</div>
+      <div class="notam-body">${a.headline ? `<b>${a.headline}</b>` : ''}${a.headline && desc ? '<br>' : ''}${desc}${instr ? `<div style="margin-top:4px;font-style:italic;opacity:0.85;">\u26a0 ${instr}</div>` : ''}</div>
       <div class="notam-meta">${onset ? `Onset: ${onset}` : ''}${expires ? ` \u2022 Expires: ${expires}` : ''}${a.senderName ? ` \u2022 ${a.senderName}` : ''}</div>
     </div>`;
   }).join('');
@@ -3365,7 +3552,7 @@ function renderNWSAlertPolygons() {
     const layer = L.geoJSON(a.geometry, {
       style: { color: fillColor, weight: 2, fillColor: fillColor, fillOpacity: 0.15, dashArray: '4,4' },
     });
-    layer.bindPopup(`<b>${a.event}</b><br>${a.severity} \u2014 ${a.urgency}<br><span style="font-size:11px;">${(a.headline || '').substring(0, 200)}</span>`);
+    layer.bindPopup(`<b>${a.event}</b><br>${a.severity} \u2014 ${a.urgency}<br><span style="font-size:11px;">${(a.headline || '').substring(0, 200)}</span>${a.description ? `<br><span style="font-size:11px;">${a.description.substring(0, 400).replace(/\n+/g, ' ')}${a.description.length > 400 ? '...' : ''}</span>` : ''}`, { maxWidth: 320 });
     S.mapLayers.nws_alerts.addLayer(layer);
   });
 }
@@ -4053,6 +4240,196 @@ async function fetchGroundAccess(bounds) {
   } finally {
     trackFetchEnd('Ground Access');
   }
+}
+
+// ============================================================
+// NOAA HMS SMOKE + WINTER OPS (avalanche danger, SNODAS snow depth)
+// All opt-in overlays created OFF the map. NOAA HMS smoke is a hosted Esri
+// FeatureServer, avalanche.org and the NOHRSC WMS are public services — all
+// CORS-clean, no proxy needed. Each degrades gracefully (dormant, no hard error)
+// when its source is unreachable, mirroring the other overlay fetches.
+// ============================================================
+
+// --- NOAA HMS smoke plumes (daily satellite analysis; Light/Medium/Heavy) ---
+const HMS_SMOKE_BASE = 'https://services2.arcgis.com/C8EMgrsFcRFL6LrL/arcgis/rest/services/NOAA_Satellite_Smoke_Detection_(v1)/FeatureServer';
+
+function _smokeStyleFor(props) {
+  const d = String((props && props.Density) || '').toLowerCase();
+  const color = d.includes('heavy') ? '#7f1d1d' : d.includes('medium') ? '#ea580c' : '#f59e0b';
+  const fillOpacity = d.includes('heavy') ? 0.35 : d.includes('medium') ? 0.25 : 0.15;
+  return { color, weight: 1, fillColor: color, fillOpacity };
+}
+function _smokePopup(props) {
+  const p = props || {};
+  return `<b style="color:#b45309">Wildfire smoke — ${p.Density || 'Smoke'}</b>`
+    + (p.Satellite ? `<br>Satellite: ${p.Satellite}` : '')
+    + (p.Start ? `<br>Start: ${p.Start} UTC` : '')
+    + (p.End_ ? `<br>End: ${p.End_} UTC` : '')
+    + `<br><span style="color:#f59e0b;font-size:10px;font-weight:bold;">Reduces visibility / VLOS — advisory, current-day satellite analysis</span>`;
+}
+
+async function fetchHMSSmoke(bounds) {
+  const b = bounds || S.areaBounds;
+  if (!b) return;
+  const cacheKey = _bboxCacheKey(b);
+  try {
+    const url = _arcgisGeoJsonUrl(HMS_SMOKE_BASE, '0', b, 'Density,Satellite,Start,End_', { pad: 0.5 });
+    const r = await _fetchGeoJsonLayer('hms_smoke', cacheKey, url);
+    if (r && r.features) {
+      S.hmsSmoke = r.features;
+      _renderVectorLayer('hms_smoke', r.features, _smokeStyleFor, _smokePopup);
+      clearDataSourceError('Smoke');
+    } else if (r && r.error && r.error !== 'offline') {
+      recordDataSourceError('Smoke', new Error(r.error));
+    }
+    buildLayerControl();
+    if (S.currentArea) computeAssessment();
+  } catch (e) {
+    recordDataSourceError('Smoke', e);
+  }
+}
+
+// --- Avalanche danger zones (avalanche.org public map-layer GeoJSON, danger 1-5) ---
+const AVALANCHE_MAPLAYER_URL = 'https://api.avalanche.org/v2/public/products/map-layer';
+const AVALANCHE_DANGER_NAMES = ['No Rating', 'Low (1)', 'Moderate (2)', 'Considerable (3)', 'High (4)', 'Extreme (5)'];
+
+function _avalancheStyle(props) {
+  const p = props || {};
+  const lvl = Number(p.danger_level) || 0;
+  return { color: '#374151', weight: 1, fillColor: p.color || '#9ca3af', fillOpacity: lvl >= 1 ? 0.35 : 0.12 };
+}
+function _avalanchePopup(props) {
+  const p = props || {};
+  const lvl = (p.danger_level != null && p.danger_level >= 1) ? p.danger_level : null;
+  const label = lvl != null ? (AVALANCHE_DANGER_NAMES[lvl] || `Level ${lvl}`) : 'No rating / off-season';
+  return `<b>${p.name || 'Avalanche zone'}</b>`
+    + (p.center ? `<br>${p.center}` : '')
+    + `<br>Danger: <b style="color:${p.color || '#999'}">${label}</b>`
+    + (p.warning ? `<br><span style="color:#ef4444;font-weight:bold;">⚠ Avalanche warning in effect</span>` : '')
+    + (p.travel_advice ? `<br><span style="font-size:10px;opacity:0.7">${String(p.travel_advice).slice(0, 160)}</span>` : '')
+    + `<br><span style="font-size:10px;opacity:0.6">avalanche.org — verify at the source before travel</span>`;
+}
+// True when a [lat,lng] ring's bbox overlaps the padded area bbox.
+function _ringNearArea(ring, south, west, north, east) {
+  let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+  for (const pt of ring) {
+    const la = pt[0], ln = pt[1];
+    if (la < minLat) minLat = la; if (la > maxLat) maxLat = la;
+    if (ln < minLng) minLng = ln; if (ln > maxLng) maxLng = ln;
+  }
+  return !(maxLat < south || minLat > north || maxLng < west || minLng > east);
+}
+
+async function fetchAvalanche(bounds) {
+  const b = bounds || S.areaBounds;
+  if (!b) return;
+  const pad = 0.75;
+  const south = b.getSouth() - pad, north = b.getNorth() + pad, west = b.getWest() - pad, east = b.getEast() + pad;
+  const online = (typeof isOnline !== 'function') || isOnline();
+  try {
+    let fc = null;
+    if (online) {
+      const res = await fetch(AVALANCHE_MAPLAYER_URL);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      fc = await res.json();
+      if (typeof cacheApiResponse === 'function') cacheApiResponse('avalanche', 'us', fc);
+    } else {
+      const c = await _cachedFeatures('avalanche', 'us');
+      if (c) fc = { features: c.features };
+    }
+    const all = (fc && fc.features) ? fc.features : [];
+    const near = all.filter(f => (typeof geoJsonOuterRings === 'function' ? geoJsonOuterRings(f.geometry) : [])
+      .some(r => _ringNearArea(r, south, west, north, east)));
+    S.avalanche = near;
+    _renderVectorLayer('avalanche', near, _avalancheStyle, _avalanchePopup);
+    clearDataSourceError('Avalanche');
+    buildLayerControl();
+    if (S.currentArea) computeAssessment();
+  } catch (e) {
+    recordDataSourceError('Avalanche', e);
+  }
+}
+
+// --- SNODAS snow depth (NOHRSC WMS raster overlay; global, built lazily) ---
+const SNODAS_WMS_URL = 'https://mapservices.weather.noaa.gov/raster/services/snow/NOHRSC_Snow_Analysis/MapServer/WMSServer';
+
+// Create (off-map) the SNODAS snow-depth WMS layer once. Sublayer 5 is the snow-depth
+// image (1 = SWE image; 3/7 are boundary outlines — requesting 3 was a bug that drew
+// nothing). The service only supports EPSG:4326-family CRS, not Leaflet's default
+// EPSG:3857, so the layer pins crs explicitly. Returns the layer or null if Leaflet
+// WMS is unavailable (e.g. under jsdom in tests).
+function ensureSnowLayer() {
+  if (typeof L === 'undefined' || !L.tileLayer || typeof L.tileLayer.wms !== 'function') return null;
+  if (!S.mapLayers.snow_depth) {
+    S.mapLayers.snow_depth = L.tileLayer.wms(SNODAS_WMS_URL, {
+      layers: '5', format: 'image/png', transparent: true, opacity: 0.55,
+      crs: L.CRS.EPSG4326,
+      attribution: 'NOAA NOHRSC SNODAS',
+    });
+  }
+  return S.mapLayers.snow_depth;
+}
+
+// --- GOES-East GeoColor clouds (NASA GIBS WMS) + lightning strike density (NOAA nowCOAST) ---
+// Global near-real-time raster overlays, built lazily and off by default. Both use the
+// WMS path (not WMTS) so Leaflet handles the bbox and we don't hard-code a tile-matrix
+// set. A wrong layer/time just yields blank tiles — never a crash.
+
+const GIBS_WMS_URL = 'https://gibs.earthdata.nasa.gov/wms/epsg3857/best/wms.cgi';
+function ensureGoesLayer() {
+  if (typeof L === 'undefined' || !L.tileLayer || typeof L.tileLayer.wms !== 'function') return null;
+  if (!S.mapLayers.goes_clouds) {
+    S.mapLayers.goes_clouds = L.tileLayer.wms(GIBS_WMS_URL, {
+      layers: 'GOES-East_ABI_GeoColor', format: 'image/png', transparent: true,
+      // TIME is deliberately omitted: GIBS then serves its latest available frame. Computing
+      // 'now minus a latency buffer' breaks whenever GIBS ingest lag exceeds the buffer
+      // (observed >2 h), which returns blank transparent tiles for the not-yet-existing frame.
+      opacity: 0.7, attribution: 'NASA GIBS / NOAA GOES-East',
+    });
+  }
+  return S.mapLayers.goes_clouds;
+}
+
+// Fetch the newest available GeoColor frame time from GIBS WMTS DescribeDomains (a few KB
+// with a bounded TIME window, vs the multi-MB full GetCapabilities). GIBS ingest lag varies
+// from minutes to hours, so we show users how old the imagery actually is rather than
+// pretending it is live. Stored on S.goesFrameTime and surfaced in the layer-control label.
+async function refreshGoesFrameTime() {
+  try {
+    const now = Date.now();
+    const d0 = new Date(now - 3 * 86400e3).toISOString().slice(0, 10);
+    const d1 = new Date(now + 86400e3).toISOString().slice(0, 10);
+    const u = 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/wmts.cgi?SERVICE=WMTS&VERSION=1.0.0'
+      + '&REQUEST=DescribeDomains&LAYER=GOES-East_ABI_GeoColor&TILEMATRIXSET=GoogleMapsCompatible_Level8'
+      + `&TIME=${d0}/${d1}`;
+    const res = await fetch(u);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const txt = await res.text();
+    // <Domain> holds comma-separated 'start/end/PT10M' ranges, oldest first — take the last end.
+    const m = txt.match(/<Domain>([^<]*)<\/Domain>/);
+    if (!m || !m[1]) return null;
+    const ranges = m[1].split(',');
+    const newest = ranges[ranges.length - 1].split('/')[1];
+    if (newest) { S.goesFrameTime = newest; buildLayerControl(); }
+    return newest || null;
+  } catch (e) { return null; } // cosmetic only — never block the layer on this
+}
+
+// NOAA nowCOAST GeoServer lightning strike density (ground-network LDN, 15-min, ~8 km grid;
+// not GOES GLM satellite data, despite the internal glm_* identifiers kept for compatibility). Endpoint per
+// the 2023 nowCOAST GeoServer migration (the old /arcgis/ MapServer was retired). Time is
+// omitted so the service returns its latest frame. If tiles are blank, confirm the layer
+// name against nowcoast.noaa.gov/geoserver/lightning_detection/ows?request=GetCapabilities.
+const GLM_WMS_URL = 'https://nowcoast.noaa.gov/geoserver/lightning_detection/ows';
+function ensureGlmLayer() {
+  if (typeof L === 'undefined' || !L.tileLayer || typeof L.tileLayer.wms !== 'function') return null;
+  if (!S.mapLayers.glm_lightning) {
+    S.mapLayers.glm_lightning = L.tileLayer.wms(GLM_WMS_URL, {
+      layers: 'lightning_detection:ldn_lightning_strike_density', format: 'image/png', transparent: true,
+      opacity: 0.75, attribution: 'NOAA nowCOAST lightning strike density',
+    });
+  }
+  return S.mapLayers.glm_lightning;
 }
 
 // BLM Surface Management Agency — public/private land + the non-public CAUTION.
@@ -5450,6 +5827,7 @@ const THRESHOLD_FIELDS = [
   ['sopTempHotCaution', 'tempHotCaution'],
   ['sopTempHotNoGo', 'tempHotNoGo'],
   ['sopWxCodeNoGo', 'weatherCodeNoGo'],
+  ['sopCloudClearance', 'cloudClearanceFt'],
   ['sopElevCaution', 'elevCaution'],
   ['sopDensAltCaution', 'densAltCaution'],
   ['sopDensAltNoGo', 'densAltNoGo'],
@@ -5634,6 +6012,58 @@ function computeAssessment(snap) {
   // (NWS/TFR/NOTAM/airspace/fire/ADS-B/Kp/AQI) remain current-time — the
   // timeline banner notes this when a forecast hour is selected.
   const result = assessRisk(snap, S.wind, S.elev, thresholds.maxWindTol, thresholds);
+
+  // Observed-METAR cloud-clearance + minimum-visibility gate (Part 107 §107.51(c)).
+  // Current-time observation from the nearest reporting station; applied to every
+  // timeline hour (the banner notes overlays are current-time when scrubbing).
+  if (S.metar && S.metar.ok) {
+    const cc = assessCloudClearance(S.metar.ceilingFt, S.metar.visSm, thresholds.maxAltAGL, thresholds);
+    if (cc.issues.length) {
+      result.level = 'NO-GO';
+      result.issues = (result.issues || []).concat(cc.issues.map(s => `${s} (${S.metar.station})`));
+      result.text = result.issues.join(' • ');
+    }
+    if (cc.cautions.length) {
+      result.cautions = (result.cautions || []).concat(cc.cautions.map(s => `${s} (${S.metar.station})`));
+      if (result.level === 'GO') { result.level = 'CAUTION'; result.text = result.cautions.join(' • '); }
+    }
+  }
+
+  // Wildfire smoke plume (NOAA HMS) over the area — reduced visibility / VLOS (CAUTION).
+  if (S.hmsSmoke && S.hmsSmoke.length && S.currentArea) {
+    const areaPoly = currentAreaPolygon();
+    if (areaPoly) {
+      const hit = S.hmsSmoke.some(f => {
+        const dens = String((f.properties || {}).Density || '').toLowerCase();
+        if (!(dens.includes('medium') || dens.includes('heavy'))) return false;
+        return geoJsonOuterRings(f.geometry).some(r => polygonsIntersect(r, areaPoly));
+      });
+      if (hit && result.level !== 'NO-GO') {
+        if (result.level === 'GO') result.level = 'CAUTION';
+        result.cautions = result.cautions || [];
+        result.cautions.push('Wildfire smoke plume over area — reduced visibility/VLOS');
+        if (!result.issues || !result.issues.length) result.text = result.cautions.join(' • ');
+      }
+    }
+  }
+
+  // Avalanche danger (avalanche.org) at the launch point — ground-team hazard (CAUTION).
+  // Considerable (3) or higher, or an active warning, over the launch coordinates.
+  if (S.avalanche && S.avalanche.length && S.areaCenter) {
+    const c = S.areaCenter;
+    const danger = S.avalanche.find(f => {
+      const p = f.properties || {};
+      if (!((p.danger_level != null && p.danger_level >= 3) || p.warning)) return false;
+      return geoJsonOuterRings(f.geometry).some(r => pointInPolygon(c.lat, c.lng, r));
+    });
+    if (danger && result.level !== 'NO-GO') {
+      const p = danger.properties || {};
+      if (result.level === 'GO') result.level = 'CAUTION';
+      result.cautions = result.cautions || [];
+      result.cautions.push(p.warning ? 'Avalanche warning in effect for area' : `Avalanche danger level ${p.danger_level} — ground-team hazard`);
+      if (!result.issues || !result.issues.length) result.text = result.cautions.join(' • ');
+    }
+  }
 
   // Integrate NWS severe weather alerts into assessment
   if (S.nwsAlerts && S.nwsAlerts.length > 0) {
@@ -5939,7 +6369,7 @@ function _exportStyleForLayer(key) {
     faa_obstacles: 'obstacle', airports: 'airport', cell_towers: 'tower', dams: 'dam',
     adsb_aircraft: 'aircraft', wilderness: 'protected', national_parks: 'protected',
     emergency_lz: 'protected', swap_radius: 'opsArea', observers: 'observer',
-    trails: 'trail',
+    trails: 'trail', hms_smoke: 'fire', avalanche: 'protected',
   };
   return m[key] || 'generic';
 }
@@ -6586,6 +7016,17 @@ function _layerRow(id, color, label) {
   </div>`;
 }
 
+// ' · frame 22:40Z (2h 05m old)' suffix for the GOES layer row, '' until known.
+function _goesFrameLabel() {
+  if (!S.goesFrameTime) return '';
+  const t = new Date(S.goesFrameTime);
+  if (isNaN(t)) return '';
+  const ageMin = Math.max(0, Math.round((Date.now() - t.getTime()) / 60000));
+  const age = ageMin >= 60 ? `${Math.floor(ageMin / 60)}h ${String(ageMin % 60).padStart(2, '0')}m` : `${ageMin}m`;
+  const hhmm = t.toISOString().slice(11, 16);
+  return ` <span style="opacity:0.65;font-size:10px;">· frame ${hhmm}Z (${age} old)</span>`;
+}
+
 function buildLayerControl() {
   const baseLayers = [
     { id: 'satellite', name: 'Satellite', color: '#3d8bfd' },
@@ -6614,6 +7055,27 @@ function buildLayerControl() {
     html += `<div class="layer-item${radarOn ? ' active' : ''}" data-layer="radar" onclick="toggleLayer('radar',this)">
       <div class="layer-check"></div><div class="layer-color" style="background:#22c55e"></div><span>Weather Radar</span>
     </div>`;
+  }
+
+  // Weather Imagery (optional near-real-time global rasters): GOES-East GeoColor clouds
+  // + NOAA lightning strike density. Both built lazily so their toggles are always available.
+  {
+    ensureGoesLayer(); ensureGlmLayer();
+    if (S.mapLayers.goes_clouds || S.mapLayers.glm_lightning) {
+      html += `<h4 style="margin-top:10px">Weather Imagery</h4>`;
+      if (S.mapLayers.goes_clouds) {
+        const on = S.map.hasLayer(S.mapLayers.goes_clouds);
+        html += `<div class="layer-item${on ? ' active' : ''}" data-layer="goes_clouds" onclick="toggleLayer('goes_clouds',this)">
+          <div class="layer-check"></div><div class="layer-color" style="background:#93c5fd"></div><span>GOES Clouds (GeoColor)${_goesFrameLabel()}</span>
+        </div>`;
+      }
+      if (S.mapLayers.glm_lightning) {
+        const on = S.map.hasLayer(S.mapLayers.glm_lightning);
+        html += `<div class="layer-item${on ? ' active' : ''}" data-layer="glm_lightning" onclick="toggleLayer('glm_lightning',this)">
+          <div class="layer-check"></div><div class="layer-color" style="background:#fde047"></div><span>Lightning strike density (NOAA)</span>
+        </div>`;
+      }
+    }
   }
 
   // Facilities section: airports + cell towers + emergency LZs
@@ -6688,6 +7150,12 @@ function buildLayerControl() {
     html += `<div class="layer-item${on ? ' active' : ''}" data-layer="fire_perimeters" onclick="toggleLayer('fire_perimeters',this)">
       <div class="layer-check"></div><div class="layer-color" style="background:#f97316"></div><span>Fire Perimeters (${S.mapLayers.fire_perimeters.getLayers().length})</span>
     </div>`;
+  }
+
+  // Smoke (NOAA HMS) section
+  if (_layerHasFeatures('hms_smoke')) {
+    html += `<h4 style="margin-top:10px">Smoke</h4>`;
+    html += _layerRow('hms_smoke', '#ea580c', 'HMS Smoke Plumes');
   }
 
   // FAA Airspace section
@@ -6897,6 +7365,25 @@ function buildLayerControl() {
     }
   }
 
+  // Winter Ops (optional): avalanche danger zones + SNODAS snow depth. Snow depth is a
+  // CONUS-wide WMS overlay (NOHRSC analysis domain, not clipped to the drawn area) built lazily so its toggle is always available; avalanche rows
+  // appear once zones near the area have been fetched. Both are off by default.
+  {
+    ensureSnowLayer();
+    const hasAval = _layerHasFeatures('avalanche');
+    const hasSnow = !!S.mapLayers.snow_depth;
+    if (hasAval || hasSnow) {
+      html += `<h4 style="margin-top:10px">Winter Ops</h4>`;
+      if (hasAval) html += _layerRow('avalanche', '#ef4444', 'Avalanche Danger');
+      if (hasSnow) {
+        const on = S.map.hasLayer(S.mapLayers.snow_depth);
+        html += `<div class="layer-item${on ? ' active' : ''}" data-layer="snow_depth" onclick="toggleLayer('snow_depth',this)">
+          <div class="layer-check"></div><div class="layer-color" style="background:#38bdf8"></div><span>Snow Depth (SNODAS)</span>
+        </div>`;
+      }
+    }
+  }
+
   document.getElementById('layerList').innerHTML = html;
   // buildLayerControl runs after virtually every layer (re)render, so use it as
   // the chokepoint to (re)wire feature clicks into the aggregated popup system.
@@ -6937,10 +7424,28 @@ function toggleLayer(id, el) {
     // Play panel is visible only while the radar layer is checked on
     const controls = document.getElementById('radarControls');
     if (controls) controls.style.display = on ? 'flex' : 'none';
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'parcels' || id === 'slope' || id === 'streets' || id === 'trails' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
+  } else if (id === 'snow_depth') {
+    const layer = ensureSnowLayer();
+    if (layer) { if (on) S.map.addLayer(layer); else S.map.removeLayer(layer); }
+  } else if (id === 'goes_clouds') {
+    const layer = ensureGoesLayer();
+    if (layer) { if (on) { S.map.addLayer(layer); refreshGoesFrameTime(); } else S.map.removeLayer(layer); } // no TIME param — GIBS serves its latest frame; label shows frame age
+  } else if (id === 'glm_lightning') {
+    const layer = ensureGlmLayer();
+    if (layer) { if (on) S.map.addLayer(layer); else S.map.removeLayer(layer); }
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'parcels' || id === 'slope' || id === 'streets' || id === 'trails' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
+    if (id === 'canopy' || id === 'viewshed') {
+      // Keep the zoom-cap's "wanted" flag in sync — otherwise _applyOverlayZoomCap
+      // re-adds the overlay on the next zoomend after it was unchecked here.
+      if (!S._overlayWanted) S._overlayWanted = {};
+      S._overlayWanted[id] = on;
+    }
     if (id === 'canopy') { const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = on; }
-    if (on) S.map.addLayer(S.mapLayers[id]);
-    else S.map.removeLayer(S.mapLayers[id]);
+    if (on) {
+      // Raster overlays go through the zoom cap so the mobile display-size budget still applies
+      if (id === 'canopy' || id === 'viewshed') _applyOverlayZoomCap();
+      else S.map.addLayer(S.mapLayers[id]);
+    } else S.map.removeLayer(S.mapLayers[id]);
     // Toggling aircraft also toggles trails
     if (id === 'adsb_aircraft' && S.mapLayers.adsb_trails) {
       if (on) S.map.addLayer(S.mapLayers.adsb_trails);
@@ -6959,7 +7464,7 @@ function toggleLayer(id, el) {
 // show all matches in one popup with "<- n/N ->" pagination.
 // ============================================================
 const AGG_HIT_PX = 8; // pixel tolerance for line / point hit-testing
-const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'parcels', 'slope', 'streets']);
+const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'parcels', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning']);
 // Export-only exclusion set. Extends the popup-skip set (so basemaps / parcels /
 // rasters stay out of the vector export) and adds layers CalTopo already provides
 // natively and that would be stale by import time. These layers remain visible and
@@ -6997,6 +7502,7 @@ const AGG_LAYER_META = {
   blm_gtlf: { label: 'BLM Route', pri: 7 },
   cell_att: { label: 'AT&T LTE', pri: 8 }, cell_tmobile: { label: 'T-Mobile LTE', pri: 8 },
   cell_verizon: { label: 'Verizon LTE', pri: 8 },
+  hms_smoke: { label: 'Smoke Plume', pri: 5 }, avalanche: { label: 'Avalanche Zone', pri: 6 },
 };
 
 function _aggMeta(key) {

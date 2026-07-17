@@ -29,7 +29,7 @@ Version history is in [CHANGELOG.md](CHANGELOG.md). In the app, a **What's New**
 7. **Export** a pre-flight briefing as PDF, email, clipboard text, or KML. The KML export captures **every currently-visible map layer** as real geometry — airspace, TFRs, NOTAMs, obstacles, wires, airports, towers, fires, NWS alerts, ADS-B, etc. — with plain-text descriptions, category icons (plane for airports, circle-H for heliports), and NOTAM/TFR folders that lead with a plain-English summary before the raw text. It also adds **hourly sun & wind bearing lines** (24 h, time-slider animation; sun omitted while below the horizon, wind drawn downwind). Canopy and viewshed overlays export as **georeferenced GeoTIFFs in Web Mercator (EPSG:3857)** — the projection CalTopo's *Map Sheet* import expects — and, optionally, as **KMZ GroundOverlays** for Google Earth. Wire, obstacle, NOTAM and TFR folders carry a *"verify independently — not a complete inventory"* note
 
 ### Map Features
-- Toggle map layers (satellite, topo, FAA sectional, weather radar, airspace, LAANC grid, FAA obstacles, towers, wire hazards, dams, fire perimeters, live aircraft traffic) via the **Map Layers** control
+- Toggle map layers (satellite, topo, FAA sectional, weather radar, GOES cloud imagery + lightning strike density, airspace, LAANC grid, FAA obstacles, towers, wire hazards, dams, fire perimeters, wildfire smoke plumes, live aircraft traffic, and an optional **Winter Ops** group — avalanche danger zones + SNODAS snow depth) via the **Map Layers** control
 - **Click any point to inspect overlapping features.** A single click hit-tests every visible layer and shows all matches in one popup with `← n/N →` pagination, so overlapping airspace, an obstacle, a LAANC cell, and a NOTAM at the same spot can all be read without toggling layers off
 - The **FAA Obstacles (DOF)** layer plots verified man-made obstacles color-coded by height (red ≥ 200 ft AGL, amber 100–199, yellow < 100); popups show AGL/AMSL height, lighting, and marking status
 - The **FAA Sectional** layer streams the current official FAA VFR sectional (56-day cycle); drawing an operational area auto-caches its tiles for offline use, and the cached edition is shown / refreshed when a newer one is published
@@ -51,6 +51,8 @@ All data is fetched from free, public APIs. No API keys are required.
 | Current weather, temperature, humidity, pressure, visibility | [Open-Meteo](https://open-meteo.com/) | ~30 min |
 | 24-hour hourly forecast (temp, wind, precip) | [Open-Meteo](https://open-meteo.com/) | ~30 min |
 | Upper winds (80m, 120m, 180m) | [Open-Meteo](https://open-meteo.com/) | ~30 min |
+| Freezing level (0 °C isotherm, icing-aloft flag) | [Open-Meteo](https://open-meteo.com/) | ~30 min |
+| Observed ceiling, visibility & flight category (VFR/MVFR/IFR/LIFR) for the Part 107 cloud-clearance gate | [FAA Aviation Weather Center METAR](https://aviationweather.gov/data/api/) | ~hourly |
 | Air quality (AQI, PM2.5, PM10, ozone) | [Open-Meteo Air Quality](https://open-meteo.com/) | ~30 min |
 | Cursor elevation | [Open-Meteo Elevation](https://open-meteo.com/) | Static |
 | Terrain elevation grid | [Open-Elevation](https://open-elevation.com/) | Static |
@@ -62,6 +64,8 @@ All data is fetched from free, public APIs. No API keys are required.
 | Geomagnetic Kp index (GNSS accuracy) | [NOAA SWPC](https://www.swpc.noaa.gov/) | ~1 hr |
 | NWS severe weather alerts | [NWS Weather API](https://www.weather.gov/documentation/services-web-api) | ~15 min |
 | Weather radar animation | [RainViewer](https://www.rainviewer.com/) | ~10 min |
+| GOES-East GeoColor cloud imagery (Weather Imagery layer) | [NASA GIBS](https://nasa-gibs.github.io/gibs-api-docs/) / NOAA GOES-East | ~10 min |
+| Lightning strike density (Weather Imagery layer) | [NOAA nowCOAST](https://nowcoast.noaa.gov/) via WMS | ~15 min |
 | Class B/C/D/E airspace boundaries | [FAA UDDS](https://udds.faa.gov/) via ArcGIS | Static |
 | Special use airspace (MOAs, restricted, prohibited) | [FAA UDDS](https://udds.faa.gov/) via ArcGIS | Static |
 | TFR areas (national defense) | [FAA UDDS](https://udds.faa.gov/) via ArcGIS | Static |
@@ -75,6 +79,9 @@ All data is fetched from free, public APIs. No API keys are required.
 | Towers (comm, water, wind turbine, chimney, etc.) | [OpenStreetMap](https://www.openstreetmap.org/) via Overpass API | Cached 7 days |
 | Wire/cable hazards & power transmission lines (with voltage where tagged) | [OpenStreetMap](https://www.openstreetmap.org/) via Overpass API | Cached 7 days |
 | Active wildfire perimeters | [NIFC](https://data-nifc.opendata.arcgis.com/) via ArcGIS | ~5 min |
+| Wildfire smoke plumes (Light/Medium/Heavy) | [NOAA HMS Smoke](https://www.ospo.noaa.gov/products/land/hms.html) via ArcGIS | Daily |
+| Avalanche danger zones (danger 1–5, warnings) — Winter Ops layer | [avalanche.org](https://api.avalanche.org/) public API | ~Daily (season) |
+| Snow depth (SNODAS) — Winter Ops layer | [NOAA NOHRSC](https://www.nohrsc.noaa.gov/) via WMS | Daily |
 | Fire danger rating (CA only: BI, ERC, fuel moisture) | [NIFC CA NFDRS](https://data-nifc.opendata.arcgis.com/) via ArcGIS | Daily |
 | Dams | [HIFLD](https://hifld-geoplatform.opendata.arcgis.com/) via ArcGIS | Static |
 | Wilderness areas | [USFS](https://services1.arcgis.com/) via ArcGIS | Static |

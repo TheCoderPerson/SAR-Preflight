@@ -765,6 +765,7 @@ select.api-input { cursor: pointer; }
             <div class="data-cell"><div class="data-label">Visibility</div><div class="data-value" id="wxVis">-- mi</div></div>
             <div class="data-cell"><div class="data-label">Cloud Cover</div><div class="data-value" id="wxCloud">--%</div></div>
             <div class="data-cell"><div class="data-label">Cloud Ceiling</div><div class="data-value sm" id="wxCeiling">-- ft</div></div>
+            <div class="data-cell"><div class="data-label">Flight Category</div><div class="data-value" id="wxFlightCat">--</div></div>
             <div class="data-cell"><div class="data-label">Conditions</div><div class="data-value sm" id="wxConditions">--</div></div>
           </div>
         </div>
@@ -777,6 +778,7 @@ select.api-input { cursor: pointer; }
             <div class="data-cell"><div class="data-label">UV Index</div><div class="data-value" id="wxUV">--</div></div>
             <div class="data-cell"><div class="data-label">Kp Index</div><div class="data-value" id="wxKp">--</div></div>
             <div class="data-cell"><div class="data-label">Icing Risk</div><div class="data-value" id="wxIcing">--</div></div>
+            <div class="data-cell"><div class="data-label">Freezing Level</div><div class="data-value sm" id="wxFreezing">-- ft</div></div>
             <div class="data-cell"><div class="data-label">Fire Danger</div><div class="data-value" id="wxFire">--</div></div>
           </div>
         </div>
@@ -1344,6 +1346,7 @@ select.api-input { cursor: pointer; }
               <div class="data-cell"><div class="data-label">Temp hot CAUT (°F)</div><input class="api-input" id="sopTempHotCaution" type="number" value="95" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
               <div class="data-cell"><div class="data-label">Temp hot NO-GO (°F)</div><input class="api-input" id="sopTempHotNoGo" type="number" value="104" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
               <div class="data-cell"><div class="data-label">Wx Code NO-GO</div><input class="api-input" id="sopWxCodeNoGo" type="number" value="95" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">Cloud clearance (ft)</div><input class="api-input" id="sopCloudClearance" type="number" value="500" oninput="onThresholdEdit()" style="font-size:11px;padding:3px;"></div>
             </div>
           </div>
           <div class="api-config">

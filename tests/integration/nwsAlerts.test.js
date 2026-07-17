@@ -300,7 +300,7 @@ describe('renderNWSAlertCards()', () => {
   });
 
   it('truncates long descriptions', () => {
-    const longDesc = 'A'.repeat(500);
+    const longDesc = 'A'.repeat(800); // > the 600-char card cap
     S.nwsAlerts = [{
       event: 'Test',
       severity: 'Minor',

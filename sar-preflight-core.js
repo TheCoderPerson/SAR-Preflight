@@ -35,6 +35,44 @@ const CHANGELOG_ENTRIES = [
     ],
   },
   {
+    version: '2026.07.13-g',
+    date: '2026-07-13',
+    changes: [
+      'Vegetation Height and Viewshed overlays no longer reappear after zooming when their Map Layers checkbox is off: unchecking them in the layer control now clears the internal “overlay wanted” flag that the zoom handler (which re-attaches overlays after the mobile display-size cap) was still honoring. Re-checking them also goes through that size cap, so the mobile memory protection still applies.',
+    ],
+  },
+  {
+    version: '2026.07.13-f',
+    date: '2026-07-13',
+    changes: [
+      'Lightning layer fixed and renamed: the Weather Imagery lightning layer now requests the correct NOAA nowCOAST GeoServer layer (lightning_detection:ldn_lightning_strike_density) — the previous endpoint returned errors, so the layer always rendered blank. Renamed from “Lightning (GOES GLM)” to “Lightning strike density (NOAA)”: the nowCOAST product is 15-minute strike density from ground-based lightning detection networks, not GOES GLM satellite data.',
+      'GOES GeoColor cloud layer fixed: the WMS request no longer computes a “now minus 30 minutes” TIME value — GIBS ingest lag regularly exceeds that buffer (2+ hours observed), which made every tile come back blank. TIME is now omitted so GIBS always serves its latest available frame.',
+      'NWS alert details: alert cards now show the full hazard description (wind gusts, hail size, flooding, etc.) and safety instructions instead of only the one-line headline, and map polygon popups include the description too — a Special Weather Statement now tells you what the weather actually is.',
+      'GOES Clouds layer now shows its frame time and age (e.g. “frame 22:40Z (2h 05m old)”) in the Map Layers control, refreshed each time the layer is enabled, so users know how current the satellite imagery actually is.',
+      'Aviation weather source switched to NWS api.weather.gov station observations: aviationweather.gov’s API does not allow cross-origin browser requests, so the METAR fetch always failed with a NetworkError and the Flight Category / cloud-ceiling readout never populated. The app now resolves the nearest reporting stations via api.weather.gov (CORS-enabled, includes the raw METAR) and skips automated stations that report no ceiling or visibility.',
+      'SNODAS snow-depth layer fixed: the WMS request asked for sublayer 3 (a boundary outline) instead of sublayer 5 (the snow-depth image), and used EPSG:3857 coordinates the NOHRSC ArcGIS server does not support — both meant the layer never showed snow. Now requests sublayer 5 in EPSG:4326.',
+      'Fire danger nationwide: outside California the fire-danger card now pulls NFDRS from the nearest RAWS station via the USDA FEMS API (current ERC/BI and fuel moistures, with percentile colors computed against that station’s own climatological thresholds). Previously the danger indices only populated inside California (CA_NFDRS); active-fire perimeters were already nationwide.',
+    ],
+  },
+  {
+    version: '2026.07.03-b',
+    date: '2026-07-03',
+    changes: [
+      'New GOES-East GeoColor cloud layer (Map Layers → Weather Imagery): near-real-time geostationary satellite imagery (true-color by day, IR at night) via NASA GIBS — see cloud decks and storm systems approaching your area, complementing the precipitation radar.',
+      'New GOES GLM lightning layer (Map Layers → Weather Imagery): near-real-time lightning strike density from NOAA nowCOAST for at-a-glance thunderstorm situational awareness. Both new imagery layers are off by default.',
+    ],
+  },
+  {
+    version: '2026.07.03-a',
+    date: '2026-07-03',
+    changes: [
+      'New Flight Category & cloud ceiling: the Weather tab now shows the observed ceiling and VFR/MVFR/IFR/LIFR flight category from the nearest reporting station (FAA aviationweather.gov METAR), and a Part 107 §107.51(c) cloud-clearance gate flags CAUTION/NO-GO when the ceiling can\'t keep you 500 ft below clouds or visibility is below the 3 sm minimum. The required cloud clearance is an editable threshold (Config → Weather).',
+      'New Freezing Level readout (Open-Meteo 0 °C isotherm): flags a CAUTION for icing aloft when the freezing level sits within your flight envelope (launch elevation up to launch + max AGL).',
+      'New NOAA HMS wildfire-smoke layer: toggle current-day satellite smoke plumes (Light / Medium / Heavy) under Map Layers → Smoke. A Medium/Heavy plume over your area raises a reduced-visibility/VLOS CAUTION.',
+      'New optional Winter Ops layer group: avalanche danger zones (avalanche.org, danger 1–5 with active-warning flags) and NOHRSC SNODAS snow-depth. A Considerable-or-higher danger level or warning over the launch point raises a ground-team-hazard CAUTION. Both layers are off by default.',
+    ],
+  },
+  {
     version: '2026.06.20-j',
     date: '2026-06-20',
     changes: [
@@ -344,6 +382,7 @@ const DEFAULT_THRESHOLDS = {
   tempHotCaution: 95,    // °F — above this = CAUTION (heat stress)
   tempHotNoGo: 104,      // °F — above this = NO-GO (airframe operating maximum)
   weatherCodeNoGo: 95,   // WMO code — at or above = NO-GO (thunderstorm)
+  cloudClearanceFt: 500, // ft — required vertical clearance below clouds (Part 107 §107.51(c))
   // --- Terrain / Ops ---
   elevCaution: 6000,     // ft MSL — terrain elevation CAUTION
   densAltCaution: 5000,  // ft — density altitude CAUTION
@@ -393,6 +432,7 @@ const DRONE_PROFILES = [
 const WX_HOURLY_FIELDS = [
   'temperature_2m', 'dew_point_2m', 'apparent_temperature', 'relative_humidity_2m',
   'surface_pressure', 'visibility', 'uv_index', 'cloud_cover', 'weather_code',
+  'freezing_level_height',
   'precipitation_probability', 'wind_speed_10m', 'wind_direction_10m', 'wind_gusts_10m',
   'wind_speed_80m', 'wind_speed_120m', 'wind_speed_180m',
   'wind_direction_80m', 'wind_direction_120m', 'wind_direction_180m', 'is_day',
@@ -516,11 +556,95 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
   if (icing.severity === 'nogo') { issues.push(`Prop icing — ${icing.reason}`); }
   else if (icing.severity === 'caution') { cautions.push(`Prop icing — ${icing.reason}`); }
 
+  // Freezing level (0°C isotherm) within the flight envelope — icing aloft (advisory).
+  // Guarded on presence so it stays inert where no freezing-level data is supplied.
+  if (wx.freezing_level_height != null) {
+    const fz = freezingLevelRisk(wx.freezing_level_height, centerElev, t.maxAltAGL);
+    if (fz) cautions.push(`Freezing level — ${fz.reason}`);
+  }
+
   let level = 'GO', text = 'All conditions nominal for UAS operations';
   if (issues.length > 0) { level = 'NO-GO'; text = issues.join(' • '); }
   else if (cautions.length > 0) { level = 'CAUTION'; text = cautions.join(' • '); }
 
   return { level, text, issues, cautions };
+}
+
+// --- Freezing level (icing aloft) ---
+// Open-Meteo `freezing_level_height` is the 0°C isotherm altitude in METERS above
+// sea level. Returns an advisory (amber) when that level sits within the flight
+// envelope — from launch elevation up to launch + maxAltAGL — else null. Icing aloft
+// is a pilot-judgement CAUTION, never an automatic NO-GO.
+function freezingLevelRisk(freezingLevelM, launchElevFt, maxAltAGL) {
+  if (freezingLevelM == null || Number.isNaN(Number(freezingLevelM))) return null;
+  const fzFt = Math.round(Number(freezingLevelM) * 3.28084);
+  const baseFt = launchElevFt ?? 0;
+  const topFt = baseFt + (maxAltAGL ?? 400);
+  if (fzFt <= baseFt) {
+    return { level: 'amber', freezingLevelFt: fzFt, reason: `0°C level ${fzFt.toLocaleString()} ft at/below launch elevation` };
+  }
+  if (fzFt <= topFt) {
+    return { level: 'amber', freezingLevelFt: fzFt, reason: `0°C level ${fzFt.toLocaleString()} ft within flight envelope` };
+  }
+  return null;
+}
+
+// --- Aviation weather (METAR-derived) ---
+// Ceiling = the lowest cloud base (ft AGL) among BROKEN / OVERCAST / obscured layers.
+// `clouds` is the array of { cover, base } from the aviationweather.gov METAR JSON.
+// Returns null when there is no broken/overcast layer (sky clear or only few/scattered
+// → no ceiling / unlimited).
+function metarCeilingFt(clouds) {
+  if (!Array.isArray(clouds)) return null;
+  let ceil = null;
+  for (const c of clouds) {
+    if (!c) continue;
+    const cover = String(c.cover || '').toUpperCase();
+    if (cover === 'BKN' || cover === 'OVC' || cover === 'OVX') {
+      const base = Number(c.base);
+      if (Number.isFinite(base) && (ceil === null || base < ceil)) ceil = base;
+    }
+  }
+  return ceil;
+}
+
+// Aviation flight category from ceiling (ft AGL; null = unlimited) and visibility
+// (statute miles; null = unrestricted). Matches the FAA/AWC thresholds. Returns one
+// of 'VFR' | 'MVFR' | 'IFR' | 'LIFR'.
+function flightCategory(ceilingFt, visSm) {
+  const ceil = (ceilingFt == null) ? Infinity : ceilingFt;
+  const vis = (visSm == null) ? 99 : visSm;
+  if (ceil < 500 || vis < 1) return 'LIFR';
+  if (ceil < 1000 || vis < 3) return 'IFR';
+  if (ceil <= 3000 || vis <= 5) return 'MVFR';
+  return 'VFR';
+}
+
+// Part 107 §107.51(c) cloud-clearance + minimum-visibility gate from observed METAR.
+// ceilingFt: ft AGL (null = no ceiling). visSm: statute miles. maxAltAGL: planned
+// operating ceiling (ft AGL). Returns { issues:[], cautions:[] } to merge into the
+// assessment. Below 3 sm visibility is the FAA legal minimum (NO-GO); a ceiling that
+// leaves no room for the required clearance is a NO-GO; a ceiling that only trims the
+// usable envelope below the planned altitude is a CAUTION.
+function assessCloudClearance(ceilingFt, visSm, maxAltAGL, thresholds) {
+  const t = thresholds || DEFAULT_THRESHOLDS;
+  const clearance = t.cloudClearanceFt ?? 500;
+  const planAgl = maxAltAGL ?? t.maxAltAGL ?? 400;
+  const issues = [], cautions = [];
+  if (visSm != null && visSm < 3) {
+    issues.push(`METAR visibility ${visSm} sm below Part 107 3 sm minimum`);
+  } else if (visSm != null && visSm < 5) {
+    cautions.push(`METAR visibility ${visSm} sm — marginal`);
+  }
+  if (ceilingFt != null) {
+    const usable = ceilingFt - clearance;
+    if (usable <= 0) {
+      issues.push(`Ceiling ${ceilingFt.toLocaleString()} ft — cannot maintain ${clearance} ft cloud clearance`);
+    } else if (usable < planAgl) {
+      cautions.push(`Ceiling ${ceilingFt.toLocaleString()} ft limits ops to ~${usable.toLocaleString()} ft AGL (${clearance} ft cloud clearance)`);
+    }
+  }
+  return { issues, cautions };
 }
 
 // --- Terrain Classification ---
@@ -2548,6 +2672,7 @@ if (typeof module !== 'undefined' && module.exports) {
     DOF_LIGHTING, obstacleLighting, obstacleMarkerColor, obstacleLabel,
     summarizeObstacles, obstacleHazardLevel,
     wxAtHour, kpAtTime, calcDensityAltitude, calcBatteryDerating, assessPropIcing, assessRisk,
+    freezingLevelRisk, metarCeilingFt, flightCategory, assessCloudClearance,
     DEFAULT_THRESHOLDS, DRONE_PROFILES,
     classifyTerrain, estimateVegetation, estimateCellCoverage,
     SMA_NONPUBLIC_CODES, smaAgencyInfo, smaIsPublic, classifyAreaPublicPrivate, cellCoverageAt,

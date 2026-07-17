@@ -6,3 +6,6 @@ dist/
 .claude/
 # Cell-coverage build inputs (raw FCC downloads — large, regenerable scratch)
 tools/cell-coverage/input/
+
+# scratch folder for files the Claude device bridge cannot delete
+_to_delete/
