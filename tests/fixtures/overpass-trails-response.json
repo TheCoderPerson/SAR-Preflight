@@ -1,0 +1,60 @@
+{
+  "version": 0.6,
+  "generator": "Overpass API",
+  "elements": [
+    {
+      "type": "way",
+      "id": 111111,
+      "bounds": { "minlat": 38.700, "minlon": -120.600, "maxlat": 38.702, "maxlon": -120.598 },
+      "geometry": [
+        { "lat": 38.700, "lon": -120.600 },
+        { "lat": 38.701, "lon": -120.599 },
+        { "lat": 38.702, "lon": -120.598 }
+      ],
+      "tags": { "highway": "path", "name": "Caples Creek Trail", "sac_scale": "mountain_hiking" }
+    },
+    {
+      "type": "way",
+      "id": 222222,
+      "bounds": { "minlat": 38.710, "minlon": -120.610, "maxlat": 38.711, "maxlon": -120.609 },
+      "geometry": [
+        { "lat": 38.710, "lon": -120.610 },
+        { "lat": 38.711, "lon": -120.609 }
+      ],
+      "tags": { "highway": "track", "name": "Barrett Lake Jeep Trail", "surface": "dirt" }
+    },
+    {
+      "type": "way",
+      "id": 333333,
+      "geometry": [
+        { "lat": 38.720, "lon": -120.620 },
+        { "lat": 38.721, "lon": -120.619 }
+      ],
+      "tags": { "highway": "path", "surface": "ground" }
+    },
+    {
+      "type": "way",
+      "id": 444444,
+      "geometry": [
+        { "lat": 38.730, "lon": -120.630 },
+        { "lat": 38.731, "lon": -120.629 }
+      ],
+      "tags": { "highway": "residential", "name": "Pleasant Valley Road" }
+    },
+    {
+      "type": "way",
+      "id": 555555,
+      "geometry": [
+        { "lat": 38.740, "lon": -120.640 }
+      ],
+      "tags": { "highway": "footway", "name": "Degenerate Path" }
+    },
+    {
+      "type": "node",
+      "id": 666666,
+      "lat": 38.750,
+      "lon": -120.650,
+      "tags": { "name": "Stray Node" }
+    }
+  ]
+}

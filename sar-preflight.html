@@ -950,6 +950,13 @@ select.api-input { cursor: pointer; }
           </div>
         </div>
         <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-purple)"></div>Named Trails (OSM) <span class="fetch-status" id="trailsStatus"></span></div>
+          <div class="section-meta" id="meta_trails"></div>
+          <div class="data-grid">
+            <div class="data-cell full"><div class="data-label">Named trails &amp; offroad paths</div><div class="data-value sm" id="terrTrails">Draw area to load</div></div>
+          </div>
+        </div>
+        <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-purple)"></div>Comms &amp; Connectivity</div>
           <div class="data-grid">
             <div class="data-cell"><div class="data-label">Cell Coverage</div><div class="data-value sm" id="terrCell">--</div></div>
@@ -1273,6 +1280,7 @@ select.api-input { cursor: pointer; }
               <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileSectional" checked> FAA Sectional</label>
               <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileHillshade"> Hillshade</label>
               <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileParcels"> Parcels</label>
+              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileStreets"> Streets/Labels</label>
             </div>
             <div class="risk-bar" style="margin-top:8px;"><div class="risk-fill" id="tileProgressBar" style="width:0;background:var(--accent-cyan);"></div></div>
             <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:4px;" id="tileProgressText"></div>

@@ -30,6 +30,7 @@ const ENDPOINT_TTL = {
   public_lands: 30 * 24 * 60 * 60000,
   nhd_water:   30 * 24 * 60 * 60000,
   hospitals:   30 * 24 * 60 * 60000,
+  trails:      30 * 24 * 60 * 60000,
   cell_coverage: 180 * 24 * 60 * 60000, // 180 days — bundled FCC LTE, refreshed ~2×/yr
 };
 

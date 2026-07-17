@@ -629,6 +629,17 @@ function initMap() {
   S.mapLayers.slope = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Elevation/World_Hillshade/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, opacity: 0.6, attribution: 'USGS 3DEP / Esri' });
   // ReGrid nationwide parcel boundaries (boundaries only — no ownership). Cached PNG, native z17.
   S.mapLayers.parcels = L.tileLayer('https://tiles.arcgis.com/tiles/KzeiCaQsMoeCfoCq/arcgis/rest/services/Regrid_Nationwide_Parcel_Boundaries_v1/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 17, maxZoom: 19, opacity: 0.85, attribution: 'Parcels &copy; Regrid' });
+  // Streets/labels reference overlay — Esri transparent hybrid tiles (roads with
+  // street names + town/place labels), meant for draping over World Imagery.
+  // zIndex 250: above base tiles (which re-stack by DOM order on every base
+  // toggle, so an explicit zIndex is required), below radar frames (zIndex 500).
+  // maxNativeZoom 15: past z15 the service stops drawing road LINES and renders
+  // labels only (it assumes the imagery shows the road), so upscale the z15
+  // tiles instead — road geometry stays visible at close zoom.
+  S.mapLayers.streets = L.layerGroup([
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 15, maxZoom: 19, zIndex: 250, attribution: 'Esri' }),
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 15, maxZoom: 19, zIndex: 250 }),
+  ]);
   S.drawnItems = new L.FeatureGroup();
   S.map.addLayer(S.drawnItems);
   // Cursor coordinate + elevation display
@@ -910,6 +921,7 @@ async function processArea(layer, type) {
     fetchPublicLands(bounds),
     fetchWaterFeatures(bounds),
     fetchHospitals(bounds),
+    fetchTrails(bounds),
   ]);
 
   // Start ADS-B polling (needs elevation data for AGL)
@@ -1104,6 +1116,11 @@ const SECTION_DEFS = {
     label: 'Hospitals & LZs', computes: null,
     fetch: (c, b) => fetchHospitals(b),
     lines: [{ id: 'meta_hospitals', button: true }],
+  },
+  trails: {
+    label: 'Named Trails', computes: null,
+    fetch: (c, b) => fetchTrails(b),
+    lines: [{ id: 'meta_trails', button: true }],
   },
 };
 
@@ -4598,6 +4615,67 @@ async function fetchHospitals(bounds) {
 }
 
 // ============================================================
+// NAMED TRAILS (OSM via Overpass) — named paths/tracks/footways in the ops
+// area, rendered as clickable polylines. Complements the USFS/MVUM layers
+// (NFS-land only, export-excluded): OSM covers all land and exports.
+// ============================================================
+const TRAILS_COLOR = '#f472b6';
+function _renderTrails(records) {
+  if (typeof L === 'undefined') return 0;
+  if (S.mapLayers.trails) S.mapLayers.trails.clearLayers();
+  else S.mapLayers.trails = L.layerGroup().addTo(S.map);
+  (records || []).forEach(rec => {
+    const popup = `<b style="color:${TRAILS_COLOR}">${rec.name}</b>`
+      + `<br>${trailTypeLabel(rec.type)}`
+      + (rec.surface ? `<br>Surface: ${rec.surface}` : '')
+      + (rec.sacScale ? `<br>SAC scale: ${rec.sacScale.replace(/_/g, ' ')}` : '')
+      + `<br><span style="font-size:10px;opacity:0.6">OSM Way ${rec.id}</span>`;
+    L.polyline(rec.coords, { color: TRAILS_COLOR, weight: 2, dashArray: '5,4', opacity: 0.85 })
+      .bindPopup(popup).addTo(S.mapLayers.trails);
+  });
+  return (records || []).length;
+}
+async function fetchTrails(bounds) {
+  trackFetchStart('Trails');
+  setStatus('trailsStatus', 'loading', 'Fetching...');
+  const cacheKey = _bboxCacheKey(bounds);
+  const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  const pad = 0.015; // hug the ops area — trails are dense data
+  const bbox = `${sw.lat - pad},${sw.lng - pad},${ne.lat + pad},${ne.lng + pad}`;
+  const query = buildTrailsOverpassQuery(bbox);
+  let data = null, fromCache = false, cachedAt = null;
+  try {
+    if ((typeof isOnline !== 'function') || isOnline()) {
+      for (const server of OVERPASS_MIRRORS) {
+        try {
+          const res = await fetch(server, { method: 'POST', body: 'data=' + encodeURIComponent(query), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          data = await res.json(); break;
+        } catch (_) { /* try next mirror */ }
+      }
+    }
+    if (data) { if (typeof cacheApiResponse === 'function') cacheApiResponse('trails', cacheKey, data); }
+    else if (typeof getCachedApiResponse === 'function') {
+      try { const c = await getCachedApiResponse('trails', cacheKey); if (c && c.data) { data = c.data; fromCache = true; cachedAt = c.timestamp; } } catch (_) { /* ignore */ }
+    }
+    let count = 0;
+    if (data) count = _renderTrails(parseOverpassTrails(data));
+    setText('terrTrails', data
+      ? (count ? `${count} named trail${count === 1 ? '' : 's'} / paths` : 'None found in area')
+      : 'Unavailable (offline, no cache)');
+    if (typeof markSection === 'function') {
+      if (data && !fromCache) markSection('trails', { status: 'live', updatedAt: Date.now(), error: null });
+      else if (data && fromCache) markSection('trails', { status: 'cached', cachedAt: cachedAt || Date.now(), error: null });
+      else markSection('trails', { status: 'error', error: 'No data' });
+    }
+    _syncStatusFromMeta('trailsStatus', 'trails');
+    buildLayerControl();
+  } finally {
+    trackFetchEnd('Trails');
+  }
+}
+
+// ============================================================
 // CELL COVERAGE (per-carrier FCC LTE) — bundled regional overlay
 // FCC mobile LTE coverage has no free live API/tile service, so a one-time build
 // step (tools/cell-coverage) downloads + simplifies the FCC BDC mobile data for the
@@ -6291,7 +6369,7 @@ function _exportStyleForLayer(key) {
     faa_obstacles: 'obstacle', airports: 'airport', cell_towers: 'tower', dams: 'dam',
     adsb_aircraft: 'aircraft', wilderness: 'protected', national_parks: 'protected',
     emergency_lz: 'protected', swap_radius: 'opsArea', observers: 'observer',
-    hms_smoke: 'fire', avalanche: 'protected',
+    trails: 'trail', hms_smoke: 'fire', avalanche: 'protected',
   };
   return m[key] || 'generic';
 }
@@ -6960,6 +7038,15 @@ function buildLayerControl() {
       <div class="layer-check"></div><div class="layer-color" style="background:${l.color}"></div><span>${l.name}</span>
     </div>`
   ).join('');
+  // Streets/labels overlay — independent of the mutually-exclusive base group,
+  // so it can drape over satellite (or any base). Raw row (not _layerRow) to
+  // avoid the misleading "(2)" LayerGroup count.
+  if (S.mapLayers.streets) {
+    const streetsOn = S.map.hasLayer(S.mapLayers.streets);
+    html += `<div class="layer-item${streetsOn ? ' active' : ''}" data-layer="streets" onclick="toggleLayer('streets',this)">
+      <div class="layer-check"></div><div class="layer-color" style="background:#e5e7eb"></div><span>Streets / Labels</span>
+    </div>`;
+  }
 
   // Radar overlay
   if (S.radarAnim && S.radarAnim.layers && S.radarAnim.layers.length > 0) {
@@ -7191,13 +7278,14 @@ function buildLayerControl() {
     });
   }
   // Ground Access section: forest roads/trails, MVUM, BLM routes
-  if (_layerHasFeatures('usfs_roads') || _layerHasFeatures('usfs_trails') || _layerHasFeatures('mvum_roads') || _layerHasFeatures('mvum_trails') || _layerHasFeatures('blm_gtlf')) {
+  if (_layerHasFeatures('usfs_roads') || _layerHasFeatures('usfs_trails') || _layerHasFeatures('mvum_roads') || _layerHasFeatures('mvum_trails') || _layerHasFeatures('blm_gtlf') || _layerHasFeatures('trails')) {
     html += `<h4 style="margin-top:10px">Ground Access</h4>`;
     if (_layerHasFeatures('usfs_roads')) html += _layerRow('usfs_roads', '#c98a3a', 'NFS Roads');
     if (_layerHasFeatures('usfs_trails')) html += _layerRow('usfs_trails', '#8b5a2b', 'NFS Trails');
     if (_layerHasFeatures('mvum_roads')) html += _layerRow('mvum_roads', '#e0a458', 'MVUM Roads');
     if (_layerHasFeatures('mvum_trails')) html += _layerRow('mvum_trails', '#c97f3a', 'MVUM Trails');
     if (_layerHasFeatures('blm_gtlf')) html += _layerRow('blm_gtlf', '#84cc16', 'BLM Routes');
+    if (_layerHasFeatures('trails')) html += _layerRow('trails', TRAILS_COLOR, 'Named Trails (OSM)');
   }
 
   // Public Lands (surface management agency) + Water
@@ -7345,7 +7433,7 @@ function toggleLayer(id, el) {
   } else if (id === 'glm_lightning') {
     const layer = ensureGlmLayer();
     if (layer) { if (on) S.map.addLayer(layer); else S.map.removeLayer(layer); }
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'parcels' || id === 'slope' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'parcels' || id === 'slope' || id === 'streets' || id === 'trails' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
     if (id === 'canopy' || id === 'viewshed') {
       // Keep the zoom-cap's "wanted" flag in sync — otherwise _applyOverlayZoomCap
       // re-adds the overlay on the next zoomend after it was unchecked here.
@@ -7376,7 +7464,7 @@ function toggleLayer(id, el) {
 // show all matches in one popup with "<- n/N ->" pagination.
 // ============================================================
 const AGG_HIT_PX = 8; // pixel tolerance for line / point hit-testing
-const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'parcels', 'slope', 'snow_depth', 'goes_clouds', 'glm_lightning']);
+const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'parcels', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning']);
 // Export-only exclusion set. Extends the popup-skip set (so basemaps / parcels /
 // rasters stay out of the vector export) and adds layers CalTopo already provides
 // natively and that would be stale by import time. These layers remain visible and
@@ -7409,6 +7497,7 @@ const AGG_LAYER_META = {
   public_lands: { label: 'Land Status', pri: 6 }, nhd_water: { label: 'Water', pri: 7 },
   hospitals: { label: 'Hospital/LZ', pri: 4 }, emergency_lz: { label: 'Emergency LZ', pri: 4 },
   usfs_roads: { label: 'NFS Road', pri: 7 }, usfs_trails: { label: 'NFS Trail', pri: 7 },
+  trails: { label: 'Named Trail (OSM)', pri: 7 },
   mvum_roads: { label: 'MVUM Road', pri: 7 }, mvum_trails: { label: 'MVUM Trail', pri: 7 },
   blm_gtlf: { label: 'BLM Route', pri: 7 },
   cell_att: { label: 'AT&T LTE', pri: 8 }, cell_tmobile: { label: 'T-Mobile LTE', pri: 8 },
@@ -7919,6 +8008,7 @@ function getSelectedTileProviders() {
   if (document.getElementById('cfgTileSectional')?.checked) providers.push('sectional');
   if (document.getElementById('cfgTileHillshade')?.checked) providers.push('hillshade');
   if (document.getElementById('cfgTileParcels')?.checked) providers.push('parcels');
+  if (document.getElementById('cfgTileStreets')?.checked) providers.push('streets_roads', 'streets_labels');
   return providers;
 }
 
@@ -7958,6 +8048,7 @@ async function cacheCurrentView() {
     fetchProtectedAreas(bounds), fetchNearbyAirports(center, bounds),
     fetchPublicLands(bounds), fetchGroundAccess(bounds), fetchWaterFeatures(bounds),
     fetchFireDanger(center.lat, center.lng, bounds), fetchHospitals(bounds),
+    fetchTrails(bounds),
   ];
   if (document.getElementById('cfgViewDEM')?.checked) jobs.push(_cacheViewRaster('dem', bounds));
   if (document.getElementById('cfgViewCanopy')?.checked) jobs.push(_cacheViewRaster('canopy', bounds));
@@ -9903,6 +9994,7 @@ if (typeof module !== 'undefined' && module.exports) {
     proxiedArcgis, _arcgisGeoJsonUrl, _govArcgisUrl, _envelopeGeom, _bboxCacheKey, _prop,
     fetchGroundAccess, fetchPublicLands, fetchWaterFeatures, fetchHospitals,
     _renderPublicLands, computeLandStatus, _renderHospitals,
+    fetchTrails, _renderTrails, TRAILS_COLOR,
     _markSectionFromResults, _syncStatusFromMeta,
     loadCellCoverage, cellCoverageReadout, _pointInRegion, _ringsBBox,
     cacheCurrentView, gridForView, _cacheViewRaster, getSelectedTileProviders,

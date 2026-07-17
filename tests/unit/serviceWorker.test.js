@@ -14,6 +14,11 @@ describe('routeStrategy(url)', () => {
     expect(routeStrategy(SECTIONAL_TILE)).toBe('cache-first');
   });
 
+  it('routes Esri streets/labels reference tiles to cache-first', () => {
+    expect(routeStrategy('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/12/1571/671')).toBe('cache-first');
+    expect(routeStrategy('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/12/1571/671')).toBe('cache-first');
+  });
+
   it('routes FAA VFR sectional service metadata to network-first', () => {
     expect(routeStrategy(SECTIONAL_META)).toBe('network-first');
   });
@@ -85,6 +90,7 @@ describe('latlngToTile(lat, lng, zoom)', () => {
 describe('getCacheName(url)', () => {
   it('returns CACHE_TILES for tile URLs', () => {
     expect(getCacheName('https://a.basemaps.cartocdn.com/dark_all/11/335/785.png')).toBe(CACHE_TILES);
+    expect(getCacheName('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/12/1571/671')).toBe(CACHE_TILES);
   });
 
   it('returns CACHE_SECTIONAL for FAA VFR sectional tiles', () => {

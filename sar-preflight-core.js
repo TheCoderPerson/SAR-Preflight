@@ -19,6 +19,22 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.17-b',
+    date: '2026-07-17',
+    changes: [
+      'Streets/Labels overlay: road lines now stay visible when zoomed in close. The Esri street tiles stop drawing road geometry past zoom 15 (labels only), so the app now upscales the zoom-15 tiles at closer zooms — lines and names get slightly softer the further you zoom, but the road vector no longer disappears.',
+    ],
+  },
+  {
+    version: '2026.07.17',
+    date: '2026-07-17',
+    changes: [
+      'New "Streets / Labels" map overlay: transparent street lines with road names plus town/place labels (Esri hybrid reference tiles), designed to drape over the Satellite base layer — but it works over any base. Toggle it in the layer list right under the base layers; it can also be pre-downloaded for offline use in Config → Offline Tiles.',
+      'New "Named Trails (OSM)" layer: named hiking trails, footpaths, 4WD tracks, bridleways and cycleways from OpenStreetMap for the drawn operational area, shown as pink dashed lines. Tap a trail for its name, type, surface and difficulty (SAC scale). Unlike the NFS/MVUM layers this covers all land ownership, is cached for offline use, and IS included in the CalTopo/KML export (as a "Named Trail (OSM)" folder).',
+      'A "Named Trails (OSM)" section on the Terrain tab shows the trail count with the standard freshness row and UPDATE button.',
+    ],
+  },
+  {
     version: '2026.07.13-g',
     date: '2026-07-13',
     changes: [
@@ -216,6 +232,53 @@ function wireHazardName(tags, cat) {
     return tags.name ? `${tags.name} (${type})` : type || 'Aerialway';
   }
   return '';
+}
+
+// --- OSM Named Trails (Overpass) ---
+// Named foot/offroad routes from OpenStreetMap. Ways only (route relations are
+// out of scope); `out geom` returns each way's geometry inline, so no node-join
+// pass is needed.
+
+const TRAIL_HIGHWAY_TYPES = ['path', 'footway', 'track', 'bridleway', 'cycleway'];
+
+// bbox: "south,west,north,east" string (same shape the app builds elsewhere).
+function buildTrailsOverpassQuery(bbox) {
+  return `[out:json][timeout:45];(`
+    + `way["highway"~"^(${TRAIL_HIGHWAY_TYPES.join('|')})$"]["name"](${bbox});`
+    + `);out geom tags;`;
+}
+
+// Overpass `out geom` JSON -> neutral trail records:
+//   [{ id, name, type, surface, sacScale, coords: [[lat,lng],...] }]
+// Drops unnamed ways, non-ways, non-trail highway types, and degenerate
+// geometry (< 2 points).
+function parseOverpassTrails(data) {
+  const out = [];
+  ((data && data.elements) || []).forEach(el => {
+    if (el.type !== 'way' || !el.tags || !el.tags.name) return;
+    if (TRAIL_HIGHWAY_TYPES.indexOf(el.tags.highway) === -1) return;
+    const coords = (el.geometry || [])
+      .filter(p => p && p.lat != null && p.lon != null)
+      .map(p => [p.lat, p.lon]);
+    if (coords.length < 2) return;
+    out.push({
+      id: el.id,
+      name: el.tags.name,
+      type: el.tags.highway || '',
+      surface: el.tags.surface || null,
+      sacScale: el.tags.sac_scale || null,
+      coords,
+    });
+  });
+  return out;
+}
+
+function trailTypeLabel(type) {
+  const m = {
+    path: 'Trail (path)', footway: 'Footpath', track: 'Track / 4WD',
+    bridleway: 'Bridleway', cycleway: 'Cycleway',
+  };
+  return m[type] || 'Trail';
 }
 
 // --- FAA Digital Obstacle File (DOF) helpers ---
@@ -2294,6 +2357,7 @@ const KML_STYLE_DEFS = {
   dam:       { color: 'ffd4b606', width: 2, icon: 'water.png' },     // cyan — dams
   aircraft:  { color: 'ffd4b606', width: 2, icon: 'airports.png' },  // cyan — ADS-B (plane)
   observer:  { color: 'ff5ec522', width: 2, icon: 'placemark_circle.png' }, // green — viewshed observer
+  trail:     { color: 'ffb672f4', width: 2 },                   // pink — OSM named trails
   generic:   { color: 'ffffffff', fill: '20ffffff', width: 2 }, // white — fallback
   sunArrow:  { color: 'ff00ccff', width: 3 },                   // gold — sun
   windArrow: { color: 'ffd4b606', width: 3 },                   // cyan — wind
@@ -2604,6 +2668,7 @@ if (typeof module !== 'undefined' && module.exports) {
     WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,
     calcSunPosition, calcMoonPhase, wireHazardName,
+    TRAIL_HIGHWAY_TYPES, buildTrailsOverpassQuery, parseOverpassTrails, trailTypeLabel,
     DOF_LIGHTING, obstacleLighting, obstacleMarkerColor, obstacleLabel,
     summarizeObstacles, obstacleHazardLevel,
     wxAtHour, kpAtTime, calcDensityAltitude, calcBatteryDerating, assessPropIcing, assessRisk,
