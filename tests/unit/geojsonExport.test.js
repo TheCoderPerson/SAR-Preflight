@@ -38,6 +38,13 @@ describe('caltopoStyleProps', () => {
   it('falls back to the generic style for an unknown id', () => {
     expect(caltopoStyleProps('nope').stroke).toBe(caltopoStyleProps('generic').stroke);
   });
+  it('derives the trail line style (pink, no fill, no marker)', () => {
+    const p = caltopoStyleProps('trail');
+    expect(p.stroke).toBe('#f472b6');
+    expect(p['stroke-width']).toBe(2);
+    expect(p.fill).toBeUndefined();
+    expect(p['marker-symbol']).toBeUndefined();
+  });
 });
 
 describe('geojson feature builders', () => {

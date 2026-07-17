@@ -4,6 +4,12 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.17 — 2026-07-17
+
+- New "Streets / Labels" map overlay: transparent street lines with road names plus town/place labels (Esri hybrid reference tiles), designed to drape over the Satellite base layer — but it works over any base. Toggle it in the layer list right under the base layers; it can also be pre-downloaded for offline use in Config → Offline Tiles.
+- New "Named Trails (OSM)" layer: named hiking trails, footpaths, 4WD tracks, bridleways and cycleways from OpenStreetMap for the drawn operational area, shown as pink dashed lines. Tap a trail for its name, type, surface and difficulty (SAC scale). Unlike the NFS/MVUM layers this covers all land ownership, is cached for offline use, and IS included in the CalTopo/KML export (as a "Named Trail (OSM)" folder).
+- A "Named Trails (OSM)" section on the Terrain tab shows the trail count with the standard freshness row and UPDATE button.
+
 ## v2026.06.20-j — 2026-06-20
 
 - The 24-hour timeline now drives the entire data panel, not just the sun & wind arrows: drag it and the weather, wind-by-altitude profile, ops/battery estimates, GNSS outlook and the overall GO/CAUTION/NO-GO all update to the selected forecast hour, so you can scrub to find the best launch window. A "FORECAST +Xh" banner makes clear when you are viewing a future hour, and notes that airspace, TFRs, fire and live traffic remain current-time.
