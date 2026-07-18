@@ -231,6 +231,23 @@ self.addEventListener('message', event => {
   if (event.data?.type === 'DOWNLOAD_TILES') {
     downloadTiles(event.data, event.source || event.ports?.[0]);
   }
+  if (event.data?.type === 'REFRESH_SHELL') {
+    // Re-pull the app shell from the network into the current static cache.
+    // Used by applyUpdate() when a new version is deployed but sw.js itself is
+    // byte-identical (so the browser never installs a new SW): refreshing the
+    // cache this active SW serves from, then reloading, picks up the new
+    // version. (The old approach — unregister + reload — fell back to the
+    // browser HTTP cache, which can hold the OLD shell for its full max-age;
+    // on GitHub Pages that's 10 min of "Update Available" → reload → same old
+    // version → modal loop.) cache:'reload' bypasses the HTTP cache.
+    const port = event.ports && event.ports[0];
+    event.waitUntil(
+      caches.open(CACHE_STATIC)
+        .then(cache => cache.addAll(APP_SHELL.map(u => new Request(u, { cache: 'reload' }))))
+        .then(() => { port?.postMessage({ ok: true }); })
+        .catch(() => { port?.postMessage({ ok: false }); })
+    );
+  }
   if (event.data?.type === 'CLEAR_TILE_CACHE') {
     Promise.all([caches.delete(CACHE_TILES), caches.delete(CACHE_SECTIONAL)]).then(() => {
       caches.open(CACHE_TILES);     // re-create empty

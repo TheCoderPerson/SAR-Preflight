@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.17-j — 2026-07-17
+
+- Fixed: the "Update Available" modal could loop — clicking "Reload & Update" reloaded back into the old version (typically within ~10 minutes of a release, when the browser's HTTP cache still held the old files). Applying an update now refreshes the offline app cache directly from the network before reloading, instead of dropping it and re-reading the stale HTTP cache.
+
 ## v2026.07.17-i — 2026-07-17
 
 - Wording cleanup: the built-in data proxy and the PDF briefing header are now described generically (no team-specific naming).

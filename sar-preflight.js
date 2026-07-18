@@ -8078,18 +8078,67 @@ async function checkDeployedVersion() {
   } catch (_) { /* offline / transient — next visibility change retries */ }
 }
 
-// Apply a discovered update. When the SW has the new version waiting/installing,
-// a plain reload activates it (skipWaiting + clients.claim). But when discovery
-// came from the version check above, the SW never installed anything new and a
-// plain reload would re-serve the OLD cached shell — so drop the registration
-// first (online only; offline keeps the working copy) and let the reload fetch
-// the new shell from the network and register a fresh SW.
+// Ask the active SW to re-fetch the app shell from the network into its cache
+// (REFRESH_SHELL). Resolves false on timeout — e.g. an older deployed SW
+// without the handler — so the caller can fall back.
+function _swRefreshShell(sw, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
+    setTimeout(() => finish(false), timeoutMs || 12000);
+    try {
+      const ch = new MessageChannel();
+      ch.port1.onmessage = (e) => finish(!!(e.data && e.data.ok));
+      sw.postMessage({ type: 'REFRESH_SHELL' }, [ch.port2]);
+    } catch (_) { finish(false); }
+  });
+}
+
+// Wait for an in-flight SW install to settle (installed/activated) so a reload
+// lands on the new worker's cache rather than racing the install.
+function _swAwaitInstalled(reg, timeoutMs) {
+  return new Promise((resolve) => {
+    const sw = reg && reg.installing;
+    if (!sw) return resolve(true);
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    setTimeout(() => finish(true), timeoutMs || 8000);
+    sw.addEventListener('statechange', () => {
+      if (sw.state === 'installed' || sw.state === 'activated') finish(true);
+      if (sw.state === 'redundant') finish(false);
+    });
+  });
+}
+
+// Apply a discovered update.
+// 1) sw.js itself changed → normal SW update: nudge it, wait for the install
+//    to settle (skipWaiting + clients.claim), reload.
+// 2) Only app files / version.js changed (sw.js byte-identical → the browser
+//    installs nothing) → REFRESH_SHELL: the ACTIVE SW re-pulls the shell from
+//    the network into its cache, then a plain reload serves the new version
+//    cache-first. NEVER unregister here: an unregistered reload falls back to
+//    the browser HTTP cache, which can hold the OLD shell for its full
+//    max-age (10 min on GitHub Pages) — that caused an "Update Available" →
+//    reload → same old version modal loop.
+// 3) Old deployed SW without REFRESH_SHELL (timeout) → legacy fallback:
+//    unregister so the reload fetches from the network.
 async function applyUpdate() {
   try {
     const reg = S._swReg;
-    const swHasUpdate = !!(reg && (reg.waiting || reg.installing));
     const online = (typeof isOnline !== 'function') || isOnline();
-    if (reg && !swHasUpdate && online) { try { await reg.unregister(); } catch (_) {} }
+    if (reg && online) {
+      if (!reg.waiting && !reg.installing) { try { await reg.update(); } catch (_) {} }
+      if (reg.waiting || reg.installing) {
+        await _swAwaitInstalled(reg);
+        location.reload();
+        return;
+      }
+      if (reg.active) {
+        const ok = await _swRefreshShell(reg.active);
+        if (ok) { location.reload(); return; }
+      }
+      try { await reg.unregister(); } catch (_) {}
+    }
   } catch (_) {}
   location.reload();
 }
@@ -10655,7 +10704,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer,
-    checkDeployedVersion, applyUpdate, fetchLatestVersion,
+    checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitInstalled,
     getCanopyProxyBase, getCustomProxy, saveCanopyProxy, DEFAULT_DATA_PROXY, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
     notifyProxyRateLimited, _proxyFetch,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
