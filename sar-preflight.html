@@ -641,6 +641,7 @@ select.api-input { cursor: pointer; }
     <button class="header-btn" id="btnClearArea" onclick="clearArea()">CLEAR</button>
   </div>
   <div class="header-status">
+    <span id="proxyWarn" style="font-size:10px;color:var(--accent-amber);display:none;cursor:help;"></span>
     <span id="fetchActivity" style="font-size:10px;color:var(--accent-cyan);display:none;"></span>
     <div class="status-dot" id="statusDot"></div>
     <span id="clockDisplay">--:--:-- UTC</span>
@@ -1261,12 +1262,12 @@ select.api-input { cursor: pointer; }
             </div>
           </div>
           <div class="api-config">
-            <div class="data-label">Data proxy URL — canopy + live TFR/NOTAM (Cloudflare Worker — <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">setup guide ↗</a>)</div>
+            <div class="data-label">Data proxy URL — canopy + live TFR/NOTAM (optional override — <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">self-host guide ↗</a>)</div>
             <div class="api-input-group">
-              <input class="api-input" id="cfgCanopyProxy" type="text" placeholder="https://sar-canopy-proxy.you.workers.dev" onchange="saveCanopyProxy(this.value)" />
+              <input class="api-input" id="cfgCanopyProxy" type="text" placeholder="Leave blank for built-in default (sar-canopy-proxy.joja15.workers.dev)" onchange="saveCanopyProxy(this.value)" />
               <button class="btn btn-ghost" onclick="saveCanopyProxy(document.getElementById('cfgCanopyProxy').value)">Save</button>
             </div>
-            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">One self-hosted proxy serves CORS-blocked sources: Meta/WRI 1&nbsp;m canopy tiles (vegetation overlay &amp; viewshed), the FAA TFR GeoServer (live TFRs), the FAA NOTAM Search backend (live NOTAMs), and the USFS/BLM ArcGIS servers (forest roads/trails/MVUM, BLM transport &amp; public-land ownership) — TFRs/NOTAMs auto-fetched per area. NOTAMs come from an unofficial endpoint: treat as advisory and verify officially. Terrain (3DEP), water, fire, hospitals &amp; cell coverage work without the proxy; canopy is cached for offline use, live TFR/NOTAM and USFS/BLM layers need the proxy. Don't have one? <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Set up your own free Cloudflare Worker ↗</a> (step-by-step instructions &amp; code).</div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;"><b>Leave blank to use the built-in EDSAR proxy</b> — the app works out of the box. Enter your own Cloudflare Worker URL to override (e.g. for a fork hosted elsewhere; the built-in proxy only serves the official app origins). The proxy serves CORS-blocked sources: Meta/WRI 1&nbsp;m canopy tiles (vegetation overlay &amp; viewshed), the FAA TFR GeoServer (live TFRs), the FAA NOTAM Search backend (live NOTAMs), and the USFS/BLM ArcGIS servers (forest roads/trails/MVUM, BLM transport &amp; public-land ownership) — TFRs/NOTAMs auto-fetched per area. NOTAMs come from an unofficial endpoint: treat as advisory and verify officially. Heavy use may briefly rate-limit (⚠ PROXY LIMIT in the header); it clears in about a minute. <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Self-host your own free Cloudflare Worker ↗</a> (step-by-step instructions &amp; code).</div>
           </div>
         </div>
         <div class="data-section">

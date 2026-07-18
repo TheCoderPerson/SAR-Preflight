@@ -23,11 +23,10 @@ describe('renderAutoCheckStatus', () => {
   });
   afterEach(() => { document.body.innerHTML = ''; localStorage.removeItem('sar_canopy_proxy'); });
 
-  it('shows OFF and hides Re-check when no proxy is configured', () => {
+  it('shows READY via the built-in default proxy when no custom proxy is configured', () => {
     renderAutoCheckStatus();
-    expect(document.getElementById('autoCheckStatus').textContent).toBe('OFF');
-    expect(document.getElementById('autoCheckDetail').textContent).toMatch(/Config/);
-    expect(document.getElementById('autoCheckReBtn').style.display).toBe('none');
+    expect(document.getElementById('autoCheckStatus').textContent).toBe('READY');
+    expect(document.getElementById('autoCheckReBtn').style.display).toBe('none'); // no area yet
     expect(document.getElementById('autoCheckStatusSection').style.display).toBe('');
   });
 

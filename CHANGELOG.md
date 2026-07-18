@@ -4,6 +4,11 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.17-h — 2026-07-17
+
+- Works out of the box — no proxy setup needed: the app now ships with a built-in EDSAR data proxy, so the vegetation overlay, viewshed canopy, live TFRs/NOTAMs, ADS-B proxy route, and USFS/BLM layers work immediately without deploying your own Cloudflare Worker. Entering your own Worker URL in Config still overrides the default (needed for forks hosted on other origins); clearing the field returns to the built-in proxy.
+- If the shared proxy briefly rate-limits heavy use, an amber "⚠ PROXY LIMIT" indicator now appears in the header status bar (hover it for details) and clears automatically after about a minute — affected fetches can be retried with REFRESH.
+
 ## v2026.07.17-g — 2026-07-17
 
 - 3D view phase 3 — vertical hazards and live traffic: FAA obstacles, towers, and dams with known heights now rise from the terrain as bold vertical height lines at their true AGL height (colored by the same hazard scale as their 2D markers). Live ADS-B aircraft appear in 3D at their actual altitude above the terrain — each plane is an X marker at its AGL altitude with a thin drop line to the ground so you can judge its height and position at a glance — updating with every 5-second traffic poll, with a clickable ground dot for the full aircraft popup. The weather radar layer now also drapes in 3D (current frame, follows the frame stepper).

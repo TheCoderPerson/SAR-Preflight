@@ -8,7 +8,7 @@ globalThis.L = {
   circleMarker: () => ({ bindPopup() { return this; } }),
 };
 
-const { S, fetchNotams } = require('../../sar-preflight.js');
+const { S, fetchNotams, DEFAULT_DATA_PROXY } = require('../../sar-preflight.js');
 
 S.map = { hasLayer: () => false, addLayer() {}, removeLayer() {}, fitBounds: vi.fn(), setView: vi.fn() };
 
@@ -43,13 +43,13 @@ describe('fetchNotams (live NOTAMs via proxy)', () => {
     delete globalThis.fetch;
   });
 
-  it('is a no-op when no proxy is configured', async () => {
+  it('uses the built-in default proxy when no custom proxy is configured', async () => {
     localStorage.removeItem('sar_canopy_proxy');
-    let called = false;
-    globalThis.fetch = () => { called = true; return Promise.resolve({ ok: true, json: async () => payload }); };
+    let calledUrl = null;
+    globalThis.fetch = (url) => { calledUrl = url; return Promise.resolve({ ok: true, json: async () => payload }); };
     await fetchNotams(38.65, -120.99, 20);
-    expect(called).toBe(false);
-    expect(S.importedNotams.length).toBe(0);
+    expect(calledUrl).toContain(DEFAULT_DATA_PROXY + '/notam?');
+    expect(S.importedNotams.length).toBe(2);
   });
 
   it('fetches the /notam route with lat/lng/radius and populates S.importedNotams', async () => {

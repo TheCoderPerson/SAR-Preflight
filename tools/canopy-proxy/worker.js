@@ -13,6 +13,9 @@
 //   • Only the two upstreams above are reachable (never an open proxy; `..` rejected).
 //   • Requests whose Origin/Referer isn't in ALLOWED_ORIGINS get 403, so other
 //     sites can't hot-link it and burn your quota.
+//   • Per-IP rate limit (RATE_LIMITER binding in wrangler.toml) returns 429 to
+//     scripted abuse that spoofs an allowed Origin. Optional — the code guards
+//     on the binding existing.
 //   • Workers FREE plan has no overage billing — past ~100k req/day it just
 //     returns errors until the next UTC day; it cannot cost you money.
 //
@@ -103,7 +106,7 @@ function resolveTarget(url) {
 }
 
 export default {
-  async fetch(req) {
+  async fetch(req, env) {
     const allow = allowedOriginFor(req);
 
     if (req.method === 'OPTIONS') {
@@ -114,6 +117,22 @@ export default {
       return new Response('method not allowed', { status: 405 });
     }
     if (!allow) return new Response('forbidden', { status: 403 });
+
+    // Per-IP rate limit (guarded: works fine when deployed without the binding).
+    if (env && env.RATE_LIMITER) {
+      try {
+        const { success } = await env.RATE_LIMITER.limit({ key: req.headers.get('CF-Connecting-IP') || '' });
+        if (!success) {
+          return new Response('rate limited', {
+            status: 429,
+            headers: Object.assign({}, corsHeaders(allow), {
+              'Retry-After': '60',
+              'Access-Control-Expose-Headers': 'Retry-After',
+            }),
+          });
+        }
+      } catch (_) { /* limiter unavailable → fail open */ }
+    }
 
     const reqUrl = new URL(req.url);
     if (reqUrl.pathname === '/notam' || reqUrl.pathname === '/notam/') {

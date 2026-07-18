@@ -9,7 +9,7 @@ globalThis.L = {
   circleMarker: () => ({ bindPopup() { return this; } }),
 };
 
-const { S, fetchLiveTFRs, tfrGeoJsonUrlForBounds } = require('../../sar-preflight.js');
+const { S, fetchLiveTFRs, tfrGeoJsonUrlForBounds, DEFAULT_DATA_PROXY } = require('../../sar-preflight.js');
 
 S.map = { hasLayer: () => false, addLayer() {}, removeLayer() {}, fitBounds: vi.fn(), setView: vi.fn() };
 
@@ -94,12 +94,13 @@ describe('fetchLiveTFRs (live TFR via proxy)', () => {
     delete globalThis.fetch;
   });
 
-  it('is a no-op when no proxy is configured', async () => {
+  it('uses the built-in default proxy when no custom proxy is configured', async () => {
     localStorage.removeItem('sar_canopy_proxy');
     const urls = installFetch();
     await fetchLiveTFRs(bounds);
-    expect(urls.length).toBe(0);
-    expect(S.tfrs.length).toBe(0);
+    const wfs = urls.find(u => u.includes('/geoserver/'));
+    expect(wfs).toContain(DEFAULT_DATA_PROXY + '/tfr/geoserver/TFR/ows');
+    expect(S.tfrs.length).toBe(1);
   });
 
   it('fetches the proxied /tfr/ GeoServer URL and populates S.tfrs flagged _live', async () => {

@@ -26,12 +26,14 @@ A small CORS+Range proxy so the browser-only app can read CORS-blocked sources:
 It only ever forwards those upstreams (it is not a general open proxy; `..` is
 rejected), and it enforces an Origin allowlist (below).
 
-> The app works without this proxy — the DEM/terrain side of the viewshed uses
-> USGS 3DEP (already CORS-enabled), and TFR/NOTAM fall back to deep-link/import.
-> The canopy overlay, vegetation-aware viewshed, and live TFR/NOTAM auto-fetch stay
-> dormant until a proxy URL is configured (Config tab → "Data proxy URL").
+> **The app ships with a built-in default proxy** (the maintainer's Worker,
+> `https://sar-canopy-proxy.joja15.workers.dev`), so end users don't need to deploy
+> anything — everything below is only for **self-hosting your own** proxy (e.g. for
+> a fork hosted on a different origin, or to be independent of the shared one).
+> Entering a URL in Config tab → "Data proxy URL" overrides the default; clearing
+> it returns to the default.
 
-## Deploy
+## Deploy (self-hosting only)
 
 ```bash
 npm i -g wrangler          # one-time
@@ -57,7 +59,8 @@ working in the field with no network (and no proxy) available.
 
 ## Preventing abuse
 
-Three things keep the proxy from being misused:
+Four things keep the proxy from being misused (they stack: the Origin allowlist
+stops browsers, the per-IP rate limit stops scripts, the free-plan cap stops bills):
 
 1. **No surprise bill.** On the Workers **free plan** there is no usage-based billing.
    If the ~100,000 requests/day limit is ever hit, the Worker just returns errors
@@ -74,7 +77,15 @@ Three things keep the proxy from being misused:
    needed) and redeploy. Note: a CORS `Access-Control-Allow-Origin` header alone
    does **not** block abuse — it only controls which browsers may *read* the
    response — which is why the Worker actively rejects disallowed origins instead.
+4. **Per-IP rate limit.** The Origin check only binds real browsers — a script
+   (curl) can spoof an allowed `Origin` header. The `RATE_LIMITER` binding in
+   `wrangler.toml` (Cloudflare's Workers rate-limiting binding) caps each IP at
+   300 requests/min; excess requests get **429** with a `Retry-After: 60` header,
+   and the app surfaces this in its status bar. Note: dashboard **WAF rate-limiting
+   rules do not apply to `*.workers.dev`** (they need a custom domain in your zone),
+   which is why the limit lives in the Worker. The code guards on the binding, so
+   removing the `[[unsafe.bindings]]` block just disables it.
 
-For extra protection you can optionally add a **Rate limiting rule** in the
-Cloudflare dashboard (Security → WAF → Rate limiting rules) to cap requests per IP.
-For a SAR tool the allowlist + free-plan limits are normally enough.
+If you host the shared/default proxy, also consider a Cloudflare **Notification**
+(dashboard → Notifications) on Workers usage so a traffic spike emails you before
+the daily cap kicks in.
