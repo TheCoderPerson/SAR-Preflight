@@ -5790,6 +5790,7 @@ function _updateTimeBar(frac) {
   _updateWindArrow(windDir, windSpd);
   _updateSunArrow(sunPos);
   if (typeof _update3dLight === 'function') _update3dLight();
+  if (typeof _updateShadowForTime === 'function') _updateShadowForTime();
 
   // Re-render the data panel (weather / wind / ops / assessment) for this hour.
   refreshPanelForHour();
@@ -7464,8 +7465,9 @@ function buildLayerControl() {
   // Analysis overlays: vegetation height + viewshed (each with an opacity slider)
   const hasCanopy = S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy);
   const hasViewshed = S.mapLayers.viewshed && S.map.hasLayer(S.mapLayers.viewshed);
+  const hasShadow = S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow);
   const hasObservers = S.mapLayers.observers && S.map.hasLayer(S.mapLayers.observers) && (S.viewsheds || []).length;
-  if (hasCanopy || hasViewshed || hasObservers) {
+  if (hasCanopy || hasViewshed || hasShadow || hasObservers) {
     html += `<h4 style="margin-top:10px">Analysis</h4>`;
     if (hasObservers) {
       html += `<div class="layer-item active" data-layer="observers" onclick="toggleLayer('observers',this)">
@@ -7489,6 +7491,16 @@ function buildLayerControl() {
       </div>
       <div style="display:flex;align-items:center;gap:6px;margin:2px 0 4px 22px;">
         <input type="range" min="0" max="1" step="0.05" value="${op}" style="width:90px;" oninput="setViewshedOpacity(this.value)" onclick="event.stopPropagation()">
+        <span style="font-size:9px;color:var(--text-muted);">opacity</span>
+      </div>`;
+    }
+    if (hasShadow) {
+      const op = S.mapLayers.shadow.options.opacity != null ? S.mapLayers.shadow.options.opacity : SHADOW_OVERLAY_OPACITY;
+      html += `<div class="layer-item active" data-layer="shadow" onclick="toggleLayer('shadow',this)">
+        <div class="layer-check"></div><div class="layer-color" style="background:#0b1220;border:1px solid #475569"></div><span>Sun Shadow</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin:2px 0 4px 22px;">
+        <input type="range" min="0" max="1" step="0.05" value="${op}" style="width:90px;" oninput="setShadowOpacity(this.value)" onclick="event.stopPropagation()">
         <span style="font-size:9px;color:var(--text-muted);">opacity</span>
       </div>`;
     }
@@ -7564,17 +7576,18 @@ function toggleLayer(id, el) {
   } else if (id === 'glm_lightning') {
     const layer = ensureGlmLayer();
     if (layer) { if (on) S.map.addLayer(layer); else S.map.removeLayer(layer); }
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'parcels' || id === 'slope' || id === 'streets' || id === 'trails' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
-    if (id === 'canopy' || id === 'viewshed') {
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'shadow' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'parcels' || id === 'slope' || id === 'streets' || id === 'trails' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
+    if (id === 'canopy' || id === 'viewshed' || id === 'shadow') {
       // Keep the zoom-cap's "wanted" flag in sync — otherwise _applyOverlayZoomCap
       // re-adds the overlay on the next zoomend after it was unchecked here.
       if (!S._overlayWanted) S._overlayWanted = {};
       S._overlayWanted[id] = on;
     }
     if (id === 'canopy') { const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = on; }
+    if (id === 'shadow') { const cb = document.getElementById('shadowToggle'); if (cb) cb.checked = on; }
     if (on) {
       // Raster overlays go through the zoom cap so the mobile display-size budget still applies
-      if (id === 'canopy' || id === 'viewshed') _applyOverlayZoomCap();
+      if (id === 'canopy' || id === 'viewshed' || id === 'shadow') _applyOverlayZoomCap();
       else S.map.addLayer(S.mapLayers[id]);
     } else S.map.removeLayer(S.mapLayers[id]);
     // Toggling aircraft also toggles trails
@@ -7597,7 +7610,7 @@ function toggleLayer(id, el) {
 // show all matches in one popup with "<- n/N ->" pagination.
 // ============================================================
 const AGG_HIT_PX = 8; // pixel tolerance for line / point hit-testing
-const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'parcels', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning']);
+const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'shadow', 'parcels', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning']);
 // Export-only exclusion set. Extends the popup-skip set (so basemaps / parcels /
 // rasters stay out of the vector export) and adds layers CalTopo already provides
 // natively and that would be stale by import time. These layers remain visible and
@@ -9430,6 +9443,7 @@ async function exportMissionLogsAsCSV() {
 
 const CANOPY_OVERLAY_OPACITY = 0.6;
 const VIEWSHED_OVERLAY_OPACITY = 0.5;
+const SHADOW_OVERLAY_OPACITY = 0.45;
 const CANOPY_MAX_M = 60;        // clamp canopy heights (guards COG fill/nodata artifacts)
 // Cap the per-tile COG window read; a coarser overview is chosen if larger.
 // (Meta canopy COGs turned out to have NO usable overviews, so this rarely
@@ -9780,7 +9794,7 @@ function _overlayDisplayPx(layer) {
 function _applyOverlayZoomCap() {
   if (!S.map || !S._overlayWanted) return;
   const constrained = _isConstrained();
-  ['canopy', 'viewshed'].forEach(id => {
+  ['canopy', 'viewshed', 'shadow'].forEach(id => {
     const layer = S.mapLayers[id];
     if (!layer || !S._overlayWanted[id]) return;
     // Desktop: never hide for size (no compositing-memory crash risk) — keep the
@@ -9797,7 +9811,7 @@ function _applyOverlayZoomCap() {
 function _hideOverlaysForZoom() {
   if (!_isConstrained()) return; // desktop keeps overlays visible throughout zoom
   if (!S.map || !S._overlayWanted) return;
-  ['canopy', 'viewshed'].forEach(id => {
+  ['canopy', 'viewshed', 'shadow'].forEach(id => {
     const layer = S.mapLayers[id];
     if (layer && S._overlayWanted[id] && S.map.hasLayer(layer)) S.map.removeLayer(layer);
   });
@@ -9936,6 +9950,127 @@ async function loadCanopyForView() {
   } finally {
     trackFetchEnd('Canopy');
   }
+}
+
+// ============================================================
+// SUN SHADOW OVERLAY — terrain-cast shade at the time bar's hour.
+// View-based like the canopy overlay: fetch a 3DEP DEM for the current map
+// view once, then recompute the (cheap, O(cells)) shadow sweep whenever the
+// forecast time bar is scrubbed. Bare-earth terrain only — tree/building
+// shade is NOT modeled.
+// ============================================================
+
+// The time the shadow (and the rest of the time-scrubbed UI) represents:
+// the time bar's selected hour when available, else now.
+function _shadowTime() {
+  const hourly = S.wx && S.wx.hourly;
+  if (hourly && hourly.time && hourly.time.length && S.timeIdx != null && hourly.time[S.timeIdx] != null) {
+    return new Date(hourly.time[S.timeIdx]);
+  }
+  return new Date();
+}
+
+function setShadowOpacity(v) {
+  const o = parseFloat(v);
+  if (S.mapLayers.shadow && S.mapLayers.shadow.setOpacity) S.mapLayers.shadow.setOpacity(o);
+  const span = document.getElementById('shadowOpacityVal');
+  if (span) span.textContent = Math.round(o * 100) + '%';
+  if (S.is3D && typeof sync3d === 'function') sync3d();
+}
+
+async function toggleShadowOverlay() {
+  const cb = document.getElementById('shadowToggle');
+  const on = cb ? cb.checked : !(S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow));
+  if (!on) {
+    if (S._overlayWanted) S._overlayWanted.shadow = false;
+    if (S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow)) S.map.removeLayer(S.mapLayers.shadow);
+    if (S.is3D && typeof sync3d === 'function') sync3d();
+    buildLayerControl();
+    return;
+  }
+  // Re-showing after a toggle: if the loaded DEM still covers the current view
+  // centre, just recompute for the current hour instead of refetching.
+  if (S.shadow && S.shadow.grid && S.shadow.demFlat) {
+    const b = S.shadow.grid.bounds;
+    const c2 = S.map.getCenter();
+    if (c2.lat <= b.north && c2.lat >= b.south && c2.lng >= b.west && c2.lng <= b.east) {
+      _renderShadowForTime();
+      buildLayerControl();
+      return;
+    }
+  }
+  await loadShadowForView();
+}
+
+async function loadShadowForView() {
+  if (!S.map) return;
+  trackFetchStart('Sun shadow');
+  setStatus('shadowStatus', 'loading', 'Fetching...');
+  try {
+    const vb = S.map.getBounds();
+    const center = vb.getCenter();
+    const halfWidthM = Math.max(
+      center.distanceTo(L.latLng(center.lat, vb.getWest())),
+      center.distanceTo(L.latLng(vb.getNorth(), center.lng))
+    );
+    // One capped-size exportImage request regardless of view width (unlike the
+    // 1 m canopy COGs), so no zoom guard is needed — wide views just go coarse.
+    const resM = Math.max(WORK_RES_M, (2 * halfWidthM) / MAX_GRID);
+    const grid = makeGrid(center.lat, center.lng, halfWidthM, resM);
+    const dem = await fetch3DEPDEM(grid);
+    if (!dem.demFlat) {
+      setStatus('shadowStatus', 'error', 'NO DEM');
+      const cbn = document.getElementById('shadowToggle'); if (cbn) cbn.checked = false;
+      if (S._overlayWanted) S._overlayWanted.shadow = false;
+      return;
+    }
+    S.shadow = { grid, demFlat: dem.demFlat, source: dem.source };
+    _renderShadowForTime();
+    const cb = document.getElementById('shadowToggle'); if (cb) cb.checked = true;
+    buildLayerControl();
+  } catch (e) {
+    console.error('Sun shadow overlay error:', e);
+    recordDataSourceError('Sun shadow', e);
+    setStatus('shadowStatus', 'error', 'ERROR');
+  } finally {
+    trackFetchEnd('Sun shadow');
+  }
+}
+
+// Compute + paint the shadow mask for the currently selected hour. Cheap
+// enough (single O(cells) sweep over the resident DEM) to run per scrub tick.
+function _renderShadowForTime() {
+  if (!S.shadow || !S.shadow.grid || !S.shadow.demFlat) return;
+  const grid = S.shadow.grid;
+  const t = _shadowTime();
+  const sun = calcSunPosition(grid.lat0, grid.lng0, t);
+  const mask = computeShadowMask(grid, S.shadow.demFlat, sun.azimuth, sun.elevation);
+  S.shadow.mask = mask;
+  S.shadow.sun = sun;
+  S.shadow.timeMs = t.getTime();
+  const op = parseFloat((document.getElementById('shadowOpacity') || {}).value) || SHADOW_OVERLAY_OPACITY;
+  renderRasterOverlay('shadow', shadowMaskToRGBA(grid, mask), grid, op);
+  const night = !(sun.elevation > 0);
+  setStatus('shadowStatus', 'live', night ? 'NIGHT' : `SUN ${Math.round(sun.azimuth)}° ↑${Math.round(sun.elevation)}°`);
+  const res = document.getElementById('shadowResult');
+  if (res) {
+    // mask holds graded shade depth (0..255) — weight partially shaded cells.
+    let shaded = 0, known = 0;
+    for (let i = 0; i < mask.length; i++) { if (Number.isFinite(S.shadow.demFlat[i])) { known++; shaded += mask[i] / 255; } }
+    const pct = known ? Math.round(shaded / known * 100) : 0;
+    const when = t.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: _localTZ() });
+    res.textContent = night
+      ? `${when}: sun below horizon — all terrain shaded (${S.shadow.source})`
+      : `${when}: ${pct}% of view in shade (${S.shadow.source})`;
+  }
+}
+
+// Time-bar hook: recompute the mask for the newly scrubbed hour (debounced —
+// the scrubber fires on every mousemove).
+function _updateShadowForTime() {
+  if (!S.shadow || !S._overlayWanted || !S._overlayWanted.shadow) return;
+  clearTimeout(S._shadowTimeTimer);
+  S._shadowTimeTimer = setTimeout(_renderShadowForTime, 120);
 }
 
 // --- Viewshed: tap-to-pick observer + compute ---
@@ -10425,7 +10560,7 @@ function collect3dState() {
   let base = null;
   ['satellite', 'topo', 'sectional'].forEach(id => { if (active(id)) base = id; });
   const rasters = [];
-  ['canopy', 'viewshed'].forEach(id => {
+  ['canopy', 'viewshed', 'shadow'].forEach(id => {
     const info = S._raster3d && S._raster3d[id];
     if (!info || !S._overlayWanted || !S._overlayWanted[id]) return;
     // The canopy renders as a 3D surface mesh instead of a flat drape when
@@ -11231,6 +11366,7 @@ if (typeof module !== 'undefined' && module.exports) {
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
     renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, _isConstrained, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,
+    setShadowOpacity, toggleShadowOverlay, loadShadowForView, _renderShadowForTime, _updateShadowForTime, _shadowTime,
     startViewshedPick, cancelViewshedPick, onViewshedMapClick, runViewshed, clearAllViewsheds,
     genViewshedId, _ensureObserverLayer, _addObserverMarker, _observerPopupHtml, _toPersistable,
     _renderActiveViewshed, setActiveViewshed, recomputeViewshed, renameViewshed, renameViewshedPrompt,

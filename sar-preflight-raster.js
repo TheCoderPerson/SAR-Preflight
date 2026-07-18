@@ -318,6 +318,121 @@ function computeViewshed(opts) {
   return out;
 }
 
+// ============================================================
+// SUN-SHADOW KERNEL — how shaded is each cell from a light source at
+// (azimuthDeg, elevationDeg)? Classic DEM shadow-cast sweep: rays enter the
+// grid from the sun-facing edges and march away from the sun along the
+// dominant axis; each ray carries a "shadow front" height that descends at
+// tan(elevation) per metre travelled. A cell below the front is in shadow;
+// a cell at/above it is lit and resets the front to its own height. Slopes
+// facing away from the sun fall out of this naturally (terrain dropping
+// faster than the ray descends stays under the front). O(cells) total.
+//
+// Two anti-aliasing measures keep coarse/rough DEMs from producing hard
+// synchronized speckle ("comb" stripes at low sun over corrugated terrain):
+// the terrain is sampled BILINEARLY along the ray (all rays share the same
+// fractional stepping pattern, so nearest-cell sampling makes every ray jump
+// rows at the same columns), and the result is a GRADED shade depth rather
+// than a binary verdict — cells barely below the shadow front get partial
+// values, so marginal cells render as faint shade instead of flickering.
+//
+// Returns Uint8Array: 0 = sunlit or unknown (NaN) terrain, 255 = fully
+// shaded, 1..254 = penumbra/marginal shade (soft edge). Sun at/below the
+// horizon → every known cell is 255 (night).
+// ============================================================
+function computeShadowMask(grid, dem, sunAzDeg, sunElDeg) {
+  const cols = grid.cols, rows = grid.rows, n = rows * cols;
+  const out = new Uint8Array(n);
+  if (!dem) return out;
+  if (!(sunElDeg > 0)) {
+    for (let i = 0; i < n; i++) if (Number.isFinite(dem[i])) out[i] = 255;
+    return out;
+  }
+  if (cols < 2 || rows < 2) return out; // a 1-cell strip can't cast shadows
+  const az = sunAzDeg * Math.PI / 180;
+  // Horizontal direction the LIGHT travels (away from the sun), in grid axes:
+  // +x = east = +col; grid rows grow southward, so +y(row) = -north.
+  let dx = -Math.sin(az);
+  let dy = Math.cos(az);
+  const dom = Math.max(Math.abs(dx), Math.abs(dy));
+  if (!(dom > 0)) return out; // degenerate (never happens for a real azimuth)
+  dx /= dom; dy /= dom;
+  const dropM = Math.tan(sunElDeg * Math.PI / 180) * Math.hypot(dx, dy) * grid.resM;
+  // Soft-edge width: full shade only when the terrain sits at least this far
+  // below the shadow front. Scaled to the per-step drop (bounded) so the
+  // penumbra spans roughly one ray step regardless of grid resolution.
+  const softM = Math.max(2, Math.min(15, dropM));
+
+  // Bilinear terrain sample at fractional cell coords (clamped to the grid).
+  // Falls back to the heaviest finite corner when a neighbour is NaN.
+  const zAt = (x, y) => {
+    let x0 = Math.floor(x), y0 = Math.floor(y);
+    if (x0 < 0) x0 = 0; else if (x0 > cols - 2) x0 = cols - 2;
+    if (y0 < 0) y0 = 0; else if (y0 > rows - 2) y0 = rows - 2;
+    const tx = Math.min(1, Math.max(0, x - x0)), ty = Math.min(1, Math.max(0, y - y0));
+    const i00 = y0 * cols + x0;
+    const v00 = dem[i00], v10 = dem[i00 + 1], v01 = dem[i00 + cols], v11 = dem[i00 + cols + 1];
+    if (Number.isFinite(v00) && Number.isFinite(v10) && Number.isFinite(v01) && Number.isFinite(v11)) {
+      return (v00 * (1 - tx) + v10 * tx) * (1 - ty) + (v01 * (1 - tx) + v11 * tx) * ty;
+    }
+    let best = NaN, bestW = -1;
+    const w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty), w01 = (1 - tx) * ty, w11 = tx * ty;
+    if (Number.isFinite(v00) && w00 > bestW) { best = v00; bestW = w00; }
+    if (Number.isFinite(v10) && w10 > bestW) { best = v10; bestW = w10; }
+    if (Number.isFinite(v01) && w01 > bestW) { best = v01; bestW = w01; }
+    if (Number.isFinite(v11) && w11 > bestW) { best = v11; bestW = w11; }
+    return best;
+  };
+
+  const trace = (sx, sy) => {
+    let x = sx, y = sy;
+    let frontZ = -Infinity;
+    while (x > -0.5 && x < cols - 0.5 && y > -0.5 && y < rows - 0.5) {
+      const z = zAt(x, y);
+      if (Number.isFinite(z)) {
+        if (z >= frontZ) {
+          frontZ = z;
+        } else {
+          const idx = Math.round(y) * cols + Math.round(x);
+          if (Number.isFinite(dem[idx])) {
+            const d = (frontZ - z) / softM;
+            const v = d >= 1 ? 255 : Math.round(d * 255);
+            if (v > out[idx]) out[idx] = v;
+          }
+        }
+      }
+      x += dx; y += dy;
+      frontZ -= dropM;
+    }
+  };
+
+  // Rays start on the edge(s) the light enters through; together the two
+  // entry edges cover every cell (dominant-axis stepping, unit ray spacing).
+  if (dx > 1e-12) for (let r = 0; r < rows; r++) trace(0, r);
+  else if (dx < -1e-12) for (let r = 0; r < rows; r++) trace(cols - 1, r);
+  if (dy > 1e-12) for (let c = 0; c < cols; c++) trace(c, 0);
+  else if (dy < -1e-12) for (let c = 0; c < cols; c++) trace(c, rows - 1);
+  return out;
+}
+
+// Shade depth (0..255) → translucent cool dark with proportional alpha;
+// sunlit / unknown → fully transparent. (Global translucency comes from the
+// overlay's opacity slider on top of the per-pixel alpha.)
+function shadowColorRamp(v) {
+  return v ? [11, 18, 32, v] : [0, 0, 0, 0];
+}
+
+function shadowMaskToRGBA(grid, mask) {
+  const n = grid.rows * grid.cols;
+  const rgba = new Uint8ClampedArray(n * 4);
+  for (let i = 0; i < n; i++) {
+    const c = shadowColorRamp(mask[i]);
+    const o = i * 4;
+    rgba[o] = c[0]; rgba[o + 1] = c[1]; rgba[o + 2] = c[2]; rgba[o + 3] = c[3];
+  }
+  return rgba;
+}
+
 // Fraction of in-range cells that are visible (for the result readout).
 function viewshedCoverage(grid, mask, obsCol, obsRow, vlosRangeM) {
   const cols = grid.cols, rows = grid.rows;
@@ -795,6 +910,7 @@ if (typeof module !== 'undefined' && module.exports) {
     sampleGridBilinear,
     resampleToGrid, buildDSM, sanitizeForKernel,
     curvatureDrop, isVisible, computeViewshed, viewshedCoverage,
+    computeShadowMask, shadowColorRamp, shadowMaskToRGBA,
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,
     decimateCanopyMesh, canopyMeshIndexed, normalFromSlopes,
     encodeGeoTiffRGBA, reprojectRgbaTo3857, worldFileForBounds, WGS84_WKT, WEBMERC_WKT, crc32, zipStore,

@@ -19,6 +19,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.18-b',
+    date: '2026-07-18',
+    changes: [
+      'New Sun Shadow overlay (Terrain tab): shows which terrain is in shade vs. direct sun at the selected hour. Shadows are cast from real 3DEP terrain using the computed sun position, and scrubbing the forecast time bar re-casts them instantly, so you can preview how shade moves across the search area through the day. Toggleable with its own opacity slider (layer list → Analysis → "Sun Shadow"), works in both the 2D map and the 3D view, and shows the % of the view in shade. Shadow edges render as a soft graded penumbra (marginal cells fade instead of flickering), so low-sun shade over rough terrain looks natural rather than speckled. After sunset the whole area reads as shaded (night). Bare-earth terrain only — tree and building shade are not modeled.',
+    ],
+  },
+  {
     version: '2026.07.18-a',
     date: '2026-07-18',
     changes: [

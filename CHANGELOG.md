@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.18-b — 2026-07-18
+
+- New Sun Shadow overlay (Terrain tab): shows which terrain is in shade vs. direct sun at the selected hour. Shadows are cast from real 3DEP terrain using the computed sun position, and scrubbing the forecast time bar re-casts them instantly, so you can preview how shade moves across the search area through the day. Toggleable with its own opacity slider (layer list → Analysis → "Sun Shadow"), works in both the 2D map and the 3D view, and shows the % of the view in shade. Shadow edges render as a soft graded penumbra (marginal cells fade instead of flickering), so low-sun shade over rough terrain looks natural rather than speckled. After sunset the whole area reads as shaded (night). Bare-earth terrain only — tree and building shade are not modeled.
+
 ## v2026.07.18-a — 2026-07-18
 
 - 3D buildings: OSM building footprints for the operational area now render in 3D as extruded, sun-shaded buildings (fetched automatically on first 3D entry; heights from OSM tags where mapped, estimated otherwise — treat as approximate). In 2D they appear as a shaded footprint layer under Facilities. A new Config option ("Buildings in 3D view") can force flat draped footprints instead of 3D — chosen automatically on phones/tablets.
