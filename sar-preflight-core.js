@@ -19,6 +19,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.17-d',
+    date: '2026-07-17',
+    changes: [
+      'New 3D terrain view: the "⛰ 3D" button (under the theme toggle) switches the map to a tilt-and-rotate 3D view with real terrain relief. Whatever imagery the 2D map is showing — satellite, topo, FAA sectional, hillshade, parcels, streets, and the canopy/viewshed overlays — drapes over the terrain, and the camera position carries over when switching between 2D and 3D. Data overlays (TFRs, wires, airports, etc.) and the drawing tools remain 2D for now; starting a draw or viewshed pick automatically returns to 2D. The 3D engine loads on first use and needs an internet connection.',
+    ],
+  },
+  {
     version: '2026.07.17-c',
     date: '2026-07-17',
     changes: [
@@ -2692,6 +2699,102 @@ function metaToneClass(tone) {
   return 'section-meta-muted';
 }
 
+// ============================================================
+// 3D TERRAIN VIEW — pure style + camera helpers (MapLibre)
+// The 3D toggle drapes the raster layers the 2D map is showing over real
+// terrain. These builders are pure (no DOM/MapLibre) so they are testable
+// in Node; sar-preflight.js snapshots the live 2D layer state and feeds it
+// to build3dStyle().
+// ============================================================
+// AWS Open Data terrain tiles (Mapzen/Terrarium encoding — global, free, no key).
+const TERRAIN_DEM_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png';
+
+// Leaflet zoom is defined against 256 px tiles, MapLibre style zoom against
+// 512 px — the same view scale is one zoom level apart.
+function leafletToMaplibreCamera(lat, lng, zoom) {
+  return { center: [lng, lat], zoom: Math.max(0, (zoom || 0) - 1) };
+}
+function maplibreToLeafletCamera(lng, lat, zoom) {
+  return { lat, lng, zoom: (zoom || 0) + 1 };
+}
+
+function _raster3dSource(urls, maxzoom) {
+  return { type: 'raster', tiles: Array.isArray(urls) ? urls : [urls], tileSize: 256, maxzoom };
+}
+
+// Build a complete MapLibre style document from a snapshot of 2D layer state.
+// opts: {
+//   theme: 'dark'|'light',
+//   base: null|'satellite'|'topo'|'sectional',
+//   sectionalUrl: FAA sectional XYZ template (used only when base==='sectional'),
+//   overlays: { slope, parcels, streets } booleans,
+//   rasters: [{ id, url, bounds:{west,south,east,north}, opacity }],  // canopy/viewshed data-URL images
+//   exaggeration: vertical terrain exaggeration (default 1),
+// }
+function build3dStyle(opts) {
+  const o = opts || {};
+  const theme = o.theme === 'light' ? 'light' : 'dark';
+  const cartoSubs = ['a', 'b', 'c', 'd'];
+  const sources = {
+    dem: {
+      type: 'raster-dem', tiles: [TERRAIN_DEM_URL], encoding: 'terrarium',
+      tileSize: 256, maxzoom: 15, attribution: 'Terrain: Mapzen/AWS, USGS 3DEP',
+    },
+    basemap: _raster3dSource(
+      cartoSubs.map(s => `https://${s}.basemaps.cartocdn.com/${theme === 'light' ? 'light_all' : 'dark_all'}/{z}/{x}/{y}.png`), 19),
+  };
+  const layers = [
+    { id: 'bg', type: 'background', paint: { 'background-color': theme === 'light' ? '#dfe8f0' : '#0a0e14' } },
+    { id: 'basemap', type: 'raster', source: 'basemap' },
+  ];
+  // Mutually exclusive base overlay (same trio as the 2D layer control).
+  if (o.base === 'satellite') {
+    sources.satellite = _raster3dSource('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', 19);
+    layers.push({ id: 'satellite', type: 'raster', source: 'satellite' });
+  } else if (o.base === 'topo') {
+    sources.topo = _raster3dSource(['a', 'b', 'c'].map(s => `https://${s}.tile.opentopomap.org/{z}/{x}/{y}.png`), 17);
+    layers.push({ id: 'topo', type: 'raster', source: 'topo' });
+  } else if (o.base === 'sectional' && o.sectionalUrl) {
+    sources.sectional = _raster3dSource(o.sectionalUrl, 12); // native z12 — MapLibre overzooms past it
+    layers.push({ id: 'sectional', type: 'raster', source: 'sectional' });
+  }
+  const ov = o.overlays || {};
+  if (ov.slope) {
+    sources.slope = _raster3dSource('https://server.arcgisonline.com/ArcGIS/rest/services/Elevation/World_Hillshade/MapServer/tile/{z}/{y}/{x}', 19);
+    layers.push({ id: 'slope', type: 'raster', source: 'slope', paint: { 'raster-opacity': 0.6 } });
+  }
+  if (ov.parcels) {
+    sources.parcels = _raster3dSource('https://tiles.arcgis.com/tiles/KzeiCaQsMoeCfoCq/arcgis/rest/services/Regrid_Nationwide_Parcel_Boundaries_v1/MapServer/tile/{z}/{y}/{x}', 17);
+    layers.push({ id: 'parcels', type: 'raster', source: 'parcels', paint: { 'raster-opacity': 0.85 } });
+  }
+  if (ov.streets) {
+    sources.streets_roads = _raster3dSource('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}', 15);
+    sources.streets_places = _raster3dSource('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', 15);
+    layers.push({ id: 'streets_roads', type: 'raster', source: 'streets_roads' });
+    layers.push({ id: 'streets_places', type: 'raster', source: 'streets_places' });
+  }
+  // Canopy / viewshed data-URL rasters draped as georeferenced images.
+  (o.rasters || []).forEach(r => {
+    if (!r || !r.url || !r.bounds) return;
+    const b = r.bounds;
+    sources['img_' + r.id] = {
+      type: 'image', url: r.url,
+      coordinates: [[b.west, b.north], [b.east, b.north], [b.east, b.south], [b.west, b.south]],
+    };
+    layers.push({
+      id: 'img_' + r.id, type: 'raster', source: 'img_' + r.id,
+      paint: { 'raster-opacity': r.opacity == null ? 0.7 : r.opacity },
+    });
+  });
+  return {
+    version: 8,
+    name: 'sar-3d',
+    sources,
+    layers,
+    terrain: { source: 'dem', exaggeration: o.exaggeration == null ? 1 : o.exaggeration },
+  };
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -2730,5 +2833,6 @@ if (typeof module !== 'undefined' && module.exports) {
     KML_ICON_BASE, kmlColorToRgba, caltopoStyleProps, geojsonFolderFeature, geojsonMarkerFeature,
     geojsonShapeFeature, geojsonLineGeometry, geojsonPolygonGeometry, geojsonFeatureCollection,
     formatStamp, relAge, buildSectionMetaLine, rollupSources, metaToneClass,
+    TERRAIN_DEM_URL, leafletToMaplibreCamera, maplibreToLeafletCamera, build3dStyle,
   };
 }

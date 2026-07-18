@@ -559,6 +559,7 @@ function applyTheme(theme) {
   const btn = (typeof document !== 'undefined') ? document.getElementById('themeToggle') : null;
   if (btn) btn.textContent = THEME_LABELS[theme];
   S.theme = theme;
+  if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 
 function cycleTheme() {
@@ -748,6 +749,7 @@ function initMap() {
 // DRAW
 // ============================================================
 function startDraw(type) {
+  if (S.is3D && typeof _exit3D === 'function') _exit3D(); // drawing happens on the 2D map
   if (typeof cancelViewshedPick === 'function') cancelViewshedPick(); // draw + viewshed-pick are mutually exclusive
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
   clearDrawBtns();
@@ -6986,7 +6988,7 @@ function togglePanel() {
   document.getElementById('btnPanel').classList.toggle('active');
   // Close hamburger menu when toggling panel
   document.getElementById('headerActions')?.classList.remove('open');
-  setTimeout(() => S.map.invalidateSize(), 350);
+  setTimeout(() => { S.map.invalidateSize(); if (S.map3d) S.map3d.resize(); }, 350);
 }
 function switchTab(tab) {
   S.activeTab = tab;
@@ -7454,6 +7456,8 @@ function toggleLayer(id, el) {
       if (trailEl) { if (on) trailEl.classList.add('active'); else trailEl.classList.remove('active'); }
     }
   }
+  // Mirror raster layer changes into the 3D view while it is active.
+  if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 
 // ============================================================
@@ -9606,6 +9610,10 @@ function renderRasterOverlay(layerId, rgba, grid, opacity) {
   }
   if (!S._overlayWanted) S._overlayWanted = {};
   S._overlayWanted[layerId] = true;
+  // Retain the encoded image + bounds so the 3D view can drape the same raster.
+  if (!S._raster3d) S._raster3d = {};
+  S._raster3d[layerId] = { url, bounds: grid.bounds };
+  if (S.is3D && typeof sync3d === 'function') sync3d();
   _applyOverlayZoomCap(); // adds to the map only if within the display-size budget
   return layer;
 }
@@ -9615,12 +9623,14 @@ function setCanopyOpacity(v) {
   if (S.mapLayers.canopy && S.mapLayers.canopy.setOpacity) S.mapLayers.canopy.setOpacity(o);
   const span = document.getElementById('canopyOpacityVal');
   if (span) span.textContent = Math.round(o * 100) + '%';
+  if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 function setViewshedOpacity(v) {
   const o = parseFloat(v);
   if (S.mapLayers.viewshed && S.mapLayers.viewshed.setOpacity) S.mapLayers.viewshed.setOpacity(o);
   const span = document.getElementById('viewshedOpacityVal');
   if (span) span.textContent = Math.round(o * 100) + '%';
+  if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 
 async function toggleCanopyOverlay() {
@@ -9629,6 +9639,7 @@ async function toggleCanopyOverlay() {
   if (!on) {
     if (S._overlayWanted) S._overlayWanted.canopy = false;
     if (S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
+    if (S.is3D && typeof sync3d === 'function') sync3d();
     buildLayerControl();
     return;
   }
@@ -9707,6 +9718,7 @@ function _readVsInputs() {
 }
 
 function startViewshedPick() {
+  if (S.is3D && typeof _exit3D === 'function') _exit3D(); // observer pick is a 2D map tap
   // Mutually exclusive with the draw tools.
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
   clearDrawBtns();
@@ -9808,6 +9820,7 @@ function _renderActiveViewshed() {
   if (!rec || !rec.grid || !rec.mask) {
     if (S._overlayWanted) S._overlayWanted.viewshed = false;
     if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
+    if (S.is3D && typeof sync3d === 'function') sync3d();
     if (r) r.textContent = rec ? `${rec.name}: ${rec.computedAt ? 'terrain unavailable — no viewshed' : 'computing…'}` : '';
     buildLayerControl();
     return;
@@ -10035,6 +10048,151 @@ async function _runViewshedKernel(opts) {
   return out;
 }
 
+// ============================================================
+// 3D TERRAIN VIEW (MapLibre GL)
+// Opt-in second view: real terrain (AWS Terrarium DEM tiles) with the same
+// raster layers the 2D map is showing draped over it — basemap, satellite/
+// topo/sectional, hillshade, parcels, streets, canopy + viewshed. Vector
+// overlays, radar and the draw tools stay 2D; entering a draw/viewshed-pick
+// tool drops back to 2D automatically. Online-only planning aid: the
+// MapLibre engine + terrain tiles come from the network on first use, so
+// the library is lazy-loaded here instead of shipping in the app shell.
+// ============================================================
+const MAPLIBRE_JS_URL = 'https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js';
+const MAPLIBRE_CSS_URL = 'https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css';
+const TERRAIN_EXAGGERATION = 1.15;
+
+let _mlLoadPromise = null;
+function _loadMaplibre() {
+  if (typeof maplibregl !== 'undefined') return Promise.resolve();
+  if (_mlLoadPromise) return _mlLoadPromise;
+  _mlLoadPromise = new Promise((resolve, reject) => {
+    const css = document.createElement('link');
+    css.rel = 'stylesheet'; css.href = MAPLIBRE_CSS_URL;
+    document.head.appendChild(css);
+    const js = document.createElement('script');
+    js.src = MAPLIBRE_JS_URL;
+    js.onload = () => resolve();
+    js.onerror = () => { _mlLoadPromise = null; reject(new Error('maplibre load failed')); };
+    document.head.appendChild(js);
+  });
+  return _mlLoadPromise;
+}
+
+// Snapshot the live 2D layer state into the shape build3dStyle() consumes.
+function collect3dState() {
+  const active = id => !!(S.map && S.mapLayers[id] && S.map.hasLayer(S.mapLayers[id]));
+  let base = null;
+  ['satellite', 'topo', 'sectional'].forEach(id => { if (active(id)) base = id; });
+  const rasters = [];
+  ['canopy', 'viewshed'].forEach(id => {
+    const info = S._raster3d && S._raster3d[id];
+    if (!info || !S._overlayWanted || !S._overlayWanted[id]) return;
+    const lyr = S.mapLayers[id];
+    const op = (lyr && lyr.options && lyr.options.opacity != null) ? lyr.options.opacity : 0.7;
+    rasters.push({ id, url: info.url, bounds: info.bounds, opacity: op });
+  });
+  return {
+    theme: (S.theme === 'light' || S.theme === 'light-map') ? 'light' : 'dark',
+    base,
+    sectionalUrl: sectionalTileUrl(getStoredSectionalEdition()),
+    overlays: { slope: active('slope'), parcels: active('parcels'), streets: active('streets') },
+    rasters,
+    exaggeration: TERRAIN_EXAGGERATION,
+  };
+}
+
+function sync3d() {
+  if (!S.map3d || !S.is3D) return;
+  try {
+    S.map3d.setStyle(build3dStyle(collect3dState()), { diff: true });
+  } catch (e) {
+    try { Diag.note('3d.sync.err', { m: String(e && e.message).slice(0, 120) }); } catch (_) {}
+  }
+}
+
+async function toggle3D() {
+  if (S.is3D) { _exit3D(); return; }
+  if (_isConstrained() && !S._warned3d) {
+    const go = (typeof confirm !== 'function') || confirm('3D terrain view uses significant memory and may be unstable on phones/tablets. Continue?');
+    if (!go) return;
+    S._warned3d = true;
+  }
+  const btn = document.getElementById('view3dToggle');
+  if (btn) btn.textContent = '⛰ …';
+  try {
+    await _loadMaplibre();
+  } catch (e) {
+    if (btn) btn.textContent = '⛰ 3D';
+    if (typeof alert === 'function') alert('Could not load the 3D engine — the 3D view needs an internet connection.');
+    return;
+  }
+  _enter3D();
+}
+
+function _enter3D() {
+  const container = document.querySelector('.map-container');
+  if (!container || !S.map) return;
+  // Drop tools that depend on 2D map clicks.
+  if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; clearDrawBtns(); }
+  if (typeof cancelViewshedPick === 'function') cancelViewshedPick();
+  container.classList.add('mode-3d');
+  S.is3D = true;
+  const c = S.map.getCenter();
+  const cam = leafletToMaplibreCamera(c.lat, c.lng, S.map.getZoom());
+  if (!S.map3d) {
+    try {
+      S.map3d = new maplibregl.Map({
+        container: 'map3d',
+        style: build3dStyle(collect3dState()),
+        center: cam.center, zoom: cam.zoom, pitch: 60, bearing: 0,
+        maxPitch: 80, maxZoom: MAX_MAP_ZOOM - 1,
+        attributionControl: false,
+      });
+      S.map3d.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
+      S.map3d.on('mousemove', e => {
+        const el = document.getElementById('cursorCoord');
+        if (el) el.textContent = `${e.lngLat.lat.toFixed(5)}°, ${e.lngLat.lng.toFixed(5)}°`;
+      });
+      S.map3d.on('error', ev => {
+        try { Diag.noteThrottled('3d.err', 5000, { m: String(ev && ev.error && ev.error.message).slice(0, 120) }); } catch (_) {}
+      });
+    } catch (e) {
+      container.classList.remove('mode-3d');
+      S.is3D = false;
+      S.map3d = null;
+      if (typeof alert === 'function') alert('3D view failed to start (WebGL unavailable?).');
+      return;
+    }
+  } else {
+    S.map3d.jumpTo({ center: cam.center, zoom: cam.zoom });
+    sync3d();
+    S.map3d.resize();
+  }
+  const btn = document.getElementById('view3dToggle');
+  if (btn) { btn.textContent = '▦ 2D'; btn.classList.add('active'); btn.title = 'Return to 2D map'; }
+  try { Diag.note('3d.enter', { z: Math.round(cam.zoom * 10) / 10 }); } catch (_) {}
+}
+
+function _exit3D() {
+  const container = document.querySelector('.map-container');
+  if (S.map3d && S.map) {
+    const c = S.map3d.getCenter();
+    const cam = maplibreToLeafletCamera(c.lng, c.lat, S.map3d.getZoom());
+    S.map.setView([cam.lat, cam.lng], Math.round(cam.zoom), { animate: false });
+  }
+  if (container) container.classList.remove('mode-3d');
+  S.is3D = false;
+  const btn = document.getElementById('view3dToggle');
+  if (btn) {
+    btn.textContent = '⛰ 3D';
+    btn.classList.remove('active');
+    btn.title = '3D terrain view — imagery layers drape on real terrain (data overlays stay in 2D)';
+  }
+  if (S.map) setTimeout(() => S.map.invalidateSize(), 50);
+  try { Diag.note('3d.exit', {}); } catch (_) {}
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -10090,6 +10248,7 @@ if (typeof module !== 'undefined' && module.exports) {
     cacheCurrentView, gridForView, _cacheViewRaster, getSelectedTileProviders,
     initMap, startDraw, clearDrawBtns, clearArea, enterCoords,
     getStoredTheme, applyTheme, cycleTheme,
+    toggle3D, collect3dState, sync3d, _enter3D, _exit3D, _loadMaplibre,
     scrollTabs, updateScrollBtns,
     importKML, handleKMLFile, parseKML,
     copyBriefing, buildBriefingText,
