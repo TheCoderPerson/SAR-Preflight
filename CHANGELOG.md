@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.17-f — 2026-07-17
+
+- Fixed: viewshed and canopy overlays rendered wrong in the 3D view — large chunks were sliced off along straight tile-boundary lines (the 2D view was always correct). Cause was a terrain-draping bug in the 3D engine version the app was loading; upgrading the engine (MapLibre GL 4.7.1 → 5.24.0) fixes it. Overlays now drape completely and match the 2D view exactly.
+
 ## v2026.07.17-e — 2026-07-17
 
 - 3D view phase 2 — data overlays now appear in 3D: TFRs, NOTAMs, airspace, LAANC, obstacles, wires, power lines, towers, airports, NWS alerts, fire perimeters, trails, water, hospitals/LZs, land status, observers, and the drawn ops area all drape onto the 3D terrain with their 2D colors. Clicking features in 3D opens the same paginated multi-feature popup as the 2D map. Icon markers (airports, towers, etc.) render as colored dots in 3D for now; live aircraft and radar remain 2D-only until phase 3.

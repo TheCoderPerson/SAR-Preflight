@@ -10060,8 +10060,8 @@ async function _runViewshedKernel(opts) {
 // MapLibre engine + terrain tiles come from the network on first use, so
 // the library is lazy-loaded here instead of shipping in the app shell.
 // ============================================================
-const MAPLIBRE_JS_URL = 'https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js';
-const MAPLIBRE_CSS_URL = 'https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css';
+const MAPLIBRE_JS_URL = 'https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.js';
+const MAPLIBRE_CSS_URL = 'https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.css';
 const TERRAIN_EXAGGERATION = 1.15;
 
 let _mlLoadPromise = null;
