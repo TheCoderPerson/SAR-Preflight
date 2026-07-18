@@ -4,6 +4,15 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.18-a — 2026-07-18
+
+- 3D buildings: OSM building footprints for the operational area now render in 3D as extruded, sun-shaded buildings (fetched automatically on first 3D entry; heights from OSM tags where mapped, estimated otherwise — treat as approximate). In 2D they appear as a shaded footprint layer under Facilities. A new Config option ("Buildings in 3D view") can force flat draped footprints instead of 3D — chosen automatically on phones/tablets.
+- 3D vegetation surface: the canopy overlay now renders in 3D as a solid green canopy-height surface hugging the terrain at treetop height (full resolution on desktop), replacing the flat draped image. First build shows a progress bar with a Cancel button; the built surface is cached, so toggling the layer or switching 2D/3D is instant afterwards.
+- Sun & moon lighting in 3D: terrain, buildings, and the canopy surface are shaded by the real sun position (or the moon at night, dimmed by phase — flat ambient when neither is up). Scrubbing the time bar swings the lighting across the day instantly.
+- Fixed 3D rendering stability: buildings no longer shimmer or change appearance when rotating the camera (vertex precision fix), and the canopy surface no longer flickers against the ground (near-ground scrub below 2 m is culled and the surface floats slightly above terrain).
+- Tower heights: OSM height tags with unit suffixes (e.g. "150 ft") are now parsed correctly instead of being misread as meters, and towers with no height in OSM say "Height not in OSM" in their popup instead of omitting the line.
+- Vegetation overlay toggle no longer re-downloads canopy data when re-enabled for the same area.
+
 ## v2026.07.17-j — 2026-07-17
 
 - Fixed: the "Update Available" modal could loop — clicking "Reload & Update" reloaded back into the old version (typically within ~10 minutes of a release, when the browser's HTTP cache still held the old files). Applying an update now refreshes the offline app cache directly from the network before reloading, instead of dropping it and re-reading the stale HTTP cache.

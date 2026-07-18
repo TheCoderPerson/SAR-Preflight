@@ -82,6 +82,25 @@
 }
 .view3d-toggle:hover { border-color: var(--accent-blue); color: var(--text-primary); }
 .view3d-toggle.active { border-color: var(--accent-cyan); color: var(--accent-cyan); }
+/* 3D canopy mesh build progress — floats over the map in 3D mode */
+#canopy3dProgress {
+  position: absolute; bottom: 52px; left: 50%; transform: translateX(-50%); z-index: 850;
+  display: none; align-items: center; gap: 10px;
+  background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 12px; font-family: var(--font-mono); font-size: 10px;
+  color: var(--text-secondary); letter-spacing: 0.5px; white-space: nowrap;
+}
+#canopy3dProgress .c3p-track {
+  width: 140px; height: 5px; background: var(--bg-primary);
+  border: 1px solid var(--border); border-radius: 3px; overflow: hidden;
+}
+#canopy3dProgress .c3p-fill { height: 100%; width: 0; background: var(--accent-green); transition: width 0.15s linear; }
+#canopy3dProgress button {
+  background: transparent; border: 1px solid var(--border); border-radius: 4px;
+  color: var(--text-secondary); cursor: pointer; padding: 3px 9px;
+  font-family: var(--font-mono); font-size: 10px; font-weight: 600; letter-spacing: 1px;
+}
+#canopy3dProgress button:hover { border-color: var(--accent-red); color: var(--accent-red); }
 /* MapLibre 3D canvas overlays the Leaflet map; toolbars (z-index 800) stay on top */
 #map3d { position: absolute; inset: 0; display: none; background: var(--bg-primary); }
 .map-container.mode-3d #map3d { display: block; }
@@ -653,6 +672,12 @@ select.api-input { cursor: pointer; }
   <div class="map-container">
     <div id="map"></div>
     <div id="map3d"></div>
+    <div id="canopy3dProgress">
+      <span>BUILDING 3D CANOPY</span>
+      <div class="c3p-track"><div class="c3p-fill" id="canopy3dProgressFill"></div></div>
+      <span id="canopy3dProgressText" style="min-width:74px;color:var(--text-muted);"></span>
+      <button type="button" onclick="cancelCanopy3dBuild()">CANCEL</button>
+    </div>
     <div class="draw-toolbar" id="drawToolbar">
       <div class="draw-toolbar-head" onclick="toggleDrawToolbar()">OPS</div>
       <div class="draw-toolbar-body">
@@ -1260,6 +1285,15 @@ select.api-input { cursor: pointer; }
               </select>
               <span id="adsbPollStatus" style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);">Idle</span>
             </div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Buildings in 3D view</div>
+            <select class="api-input" id="cfgBuildings3d" onchange="setBuildings3dMode(this.value)">
+              <option value="auto" selected>Auto — 3D buildings on desktop, flat footprints on phones/tablets</option>
+              <option value="prisms">Always 3D buildings</option>
+              <option value="flat">Always flat 2D footprints (fastest)</option>
+            </select>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">Flat mode drapes the shaded building footprints on the terrain instead of extruding them — lighter on memory and GPU for resource-constrained devices.</div>
           </div>
           <div class="api-config">
             <div class="data-label">Data proxy URL — canopy + live TFR/NOTAM (optional override — <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">self-host guide ↗</a>)</div>

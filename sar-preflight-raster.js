@@ -362,6 +362,119 @@ function canopyGridToRGBA(grid, canopyFlat) {
   return rgba;
 }
 
+// ============================================================
+// 3D CANOPY SURFACE MESH — decimate the canopy grid to a renderable vertex
+// count and triangulate it into a surface for the custom WebGL layer.
+// ============================================================
+
+// Decimate to at most maxDim × maxDim vertices. Each decimated cell
+// MAX-POOLS its source block (point-sampling would arbitrarily drop half
+// the trees and speckle the surface); at full resolution (maxDim >= grid
+// dim) the blocks are single cells and this is a pass-through. Returns
+// { rows, cols, lats, lngs, canopy } where lats[r]/lngs[c] are vertex
+// positions (block centres) and canopy is Float32Array(rows*cols) of
+// heights in m (NaN/<=0 normalized to 0 so the triangulator can hole/fade).
+function decimateCanopyMesh(grid, canopyFlat, maxDim) {
+  const dim = Math.max(2, Math.min(maxDim || MAX_GRID, Math.max(grid.rows, grid.cols)));
+  const rows = Math.min(grid.rows, dim), cols = Math.min(grid.cols, dim);
+  const lats = new Float64Array(rows), lngs = new Float64Array(cols);
+  const canopy = new Float32Array(rows * cols);
+  const blockOf = (i, n, srcN) => {
+    const a = Math.floor(i * srcN / n);
+    return [a, Math.max(a + 1, Math.floor((i + 1) * srcN / n))];
+  };
+  for (let c = 0; c < cols; c++) {
+    const [c0, c1] = blockOf(c, cols, grid.cols);
+    lngs[c] = gridColToLng(grid, (c0 + c1 - 1) / 2);
+  }
+  for (let r = 0; r < rows; r++) {
+    const [r0, r1] = blockOf(r, rows, grid.rows);
+    lats[r] = gridRowToLat(grid, (r0 + r1 - 1) / 2);
+    for (let c = 0; c < cols; c++) {
+      const [c0, c1] = blockOf(c, cols, grid.cols);
+      let max = 0;
+      for (let sr = r0; sr < r1; sr++) {
+        for (let sc = c0; sc < c1; sc++) {
+          const v = canopyFlat[sr * grid.cols + sc];
+          if (Number.isFinite(v) && v > max) max = v;
+        }
+      }
+      canopy[r * cols + c] = max;
+    }
+  }
+  return { rows, cols, lats, lngs, canopy };
+}
+
+// Mesh → INDEXED triangle surface: shared vertices + Uint32 index triples
+// (6× less vertex data than unindexed at full grid resolution). A quad is
+// emitted when ANY of its four corners has canopy > 0; zero-canopy corners
+// sit at ground level, so the surface tapers to the ground at clearing
+// edges instead of cutting hard swiss-cheese holes. Fully-zero regions emit
+// nothing. Returns
+// { vRow, vCol, vCanopy, vColor (rgba per vertex, 0..1), indices } —
+// vertex lat/lng come from mesh.lats[vRow[i]] / mesh.lngs[vCol[i]].
+// opts.color: [r,g,b] 0..1 → a single uniform OPAQUE color for every vertex
+// (rendered in the opaque pass). Default: the 2D height ramp, with alpha 0
+// on zero-canopy edge verts for translucent-pass fading.
+// opts.minH: metres of canopy below which a corner does not count as
+// forested (default 0) — culls near-ground scrub that would z-fight the
+// terrain surface.
+function canopyMeshIndexed(mesh, opts) {
+  const { rows, cols, canopy } = mesh;
+  const map = new Int32Array(rows * cols).fill(-1);
+  const vRow = [], vCol = [], vCanopy = [];
+  const indices = [];
+  const reg = (r, c) => {
+    const k = r * cols + c;
+    if (map[k] === -1) {
+      map[k] = vRow.length;
+      vRow.push(r); vCol.push(c); vCanopy.push(canopy[k]);
+    }
+    return map[k];
+  };
+  const minH = (opts && opts.minH) || 0;
+  for (let r = 0; r < rows - 1; r++) {
+    for (let c = 0; c < cols - 1; c++) {
+      if (!(canopy[r * cols + c] > minH || canopy[r * cols + c + 1] > minH
+        || canopy[(r + 1) * cols + c] > minH || canopy[(r + 1) * cols + c + 1] > minH)) continue;
+      const a = reg(r, c), b = reg(r, c + 1), d = reg(r + 1, c + 1), e = reg(r + 1, c);
+      indices.push(a, b, d, a, d, e);
+    }
+  }
+  const uniform = opts && opts.color;
+  const vColor = new Float32Array(vRow.length * 4);
+  for (let i = 0; i < vRow.length; i++) {
+    if (uniform) {
+      vColor[i * 4] = uniform[0];
+      vColor[i * 4 + 1] = uniform[1];
+      vColor[i * 4 + 2] = uniform[2];
+      vColor[i * 4 + 3] = 1;
+      continue;
+    }
+    const h = vCanopy[i];
+    // Zero-canopy edge verts keep a low-ramp tint so the fade doesn't darken
+    // through black — only their alpha goes to 0.
+    const ramp = canopyColorRamp(h > 0 ? h : 0.5);
+    vColor[i * 4] = ramp[0] / 255;
+    vColor[i * 4 + 1] = ramp[1] / 255;
+    vColor[i * 4 + 2] = ramp[2] / 255;
+    vColor[i * 4 + 3] = h > 0 ? ramp[3] / 255 : 0;
+  }
+  return {
+    vRow: Int32Array.from(vRow), vCol: Int32Array.from(vCol),
+    vCanopy: Float32Array.from(vCanopy), vColor,
+    indices: Uint32Array.from(indices),
+  };
+}
+
+// Unit ENU surface normal from local slopes dz/dx (east) and dz/dy (north),
+// all in meters. Flat ground → [0,0,1]. Used to light the 3D canopy surface
+// by sun/moon position.
+function normalFromSlopes(dzdx, dzdy) {
+  const len = Math.sqrt(dzdx * dzdx + dzdy * dzdy + 1);
+  return [-dzdx / len, -dzdy / len, 1 / len];
+}
+
 function viewshedMaskToRGBA(grid, mask) {
   const n = grid.rows * grid.cols;
   const rgba = new Uint8ClampedArray(n * 4);
@@ -683,6 +796,7 @@ if (typeof module !== 'undefined' && module.exports) {
     resampleToGrid, buildDSM, sanitizeForKernel,
     curvatureDrop, isVisible, computeViewshed, viewshedCoverage,
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,
+    decimateCanopyMesh, canopyMeshIndexed, normalFromSlopes,
     encodeGeoTiffRGBA, reprojectRgbaTo3857, worldFileForBounds, WGS84_WKT, WEBMERC_WKT, crc32, zipStore,
     makeViewshedRecord, viewshedFilenameSlug, uniqueViewshedName, observerKmlDescription,
   };

@@ -47,6 +47,21 @@ describe('build3dStyle', () => {
     expect(build3dStyle({ exaggeration: 1.15 }).terrain.exaggeration).toBe(1.15);
   });
 
+  it('always includes the sun/moon terrain hillshade on its own DEM source', () => {
+    const style = build3dStyle({ lightAzimuth: 247.6, lightShade: 0.62 });
+    expect(style.sources.demShade.type).toBe('raster-dem');
+    const hs = style.layers.find(l => l.id === 'sunshade');
+    expect(hs.type).toBe('hillshade');
+    expect(hs.source).toBe('demShade');
+    expect(hs.paint['hillshade-illumination-direction']).toBe(248);
+    expect(hs.paint['hillshade-illumination-anchor']).toBe('map');
+    expect(hs.paint['hillshade-exaggeration']).toBe(0.62);
+    // Defaults when no light is supplied
+    const def = build3dStyle({}).layers.find(l => l.id === 'sunshade');
+    expect(def.paint['hillshade-illumination-direction']).toBe(335);
+    expect(def.paint['hillshade-exaggeration']).toBe(0.4);
+  });
+
   it('uses the dark CARTO basemap by default and light when themed', () => {
     const dark = build3dStyle({});
     expect(dark.sources.basemap.tiles[0]).toContain('dark_all');

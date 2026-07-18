@@ -6,7 +6,7 @@
 // Uses `var` (not const) so that when build.js inlines this file inside an
 // `if` block in dist/sw.js, the binding is hoisted to script scope instead
 // of being trapped inside the block.
-var SAR_VERSION = '2026.07.17-j';
+var SAR_VERSION = '2026.07.18-a';
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { SAR_VERSION };
