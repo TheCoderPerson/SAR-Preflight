@@ -439,6 +439,43 @@ function _updateFetchActivity() {
   }
 }
 
+// ---- Data-proxy rate-limit surfacing ----
+// The shared Cloudflare Worker proxy rate-limits per IP (429 + Retry-After).
+// Surface that in the header status bar instead of failing silently.
+function notifyProxyRateLimited(retryAfterSec) {
+  const sec = (isFinite(retryAfterSec) && retryAfterSec > 0) ? Math.min(retryAfterSec, 600) : 60;
+  const el = document.getElementById('proxyWarn');
+  if (el) {
+    el.style.display = '';
+    el.textContent = '\u26A0 PROXY LIMIT';
+    el.title = 'Data proxy rate limit reached \u2014 some fetches were throttled. They will work again in ~' + sec + ' s (REFRESH to retry).';
+  }
+  const dot = document.getElementById('statusDot');
+  if (dot) { dot.style.background = 'var(--accent-amber)'; dot.style.animation = ''; }
+  if (S._proxyWarnTimer) clearTimeout(S._proxyWarnTimer);
+  S._proxyWarnTimer = setTimeout(() => {
+    S._proxyWarnTimer = null;
+    const el2 = document.getElementById('proxyWarn');
+    if (el2) { el2.style.display = 'none'; el2.textContent = ''; }
+    _updateFetchActivity(); // restore the dot from the current fetch state
+  }, sec * 1000);
+}
+
+// fetch() wrapper for calls that may hit the data proxy: on a 429 from the
+// proxy base URL it flags the status bar, then returns the response unchanged
+// so each caller's existing error handling proceeds. Safe for non-proxy URLs
+// (a 429 from a direct provider is NOT reported as a proxy limit).
+async function _proxyFetch(url, opts) {
+  const res = await fetch(url, opts);
+  try {
+    const base = (typeof getCanopyProxyBase === 'function') ? getCanopyProxyBase() : null;
+    if (res && res.status === 429 && base && String(url).indexOf(base) === 0) {
+      notifyProxyRateLimited(parseInt(res.headers.get('Retry-After') || '', 10));
+    }
+  } catch (_) { /* surfacing must never break the fetch */ }
+  return res;
+}
+
 // ============================================================
 // DOM HELPERS
 // ============================================================
@@ -2191,7 +2228,7 @@ async function fetchLiveTFRs(bounds) {
   trackFetchStart('TFR');
   setStatus('notamStatus', 'loading', 'TFR…');
   try {
-    const res = await fetch(base + '/tfr/geoserver/TFR/ows' + _tfrWfsQuery(bounds));
+    const res = await _proxyFetch(base + '/tfr/geoserver/TFR/ows' + _tfrWfsQuery(bounds));
     if (!res.ok) throw new Error('TFR HTTP ' + res.status);
     const gj = await res.json();
     const parsed = (typeof parseTfrGeoJson === 'function') ? parseTfrGeoJson(gj) : { tfrs: [] };
@@ -2229,7 +2266,7 @@ async function enrichLiveTfrDetails(base, tfrs) {
 
 async function _fetchTfrDetail(base, id) {
   const fileId = String(id).replace(/\//g, '_'); // '4/3635' -> 'detail_4_3635.xml'
-  const res = await fetch(base + '/tfr/download/detail_' + fileId + '.xml');
+  const res = await _proxyFetch(base + '/tfr/download/detail_' + fileId + '.xml');
   if (!res.ok) return null;
   const xml = await res.text();
   const d = (parseTfrDetailXml(xml).tfrs || [])[0];
@@ -2266,7 +2303,7 @@ async function fetchNotams(lat, lng, radiusNm) {
   trackFetchStart('NOTAM');
   try {
     const r = Math.max(5, Math.min(100, Math.round(radiusNm || 20)));
-    const res = await fetch(base + '/notam?lat=' + lat.toFixed(5) + '&lng=' + lng.toFixed(5) + '&radius=' + r);
+    const res = await _proxyFetch(base + '/notam?lat=' + lat.toFixed(5) + '&lng=' + lng.toFixed(5) + '&radius=' + r);
     if (!res.ok) throw new Error('NOTAM HTTP ' + res.status);
     const data = await res.json();
     const parsed = (typeof parseNotamSearchResponse === 'function') ? parseNotamSearchResponse(data) : [];
@@ -4087,7 +4124,7 @@ async function _fetchGeoJsonLayer(endpoint, cacheKey, url) {
   const online = (typeof isOnline !== 'function') || isOnline();
   if (url && online) {
     try {
-      const res = await fetch(url);
+      const res = await _proxyFetch(url);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const gj = await res.json();
       const features = (gj && gj.features) ? gj.features : [];
@@ -5309,7 +5346,7 @@ async function fetchAdsb() {
     let usedApi = null;
     for (const a of _adsbAttemptUrls(lat, lon, dist)) {
       try {
-        const res = await fetch(a.url);
+        const res = await _proxyFetch(a.url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         json = await res.json();
         if (a.idx != null) S._adsbApiIndex = a.idx;
@@ -8229,10 +8266,11 @@ async function restoreConfig() {
   // Populate the dropdown first so loadSopProfile can select the restored option.
   await populateSopDropdown();
   if (profileName) loadSopProfile(profileName);
-  // Restore canopy proxy URL (localStorage) + hint
+  // Restore custom proxy URL (localStorage) + hint. Field stays empty when the
+  // built-in default proxy is in use.
   const proxyEl = document.getElementById('cfgCanopyProxy');
-  if (proxyEl) proxyEl.value = getCanopyProxyBase() || '';
-  if (typeof saveCanopyProxy === 'function') saveCanopyProxy(getCanopyProxyBase() || '');
+  if (proxyEl) proxyEl.value = getCustomProxy() || '';
+  if (typeof saveCanopyProxy === 'function') saveCanopyProxy(getCustomProxy() || '');
   // Reflect the analytics opt-out toggle (also shows DNT/GPC as opted-out).
   // If the browser forces opt-out via DNT/GPC, lock the checkbox so unchecking
   // it isn't a silent no-op.
@@ -9358,11 +9396,22 @@ function setAnalyticsOptOut(optOut) {
   } catch (_) {}
 }
 
-function getCanopyProxyBase() {
+// Built-in shared data proxy (maintainer's Cloudflare Worker) so the app works
+// out of the box. A custom URL saved in Config overrides it; clearing the field
+// returns to the default. The Worker enforces an Origin allowlist + per-IP rate
+// limit, so it only serves the app's known deploy origins (see tools/canopy-proxy).
+const DEFAULT_DATA_PROXY = 'https://sar-canopy-proxy.joja15.workers.dev';
+
+// The user's own proxy URL (Config tab), or null when using the built-in default.
+function getCustomProxy() {
   try {
     const v = localStorage.getItem('sar_canopy_proxy');
     return v && v.trim() ? v.trim().replace(/\/+$/, '') : null;
   } catch (_) { return null; }
+}
+
+function getCanopyProxyBase() {
+  return getCustomProxy() || DEFAULT_DATA_PROXY;
 }
 
 // Build a proxied URL for a CORS-blocked self-hosted ArcGIS server (USFS/BLM).
@@ -9382,7 +9431,7 @@ function saveCanopyProxy(url) {
     else localStorage.removeItem('sar_canopy_proxy');
   } catch (_) {}
   const hint = document.getElementById('canopyProxyHint');
-  if (hint) hint.textContent = getCanopyProxyBase() ? 'Canopy proxy configured ✓' : 'No canopy proxy set — set one in Config to enable vegetation.';
+  if (hint) hint.textContent = getCustomProxy() ? 'Custom data proxy configured ✓' : 'Using built-in EDSAR data proxy (default)';
 }
 
 // Quantized AOI key for the processed-raster cache (~100 m).
@@ -9460,7 +9509,8 @@ async function _fetchCanopyFromProxy(base, grid) {
   try { Diag.note('canopy.tiles', { qk: qks.length }); } catch (_) {}
   const canopy = new Float32Array(grid.rows * grid.cols).fill(NaN);
   let any = false, loaded = 0, failed = 0;
-  for (const qk of qks) {
+  for (let t = 0; t < qks.length; t++) {
+    const qk = qks[t];
     const url = base + '/chm/' + qk + '.tif';
     let tileGrid = null;
     // Retry transient proxy/S3 errors: cold Range fetches of these large COGs
@@ -9472,7 +9522,24 @@ async function _fetchCanopyFromProxy(base, grid) {
         tileGrid = await _cogTileToGrid(tiff, grid);
       } catch (_) { tileGrid = null; } // missing tile / CORS / transient
     }
-    if (!tileGrid) { failed++; try { Diag.note('canopy.tileFail', { qk }); } catch (_) {} continue; }
+    if (!tileGrid) {
+      failed++;
+      try { Diag.note('canopy.tileFail', { qk }); } catch (_) {}
+      // GeoTIFF.js fetches internally, so a proxy 429 only surfaces as a thrown
+      // error. Probe the tile once: if the proxy is rate-limiting this IP, flag
+      // the status bar and stop — more tiles would just burn more of the limit.
+      try {
+        const probe = await fetch(url, { method: 'HEAD' });
+        if (probe && probe.status === 429) {
+          if (typeof notifyProxyRateLimited === 'function') {
+            notifyProxyRateLimited(parseInt(probe.headers.get('Retry-After') || '', 10));
+          }
+          failed += qks.length - t - 1; // remaining tiles won't be attempted
+          break;
+        }
+      } catch (_) { /* probe is best-effort */ }
+      continue;
+    }
     loaded++;
     for (let i = 0; i < canopy.length; i++) {
       if (Number.isNaN(canopy[i]) && Number.isFinite(tileGrid[i])) { canopy[i] = tileGrid[i]; any = true; }
@@ -10589,7 +10656,8 @@ if (typeof module !== 'undefined' && module.exports) {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer,
     checkDeployedVersion, applyUpdate, fetchLatestVersion,
-    getCanopyProxyBase, saveCanopyProxy, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
+    getCanopyProxyBase, getCustomProxy, saveCanopyProxy, DEFAULT_DATA_PROXY, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
+    notifyProxyRateLimited, _proxyFetch,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
     renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, _isConstrained, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,

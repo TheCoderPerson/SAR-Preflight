@@ -28,7 +28,8 @@ globalThis.L = {
 };
 
 const {
-  S, collectFeaturesAt, setCanopyOpacity, setViewshedOpacity, getCanopyProxyBase, saveCanopyProxy,
+  S, collectFeaturesAt, setCanopyOpacity, setViewshedOpacity, getCanopyProxyBase, getCustomProxy,
+  saveCanopyProxy, DEFAULT_DATA_PROXY,
 } = require('../../sar-preflight.js');
 
 const LL = (lat, lng) => ({ lat, lng });
@@ -77,16 +78,24 @@ describe('canopy proxy config', () => {
     localStorage.removeItem('sar_canopy_proxy');
   });
 
-  it('saves and reads back the proxy base, trimming trailing slashes', () => {
-    expect(getCanopyProxyBase()).toBe(null);
+  it('defaults to the built-in proxy when no custom URL is saved', () => {
+    expect(getCustomProxy()).toBe(null);
+    expect(getCanopyProxyBase()).toBe(DEFAULT_DATA_PROXY);
+    saveCanopyProxy('');
+    expect(document.getElementById('canopyProxyHint').textContent.toLowerCase()).toContain('default');
+  });
+
+  it('saves and reads back a custom proxy base, trimming trailing slashes', () => {
     saveCanopyProxy('https://x.workers.dev/');
+    expect(getCustomProxy()).toBe('https://x.workers.dev');
     expect(getCanopyProxyBase()).toBe('https://x.workers.dev');
     expect(document.getElementById('canopyProxyHint').textContent.toLowerCase()).toContain('configured');
   });
 
-  it('clears the proxy when set to empty', () => {
+  it('falls back to the default when the custom proxy is cleared', () => {
     saveCanopyProxy('https://x.workers.dev');
     saveCanopyProxy('');
-    expect(getCanopyProxyBase()).toBe(null);
+    expect(getCustomProxy()).toBe(null);
+    expect(getCanopyProxyBase()).toBe(DEFAULT_DATA_PROXY);
   });
 });
