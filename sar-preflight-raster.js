@@ -318,6 +318,121 @@ function computeViewshed(opts) {
   return out;
 }
 
+// ============================================================
+// SUN-SHADOW KERNEL — how shaded is each cell from a light source at
+// (azimuthDeg, elevationDeg)? Classic DEM shadow-cast sweep: rays enter the
+// grid from the sun-facing edges and march away from the sun along the
+// dominant axis; each ray carries a "shadow front" height that descends at
+// tan(elevation) per metre travelled. A cell below the front is in shadow;
+// a cell at/above it is lit and resets the front to its own height. Slopes
+// facing away from the sun fall out of this naturally (terrain dropping
+// faster than the ray descends stays under the front). O(cells) total.
+//
+// Two anti-aliasing measures keep coarse/rough DEMs from producing hard
+// synchronized speckle ("comb" stripes at low sun over corrugated terrain):
+// the terrain is sampled BILINEARLY along the ray (all rays share the same
+// fractional stepping pattern, so nearest-cell sampling makes every ray jump
+// rows at the same columns), and the result is a GRADED shade depth rather
+// than a binary verdict — cells barely below the shadow front get partial
+// values, so marginal cells render as faint shade instead of flickering.
+//
+// Returns Uint8Array: 0 = sunlit or unknown (NaN) terrain, 255 = fully
+// shaded, 1..254 = penumbra/marginal shade (soft edge). Sun at/below the
+// horizon → every known cell is 255 (night).
+// ============================================================
+function computeShadowMask(grid, dem, sunAzDeg, sunElDeg) {
+  const cols = grid.cols, rows = grid.rows, n = rows * cols;
+  const out = new Uint8Array(n);
+  if (!dem) return out;
+  if (!(sunElDeg > 0)) {
+    for (let i = 0; i < n; i++) if (Number.isFinite(dem[i])) out[i] = 255;
+    return out;
+  }
+  if (cols < 2 || rows < 2) return out; // a 1-cell strip can't cast shadows
+  const az = sunAzDeg * Math.PI / 180;
+  // Horizontal direction the LIGHT travels (away from the sun), in grid axes:
+  // +x = east = +col; grid rows grow southward, so +y(row) = -north.
+  let dx = -Math.sin(az);
+  let dy = Math.cos(az);
+  const dom = Math.max(Math.abs(dx), Math.abs(dy));
+  if (!(dom > 0)) return out; // degenerate (never happens for a real azimuth)
+  dx /= dom; dy /= dom;
+  const dropM = Math.tan(sunElDeg * Math.PI / 180) * Math.hypot(dx, dy) * grid.resM;
+  // Soft-edge width: full shade only when the terrain sits at least this far
+  // below the shadow front. Scaled to the per-step drop (bounded) so the
+  // penumbra spans roughly one ray step regardless of grid resolution.
+  const softM = Math.max(2, Math.min(15, dropM));
+
+  // Bilinear terrain sample at fractional cell coords (clamped to the grid).
+  // Falls back to the heaviest finite corner when a neighbour is NaN.
+  const zAt = (x, y) => {
+    let x0 = Math.floor(x), y0 = Math.floor(y);
+    if (x0 < 0) x0 = 0; else if (x0 > cols - 2) x0 = cols - 2;
+    if (y0 < 0) y0 = 0; else if (y0 > rows - 2) y0 = rows - 2;
+    const tx = Math.min(1, Math.max(0, x - x0)), ty = Math.min(1, Math.max(0, y - y0));
+    const i00 = y0 * cols + x0;
+    const v00 = dem[i00], v10 = dem[i00 + 1], v01 = dem[i00 + cols], v11 = dem[i00 + cols + 1];
+    if (Number.isFinite(v00) && Number.isFinite(v10) && Number.isFinite(v01) && Number.isFinite(v11)) {
+      return (v00 * (1 - tx) + v10 * tx) * (1 - ty) + (v01 * (1 - tx) + v11 * tx) * ty;
+    }
+    let best = NaN, bestW = -1;
+    const w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty), w01 = (1 - tx) * ty, w11 = tx * ty;
+    if (Number.isFinite(v00) && w00 > bestW) { best = v00; bestW = w00; }
+    if (Number.isFinite(v10) && w10 > bestW) { best = v10; bestW = w10; }
+    if (Number.isFinite(v01) && w01 > bestW) { best = v01; bestW = w01; }
+    if (Number.isFinite(v11) && w11 > bestW) { best = v11; bestW = w11; }
+    return best;
+  };
+
+  const trace = (sx, sy) => {
+    let x = sx, y = sy;
+    let frontZ = -Infinity;
+    while (x > -0.5 && x < cols - 0.5 && y > -0.5 && y < rows - 0.5) {
+      const z = zAt(x, y);
+      if (Number.isFinite(z)) {
+        if (z >= frontZ) {
+          frontZ = z;
+        } else {
+          const idx = Math.round(y) * cols + Math.round(x);
+          if (Number.isFinite(dem[idx])) {
+            const d = (frontZ - z) / softM;
+            const v = d >= 1 ? 255 : Math.round(d * 255);
+            if (v > out[idx]) out[idx] = v;
+          }
+        }
+      }
+      x += dx; y += dy;
+      frontZ -= dropM;
+    }
+  };
+
+  // Rays start on the edge(s) the light enters through; together the two
+  // entry edges cover every cell (dominant-axis stepping, unit ray spacing).
+  if (dx > 1e-12) for (let r = 0; r < rows; r++) trace(0, r);
+  else if (dx < -1e-12) for (let r = 0; r < rows; r++) trace(cols - 1, r);
+  if (dy > 1e-12) for (let c = 0; c < cols; c++) trace(c, 0);
+  else if (dy < -1e-12) for (let c = 0; c < cols; c++) trace(c, rows - 1);
+  return out;
+}
+
+// Shade depth (0..255) → translucent cool dark with proportional alpha;
+// sunlit / unknown → fully transparent. (Global translucency comes from the
+// overlay's opacity slider on top of the per-pixel alpha.)
+function shadowColorRamp(v) {
+  return v ? [11, 18, 32, v] : [0, 0, 0, 0];
+}
+
+function shadowMaskToRGBA(grid, mask) {
+  const n = grid.rows * grid.cols;
+  const rgba = new Uint8ClampedArray(n * 4);
+  for (let i = 0; i < n; i++) {
+    const c = shadowColorRamp(mask[i]);
+    const o = i * 4;
+    rgba[o] = c[0]; rgba[o + 1] = c[1]; rgba[o + 2] = c[2]; rgba[o + 3] = c[3];
+  }
+  return rgba;
+}
+
 // Fraction of in-range cells that are visible (for the result readout).
 function viewshedCoverage(grid, mask, obsCol, obsRow, vlosRangeM) {
   const cols = grid.cols, rows = grid.rows;
@@ -360,6 +475,119 @@ function canopyGridToRGBA(grid, canopyFlat) {
     rgba[o] = c[0]; rgba[o + 1] = c[1]; rgba[o + 2] = c[2]; rgba[o + 3] = c[3];
   }
   return rgba;
+}
+
+// ============================================================
+// 3D CANOPY SURFACE MESH — decimate the canopy grid to a renderable vertex
+// count and triangulate it into a surface for the custom WebGL layer.
+// ============================================================
+
+// Decimate to at most maxDim × maxDim vertices. Each decimated cell
+// MAX-POOLS its source block (point-sampling would arbitrarily drop half
+// the trees and speckle the surface); at full resolution (maxDim >= grid
+// dim) the blocks are single cells and this is a pass-through. Returns
+// { rows, cols, lats, lngs, canopy } where lats[r]/lngs[c] are vertex
+// positions (block centres) and canopy is Float32Array(rows*cols) of
+// heights in m (NaN/<=0 normalized to 0 so the triangulator can hole/fade).
+function decimateCanopyMesh(grid, canopyFlat, maxDim) {
+  const dim = Math.max(2, Math.min(maxDim || MAX_GRID, Math.max(grid.rows, grid.cols)));
+  const rows = Math.min(grid.rows, dim), cols = Math.min(grid.cols, dim);
+  const lats = new Float64Array(rows), lngs = new Float64Array(cols);
+  const canopy = new Float32Array(rows * cols);
+  const blockOf = (i, n, srcN) => {
+    const a = Math.floor(i * srcN / n);
+    return [a, Math.max(a + 1, Math.floor((i + 1) * srcN / n))];
+  };
+  for (let c = 0; c < cols; c++) {
+    const [c0, c1] = blockOf(c, cols, grid.cols);
+    lngs[c] = gridColToLng(grid, (c0 + c1 - 1) / 2);
+  }
+  for (let r = 0; r < rows; r++) {
+    const [r0, r1] = blockOf(r, rows, grid.rows);
+    lats[r] = gridRowToLat(grid, (r0 + r1 - 1) / 2);
+    for (let c = 0; c < cols; c++) {
+      const [c0, c1] = blockOf(c, cols, grid.cols);
+      let max = 0;
+      for (let sr = r0; sr < r1; sr++) {
+        for (let sc = c0; sc < c1; sc++) {
+          const v = canopyFlat[sr * grid.cols + sc];
+          if (Number.isFinite(v) && v > max) max = v;
+        }
+      }
+      canopy[r * cols + c] = max;
+    }
+  }
+  return { rows, cols, lats, lngs, canopy };
+}
+
+// Mesh → INDEXED triangle surface: shared vertices + Uint32 index triples
+// (6× less vertex data than unindexed at full grid resolution). A quad is
+// emitted when ANY of its four corners has canopy > 0; zero-canopy corners
+// sit at ground level, so the surface tapers to the ground at clearing
+// edges instead of cutting hard swiss-cheese holes. Fully-zero regions emit
+// nothing. Returns
+// { vRow, vCol, vCanopy, vColor (rgba per vertex, 0..1), indices } —
+// vertex lat/lng come from mesh.lats[vRow[i]] / mesh.lngs[vCol[i]].
+// opts.color: [r,g,b] 0..1 → a single uniform OPAQUE color for every vertex
+// (rendered in the opaque pass). Default: the 2D height ramp, with alpha 0
+// on zero-canopy edge verts for translucent-pass fading.
+// opts.minH: metres of canopy below which a corner does not count as
+// forested (default 0) — culls near-ground scrub that would z-fight the
+// terrain surface.
+function canopyMeshIndexed(mesh, opts) {
+  const { rows, cols, canopy } = mesh;
+  const map = new Int32Array(rows * cols).fill(-1);
+  const vRow = [], vCol = [], vCanopy = [];
+  const indices = [];
+  const reg = (r, c) => {
+    const k = r * cols + c;
+    if (map[k] === -1) {
+      map[k] = vRow.length;
+      vRow.push(r); vCol.push(c); vCanopy.push(canopy[k]);
+    }
+    return map[k];
+  };
+  const minH = (opts && opts.minH) || 0;
+  for (let r = 0; r < rows - 1; r++) {
+    for (let c = 0; c < cols - 1; c++) {
+      if (!(canopy[r * cols + c] > minH || canopy[r * cols + c + 1] > minH
+        || canopy[(r + 1) * cols + c] > minH || canopy[(r + 1) * cols + c + 1] > minH)) continue;
+      const a = reg(r, c), b = reg(r, c + 1), d = reg(r + 1, c + 1), e = reg(r + 1, c);
+      indices.push(a, b, d, a, d, e);
+    }
+  }
+  const uniform = opts && opts.color;
+  const vColor = new Float32Array(vRow.length * 4);
+  for (let i = 0; i < vRow.length; i++) {
+    if (uniform) {
+      vColor[i * 4] = uniform[0];
+      vColor[i * 4 + 1] = uniform[1];
+      vColor[i * 4 + 2] = uniform[2];
+      vColor[i * 4 + 3] = 1;
+      continue;
+    }
+    const h = vCanopy[i];
+    // Zero-canopy edge verts keep a low-ramp tint so the fade doesn't darken
+    // through black — only their alpha goes to 0.
+    const ramp = canopyColorRamp(h > 0 ? h : 0.5);
+    vColor[i * 4] = ramp[0] / 255;
+    vColor[i * 4 + 1] = ramp[1] / 255;
+    vColor[i * 4 + 2] = ramp[2] / 255;
+    vColor[i * 4 + 3] = h > 0 ? ramp[3] / 255 : 0;
+  }
+  return {
+    vRow: Int32Array.from(vRow), vCol: Int32Array.from(vCol),
+    vCanopy: Float32Array.from(vCanopy), vColor,
+    indices: Uint32Array.from(indices),
+  };
+}
+
+// Unit ENU surface normal from local slopes dz/dx (east) and dz/dy (north),
+// all in meters. Flat ground → [0,0,1]. Used to light the 3D canopy surface
+// by sun/moon position.
+function normalFromSlopes(dzdx, dzdy) {
+  const len = Math.sqrt(dzdx * dzdx + dzdy * dzdy + 1);
+  return [-dzdx / len, -dzdy / len, 1 / len];
 }
 
 function viewshedMaskToRGBA(grid, mask) {
@@ -682,7 +910,9 @@ if (typeof module !== 'undefined' && module.exports) {
     sampleGridBilinear,
     resampleToGrid, buildDSM, sanitizeForKernel,
     curvatureDrop, isVisible, computeViewshed, viewshedCoverage,
+    computeShadowMask, shadowColorRamp, shadowMaskToRGBA,
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,
+    decimateCanopyMesh, canopyMeshIndexed, normalFromSlopes,
     encodeGeoTiffRGBA, reprojectRgbaTo3857, worldFileForBounds, WGS84_WKT, WEBMERC_WKT, crc32, zipStore,
     makeViewshedRecord, viewshedFilenameSlug, uniqueViewshedName, observerKmlDescription,
   };

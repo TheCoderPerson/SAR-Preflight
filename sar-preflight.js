@@ -3683,9 +3683,8 @@ function renderFAAairspaceLayers() {
   if (typeof L === 'undefined') return;
   if (!S.faaAirspace) return;
 
-  const classColors = { B: '#3d8bfd', C: '#a78bfa', D: '#06b6d4', E: '#888888' };
-  const suaColors = { M: '#f59e0b', R: '#ef4444', P: '#991b1b', A: '#f59e0b', W: '#f59e0b' };
-  const laancColors = { 0: '#ef4444', 100: '#f97316', 200: '#f59e0b', 300: '#86efac', 400: '#22c55e' };
+  const classColors = AIRSPACE_CLASS_COLORS;
+  const suaColors = SUA_COLORS;
 
   // Class Airspace layer
   if (S.mapLayers.faa_class_airspace) S.mapLayers.faa_class_airspace.clearLayers();
@@ -3739,12 +3738,7 @@ function renderFAAairspaceLayers() {
   if (S.mapLayers.faa_laanc && S.faaAirspace.laanc && S.faaAirspace.laanc.features) {
     S.faaAirspace.laanc.features.forEach(f => {
       const ceil = f.properties.CEILING != null ? f.properties.CEILING : -1;
-      let color = '#888888';
-      if (ceil === 0) color = laancColors[0];
-      else if (ceil <= 100) color = laancColors[100];
-      else if (ceil <= 200) color = laancColors[200];
-      else if (ceil <= 300) color = laancColors[300];
-      else if (ceil > 300) color = laancColors[400];
+      const color = laancCeilingColor(f.properties.CEILING);
       const layer = L.geoJSON(f, {
         style: { color: color, weight: 1, fillColor: color, fillOpacity: 0.15 },
       });
@@ -4804,6 +4798,31 @@ function cellCoverageReadout(lat, lng, centerElevFt) {
 // ============================================================
 // API: OVERPASS (OSM) — Wire & Cable Hazards (FREE, no key)
 // ============================================================
+// POST an Overpass QL query, trying each public mirror in turn (the primary
+// is frequently overloaded). Resolves the parsed JSON; rejects only when
+// every mirror fails.
+async function _overpassFetch(query) {
+  const overpassServers = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+  ];
+  for (const server of overpassServers) {
+    try {
+      const res = await fetch(server, {
+        method: 'POST',
+        body: 'data=' + encodeURIComponent(query),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      console.warn(`Overpass mirror ${server} failed:`, e.message);
+      if (server === overpassServers[overpassServers.length - 1]) throw e;
+    }
+  }
+}
+
 async function fetchWireHazards(bounds) {
   trackFetchStart('Wire Hazards');
   setStatus('wireStatus', 'loading', 'Fetching...');
@@ -4837,28 +4856,7 @@ async function fetchWireHazards(bounds) {
     + `);out body;>;out skel qt;`;
 
   try {
-    // Try multiple Overpass API mirrors in case primary is overloaded
-    const overpassServers = [
-      'https://overpass-api.de/api/interpreter',
-      'https://overpass.kumi.systems/api/interpreter',
-      'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
-    ];
-    let data = null;
-    for (const server of overpassServers) {
-      try {
-        const res = await fetch(server, {
-          method: 'POST',
-          body: 'data=' + encodeURIComponent(query),
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        data = await res.json();
-        break; // success — stop trying mirrors
-      } catch (e) {
-        console.warn(`Overpass mirror ${server} failed:`, e.message);
-        if (server === overpassServers[overpassServers.length - 1]) throw e; // last one, rethrow
-      }
-    }
+    const data = await _overpassFetch(query);
     const elements = data.elements || [];
 
     const nodes = {};
@@ -4913,12 +4911,8 @@ async function fetchWireHazards(bounds) {
       towerCount++;
 
       const label = TOWER_TYPES[mm] || 'Comm Tower';
-      const heightRaw = tags.height || tags['tower:height'];
-      let heightFt = null;
-      if (heightRaw) {
-        const m = parseFloat(heightRaw);
-        if (!isNaN(m)) heightFt = Math.round(m * 3.28084);
-      }
+      const parsedH = osmTowerHeightFt(tags);
+      const heightFt = parsedH ? parsedH.heightFt : null;
       const heightLabel = heightFt ? heightFt + "'" : '';
 
       // FAA sectional-style tower icon: solid inverted triangle with dot on top
@@ -4937,8 +4931,8 @@ async function fetchWireHazards(bounds) {
       const icon = L.divIcon({ html: svgIcon, className: '', iconSize: [sz, sz], iconAnchor: [sz / 2, sz / 2] });
       const popupParts = [`<b style="color:${color}">${label}</b>`];
       if (tags.name) popupParts.push(tags.name);
-      if (heightFt) popupParts.push(`Height: ${heightFt} ft (${heightRaw}m)`);
-      else if (heightRaw) popupParts.push(`Height: ${heightRaw}`);
+      if (heightFt) popupParts.push(`Height: ${heightFt} ft (${parsedH.raw})`);
+      else popupParts.push(`<span style="opacity:0.6">Height not in OSM</span>`);
       if (tags.operator) popupParts.push(`Operator: ${tags.operator}`);
       popupParts.push(`<span style="font-size:10px;opacity:0.6">OSM Node ${el.id}</span>`);
 
@@ -5013,6 +5007,92 @@ async function fetchWireHazards(bounds) {
   } finally {
     trackFetchEnd('Wire Hazards');
   }
+}
+
+// ============================================================
+// API: OSM BUILDINGS (Overpass) — footprints for the 3D view (FREE)
+// Fetched lazily on first 3D entry: buildings only earn their keep as 3D
+// prisms, and fetching them with every area load would double Overpass
+// traffic. Heights come from OSM height/building:levels tags where mapped,
+// else a one-story default — treat as approximate, not surveyed.
+// ============================================================
+function _buildingsCap() { return (typeof _isConstrained === 'function' && _isConstrained()) ? 1500 : 4000; }
+
+// Buildings-in-3D mode ('auto' | 'prisms' | 'flat'), persisted in
+// localStorage. 'flat' skips the extruded prisms and relies on the shaded
+// footprint drape — resolveBuildings3dMode auto-picks it on constrained
+// devices.
+function getBuildings3dSetting() {
+  try { return localStorage.getItem('sar_buildings_3d') || 'auto'; } catch (e) { return 'auto'; }
+}
+
+function setBuildings3dMode(v) {
+  try { localStorage.setItem('sar_buildings_3d', v); } catch (e) { /* private mode */ }
+  if (S.is3D && typeof sync3d === 'function') sync3d();
+}
+
+function _buildings3dMode() {
+  return resolveBuildings3dMode(getBuildings3dSetting(),
+    typeof _isConstrained === 'function' && _isConstrained());
+}
+
+async function fetchBuildings(bounds) {
+  if (S._buildingsFetching) return;
+  const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  const bb = clampBBoxSpan(sw.lat, sw.lng, ne.lat, ne.lng);
+  const bboxKey = `${bb.south.toFixed(3)}_${bb.west.toFixed(3)}_${bb.north.toFixed(3)}_${bb.east.toFixed(3)}`;
+  if (S.buildings && S.buildings.bboxKey === bboxKey) return;
+  S._buildingsFetching = true;
+  const bbox = `${bb.south},${bb.west},${bb.north},${bb.east}`;
+  // `out body N` caps the way count server-side; `>;` still recurses the
+  // member nodes of the returned ways.
+  const query = `[out:json][timeout:60];way["building"](${bbox});out body ${_buildingsCap()};>;out skel qt;`;
+  try {
+    const data = await _overpassFetch(query);
+    S.buildings = { list: parseOverpassBuildings(data, _buildingsCap()), bboxKey, fetchedAt: Date.now() };
+    renderBuildingsLayer();
+    if (typeof cacheApiResponse === 'function') cacheApiResponse('osm_buildings', bboxKey, data);
+    buildLayerControl();
+    sync3d();
+  } catch (err) {
+    console.warn('Buildings fetch error:', err);
+    if (typeof getCachedApiResponse === 'function') {
+      try {
+        const cached = await getCachedApiResponse('osm_buildings', bboxKey);
+        if (cached && cached.data) {
+          S.buildings = { list: parseOverpassBuildings(cached.data, _buildingsCap()), bboxKey, fetchedAt: cached.timestamp };
+          renderBuildingsLayer();
+          buildLayerControl();
+          sync3d();
+        }
+      } catch (cacheErr) { /* buildings are an enhancement — stay silent */ }
+    }
+  } finally {
+    S._buildingsFetching = false;
+  }
+}
+
+// Shaded 2D footprint layer: readable filled footprints in 2D, the
+// visibility gate for the 3D prisms, and — because collect3dVectorGroups
+// harvests it into draped polygons — the flat-mode representation and the
+// click/popup target in 3D (custom-layer prisms aren't clickable).
+function renderBuildingsLayer() {
+  if (typeof L === 'undefined') return;
+  if (S.mapLayers.buildings) S.mapLayers.buildings.clearLayers();
+  else S.mapLayers.buildings = L.layerGroup().addTo(S.map);
+  const list = (S.buildings && S.buildings.list) || [];
+  list.forEach(b => {
+    const latlngs = b.footprint.map(p => [p[1], p[0]]);
+    const hFt = Math.round(b.heightM * 3.28084);
+    const parts = [`<b style="color:${BUILDING_3D_COLOR}">Building</b>`];
+    if (b.name) parts.push(b.name);
+    if (b.type) parts.push(b.type.replace(/_/g, ' '));
+    parts.push(`Height: ${b.est ? '~' : ''}${hFt} ft${b.est ? ' (est.)' : ' (OSM)'}`);
+    parts.push(`<span style="font-size:10px;opacity:0.6">OSM Way ${b.id}</span>`);
+    L.polygon(latlngs, { color: BUILDING_3D_COLOR, weight: 1, opacity: 0.85, fillColor: BUILDING_3D_COLOR, fillOpacity: 0.35 })
+      .bindPopup(parts.join('<br>'))
+      .addTo(S.mapLayers.buildings);
+  });
 }
 
 function updateWireDisplay(counts, towerCount) {
@@ -5706,9 +5786,11 @@ function _updateTimeBar(frac) {
   const isDay = sunPos && sunPos.elevation > 0;
   if (sunEl) sunEl.textContent = isDay ? `Sun ${Math.round(sunPos.azimuth)}° ↑${sunPos.elevation.toFixed(0)}°` : 'Night';
 
-  // Update map arrows
+  // Update map arrows + 3D scene lighting for the scrubbed hour
   _updateWindArrow(windDir, windSpd);
   _updateSunArrow(sunPos);
+  if (typeof _update3dLight === 'function') _update3dLight();
+  if (typeof _updateShadowForTime === 'function') _updateShadowForTime();
 
   // Re-render the data panel (weather / wind / ops / assessment) for this hour.
   refreshPanelForHour();
@@ -7146,6 +7228,7 @@ function buildLayerControl() {
       </div>`;
     }
     if (_layerHasFeatures('hospitals')) html += _layerRow('hospitals', '#ef4444', 'Hospitals / LZs');
+    if (_layerHasFeatures('buildings')) html += _layerRow('buildings', '#9ca3af', 'Buildings (OSM, 3D)');
     // LZ markers removed — elevation grid too coarse for reliable LZ placement.
     // Terrain tab shows suitability assessment instead.
   }
@@ -7382,8 +7465,9 @@ function buildLayerControl() {
   // Analysis overlays: vegetation height + viewshed (each with an opacity slider)
   const hasCanopy = S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy);
   const hasViewshed = S.mapLayers.viewshed && S.map.hasLayer(S.mapLayers.viewshed);
+  const hasShadow = S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow);
   const hasObservers = S.mapLayers.observers && S.map.hasLayer(S.mapLayers.observers) && (S.viewsheds || []).length;
-  if (hasCanopy || hasViewshed || hasObservers) {
+  if (hasCanopy || hasViewshed || hasShadow || hasObservers) {
     html += `<h4 style="margin-top:10px">Analysis</h4>`;
     if (hasObservers) {
       html += `<div class="layer-item active" data-layer="observers" onclick="toggleLayer('observers',this)">
@@ -7407,6 +7491,16 @@ function buildLayerControl() {
       </div>
       <div style="display:flex;align-items:center;gap:6px;margin:2px 0 4px 22px;">
         <input type="range" min="0" max="1" step="0.05" value="${op}" style="width:90px;" oninput="setViewshedOpacity(this.value)" onclick="event.stopPropagation()">
+        <span style="font-size:9px;color:var(--text-muted);">opacity</span>
+      </div>`;
+    }
+    if (hasShadow) {
+      const op = S.mapLayers.shadow.options.opacity != null ? S.mapLayers.shadow.options.opacity : SHADOW_OVERLAY_OPACITY;
+      html += `<div class="layer-item active" data-layer="shadow" onclick="toggleLayer('shadow',this)">
+        <div class="layer-check"></div><div class="layer-color" style="background:#0b1220;border:1px solid #475569"></div><span>Sun Shadow</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin:2px 0 4px 22px;">
+        <input type="range" min="0" max="1" step="0.05" value="${op}" style="width:90px;" oninput="setShadowOpacity(this.value)" onclick="event.stopPropagation()">
         <span style="font-size:9px;color:var(--text-muted);">opacity</span>
       </div>`;
     }
@@ -7482,17 +7576,18 @@ function toggleLayer(id, el) {
   } else if (id === 'glm_lightning') {
     const layer = ensureGlmLayer();
     if (layer) { if (on) S.map.addLayer(layer); else S.map.removeLayer(layer); }
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'parcels' || id === 'slope' || id === 'streets' || id === 'trails' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
-    if (id === 'canopy' || id === 'viewshed') {
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'shadow' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'parcels' || id === 'slope' || id === 'streets' || id === 'trails' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
+    if (id === 'canopy' || id === 'viewshed' || id === 'shadow') {
       // Keep the zoom-cap's "wanted" flag in sync — otherwise _applyOverlayZoomCap
       // re-adds the overlay on the next zoomend after it was unchecked here.
       if (!S._overlayWanted) S._overlayWanted = {};
       S._overlayWanted[id] = on;
     }
     if (id === 'canopy') { const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = on; }
+    if (id === 'shadow') { const cb = document.getElementById('shadowToggle'); if (cb) cb.checked = on; }
     if (on) {
       // Raster overlays go through the zoom cap so the mobile display-size budget still applies
-      if (id === 'canopy' || id === 'viewshed') _applyOverlayZoomCap();
+      if (id === 'canopy' || id === 'viewshed' || id === 'shadow') _applyOverlayZoomCap();
       else S.map.addLayer(S.mapLayers[id]);
     } else S.map.removeLayer(S.mapLayers[id]);
     // Toggling aircraft also toggles trails
@@ -7515,7 +7610,7 @@ function toggleLayer(id, el) {
 // show all matches in one popup with "<- n/N ->" pagination.
 // ============================================================
 const AGG_HIT_PX = 8; // pixel tolerance for line / point hit-testing
-const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'parcels', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning']);
+const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'shadow', 'parcels', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning']);
 // Export-only exclusion set. Extends the popup-skip set (so basemaps / parcels /
 // rasters stay out of the vector export) and adds layers CalTopo already provides
 // natively and that would be stale by import time. These layers remain visible and
@@ -7542,7 +7637,8 @@ const AGG_LAYER_META = {
   faa_class_airspace: { label: 'Class Airspace', pri: 2 }, adsb_aircraft: { label: 'Aircraft', pri: 2 },
   faa_laanc: { label: 'LAANC Grid', pri: 3 }, airports: { label: 'Airport', pri: 3 },
   faa_obstacles: { label: 'Obstacle', pri: 4 }, dams: { label: 'Dam', pri: 4 },
-  cell_towers: { label: 'Tower', pri: 5 }, wilderness: { label: 'Wilderness', pri: 6 },
+  cell_towers: { label: 'Tower', pri: 5 }, buildings: { label: 'Building', pri: 7 },
+  wilderness: { label: 'Wilderness', pri: 6 },
   national_parks: { label: 'National Park', pri: 6 }, swap_radius: { label: 'Swap Radius', pri: 8 },
   observers: { label: 'Observer', pri: 3 },
   public_lands: { label: 'Land Status', pri: 6 }, nhd_water: { label: 'Water', pri: 7 },
@@ -8315,6 +8411,9 @@ async function restoreConfig() {
   // Populate the dropdown first so loadSopProfile can select the restored option.
   await populateSopDropdown();
   if (profileName) loadSopProfile(profileName);
+  // Restore the buildings-in-3D mode select (localStorage).
+  const bld3dEl = document.getElementById('cfgBuildings3d');
+  if (bld3dEl) bld3dEl.value = getBuildings3dSetting();
   // Restore custom proxy URL (localStorage) + hint. Field stays empty when the
   // built-in default proxy is in use.
   const proxyEl = document.getElementById('cfgCanopyProxy');
@@ -9344,6 +9443,7 @@ async function exportMissionLogsAsCSV() {
 
 const CANOPY_OVERLAY_OPACITY = 0.6;
 const VIEWSHED_OVERLAY_OPACITY = 0.5;
+const SHADOW_OVERLAY_OPACITY = 0.45;
 const CANOPY_MAX_M = 60;        // clamp canopy heights (guards COG fill/nodata artifacts)
 // Cap the per-tile COG window read; a coarser overview is chosen if larger.
 // (Meta canopy COGs turned out to have NO usable overviews, so this rarely
@@ -9694,7 +9794,7 @@ function _overlayDisplayPx(layer) {
 function _applyOverlayZoomCap() {
   if (!S.map || !S._overlayWanted) return;
   const constrained = _isConstrained();
-  ['canopy', 'viewshed'].forEach(id => {
+  ['canopy', 'viewshed', 'shadow'].forEach(id => {
     const layer = S.mapLayers[id];
     if (!layer || !S._overlayWanted[id]) return;
     // Desktop: never hide for size (no compositing-memory crash risk) — keep the
@@ -9711,7 +9811,7 @@ function _applyOverlayZoomCap() {
 function _hideOverlaysForZoom() {
   if (!_isConstrained()) return; // desktop keeps overlays visible throughout zoom
   if (!S.map || !S._overlayWanted) return;
-  ['canopy', 'viewshed'].forEach(id => {
+  ['canopy', 'viewshed', 'shadow'].forEach(id => {
     const layer = S.mapLayers[id];
     if (layer && S._overlayWanted[id] && S.map.hasLayer(layer)) S.map.removeLayer(layer);
   });
@@ -9749,6 +9849,7 @@ function setCanopyOpacity(v) {
   if (S.mapLayers.canopy && S.mapLayers.canopy.setOpacity) S.mapLayers.canopy.setOpacity(o);
   const span = document.getElementById('canopyOpacityVal');
   if (span) span.textContent = Math.round(o * 100) + '%';
+  // 2D drape only — the 3D canopy surface renders fully opaque by design.
   if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 function setViewshedOpacity(v) {
@@ -9774,6 +9875,21 @@ async function toggleCanopyOverlay() {
     if (cb) cb.checked = false;
     if (typeof alert === 'function') alert('Set a Canopy proxy URL in the Config tab first (see tools/canopy-proxy/README.md).');
     return;
+  }
+  // Re-showing after a toggle: if the already-loaded canopy still covers the
+  // current view centre, reuse it (and the cached 3D mesh) instead of
+  // refetching + re-decoding the COG tiles.
+  if (S.canopy && S.canopy.grid && S.mapLayers.canopy) {
+    const b = S.canopy.grid.bounds;
+    const c2 = S.map.getCenter();
+    if (c2.lat <= b.north && c2.lat >= b.south && c2.lng >= b.west && c2.lng <= b.east) {
+      if (!S.map.hasLayer(S.mapLayers.canopy)) S.map.addLayer(S.mapLayers.canopy);
+      if (!S._overlayWanted) S._overlayWanted = {};
+      S._overlayWanted.canopy = true;
+      buildLayerControl();
+      if (S.is3D && typeof sync3d === 'function') sync3d();
+      return;
+    }
   }
   await loadCanopyForView();
 }
@@ -9834,6 +9950,127 @@ async function loadCanopyForView() {
   } finally {
     trackFetchEnd('Canopy');
   }
+}
+
+// ============================================================
+// SUN SHADOW OVERLAY — terrain-cast shade at the time bar's hour.
+// View-based like the canopy overlay: fetch a 3DEP DEM for the current map
+// view once, then recompute the (cheap, O(cells)) shadow sweep whenever the
+// forecast time bar is scrubbed. Bare-earth terrain only — tree/building
+// shade is NOT modeled.
+// ============================================================
+
+// The time the shadow (and the rest of the time-scrubbed UI) represents:
+// the time bar's selected hour when available, else now.
+function _shadowTime() {
+  const hourly = S.wx && S.wx.hourly;
+  if (hourly && hourly.time && hourly.time.length && S.timeIdx != null && hourly.time[S.timeIdx] != null) {
+    return new Date(hourly.time[S.timeIdx]);
+  }
+  return new Date();
+}
+
+function setShadowOpacity(v) {
+  const o = parseFloat(v);
+  if (S.mapLayers.shadow && S.mapLayers.shadow.setOpacity) S.mapLayers.shadow.setOpacity(o);
+  const span = document.getElementById('shadowOpacityVal');
+  if (span) span.textContent = Math.round(o * 100) + '%';
+  if (S.is3D && typeof sync3d === 'function') sync3d();
+}
+
+async function toggleShadowOverlay() {
+  const cb = document.getElementById('shadowToggle');
+  const on = cb ? cb.checked : !(S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow));
+  if (!on) {
+    if (S._overlayWanted) S._overlayWanted.shadow = false;
+    if (S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow)) S.map.removeLayer(S.mapLayers.shadow);
+    if (S.is3D && typeof sync3d === 'function') sync3d();
+    buildLayerControl();
+    return;
+  }
+  // Re-showing after a toggle: if the loaded DEM still covers the current view
+  // centre, just recompute for the current hour instead of refetching.
+  if (S.shadow && S.shadow.grid && S.shadow.demFlat) {
+    const b = S.shadow.grid.bounds;
+    const c2 = S.map.getCenter();
+    if (c2.lat <= b.north && c2.lat >= b.south && c2.lng >= b.west && c2.lng <= b.east) {
+      _renderShadowForTime();
+      buildLayerControl();
+      return;
+    }
+  }
+  await loadShadowForView();
+}
+
+async function loadShadowForView() {
+  if (!S.map) return;
+  trackFetchStart('Sun shadow');
+  setStatus('shadowStatus', 'loading', 'Fetching...');
+  try {
+    const vb = S.map.getBounds();
+    const center = vb.getCenter();
+    const halfWidthM = Math.max(
+      center.distanceTo(L.latLng(center.lat, vb.getWest())),
+      center.distanceTo(L.latLng(vb.getNorth(), center.lng))
+    );
+    // One capped-size exportImage request regardless of view width (unlike the
+    // 1 m canopy COGs), so no zoom guard is needed — wide views just go coarse.
+    const resM = Math.max(WORK_RES_M, (2 * halfWidthM) / MAX_GRID);
+    const grid = makeGrid(center.lat, center.lng, halfWidthM, resM);
+    const dem = await fetch3DEPDEM(grid);
+    if (!dem.demFlat) {
+      setStatus('shadowStatus', 'error', 'NO DEM');
+      const cbn = document.getElementById('shadowToggle'); if (cbn) cbn.checked = false;
+      if (S._overlayWanted) S._overlayWanted.shadow = false;
+      return;
+    }
+    S.shadow = { grid, demFlat: dem.demFlat, source: dem.source };
+    _renderShadowForTime();
+    const cb = document.getElementById('shadowToggle'); if (cb) cb.checked = true;
+    buildLayerControl();
+  } catch (e) {
+    console.error('Sun shadow overlay error:', e);
+    recordDataSourceError('Sun shadow', e);
+    setStatus('shadowStatus', 'error', 'ERROR');
+  } finally {
+    trackFetchEnd('Sun shadow');
+  }
+}
+
+// Compute + paint the shadow mask for the currently selected hour. Cheap
+// enough (single O(cells) sweep over the resident DEM) to run per scrub tick.
+function _renderShadowForTime() {
+  if (!S.shadow || !S.shadow.grid || !S.shadow.demFlat) return;
+  const grid = S.shadow.grid;
+  const t = _shadowTime();
+  const sun = calcSunPosition(grid.lat0, grid.lng0, t);
+  const mask = computeShadowMask(grid, S.shadow.demFlat, sun.azimuth, sun.elevation);
+  S.shadow.mask = mask;
+  S.shadow.sun = sun;
+  S.shadow.timeMs = t.getTime();
+  const op = parseFloat((document.getElementById('shadowOpacity') || {}).value) || SHADOW_OVERLAY_OPACITY;
+  renderRasterOverlay('shadow', shadowMaskToRGBA(grid, mask), grid, op);
+  const night = !(sun.elevation > 0);
+  setStatus('shadowStatus', 'live', night ? 'NIGHT' : `SUN ${Math.round(sun.azimuth)}° ↑${Math.round(sun.elevation)}°`);
+  const res = document.getElementById('shadowResult');
+  if (res) {
+    // mask holds graded shade depth (0..255) — weight partially shaded cells.
+    let shaded = 0, known = 0;
+    for (let i = 0; i < mask.length; i++) { if (Number.isFinite(S.shadow.demFlat[i])) { known++; shaded += mask[i] / 255; } }
+    const pct = known ? Math.round(shaded / known * 100) : 0;
+    const when = t.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: _localTZ() });
+    res.textContent = night
+      ? `${when}: sun below horizon — all terrain shaded (${S.shadow.source})`
+      : `${when}: ${pct}% of view in shade (${S.shadow.source})`;
+  }
+}
+
+// Time-bar hook: recompute the mask for the newly scrubbed hour (debounced —
+// the scrubber fires on every mousemove).
+function _updateShadowForTime() {
+  if (!S.shadow || !S._overlayWanted || !S._overlayWanted.shadow) return;
+  clearTimeout(S._shadowTimeTimer);
+  S._shadowTimeTimer = setTimeout(_renderShadowForTime, 120);
 }
 
 // --- Viewshed: tap-to-pick observer + compute ---
@@ -10323,9 +10560,12 @@ function collect3dState() {
   let base = null;
   ['satellite', 'topo', 'sectional'].forEach(id => { if (active(id)) base = id; });
   const rasters = [];
-  ['canopy', 'viewshed'].forEach(id => {
+  ['canopy', 'viewshed', 'shadow'].forEach(id => {
     const info = S._raster3d && S._raster3d[id];
     if (!info || !S._overlayWanted || !S._overlayWanted[id]) return;
+    // The canopy renders as a 3D surface mesh instead of a flat drape when
+    // its grid is resident — don't double-render the draped image under it.
+    if (id === 'canopy' && S.canopy && S.canopy.grid && S.canopy.canopyFlat) return;
     const lyr = S.mapLayers[id];
     const op = (lyr && lyr.options && lyr.options.opacity != null) ? lyr.options.opacity : 0.7;
     rasters.push({ id, url: info.url, bounds: info.bounds, opacity: op });
@@ -10338,6 +10578,11 @@ function collect3dState() {
       radarUrl = frame._url;
     }
   }
+  // Terrain hillshade tracks the scene light (sun/moon) direction.
+  const shade = typeof hillshadeParams === 'function'
+    ? hillshadeParams(S._light3d || (typeof lightForTime === 'function' && S.areaCenter
+      ? lightForTime(S.areaCenter.lat, S.areaCenter.lng, _context3dTime()) : null))
+    : null;
   return {
     theme: (S.theme === 'light' || S.theme === 'light-map') ? 'light' : 'dark',
     base,
@@ -10347,6 +10592,8 @@ function collect3dState() {
     radarUrl,
     vectors: collect3dVectorGroups(),
     exaggeration: TERRAIN_EXAGGERATION,
+    lightAzimuth: shade ? shade.azimuth : undefined,
+    lightShade: shade ? shade.exaggeration : undefined,
   };
 }
 
@@ -10428,16 +10675,104 @@ function _vert3dMakeLayer() {
         halfvp: gl.getUniformLocation(this.quadProg, 'u_halfvp'),
         width: gl.getUniformLocation(this.quadProg, 'u_width'),
       };
+      // Filled triangles (building prisms, canopy surface): per-vertex RGBA +
+      // ENU surface normal, Lambert-lit by the sun/moon direction uniform
+      // (see lightForTime). Positions are mercator but normals and the light
+      // vector share the local ENU frame, so N·L is computed there — the
+      // light moves with the time slider via a uniform, no mesh rebuild.
+      this.triProg = link(
+        'attribute vec3 a_pos;attribute vec4 a_color;attribute vec3 a_normal;'
+        + 'uniform mat4 u_matrix;varying vec4 v_color;varying vec3 v_normal;'
+        + 'void main(){gl_Position=u_matrix*vec4(a_pos,1.0);v_color=a_color;v_normal=a_normal;}',
+        'precision mediump float;varying vec4 v_color;varying vec3 v_normal;'
+        + 'uniform float u_alpha;uniform vec3 u_light;uniform float u_diffuse;uniform float u_ambient;'
+        + 'void main(){'
+        + 'float d=max(0.0,dot(normalize(v_normal),u_light));'
+        + 'float b=clamp(u_ambient+u_diffuse*d,0.0,1.0);'
+        + 'gl_FragColor=vec4(v_color.rgb*b,v_color.a*u_alpha);}');
+      this.triAttrs = {
+        pos: gl.getAttribLocation(this.triProg, 'a_pos'),
+        color: gl.getAttribLocation(this.triProg, 'a_color'),
+        normal: gl.getAttribLocation(this.triProg, 'a_normal'),
+        matrix: gl.getUniformLocation(this.triProg, 'u_matrix'),
+        alpha: gl.getUniformLocation(this.triProg, 'u_alpha'),
+        light: gl.getUniformLocation(this.triProg, 'u_light'),
+        diffuse: gl.getUniformLocation(this.triProg, 'u_diffuse'),
+        ambient: gl.getUniformLocation(this.triProg, 'u_ambient'),
+      };
       this.lineBuffer = gl.createBuffer();
       this.quadBuffer = gl.createBuffer();
+      this.triOpaqueBuffer = gl.createBuffer();
+      this.triCanopyBuffer = gl.createBuffer();
+      this.triCanopyIndexBuffer = gl.createBuffer();
+      gl.getExtension('OES_element_index_uint'); // no-op on WebGL2; enables Uint32 indices on WebGL1
+      // onAdd re-runs whenever a style reset re-adds the layer (fresh GL
+      // buffers) — flag every retained CPU-side mesh for re-upload.
       S._vert3dDirty = true;
+      S._tri3dOpaqueDirty = true;
+      S._tri3dCanopyDirty = true;
     },
     render(gl, matrixOrArgs) {
       // v4+ passes an args object (globe support); older versions the raw matrix.
       const m = (matrixOrArgs && matrixOrArgs.defaultProjectionData)
         ? matrixOrArgs.defaultProjectionData.mainMatrix : matrixOrArgs;
+      // Relative-to-anchor rendering: buffers hold offsets from a per-mesh
+      // mercator anchor (absolute mercator in Float32 quantizes at ~0.5 m —
+      // building-sized — making geometry crawl and depth flip as the camera
+      // moves). Fold the anchor back in here, in float64, per frame.
+      const mFor = anchor => {
+        if (!anchor) return m;
+        const out = new Float32Array(16);
+        for (let i = 0; i < 12; i++) out[i] = m[i];
+        out[12] = m[0] * anchor[0] + m[4] * anchor[1] + m[12];
+        out[13] = m[1] * anchor[0] + m[5] * anchor[1] + m[13];
+        out[14] = m[2] * anchor[0] + m[6] * anchor[1] + m[14];
+        out[15] = m[3] * anchor[0] + m[7] * anchor[1] + m[15];
+        return out;
+      };
+      const mVert = mFor(S._vert3dAnchor);
       const thin = S._vert3dVerts;
       const thick = S._vert3dThickVerts;
+      const light = S._light3d || { dir: [0, 0, 1], diffuse: 0.4, ambient: 0.55 };
+      const drawTris = (buffer, verts, dirty, alpha, indexBuffer, indices, anchor) => {
+        gl.useProgram(this.triProg);
+        gl.disable(gl.CULL_FACE);
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        if (dirty) gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
+        const stride = 40; // pos(3) + color rgba(4) + normal(3) floats
+        gl.enableVertexAttribArray(this.triAttrs.pos);
+        gl.vertexAttribPointer(this.triAttrs.pos, 3, gl.FLOAT, false, stride, 0);
+        gl.enableVertexAttribArray(this.triAttrs.color);
+        gl.vertexAttribPointer(this.triAttrs.color, 4, gl.FLOAT, false, stride, 12);
+        gl.enableVertexAttribArray(this.triAttrs.normal);
+        gl.vertexAttribPointer(this.triAttrs.normal, 3, gl.FLOAT, false, stride, 28);
+        gl.uniformMatrix4fv(this.triAttrs.matrix, false, mFor(anchor));
+        gl.uniform1f(this.triAttrs.alpha, alpha);
+        gl.uniform3f(this.triAttrs.light, light.dir[0], light.dir[1], light.dir[2]);
+        gl.uniform1f(this.triAttrs.diffuse, light.diffuse);
+        gl.uniform1f(this.triAttrs.ambient, light.ambient);
+        if (indices && indices.length) {
+          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+          if (dirty) gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.DYNAMIC_DRAW);
+          gl.drawElements(gl.TRIANGLES, indices.length, gl.UNSIGNED_INT, 0);
+          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null); // don't leak into MapLibre's state
+        } else {
+          gl.drawArrays(gl.TRIANGLES, 0, verts.length / 10);
+        }
+      };
+      // Opaque prisms (buildings) and the opaque canopy surface draw before
+      // the lines so height lines stay visible on top of them. Both write
+      // depth, so canopy hills correctly occlude each other and buildings.
+      if (S._tri3dOpaque && S._tri3dOpaque.length && this.triProg) {
+        drawTris(this.triOpaqueBuffer, S._tri3dOpaque, S._tri3dOpaqueDirty, 1.0,
+          null, null, S._tri3dOpaqueAnchor);
+        S._tri3dOpaqueDirty = false;
+      }
+      if (S._tri3dCanopy && S._tri3dCanopy.length && this.triProg) {
+        drawTris(this.triCanopyBuffer, S._tri3dCanopy, S._tri3dCanopyDirty, 1.0,
+          this.triCanopyIndexBuffer, S._tri3dCanopyIndices, S._tri3dCanopyAnchor);
+        S._tri3dCanopyDirty = false;
+      }
       if (thin && thin.length && this.lineProg) {
         gl.useProgram(this.lineProg);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuffer);
@@ -10446,7 +10781,7 @@ function _vert3dMakeLayer() {
         gl.vertexAttribPointer(this.lineAttrs.pos, 3, gl.FLOAT, false, 24, 0);
         gl.enableVertexAttribArray(this.lineAttrs.color);
         gl.vertexAttribPointer(this.lineAttrs.color, 3, gl.FLOAT, false, 24, 12);
-        gl.uniformMatrix4fv(this.lineAttrs.matrix, false, m);
+        gl.uniformMatrix4fv(this.lineAttrs.matrix, false, mVert);
         gl.drawArrays(gl.LINES, 0, thin.length / 6);
       }
       if (thick && thick.length && this.quadProg) {
@@ -10463,7 +10798,7 @@ function _vert3dMakeLayer() {
         gl.vertexAttribPointer(this.quadAttrs.side, 1, gl.FLOAT, false, stride, 24);
         gl.enableVertexAttribArray(this.quadAttrs.color);
         gl.vertexAttribPointer(this.quadAttrs.color, 3, gl.FLOAT, false, stride, 28);
-        gl.uniformMatrix4fv(this.quadAttrs.matrix, false, m);
+        gl.uniformMatrix4fv(this.quadAttrs.matrix, false, mVert);
         const c = gl.canvas;
         gl.uniform2f(this.quadAttrs.halfvp, c.width / 2, c.height / 2);
         gl.uniform1f(this.quadAttrs.width, VERT3D_THICK_PX * (window.devicePixelRatio || 1));
@@ -10490,8 +10825,19 @@ function _ensureVert3dLayer() {
 // Rebuild the GL vertex buffer from the current vertical segments. Ground
 // elevation comes from the rendered terrain (queryTerrainElevation); segments
 // over not-yet-loaded terrain get a bounded re-run once the map goes idle.
+// Mercator x/y of the scene anchor for relative-to-anchor rendering (see the
+// custom layer's mFor). z stays absolute — its magnitude (~2e-5) is fully
+// representable in Float32.
+function _vert3dAnchorOf() {
+  const c = S.areaCenter || (S.map && S.map.getCenter && S.map.getCenter());
+  if (!c || typeof maplibregl === 'undefined') return [0, 0];
+  const mc = maplibregl.MercatorCoordinate.fromLngLat([c.lng, c.lat], 0);
+  return [mc.x, mc.y];
+}
+
 function _updateVert3dVerts() {
   if (!S.map3d || !S.is3D || typeof maplibregl === 'undefined') return;
+  _update3dLight();
   const segs = collectVerticalSegments(collect3dVectorGroups());
   const thin = [];
   const thick = [];
@@ -10504,7 +10850,13 @@ function _updateVert3dVerts() {
     missing = true;
     return 0;
   };
-  const mcOf = (lng, lat, altM) => maplibregl.MercatorCoordinate.fromLngLat([lng, lat], altM);
+  const anchor = _vert3dAnchorOf();
+  S._vert3dAnchor = anchor;
+  // Offsets from the anchor (relative-to-anchor rendering — see mFor).
+  const mcOf = (lng, lat, altM) => {
+    const mc = maplibregl.MercatorCoordinate.fromLngLat([lng, lat], altM);
+    return { x: mc.x - anchor[0], y: mc.y - anchor[1], z: mc.z };
+  };
   const pushThin = (mc, c) => { thin.push(mc.x, mc.y, mc.z, c[0], c[1], c[2]); };
   // One quad (2 triangles) per thick line; each vertex carries its endpoint,
   // the opposite endpoint, and the expansion side for the billboard shader.
@@ -10531,6 +10883,62 @@ function _updateVert3dVerts() {
       pushThin(mcOf(sg.lng, sg.lat + dLat, alt), sg.color);
     }
   });
+  // Building prisms: rebuilt only when the source object changes or an
+  // earlier build sampled unloaded terrain — NOT on every aircraft-poll
+  // refresh. The built mesh is kept when the layer is toggled off so
+  // re-enabling it is instant.
+  const triSt = S._tri3dState || (S._tri3dState = {});
+  const rebuildTri = (key, src, build) => {
+    const rec = triSt[key] || (triSt[key] = { active: undefined, cacheSrc: null, cacheData: null, data: null, missing: false, dirty: false });
+    if (rec.active === src && !(src && rec.missing)) return rec;
+    if (src) {
+      if (rec.cacheSrc !== src || rec.missing) {
+        const outerMissing = missing;
+        missing = false;
+        rec.cacheData = build(src);
+        rec.missing = missing;
+        missing = outerMissing || missing;
+        rec.cacheSrc = src;
+      }
+      rec.data = rec.cacheData;
+    } else {
+      rec.data = null; // hidden — cache retained for reactivation
+    }
+    rec.active = src;
+    rec.dirty = true;
+    return rec;
+  };
+  const bldOn = S.map && S.mapLayers.buildings && S.map.hasLayer(S.mapLayers.buildings)
+    && S.buildings && S.buildings.list && S.buildings.list.length
+    && _buildings3dMode() === 'prisms'; // 'flat' keeps only the draped footprints
+  const bldRec = rebuildTri('buildings', bldOn ? S.buildings : null,
+    b => _buildBuildingTriVerts(b.list, groundOf, mcOf, anchor));
+  if (bldRec.dirty) {
+    S._tri3dOpaque = bldRec.data ? bldRec.data.verts : new Float32Array(0);
+    S._tri3dOpaqueAnchor = bldRec.data ? bldRec.data.anchor : null;
+    S._tri3dOpaqueDirty = true;
+    bldRec.dirty = false;
+  }
+  // Canopy surface: built asynchronously in chunks (progress bar + cancel)
+  // by _startCanopy3dBuild; here we only activate whatever cache matches the
+  // current source. The cache survives layer toggles and 2D/3D switches.
+  const canopyOn = S.canopy && S.canopy.grid && S.canopy.canopyFlat
+    && S._overlayWanted && S._overlayWanted.canopy;
+  const canopySrc = canopyOn ? S.canopy : null;
+  if (!canopySrc) S._canopy3dCancelledFor = null; // toggling the layer re-arms a cancelled build
+  let canopyActive = null;
+  if (canopySrc) {
+    const cache = S._canopy3dCache;
+    if (cache && cache.src === canopySrc) canopyActive = cache;
+    else if (S._canopy3dCancelledFor !== canopySrc) _startCanopy3dBuild(canopySrc);
+  }
+  if (S._canopy3dActive !== canopyActive) {
+    S._tri3dCanopy = canopyActive ? canopyActive.verts : new Float32Array(0);
+    S._tri3dCanopyIndices = canopyActive ? canopyActive.indices : null;
+    S._tri3dCanopyAnchor = canopyActive ? canopyActive.anchor : null;
+    S._tri3dCanopyDirty = true;
+    S._canopy3dActive = canopyActive;
+  }
   S._vert3dVerts = new Float32Array(thin);
   S._vert3dThickVerts = new Float32Array(thick);
   S._vert3dDirty = true;
@@ -10540,6 +10948,233 @@ function _updateVert3dVerts() {
     try { S.map3d.once('idle', () => { if (S.is3D) _updateVert3dVerts(); }); } catch (e) { /* skip */ }
   } else if (!missing) {
     S._vert3dRetry = 0;
+  }
+}
+
+// Buildings → opaque prism triangles (pos3 + rgba4 + ENU normal3 per
+// vertex; the shader lights them by sun/moon position). One terrain sample
+// per building at its centroid; the base is sunk 3 m so prisms don't float
+// on slopes (per-vertex terrain sampling is overkill at house scale).
+// Anti-z-fighting: footprints are inset a hair toward their centroid so
+// adjacent buildings' shared walls separate, and a tiny deterministic height
+// jitter keeps overlapping OSM footprints' default-height roofs off a common
+// plane. mcOf must already subtract `anchor` (relative-to-anchor rendering);
+// the anchor is returned with the mesh so the draw can fold it back in.
+const BUILDING_3D_COLOR = '#8fa3b8';
+const BUILDING_INSET_M = 0.25;
+
+function _buildBuildingTriVerts(list, groundOf, mcOf, anchor) {
+  const arr = [];
+  const col = hexToRgb01(BUILDING_3D_COLOR);
+  list.forEach(b => {
+    const fp = b.footprint;
+    let cx = 0, cy = 0;
+    fp.forEach(p => { cx += p[0]; cy += p[1]; });
+    cx /= fp.length; cy /= fp.length;
+    const mLat = 111320, mLng = 111320 * Math.cos(cy * Math.PI / 180);
+    const inset = fp.map(p => {
+      const dx = cx - p[0], dy = cy - p[1];
+      const distM = Math.hypot(dx * mLng, dy * mLat);
+      if (distM <= BUILDING_INSET_M * 2) return p;
+      const s = BUILDING_INSET_M / distM;
+      return [p[0] + dx * s, p[1] + dy * s];
+    });
+    const g = groundOf(cy, cx);
+    const hM = b.heightM + (b.id % 13) * 0.015; // ≤18 cm jitter, invisible
+    const base = g - 3 * TERRAIN_EXAGGERATION;
+    const top = g + hM * TERRAIN_EXAGGERATION;
+    buildingMeshLocal(inset, hM).forEach(v => {
+      const mc = mcOf(v.lng, v.lat, v.top ? top : base);
+      arr.push(mc.x, mc.y, mc.z, col[0], col[1], col[2], 1.0, v.normal[0], v.normal[1], v.normal[2]);
+    });
+  });
+  return { verts: new Float32Array(arr), anchor: anchor || null };
+}
+
+// --- 3D canopy surface: async chunked build + cache -----------------------
+// The canopy renders as a single opaque green surface (field feedback: the
+// height-ramp coloring read poorly in 3D). Desktop builds the grid at full
+// resolution (the grid itself caps at MAX_GRID = 512²); constrained devices
+// max-pool down to 128². Ground elevation is sampled from the RENDERED
+// terrain once per shared vertex (not 3DEP) so the surface hugs the
+// displayed ground by construction.
+// The build runs in UI-yielding chunks (same idea as _runViewshedKernel)
+// with a progress bar + cancel button; the finished {verts, indices} mesh is
+// cached on S._canopy3dCache keyed by the S.canopy object identity, so layer
+// toggles and 2D/3D switches reuse it instead of rebuilding.
+const CANOPY_3D_COLOR = '#15803d';
+const CANOPY3D_CHUNK = 20000; // vertices per UI yield
+// Anti-z-fighting vs the terrain surface: cull near-ground scrub (the Meta
+// CHM is noisy below ~2 m and a green film at ground level just shimmers)
+// and float the whole surface slightly above the ground it hugs.
+const CANOPY3D_MIN_H = 2;   // m — corners below this don't count as forest
+const CANOPY3D_LIFT_M = 1.2; // m — constant lift off the terrain
+
+async function _buildCanopy3dMeshChunked(src, onProgress, isCancelled) {
+  const maxDim = (typeof _isConstrained === 'function' && _isConstrained()) ? 128 : MAX_GRID;
+  const mesh = decimateCanopyMesh(src.grid, src.canopyFlat, maxDim);
+  const im = canopyMeshIndexed(mesh, { color: hexToRgb01(CANOPY_3D_COLOR), minH: CANOPY3D_MIN_H });
+  const n = im.vRow.length;
+  const verts = new Float32Array(n * 10); // pos3 + rgba4 + normal3
+  const state = { missing: false };
+  const groundOf = (lat, lng) => {
+    try {
+      const e = S.map3d.queryTerrainElevation([lng, lat]);
+      if (Number.isFinite(e)) return e;
+    } catch (err) { /* terrain not ready */ }
+    state.missing = true;
+    return 0;
+  };
+  // Lazily-cached surface altitude (exaggerated terrain + canopy) for every
+  // mesh grid point — each vertex needs its 4 neighbours for the normal, and
+  // neighbours are shared, so the cache keeps terrain queries ~1 per point.
+  const rowsN = mesh.rows, colsN = mesh.cols;
+  const altCache = new Float32Array(rowsN * colsN).fill(NaN);
+  const altAt = (r, c) => {
+    const k = r * colsN + c;
+    let v = altCache[k];
+    if (Number.isNaN(v)) {
+      v = groundOf(mesh.lats[r], mesh.lngs[c]) + mesh.canopy[k] * TERRAIN_EXAGGERATION + CANOPY3D_LIFT_M;
+      altCache[k] = v;
+    }
+    return v;
+  };
+  const anchor = _vert3dAnchorOf();
+  // Mean vertex spacing in meters (E-W and N-S) for slope → normal math.
+  const g = src.grid;
+  const spacingEm = Math.max(1, (mesh.lngs[colsN - 1] - mesh.lngs[0]) / Math.max(1, colsN - 1) * g.mPerDegLng);
+  const spacingNm = Math.max(1, (mesh.lats[0] - mesh.lats[rowsN - 1]) / Math.max(1, rowsN - 1) * g.mPerDegLat);
+  for (let start = 0; start < n; start += CANOPY3D_CHUNK) {
+    if (isCancelled()) return null;
+    const end = Math.min(n, start + CANOPY3D_CHUNK);
+    for (let i = start; i < end; i++) {
+      const r = im.vRow[i], c = im.vCol[i];
+      const lat = mesh.lats[r], lng = mesh.lngs[c];
+      const mcAbs = maplibregl.MercatorCoordinate.fromLngLat([lng, lat], altAt(r, c));
+      const mc = { x: mcAbs.x - anchor[0], y: mcAbs.y - anchor[1], z: mcAbs.z };
+      // Central differences on the lit surface (row 0 = north, so +row is south).
+      const cW = Math.max(0, c - 1), cE = Math.min(colsN - 1, c + 1);
+      const rN = Math.max(0, r - 1), rS = Math.min(rowsN - 1, r + 1);
+      const dzdx = (altAt(r, cE) - altAt(r, cW)) / (spacingEm * Math.max(1, cE - cW));
+      const dzdy = (altAt(rN, c) - altAt(rS, c)) / (spacingNm * Math.max(1, rS - rN));
+      const nrm = normalFromSlopes(dzdx, dzdy);
+      const o = i * 10;
+      verts[o] = mc.x; verts[o + 1] = mc.y; verts[o + 2] = mc.z;
+      verts[o + 3] = im.vColor[i * 4]; verts[o + 4] = im.vColor[i * 4 + 1];
+      verts[o + 5] = im.vColor[i * 4 + 2]; verts[o + 6] = im.vColor[i * 4 + 3];
+      verts[o + 7] = nrm[0]; verts[o + 8] = nrm[1]; verts[o + 9] = nrm[2];
+    }
+    onProgress(end / Math.max(1, n));
+    await new Promise(r => setTimeout(r, 0)); // let the progress bar paint
+  }
+  return { verts, indices: im.indices, missing: state.missing, anchor };
+}
+
+function _startCanopy3dBuild(src) {
+  if (S._canopy3dBuild) return; // single-flight
+  const build = { src, cancelled: false, startedAt: Date.now() };
+  S._canopy3dBuild = build;
+  _canopy3dProgressShow();
+  _buildCanopy3dMeshChunked(src,
+    frac => { if (!build.cancelled) _canopy3dProgressUpdate(frac, build.startedAt); },
+    () => build.cancelled || !S.map3d)
+    .then(result => {
+      if (S._canopy3dBuild === build) S._canopy3dBuild = null;
+      _canopy3dProgressHide();
+      if (!result) return; // cancelled
+      S._canopy3dCache = { src, verts: result.verts, indices: result.indices, missing: result.missing, anchor: result.anchor };
+      if (S.is3D) _updateVert3dVerts();
+      // Some vertices sampled not-yet-loaded terrain: show the mesh now, but
+      // rebuild once the map settles (bounded, mirrors the verticals' retry).
+      if (result.missing && (S._canopy3dRetry || 0) < 4 && S.map3d) {
+        S._canopy3dRetry = (S._canopy3dRetry || 0) + 1;
+        try {
+          S.map3d.once('idle', () => {
+            if (S.is3D && S._canopy3dCache && S._canopy3dCache.src === src) {
+              S._canopy3dCache = null;
+              _updateVert3dVerts();
+            }
+          });
+        } catch (e) { /* skip retry */ }
+      } else if (!result.missing) {
+        S._canopy3dRetry = 0;
+      }
+    })
+    .catch(err => {
+      if (S._canopy3dBuild === build) S._canopy3dBuild = null;
+      _canopy3dProgressHide();
+      console.warn('3D canopy build failed:', err);
+    });
+}
+
+// User-facing cancel (progress-bar button): stops the build and suppresses
+// auto-restart until the canopy layer is toggled off/on or new canopy loads.
+function cancelCanopy3dBuild() {
+  const b = S._canopy3dBuild;
+  if (!b) return;
+  b.cancelled = true;
+  S._canopy3dCancelledFor = b.src;
+  _canopy3dProgressHide();
+}
+
+// Silent abort (leaving 3D): the build restarts on the next 3D entry.
+function _abortCanopy3dBuild() {
+  const b = S._canopy3dBuild;
+  if (!b) return;
+  b.cancelled = true;
+  _canopy3dProgressHide();
+}
+
+function _canopy3dProgressShow() {
+  const el = document.getElementById('canopy3dProgress');
+  if (el) el.style.display = 'flex';
+  _canopy3dProgressUpdate(0, Date.now());
+}
+
+function _canopy3dProgressUpdate(frac, startedAt) {
+  const fill = document.getElementById('canopy3dProgressFill');
+  if (fill) fill.style.width = Math.round(frac * 100) + '%';
+  const txt = document.getElementById('canopy3dProgressText');
+  if (txt) {
+    const elapsed = (Date.now() - startedAt) / 1000;
+    const eta = frac > 0.02 ? Math.max(0, elapsed / frac - elapsed) : null;
+    txt.textContent = Math.round(frac * 100) + '%' + (eta != null ? ` · ~${Math.ceil(eta)}s left` : '');
+  }
+}
+
+function _canopy3dProgressHide() {
+  const el = document.getElementById('canopy3dProgress');
+  if (el) el.style.display = 'none';
+}
+
+// --- 3D scene lighting (sun/moon) ----------------------------------------
+// The selected time-bar hour (idx 0 = NOW) drives the light direction, so
+// scrubbing the timeline swings the lighting across the day.
+function _context3dTime() {
+  try {
+    const hourly = S.wx && S.wx.hourly;
+    if (hourly && hourly.time && S.timeIdx > 0 && hourly.time[S.timeIdx]) {
+      return new Date(hourly.time[S.timeIdx]);
+    }
+  } catch (e) { /* fall through to now */ }
+  return new Date();
+}
+
+function _update3dLight() {
+  if (typeof lightForTime !== 'function') return;
+  const c = S.areaCenter || (S.map && S.map.getCenter && S.map.getCenter());
+  if (!c) return;
+  S._light3d = lightForTime(c.lat, c.lng, _context3dTime());
+  if (S.map3d && S.is3D) {
+    try {
+      // Swing the terrain hillshade with the light (paint-only, no restyle).
+      if (typeof hillshadeParams === 'function' && S.map3d.getLayer('sunshade')) {
+        const hs = hillshadeParams(S._light3d);
+        S.map3d.setPaintProperty('sunshade', 'hillshade-illumination-direction', Math.round(hs.azimuth) % 360);
+        S.map3d.setPaintProperty('sunshade', 'hillshade-exaggeration', hs.exaggeration);
+      }
+      S.map3d.triggerRepaint();
+    } catch (e) { /* not up yet */ }
   }
 }
 
@@ -10676,6 +11311,13 @@ function _enter3D() {
   }
   const btn = document.getElementById('view3dToggle');
   if (btn) { btn.textContent = '▦ 2D'; btn.classList.add('active'); btn.title = 'Return to 2D map'; }
+  // Buildings are 3D-only value — fetch lazily on entry, preferring the ops
+  // area (padded) over the current view, which may be zoomed way out.
+  try {
+    const b = (S.drawnItems && S.drawnItems.getLayers().length)
+      ? S.drawnItems.getBounds().pad(0.3) : S.map.getBounds();
+    fetchBuildings(b);
+  } catch (e) { /* enhancement only */ }
   try { Diag.note('3d.enter', { z: Math.round(cam.zoom * 10) / 10 }); } catch (_) {}
 }
 
@@ -10696,6 +11338,20 @@ function _exit3D() {
     btn.title = '3D terrain view — imagery layers drape on real terrain (data overlays stay in 2D)';
   }
   if (S.map) setTimeout(() => S.map.invalidateSize(), 50);
+  _abortCanopy3dBuild(); // its progress bar would float over the 2D map
+  // Desktop keeps the built tri meshes so re-entering 3D is instant (the
+  // rebuild was the noticeable pause); constrained devices free the memory
+  // and rebuild on the next entry instead.
+  if (typeof _isConstrained === 'function' && _isConstrained()) {
+    S._tri3dOpaque = null;
+    S._tri3dOpaqueAnchor = null;
+    S._tri3dCanopy = null;
+    S._tri3dCanopyIndices = null;
+    S._tri3dCanopyAnchor = null;
+    S._tri3dState = {};
+    S._canopy3dCache = null;
+    S._canopy3dActive = undefined;
+  }
   try { Diag.note('3d.exit', {}); } catch (_) {}
 }
 
@@ -10710,6 +11366,7 @@ if (typeof module !== 'undefined' && module.exports) {
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
     renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, _isConstrained, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,
+    setShadowOpacity, toggleShadowOverlay, loadShadowForView, _renderShadowForTime, _updateShadowForTime, _shadowTime,
     startViewshedPick, cancelViewshedPick, onViewshedMapClick, runViewshed, clearAllViewsheds,
     genViewshedId, _ensureObserverLayer, _addObserverMarker, _observerPopupHtml, _toPersistable,
     _renderActiveViewshed, setActiveViewshed, recomputeViewshed, renameViewshed, renameViewshedPrompt,
@@ -10758,6 +11415,11 @@ if (typeof module !== 'undefined' && module.exports) {
     toggle3D, collect3dState, sync3d, _enter3D, _exit3D, _loadMaplibre,
     collect3dVectorGroups, _vec3dRecords, _open3dPopup, agg3dStep, _agg3dHtml, VEC3D_SKIP,
     _aircraft3dGroup, _refresh3dAircraft, _adsbPopupHtml,
+    _overpassFetch, fetchBuildings, renderBuildingsLayer, _buildingsCap,
+    getBuildings3dSetting, setBuildings3dMode, _buildings3dMode,
+    _buildBuildingTriVerts, _vert3dMakeLayer, _updateVert3dVerts,
+    _buildCanopy3dMeshChunked, _startCanopy3dBuild, cancelCanopy3dBuild, CANOPY_3D_COLOR,
+    _update3dLight, _context3dTime,
     scrollTabs, updateScrollBtns,
     importKML, handleKMLFile, parseKML,
     copyBriefing, buildBriefingText,

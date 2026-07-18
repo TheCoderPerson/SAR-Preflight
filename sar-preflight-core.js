@@ -19,6 +19,25 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.18-b',
+    date: '2026-07-18',
+    changes: [
+      'New Sun Shadow overlay (Terrain tab): shows which terrain is in shade vs. direct sun at the selected hour. Shadows are cast from real 3DEP terrain using the computed sun position, and scrubbing the forecast time bar re-casts them instantly, so you can preview how shade moves across the search area through the day. Toggleable with its own opacity slider (layer list → Analysis → "Sun Shadow"), works in both the 2D map and the 3D view, and shows the % of the view in shade. Shadow edges render as a soft graded penumbra (marginal cells fade instead of flickering), so low-sun shade over rough terrain looks natural rather than speckled. After sunset the whole area reads as shaded (night). Bare-earth terrain only — tree and building shade are not modeled.',
+    ],
+  },
+  {
+    version: '2026.07.18-a',
+    date: '2026-07-18',
+    changes: [
+      '3D buildings: OSM building footprints for the operational area now render in 3D as extruded, sun-shaded buildings (fetched automatically on first 3D entry; heights from OSM tags where mapped, estimated otherwise — treat as approximate). In 2D they appear as a shaded footprint layer under Facilities. A new Config option ("Buildings in 3D view") can force flat draped footprints instead of 3D — chosen automatically on phones/tablets.',
+      '3D vegetation surface: the canopy overlay now renders in 3D as a solid green canopy-height surface hugging the terrain at treetop height (full resolution on desktop), replacing the flat draped image. First build shows a progress bar with a Cancel button; the built surface is cached, so toggling the layer or switching 2D/3D is instant afterwards.',
+      'Sun & moon lighting in 3D: terrain, buildings, and the canopy surface are shaded by the real sun position (or the moon at night, dimmed by phase — flat ambient when neither is up). Scrubbing the time bar swings the lighting across the day instantly.',
+      'Fixed 3D rendering stability: buildings no longer shimmer or change appearance when rotating the camera (vertex precision fix), and the canopy surface no longer flickers against the ground (near-ground scrub below 2 m is culled and the surface floats slightly above terrain).',
+      'Tower heights: OSM height tags with unit suffixes (e.g. "150 ft") are now parsed correctly instead of being misread as meters, and towers with no height in OSM say "Height not in OSM" in their popup instead of omitting the line.',
+      'Vegetation overlay toggle no longer re-downloads canopy data when re-enabled for the same area.',
+    ],
+  },
+  {
     version: '2026.07.17-j',
     date: '2026-07-17',
     changes: [
@@ -253,8 +272,83 @@ function calcSunPosition(lat, lng, date) {
   return { elevation: el*180/Math.PI, azimuth: ((az*180/Math.PI)+360)%360 };
 }
 
-function calcMoonPhase() {
-  const now = new Date();
+// Truncated Meeus (ch. 47) lunar position → alt/az, ~1° accuracy — plenty
+// for lighting and planning. Same return shape as calcSunPosition.
+function calcMoonPosition(lat, lng, date) {
+  const now = date || new Date();
+  const jd = now.getTime() / 86400000 + 2440587.5;
+  const T = (jd - 2451545.0) / 36525;
+  const rad = Math.PI / 180;
+  const Lp = (218.3164477 + 481267.88123421 * T) % 360; // mean longitude
+  const D = (297.8501921 + 445267.1114034 * T) % 360;   // mean elongation
+  const M = (357.5291092 + 35999.0502909 * T) % 360;    // sun mean anomaly
+  const Mp = (134.9633964 + 477198.8675055 * T) % 360;  // moon mean anomaly
+  const F = (93.2720950 + 483202.0175233 * T) % 360;    // argument of latitude
+  const lon = Lp
+    + 6.288774 * Math.sin(Mp * rad)
+    + 1.274027 * Math.sin((2 * D - Mp) * rad)
+    + 0.658314 * Math.sin(2 * D * rad)
+    + 0.213618 * Math.sin(2 * Mp * rad)
+    - 0.185116 * Math.sin(M * rad)
+    - 0.114332 * Math.sin(2 * F * rad);
+  const beta =
+    5.128122 * Math.sin(F * rad)
+    + 0.280602 * Math.sin((Mp + F) * rad)
+    + 0.277693 * Math.sin((Mp - F) * rad);
+  const eps = 23.439 * rad;
+  const lonR = lon * rad, betaR = beta * rad;
+  const ra = Math.atan2(Math.sin(lonR) * Math.cos(eps) - Math.tan(betaR) * Math.sin(eps), Math.cos(lonR));
+  const dec = Math.asin(Math.sin(betaR) * Math.cos(eps) + Math.cos(betaR) * Math.sin(eps) * Math.sin(lonR));
+  const gmst = (280.46061837 + 360.98564736629 * (jd - 2451545.0)) % 360;
+  const ha = (gmst + lng) * rad - ra;
+  const latR = lat * rad;
+  const el = Math.asin(Math.sin(latR) * Math.sin(dec) + Math.cos(latR) * Math.cos(dec) * Math.cos(ha));
+  const az = Math.atan2(-Math.sin(ha), Math.cos(latR) * Math.tan(dec) - Math.sin(latR) * Math.cos(ha));
+  return { elevation: el / rad, azimuth: ((az / rad) + 360) % 360 };
+}
+
+// Az/el (deg) → unit vector in the local ENU frame (x=east, y=north, z=up),
+// pointing FROM the scene TOWARD the light source.
+function lightVecENU(azimuthDeg, elevationDeg) {
+  const az = azimuthDeg * Math.PI / 180, el = elevationDeg * Math.PI / 180;
+  return [Math.sin(az) * Math.cos(el), Math.cos(az) * Math.cos(el), Math.sin(el)];
+}
+
+// Scene lighting for the 3D view at a time+place: sun when up, else the
+// moon dimmed by its phase illumination (night ops), else a flat overhead
+// ambient so nothing goes black. diffuse/ambient are Lambert terms:
+// brightness = ambient + diffuse * max(0, N·L), clamped to 1.
+function lightForTime(lat, lng, date) {
+  const sun = calcSunPosition(lat, lng, date);
+  if (sun.elevation > 0) {
+    return { source: 'sun', dir: lightVecENU(sun.azimuth, sun.elevation), diffuse: 0.6, ambient: 0.45 };
+  }
+  const moon = calcMoonPosition(lat, lng, date);
+  if (moon.elevation > 0) {
+    const illum = calcMoonPhase(date).illumination / 100;
+    return { source: 'moon', dir: lightVecENU(moon.azimuth, moon.elevation), diffuse: 0.2 + 0.3 * illum, ambient: 0.35 };
+  }
+  return { source: 'ambient', dir: [0, 0, 1], diffuse: 0.15, ambient: 0.4 };
+}
+
+// Scene light → MapLibre hillshade paint params for the terrain: the
+// illumination direction is the light's azimuth, and the shading strength
+// grows as the light drops toward the horizon (low sun/moon = long-shadow
+// contrast, overhead sun = subtle). Moonlight shades at reduced strength;
+// no light up = faint default-direction relief so terrain never goes flat.
+function hillshadeParams(light) {
+  if (!light || light.source === 'ambient' || !light.dir) {
+    return { azimuth: 335, exaggeration: 0.15 };
+  }
+  const azimuth = (Math.atan2(light.dir[0], light.dir[1]) * 180 / Math.PI + 360) % 360;
+  const sinEl = Math.max(0, Math.min(1, light.dir[2]));
+  let exaggeration = 0.25 + 0.55 * (1 - sinEl);
+  if (light.source === 'moon') exaggeration *= 0.6;
+  return { azimuth, exaggeration: Math.round(exaggeration * 100) / 100 };
+}
+
+function calcMoonPhase(date) {
+  const now = date || new Date();
   const year = now.getFullYear(), month = now.getMonth()+1, day = now.getDate();
   let c = 0, e = 0;
   if (month < 3) { c = year - 1; e = month + 12; } else { c = year; e = month; }
@@ -290,6 +384,35 @@ function wireHazardName(tags, cat) {
     return tags.name ? `${tags.name} (${type})` : type || 'Aerialway';
   }
   return '';
+}
+
+// --- OSM height tag parsing ---
+// OSM height values default to meters but may carry a unit suffix
+// ("164 ft", "164'", "50 m"). Returns meters, or null for missing/zero/
+// negative/unparseable values so callers can distinguish "unknown".
+function parseHeightToMeters(raw) {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === 'number') return isFinite(raw) && raw > 0 ? raw : null;
+  const s = String(raw).trim().toLowerCase();
+  if (!s) return null;
+  const m = s.match(/^(-?\d+(?:\.\d+)?)\s*(m|meters?|metres?|ft|feet|foot|')?\.?$/);
+  if (!m) return null;
+  const val = parseFloat(m[1]);
+  if (!isFinite(val) || val <= 0) return null;
+  const unit = m[2] || 'm';
+  if (unit === 'ft' || unit === 'feet' || unit === 'foot' || unit === "'") return val * 0.3048;
+  return val;
+}
+
+// Tower height from OSM tags: `height` wins over `tower:height` over
+// `est_height`. Returns { heightFt, raw } or null when no tag parses.
+function osmTowerHeightFt(tags) {
+  if (!tags) return null;
+  for (const key of ['height', 'tower:height', 'est_height']) {
+    const meters = parseHeightToMeters(tags[key]);
+    if (meters !== null) return { heightFt: Math.round(meters * 3.28084), raw: String(tags[key]).trim() };
+  }
+  return null;
 }
 
 // --- Changelog markdown parser (update-available modal) ---
@@ -2817,6 +2940,24 @@ function build3dStyle(opts) {
     layers.push({ id: 'streets_roads', type: 'raster', source: 'streets_roads' });
     layers.push({ id: 'streets_places', type: 'raster', source: 'streets_places' });
   }
+  // Sun/moon terrain shading: a native hillshade layer whose illumination
+  // direction tracks the scene light (hillshadeParams), draped over the base
+  // imagery. Needs its own raster-dem source — sharing the terrain source
+  // with a hillshade layer is unsupported.
+  sources.demShade = {
+    type: 'raster-dem', tiles: [TERRAIN_DEM_URL], encoding: 'terrarium',
+    tileSize: 256, maxzoom: 15,
+  };
+  layers.push({
+    id: 'sunshade', type: 'hillshade', source: 'demShade',
+    paint: {
+      'hillshade-illumination-direction': o.lightAzimuth == null ? 335 : Math.round(o.lightAzimuth) % 360,
+      'hillshade-illumination-anchor': 'map',
+      'hillshade-exaggeration': o.lightShade == null ? 0.4 : o.lightShade,
+      'hillshade-shadow-color': '#000810',
+      'hillshade-highlight-color': '#ffffff',
+    },
+  });
   // Canopy / viewshed data-URL rasters draped as georeferenced images.
   (o.rasters || []).forEach(r => {
     if (!r || !r.url || !r.bounds) return;
@@ -2946,6 +3087,171 @@ function collectVerticalSegments(groups) {
   return out;
 }
 
+// --- Airspace palettes (shared by the 2D airspace layers) ----------------
+const AIRSPACE_CLASS_COLORS = { B: '#3d8bfd', C: '#a78bfa', D: '#06b6d4', E: '#888888' };
+const SUA_COLORS = { M: '#f59e0b', R: '#ef4444', P: '#991b1b', A: '#f59e0b', W: '#f59e0b' };
+const LAANC_COLORS = { 0: '#ef4444', 100: '#f97316', 200: '#f59e0b', 300: '#86efac', 400: '#22c55e' };
+
+function laancCeilingColor(ceil) {
+  if (ceil == null || !Number.isFinite(Number(ceil)) || Number(ceil) < 0) return '#888888';
+  const c = Number(ceil);
+  if (c === 0) return LAANC_COLORS[0];
+  if (c <= 100) return LAANC_COLORS[100];
+  if (c <= 200) return LAANC_COLORS[200];
+  if (c <= 300) return LAANC_COLORS[300];
+  return LAANC_COLORS[400];
+}
+
+// --- 3D buildings (OSM footprints → terrain-anchored prisms) -------------
+
+// Clamp a geographic bbox to a maximum span in degrees about its center.
+// Guards Overpass building fetches against accidentally huge bboxes (a
+// zoomed-out map view would otherwise request an entire region and get an
+// arbitrary server-capped subset).
+function clampBBoxSpan(south, west, north, east, maxSpanDeg) {
+  const max = maxSpanDeg || 0.15;
+  const cLat = (south + north) / 2, cLng = (west + east) / 2;
+  const halfLat = Math.min(Math.abs(north - south) / 2, max / 2);
+  const halfLng = Math.min(Math.abs(east - west) / 2, max / 2);
+  return { south: cLat - halfLat, west: cLng - halfLng, north: cLat + halfLat, east: cLng + halfLng };
+}
+
+// Buildings-in-3D display mode: 'prisms' (extruded) or 'flat' (draped 2D
+// footprints only — cheaper). 'auto' (or anything unrecognized) picks flat
+// on resource-constrained devices, prisms otherwise.
+function resolveBuildings3dMode(setting, constrained) {
+  if (setting === 'prisms' || setting === 'flat') return setting;
+  return constrained ? 'flat' : 'prisms';
+}
+
+// Building height in meters from OSM tags: explicit height tag (any unit)
+// wins, then building:levels × 3 m/story, else a 5 m one-story default.
+// Rural OSM rarely tags heights, so the default carries most buildings.
+function buildingHeightM(tags) {
+  const t = tags || {};
+  const h = parseHeightToMeters(t.height);
+  if (h !== null) return h;
+  const levels = parseFloat(t['building:levels']);
+  if (isFinite(levels) && levels >= 1) return levels * 3;
+  return 5;
+}
+
+// Overpass `way["building"]` response → [{ id, footprint:[[lng,lat]...],
+// heightM, name }]. Footprints are open rings (no repeated closing point)
+// with degenerate (<3 distinct points) ways dropped. cap bounds the output.
+function parseOverpassBuildings(data, cap) {
+  const elements = (data && data.elements) || [];
+  const nodes = {};
+  elements.forEach(el => { if (el.type === 'node') nodes[el.id] = [el.lon, el.lat]; });
+  const out = [];
+  const max = cap || 4000;
+  for (const el of elements) {
+    if (out.length >= max) break;
+    if (el.type !== 'way' || !el.tags || !el.tags.building) continue;
+    let pts = (el.nodes || []).map(nid => nodes[nid]).filter(Boolean);
+    if (pts.length >= 2 && pts[0][0] === pts[pts.length - 1][0] && pts[0][1] === pts[pts.length - 1][1]) {
+      pts = pts.slice(0, -1);
+    }
+    // Drop consecutive duplicates, then require a real polygon.
+    const fp = pts.filter((p, i) => i === 0 || p[0] !== pts[i - 1][0] || p[1] !== pts[i - 1][1]);
+    if (fp.length < 3) continue;
+    out.push({
+      id: el.id,
+      footprint: fp,
+      heightM: buildingHeightM(el.tags),
+      est: parseHeightToMeters(el.tags.height) === null, // true = levels-derived or default
+      name: el.tags.name || null,
+      type: el.tags.building !== 'yes' ? el.tags.building : null,
+    });
+  }
+  return out;
+}
+
+// Minimal ear-clipping triangulation of a simple polygon (open ring of
+// [x,y]-likes, no holes — Overpass ways can't carry holes). Returns index
+// triples into the ring. Falls back to a triangle fan if clipping stalls
+// (self-intersecting footprint) so every building still renders something.
+function earClipTriangulate(ring) {
+  const n = ring.length;
+  if (n < 3) return [];
+  if (n === 3) return [[0, 1, 2]];
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  // Signed area doubles as winding: ensure CCW index order for the ear test.
+  let area = 0;
+  for (let i = 0; i < n; i++) {
+    const a = ring[i], b = ring[(i + 1) % n];
+    area += a[0] * b[1] - b[0] * a[1];
+  }
+  const idx = [];
+  for (let i = 0; i < n; i++) idx.push(area >= 0 ? i : n - 1 - i);
+  const inTri = (p, a, b, c) =>
+    cross(a, b, p) >= 0 && cross(b, c, p) >= 0 && cross(c, a, p) >= 0;
+  const tris = [];
+  let guard = n * n; // bounded: a simple polygon clips one ear per O(n) scan
+  while (idx.length > 3 && guard-- > 0) {
+    let clipped = false;
+    for (let i = 0; i < idx.length; i++) {
+      const ia = idx[(i + idx.length - 1) % idx.length], ib = idx[i], ic = idx[(i + 1) % idx.length];
+      const a = ring[ia], b = ring[ib], c = ring[ic];
+      if (cross(a, b, c) <= 0) continue; // reflex vertex — not an ear
+      let contains = false;
+      for (const j of idx) {
+        if (j === ia || j === ib || j === ic) continue;
+        if (inTri(ring[j], a, b, c)) { contains = true; break; }
+      }
+      if (contains) continue;
+      tris.push([ia, ib, ic]);
+      idx.splice(i, 1);
+      clipped = true;
+      break;
+    }
+    if (!clipped) break; // degenerate/self-intersecting — bail to fan
+  }
+  if (idx.length === 3) {
+    tris.push([idx[0], idx[1], idx[2]]);
+    return tris;
+  }
+  // Fallback fan from vertex 0 (imperfect for concave shapes but never fails).
+  const fan = [];
+  for (let i = 1; i < n - 1; i++) fan.push([0, i, i + 1]);
+  return fan;
+}
+
+// Footprint + height → prism mesh in geographic terms: triangle vertices as
+// { lng, lat, top, normal } where top=true means the vertex sits at roof
+// height and normal is the outward unit surface normal in the local ENU
+// frame (x=east, y=north, z=up) — the 3D shader lights it by sun/moon
+// position. Walls get their edge's outward horizontal normal (winding-aware
+// via the shoelace sign), roofs point straight up.
+function buildingMeshLocal(footprint, heightM) {
+  const n = footprint.length;
+  const verts = [];
+  if (n < 3 || !(heightM > 0)) return verts;
+  let area = 0;
+  for (let i = 0; i < n; i++) {
+    const a = footprint[i], b = footprint[(i + 1) % n];
+    area += a[0] * b[1] - b[0] * a[1];
+  }
+  const sign = area >= 0 ? 1 : -1; // CCW in lng/lat: outward = (d_north, -d_east)
+  const cosLat = Math.cos((footprint[0][1] || 0) * Math.PI / 180);
+  const push = (p, top, normal) => verts.push({ lng: p[0], lat: p[1], top, normal });
+  for (let i = 0; i < n; i++) {
+    const a = footprint[i], b = footprint[(i + 1) % n];
+    const de = (b[0] - a[0]) * cosLat, dn = b[1] - a[1];
+    const len = Math.hypot(de, dn) || 1;
+    const normal = [sign * dn / len, sign * -de / len, 0];
+    push(a, false, normal); push(b, false, normal); push(b, true, normal);
+    push(a, false, normal); push(b, true, normal); push(a, true, normal);
+  }
+  const up = [0, 0, 1];
+  earClipTriangulate(footprint).forEach(t => {
+    push(footprint[t[0]], true, up);
+    push(footprint[t[1]], true, up);
+    push(footprint[t[2]], true, up);
+  });
+  return verts;
+}
+
 // ADS-B aircraft → cylinder records for the 3D view: a floating slab at the
 // aircraft's AGL altitude plus a thin full-height "how high is it" drop line.
 // MapLibre renders fill-extrusions relative to the terrain surface when
@@ -3058,7 +3364,8 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,
-    calcSunPosition, calcMoonPhase, wireHazardName,
+    calcSunPosition, calcMoonPhase, calcMoonPosition, lightVecENU, lightForTime, hillshadeParams,
+    wireHazardName, parseHeightToMeters, osmTowerHeightFt,
     parseChangelogMd,
     TRAIL_HIGHWAY_TYPES, buildTrailsOverpassQuery, parseOverpassTrails, trailTypeLabel,
     DOF_LIGHTING, obstacleLighting, obstacleMarkerColor, obstacleLabel,
@@ -3094,5 +3401,8 @@ if (typeof module !== 'undefined' && module.exports) {
     TERRAIN_DEM_URL, leafletToMaplibreCamera, maplibreToLeafletCamera, build3dStyle,
     leafletStyleTo3d, latlngsToMultiPolygon, latlngsToMultiLine, dashArrayTo3d, vector3dSourceAndLayers,
     cylRadiusForHeightM, aircraft3dRecords, hexToRgb01, collectVerticalSegments,
+    AIRSPACE_CLASS_COLORS, SUA_COLORS, LAANC_COLORS, laancCeilingColor,
+    buildingHeightM, parseOverpassBuildings, earClipTriangulate, buildingMeshLocal, clampBBoxSpan,
+    resolveBuildings3dMode,
   };
 }
