@@ -559,6 +559,7 @@ function applyTheme(theme) {
   const btn = (typeof document !== 'undefined') ? document.getElementById('themeToggle') : null;
   if (btn) btn.textContent = THEME_LABELS[theme];
   S.theme = theme;
+  if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 
 function cycleTheme() {
@@ -748,6 +749,7 @@ function initMap() {
 // DRAW
 // ============================================================
 function startDraw(type) {
+  if (S.is3D && typeof _exit3D === 'function') _exit3D(); // drawing happens on the 2D map
   if (typeof cancelViewshedPick === 'function') cancelViewshedPick(); // draw + viewshed-pick are mutually exclusive
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
   clearDrawBtns();
@@ -3847,6 +3849,7 @@ function renderObstacleLayer() {
     const color = obstacleMarkerColor(agl);
     const marker = L.circleMarker([lat, lng], {
       radius: 5, color: '#000', weight: 1, fillColor: color, fillOpacity: 0.9,
+      aglFt: isFinite(agl) && agl > 0 ? agl : null, // 3D view extrudes this as a cylinder
     });
     const lines = [`<b style="color:${color}">${obstacleLabel(p)}</b>`];
     const h = [];
@@ -3985,7 +3988,8 @@ function renderProtectedAreaLayers() {
           html: `<svg width="${sz}" height="${sz}" viewBox="0 0 24 24"><circle cx="12" cy="12" r="11" fill="#ef4444" fill-opacity="0.9" stroke="#fff" stroke-width="1.5"/><text x="12" y="17" text-anchor="middle" fill="#fff" font-size="12" font-weight="bold" font-family="sans-serif">D</text></svg>`,
           className: '', iconSize: [sz, sz], iconAnchor: [sz/2, sz/2],
         });
-        L.marker([p.LATITUDE, p.LONGITUDE], { icon }).bindPopup(popup).addTo(S.mapLayers.dams);
+        const damH = Number(p.NID_HEIGHT);
+        L.marker([p.LATITUDE, p.LONGITUDE], { icon, aglFt: isFinite(damH) && damH > 0 ? damH : null, cylColor: '#ef4444' }).bindPopup(popup).addTo(S.mapLayers.dams);
       }
     });
   }
@@ -4901,7 +4905,7 @@ async function fetchWireHazards(bounds) {
       if (tags.operator) popupParts.push(`Operator: ${tags.operator}`);
       popupParts.push(`<span style="font-size:10px;opacity:0.6">OSM Node ${el.id}</span>`);
 
-      L.marker([el.lat, el.lon], { icon })
+      L.marker([el.lat, el.lon], { icon, aglFt: heightFt || null, cylColor: color })
         .bindPopup(popupParts.join('<br>'))
         .addTo(S.mapLayers.cell_towers);
     });
@@ -5077,6 +5081,7 @@ function radarStep(dir) {
   if (!S.map.hasLayer(layers[newIdx])) layers[newIdx].addTo(S.map);
   layers[newIdx].setOpacity(0.5);
   updateRadarTime();
+  if (S.is3D && typeof sync3d === 'function') sync3d(); // 3D shows the current frame
 }
 
 function updateRadarTime() {
@@ -5429,38 +5434,43 @@ function renderAdsbMap() {
     const icon = L.divIcon({ html, className: '', iconSize: [80, 56], iconAnchor: [40, 14] });
     const marker = L.marker([ac.lat, ac.lon], { icon, zIndexOffset: 800 });
 
-    // Build popup
-    const altMsl = ac.alt_baro != null ? ac.alt_baro.toLocaleString() + ' ft MSL' : 'N/A';
-    const altAgl = ac.agl.toLocaleString() + ' ft AGL';
-    const hiRes = !!(S._adsbHiresCache && S._adsbHiresCache.has(_adsbHiresKey(ac.lat, ac.lon)));
-    const terrainBelow = (ac.groundElevFt != null && isFinite(ac.groundElevFt))
-      ? `<span style="opacity:0.6;">Terrain below: ${ac.groundElevFt.toLocaleString()} ft MSL${hiRes ? ' (3DEP point)' : ''}</span><br>` : '';
-    const speed = ac.gs != null ? Math.round(ac.gs) + ' kts' : 'N/A';
-    const track = ac.track != null ? Math.round(ac.track) + '\u00B0' : 'N/A';
-    const vrate = ac.baro_rate != null ? (ac.baro_rate > 0 ? '+' : '') + ac.baro_rate + ' ft/min' : 'N/A';
-    const sqk = ac.squawk || 'N/A';
-    const isEmergency = ac.squawk === '7500' || ac.squawk === '7600' || ac.squawk === '7700' || (ac.emergency && ac.emergency !== 'none');
-    const sqkStyle = isEmergency ? 'color:#ef4444;font-weight:bold;' : '';
-
-    const popup = `<div style="font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;">` +
-      `<b style="color:#06b6d4;font-size:13px;">${callsign}</b><br>` +
-      (ac.reg ? `Reg: ${ac.reg}<br>` : '') +
-      (ac.type ? `Type: ${ac.type}<br>` : '') +
-      `Alt: ${altMsl} / ${altAgl}<br>` +
-      terrainBelow +
-      `GS: ${speed} | Trk: ${track}<br>` +
-      `VS: ${vrate}<br>` +
-      `<span style="${sqkStyle}">Squawk: ${sqk}</span>` +
-      (isEmergency ? ' <b style="color:#ef4444;">EMERGENCY</b>' : '') + `<br>` +
-      `Dist: ${ac.distNm} nm<br>` +
-      `<span style="opacity:0.5;">ICAO: ${ac.hex.toUpperCase()}</span>` +
-    `</div>`;
-    marker.bindPopup(popup);
+    marker.bindPopup(_adsbPopupHtml(ac));
 
     S.mapLayers.adsb_aircraft.addLayer(marker);
   }
 
   if (needsLayerControlRebuild) buildLayerControl();
+  // Mirror the fresh positions into the 3D view (fast setData path).
+  if (S.is3D && typeof _refresh3dAircraft === 'function') _refresh3dAircraft();
+}
+
+// Shared 2D-marker / 3D-cylinder popup for one ADS-B aircraft.
+function _adsbPopupHtml(ac) {
+  const callsign = ac.flight || ac.hex.toUpperCase();
+  const altMsl = ac.alt_baro != null ? ac.alt_baro.toLocaleString() + ' ft MSL' : 'N/A';
+  const altAgl = ac.agl.toLocaleString() + ' ft AGL';
+  const hiRes = !!(S._adsbHiresCache && S._adsbHiresCache.has(_adsbHiresKey(ac.lat, ac.lon)));
+  const terrainBelow = (ac.groundElevFt != null && isFinite(ac.groundElevFt))
+    ? `<span style="opacity:0.6;">Terrain below: ${ac.groundElevFt.toLocaleString()} ft MSL${hiRes ? ' (3DEP point)' : ''}</span><br>` : '';
+  const speed = ac.gs != null ? Math.round(ac.gs) + ' kts' : 'N/A';
+  const track = ac.track != null ? Math.round(ac.track) + '\u00B0' : 'N/A';
+  const vrate = ac.baro_rate != null ? (ac.baro_rate > 0 ? '+' : '') + ac.baro_rate + ' ft/min' : 'N/A';
+  const sqk = ac.squawk || 'N/A';
+  const isEmergency = ac.squawk === '7500' || ac.squawk === '7600' || ac.squawk === '7700' || (ac.emergency && ac.emergency !== 'none');
+  const sqkStyle = isEmergency ? 'color:#ef4444;font-weight:bold;' : '';
+  return `<div style="font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;">` +
+    `<b style="color:#06b6d4;font-size:13px;">${callsign}</b><br>` +
+    (ac.reg ? `Reg: ${ac.reg}<br>` : '') +
+    (ac.type ? `Type: ${ac.type}<br>` : '') +
+    `Alt: ${altMsl} / ${altAgl}<br>` +
+    terrainBelow +
+    `GS: ${speed} | Trk: ${track}<br>` +
+    `VS: ${vrate}<br>` +
+    `<span style="${sqkStyle}">Squawk: ${sqk}</span>` +
+    (isEmergency ? ' <b style="color:#ef4444;">EMERGENCY</b>' : '') + `<br>` +
+    `Dist: ${ac.distNm} nm<br>` +
+    `<span style="opacity:0.5;">ICAO: ${ac.hex.toUpperCase()}</span>` +
+  `</div>`;
 }
 
 function renderAdsbTab(usedApi) {
@@ -6986,7 +6996,7 @@ function togglePanel() {
   document.getElementById('btnPanel').classList.toggle('active');
   // Close hamburger menu when toggling panel
   document.getElementById('headerActions')?.classList.remove('open');
-  setTimeout(() => S.map.invalidateSize(), 350);
+  setTimeout(() => { S.map.invalidateSize(); if (S.map3d) S.map3d.resize(); }, 350);
 }
 function switchTab(tab) {
   S.activeTab = tab;
@@ -7388,6 +7398,8 @@ function buildLayerControl() {
   // buildLayerControl runs after virtually every layer (re)render, so use it as
   // the chokepoint to (re)wire feature clicks into the aggregated popup system.
   wirePopupAggregation();
+  // Same chokepoint keeps the 3D view's mirrored vectors current as data loads.
+  if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 function toggleLayer(id, el) {
   el.classList.toggle('active');
@@ -7454,6 +7466,8 @@ function toggleLayer(id, el) {
       if (trailEl) { if (on) trailEl.classList.add('active'); else trailEl.classList.remove('active'); }
     }
   }
+  // Mirror raster layer changes into the 3D view while it is active.
+  if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 
 // ============================================================
@@ -9606,6 +9620,10 @@ function renderRasterOverlay(layerId, rgba, grid, opacity) {
   }
   if (!S._overlayWanted) S._overlayWanted = {};
   S._overlayWanted[layerId] = true;
+  // Retain the encoded image + bounds so the 3D view can drape the same raster.
+  if (!S._raster3d) S._raster3d = {};
+  S._raster3d[layerId] = { url, bounds: grid.bounds };
+  if (S.is3D && typeof sync3d === 'function') sync3d();
   _applyOverlayZoomCap(); // adds to the map only if within the display-size budget
   return layer;
 }
@@ -9615,12 +9633,14 @@ function setCanopyOpacity(v) {
   if (S.mapLayers.canopy && S.mapLayers.canopy.setOpacity) S.mapLayers.canopy.setOpacity(o);
   const span = document.getElementById('canopyOpacityVal');
   if (span) span.textContent = Math.round(o * 100) + '%';
+  if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 function setViewshedOpacity(v) {
   const o = parseFloat(v);
   if (S.mapLayers.viewshed && S.mapLayers.viewshed.setOpacity) S.mapLayers.viewshed.setOpacity(o);
   const span = document.getElementById('viewshedOpacityVal');
   if (span) span.textContent = Math.round(o * 100) + '%';
+  if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 
 async function toggleCanopyOverlay() {
@@ -9629,6 +9649,7 @@ async function toggleCanopyOverlay() {
   if (!on) {
     if (S._overlayWanted) S._overlayWanted.canopy = false;
     if (S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
+    if (S.is3D && typeof sync3d === 'function') sync3d();
     buildLayerControl();
     return;
   }
@@ -9707,6 +9728,7 @@ function _readVsInputs() {
 }
 
 function startViewshedPick() {
+  if (S.is3D && typeof _exit3D === 'function') _exit3D(); // observer pick is a 2D map tap
   // Mutually exclusive with the draw tools.
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
   clearDrawBtns();
@@ -9808,6 +9830,7 @@ function _renderActiveViewshed() {
   if (!rec || !rec.grid || !rec.mask) {
     if (S._overlayWanted) S._overlayWanted.viewshed = false;
     if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
+    if (S.is3D && typeof sync3d === 'function') sync3d();
     if (r) r.textContent = rec ? `${rec.name}: ${rec.computedAt ? 'terrain unavailable — no viewshed' : 'computing…'}` : '';
     buildLayerControl();
     return;
@@ -10035,6 +10058,531 @@ async function _runViewshedKernel(opts) {
   return out;
 }
 
+// ============================================================
+// 3D TERRAIN VIEW (MapLibre GL)
+// Opt-in second view: real terrain (AWS Terrarium DEM tiles) with the same
+// raster layers the 2D map is showing draped over it — basemap, satellite/
+// topo/sectional, hillshade, parcels, streets, canopy + viewshed. Vector
+// overlays, radar and the draw tools stay 2D; entering a draw/viewshed-pick
+// tool drops back to 2D automatically. Online-only planning aid: the
+// MapLibre engine + terrain tiles come from the network on first use, so
+// the library is lazy-loaded here instead of shipping in the app shell.
+// ============================================================
+const MAPLIBRE_JS_URL = 'https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.js';
+const MAPLIBRE_CSS_URL = 'https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.css';
+const TERRAIN_EXAGGERATION = 1.15;
+
+let _mlLoadPromise = null;
+function _loadMaplibre() {
+  if (typeof maplibregl !== 'undefined') return Promise.resolve();
+  if (_mlLoadPromise) return _mlLoadPromise;
+  _mlLoadPromise = new Promise((resolve, reject) => {
+    const css = document.createElement('link');
+    css.rel = 'stylesheet'; css.href = MAPLIBRE_CSS_URL;
+    document.head.appendChild(css);
+    const js = document.createElement('script');
+    js.src = MAPLIBRE_JS_URL;
+    js.onload = () => resolve();
+    js.onerror = () => { _mlLoadPromise = null; reject(new Error('maplibre load failed')); };
+    document.head.appendChild(js);
+  });
+  return _mlLoadPromise;
+}
+
+// Vector layers mirrored into 3D: everything the popup aggregation covers,
+// minus live ADS-B (Phase 3 — needs per-poll updates + altitude placement).
+const VEC3D_SKIP = new Set([...AGG_SKIP_LAYERS, 'adsb_aircraft']);
+
+// Walk a Leaflet layer tree and emit neutral geometry records for the 3D
+// mirror. A popup bound on a group (L.geoJSON wrapper) is inherited by its
+// leaf geometries, mirroring how eachPopupLayer/_aggLayerHit treat hits.
+function _vec3dRecords(root, meta, out, inheritedPopup) {
+  if (!root) return;
+  let popupHtml = inheritedPopup || '';
+  if (root.getPopup && root.getPopup()) popupHtml = _aggContentToHtml(root.getPopup().getContent());
+  const common = { popupHtml, label: meta.label, pri: meta.pri };
+  if (L.Circle && root instanceof L.Circle) {
+    const c = root.getLatLng();
+    const ring = circleToPolygon(c.lat, c.lng, root.getRadius()).map(p => ({ lat: p[0], lng: p[1] }));
+    out.push(Object.assign({ kind: 'polygon', multiPolygon: latlngsToMultiPolygon(ring), style: leafletStyleTo3d(root.options), dashArray: root.options && root.options.dashArray }, common));
+  } else if (L.CircleMarker && root instanceof L.CircleMarker) {
+    const c = root.getLatLng();
+    out.push(Object.assign({ kind: 'point', point: [c.lng, c.lat], radius: Math.min(root.getRadius ? root.getRadius() : 6, 10), style: leafletStyleTo3d(root.options) }, common));
+  } else if (L.Polygon && root instanceof L.Polygon) {
+    out.push(Object.assign({ kind: 'polygon', multiPolygon: latlngsToMultiPolygon(root.getLatLngs()), style: leafletStyleTo3d(root.options), dashArray: root.options && root.options.dashArray }, common));
+  } else if (L.Polyline && root instanceof L.Polyline) {
+    out.push(Object.assign({ kind: 'line', multiLine: latlngsToMultiLine(root.getLatLngs()), style: leafletStyleTo3d(root.options), dashArray: root.options && root.options.dashArray }, common));
+  } else if (root.getLatLng) {
+    // Icon markers (divIcon SVGs) render as a uniform dot in 3D for now.
+    const c = root.getLatLng();
+    out.push(Object.assign({ kind: 'point', point: [c.lng, c.lat], radius: 6, style: { stroke: '#e2e8f0', strokeWidth: 1.5, strokeOpacity: 1, fill: '#3d8bfd', fillOpacity: 0.9 } }, common));
+  } else if (root.getLayers) {
+    root.getLayers().forEach(c => _vec3dRecords(c, meta, out, popupHtml));
+    return;
+  }
+  // Anything that reported an AGL height (obstacles, towers, dams) also gets a
+  // ground-to-height cylinder so its vertical extent is visible in 3D.
+  // MapLibre renders fill-extrusions RELATIVE to the terrain surface when
+  // terrain is enabled (verified empirically on 5.24), so base 0 = the ground
+  // at the feature; heights use the terrain exaggeration for a matched scale.
+  const aglFt = root.options && Number(root.options.aglFt);
+  if (root.getLatLng && Number.isFinite(aglFt) && aglFt > 0) {
+    const c = root.getLatLng();
+    const hM = aglFt * 0.3048 * TERRAIN_EXAGGERATION;
+    const st = leafletStyleTo3d(root.options);
+    if (root.options.cylColor) { st.fill = root.options.cylColor; st.stroke = root.options.cylColor; }
+    else if (!root.options.fillColor && !root.options.color) { st.fill = '#3d8bfd'; st.stroke = '#3d8bfd'; } // divIcon markers carry no path color
+    out.push(Object.assign({ kind: 'cylinder', lat: c.lat, lng: c.lng, radiusM: cylRadiusForHeightM(hM), baseM: 0, topM: hM, style: st }, common));
+  }
+}
+
+function collect3dVectorGroups() {
+  const groups = [];
+  if (!S.map || !S.mapLayers || typeof L === 'undefined') return groups;
+  for (const key of Object.keys(S.mapLayers)) {
+    if (VEC3D_SKIP.has(key)) continue;
+    const group = S.mapLayers[key];
+    if (!group || !S.map.hasLayer(group)) continue;
+    const meta = _aggMeta(key);
+    const feats = [];
+    try { _vec3dRecords(group, meta, feats, ''); } catch (e) { /* malformed layer — skip group */ }
+    if (feats.length) groups.push({ id: key, pri: meta.pri, features: feats });
+  }
+  // The drawn ops area lives outside S.mapLayers.
+  if (S.drawnItems) {
+    const feats = [];
+    try { _vec3dRecords(S.drawnItems, { label: 'Ops Area', pri: 8 }, feats, ''); } catch (e) { /* skip */ }
+    if (feats.length) groups.push({ id: 'ops_area', pri: 8, features: feats });
+  }
+  const adsb = _aircraft3dGroup();
+  if (adsb) groups.push(adsb);
+  return groups;
+}
+
+// Live ADS-B aircraft as 3D cylinders: a slab at true AGL altitude + a thin
+// drop line to the ground, colored by the same AGL scale as the 2D markers.
+function _aircraft3dGroup() {
+  if (!S.map || !S.mapLayers.adsb_aircraft || !S.map.hasLayer(S.mapLayers.adsb_aircraft)) return null;
+  if (!Array.isArray(S.adsbAircraft) || !S.adsbAircraft.length) return null;
+  const recs = aircraft3dRecords(S.adsbAircraft.map(ac => ({
+    lat: ac.lat, lng: ac.lon,
+    aglM: (isFinite(ac.agl) && ac.agl > 0) ? ac.agl * 0.3048 * TERRAIN_EXAGGERATION : null,
+    color: adsbAglColor(ac.agl),
+    popupHtml: _adsbPopupHtml(ac),
+  })));
+  // Draped ground dot per aircraft: visual anchor for the drop line + the
+  // clickable handle for the popup (custom-layer verticals aren't clickable).
+  S.adsbAircraft.forEach(ac => {
+    recs.push({
+      kind: 'point', point: [ac.lon, ac.lat], radius: 5,
+      style: { stroke: '#000', strokeWidth: 1, strokeOpacity: 1, fill: adsbAglColor(ac.agl), fillOpacity: 0.9 },
+      popupHtml: _adsbPopupHtml(ac), label: 'Aircraft', pri: 2,
+    });
+  });
+  return recs.length ? { id: 'adsb3d', pri: 2, features: recs } : null;
+}
+
+// Fast per-poll path: replace the aircraft source data in place (no restyle).
+function _refresh3dAircraft() {
+  if (!S.map3d || !S.is3D) return;
+  const group = _aircraft3dGroup();
+  const src = S.map3d.getSource('vec_adsb3d');
+  if (src && group) {
+    const built = vector3dSourceAndLayers(group);
+    if (built) {
+      try {
+        src.setData(built.source.data);
+        _updateVert3dVerts(); // drop lines + altitude markers track the new positions
+        return;
+      } catch (e) { /* fall through to restyle */ }
+    }
+  }
+  // Source doesn't exist yet (first aircraft) or all aircraft left — restyle.
+  sync3d();
+}
+
+// Snapshot the live 2D layer state into the shape build3dStyle() consumes.
+function collect3dState() {
+  const active = id => !!(S.map && S.mapLayers[id] && S.map.hasLayer(S.mapLayers[id]));
+  let base = null;
+  ['satellite', 'topo', 'sectional'].forEach(id => { if (active(id)) base = id; });
+  const rasters = [];
+  ['canopy', 'viewshed'].forEach(id => {
+    const info = S._raster3d && S._raster3d[id];
+    if (!info || !S._overlayWanted || !S._overlayWanted[id]) return;
+    const lyr = S.mapLayers[id];
+    const op = (lyr && lyr.options && lyr.options.opacity != null) ? lyr.options.opacity : 0.7;
+    rasters.push({ id, url: info.url, bounds: info.bounds, opacity: op });
+  });
+  // Current radar frame (if the radar layer is toggled on in 2D).
+  let radarUrl = null;
+  if (S.radarAnim && S.radarAnim.layers && S.radarAnim.layers.length) {
+    const frame = S.radarAnim.layers[S.radarAnim.index];
+    if (frame && S.map.hasLayer(frame) && frame.options && frame.options.opacity > 0 && frame._url) {
+      radarUrl = frame._url;
+    }
+  }
+  return {
+    theme: (S.theme === 'light' || S.theme === 'light-map') ? 'light' : 'dark',
+    base,
+    sectionalUrl: sectionalTileUrl(getStoredSectionalEdition()),
+    overlays: { slope: active('slope'), parcels: active('parcels'), streets: active('streets') },
+    rasters,
+    radarUrl,
+    vectors: collect3dVectorGroups(),
+    exaggeration: TERRAIN_EXAGGERATION,
+  };
+}
+
+function _sync3dNow() {
+  if (!S.map3d || !S.is3D) return;
+  try {
+    S.map3d.setStyle(build3dStyle(collect3dState()), { diff: true });
+  } catch (e) {
+    try { Diag.note('3d.sync.err', { m: String(e && e.message).slice(0, 120) }); } catch (_) {}
+  }
+  _ensureVert3dLayer();
+  _updateVert3dVerts();
+}
+
+// ============================================================
+// Custom WebGL layer: vertical extents (obstacle/tower heights, aircraft
+// drop lines + altitude X markers). MapLibre's fill-extrusion misplaces
+// GeoJSON extrusions over high terrain (maplibre-gl-js#2560 family), so
+// verticals are drawn directly: two GL vertices per line at mercator
+// altitude = terrain elevation + height, which cannot drift.
+// ============================================================
+const VERT3D_LAYER_ID = 'vert3d';
+
+// Screen-space width of the thick (obstacle/tower/dam) vertical lines.
+const VERT3D_THICK_PX = 4.5;
+
+function _vert3dMakeLayer() {
+  return {
+    id: VERT3D_LAYER_ID,
+    type: 'custom',
+    renderingMode: '3d',
+    onAdd(map, gl) {
+      const compile = (type, src) => {
+        const sh = gl.createShader(type);
+        gl.shaderSource(sh, src);
+        gl.compileShader(sh);
+        return sh;
+      };
+      const link = (vs, fs) => {
+        const p = gl.createProgram();
+        gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+        gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+        gl.linkProgram(p);
+        return p;
+      };
+      const fs = 'precision mediump float;varying vec3 v_color;void main(){gl_FragColor=vec4(v_color,1.0);}';
+      // Thin 1px GL lines (aircraft verticals).
+      this.lineProg = link(
+        'attribute vec3 a_pos;attribute vec3 a_color;uniform mat4 u_matrix;varying vec3 v_color;'
+        + 'void main(){gl_Position=u_matrix*vec4(a_pos,1.0);v_color=a_color;}',
+        fs);
+      this.lineAttrs = {
+        pos: gl.getAttribLocation(this.lineProg, 'a_pos'),
+        color: gl.getAttribLocation(this.lineProg, 'a_color'),
+        matrix: gl.getUniformLocation(this.lineProg, 'u_matrix'),
+      };
+      // Thick lines as screen-space quads: each vertex carries its endpoint,
+      // the OTHER endpoint, and a side sign; the shader expands perpendicular
+      // to the projected line direction by u_width pixels (GL lineWidth is
+      // clamped to 1 on most implementations, so quads are the only way).
+      this.quadProg = link(
+        'attribute vec3 a_pos;attribute vec3 a_other;attribute float a_side;attribute vec3 a_color;'
+        + 'uniform mat4 u_matrix;uniform vec2 u_halfvp;uniform float u_width;varying vec3 v_color;'
+        + 'void main(){'
+        + 'vec4 ca=u_matrix*vec4(a_pos,1.0);vec4 cb=u_matrix*vec4(a_other,1.0);'
+        + 'vec2 sa=ca.xy/ca.w*u_halfvp;vec2 sb=cb.xy/cb.w*u_halfvp;'
+        + 'vec2 d=sb-sa;float len=length(d);'
+        + 'vec2 dir=len>0.0001?d/len:vec2(0.0,1.0);'
+        + 'vec2 norm=vec2(-dir.y,dir.x)*a_side*u_width*0.5;'
+        + 'gl_Position=ca+vec4(norm/u_halfvp*ca.w,0.0,0.0);'
+        + 'v_color=a_color;}',
+        fs);
+      this.quadAttrs = {
+        pos: gl.getAttribLocation(this.quadProg, 'a_pos'),
+        other: gl.getAttribLocation(this.quadProg, 'a_other'),
+        side: gl.getAttribLocation(this.quadProg, 'a_side'),
+        color: gl.getAttribLocation(this.quadProg, 'a_color'),
+        matrix: gl.getUniformLocation(this.quadProg, 'u_matrix'),
+        halfvp: gl.getUniformLocation(this.quadProg, 'u_halfvp'),
+        width: gl.getUniformLocation(this.quadProg, 'u_width'),
+      };
+      this.lineBuffer = gl.createBuffer();
+      this.quadBuffer = gl.createBuffer();
+      S._vert3dDirty = true;
+    },
+    render(gl, matrixOrArgs) {
+      // v4+ passes an args object (globe support); older versions the raw matrix.
+      const m = (matrixOrArgs && matrixOrArgs.defaultProjectionData)
+        ? matrixOrArgs.defaultProjectionData.mainMatrix : matrixOrArgs;
+      const thin = S._vert3dVerts;
+      const thick = S._vert3dThickVerts;
+      if (thin && thin.length && this.lineProg) {
+        gl.useProgram(this.lineProg);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuffer);
+        if (S._vert3dDirty) gl.bufferData(gl.ARRAY_BUFFER, thin, gl.DYNAMIC_DRAW);
+        gl.enableVertexAttribArray(this.lineAttrs.pos);
+        gl.vertexAttribPointer(this.lineAttrs.pos, 3, gl.FLOAT, false, 24, 0);
+        gl.enableVertexAttribArray(this.lineAttrs.color);
+        gl.vertexAttribPointer(this.lineAttrs.color, 3, gl.FLOAT, false, 24, 12);
+        gl.uniformMatrix4fv(this.lineAttrs.matrix, false, m);
+        gl.drawArrays(gl.LINES, 0, thin.length / 6);
+      }
+      if (thick && thick.length && this.quadProg) {
+        gl.useProgram(this.quadProg);
+        gl.disable(gl.CULL_FACE);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+        if (S._vert3dDirty) gl.bufferData(gl.ARRAY_BUFFER, thick, gl.DYNAMIC_DRAW);
+        const stride = 40; // pos(3) + other(3) + side(1) + color(3) floats
+        gl.enableVertexAttribArray(this.quadAttrs.pos);
+        gl.vertexAttribPointer(this.quadAttrs.pos, 3, gl.FLOAT, false, stride, 0);
+        gl.enableVertexAttribArray(this.quadAttrs.other);
+        gl.vertexAttribPointer(this.quadAttrs.other, 3, gl.FLOAT, false, stride, 12);
+        gl.enableVertexAttribArray(this.quadAttrs.side);
+        gl.vertexAttribPointer(this.quadAttrs.side, 1, gl.FLOAT, false, stride, 24);
+        gl.enableVertexAttribArray(this.quadAttrs.color);
+        gl.vertexAttribPointer(this.quadAttrs.color, 3, gl.FLOAT, false, stride, 28);
+        gl.uniformMatrix4fv(this.quadAttrs.matrix, false, m);
+        const c = gl.canvas;
+        gl.uniform2f(this.quadAttrs.halfvp, c.width / 2, c.height / 2);
+        gl.uniform1f(this.quadAttrs.width, VERT3D_THICK_PX * (window.devicePixelRatio || 1));
+        gl.drawArrays(gl.TRIANGLES, 0, thick.length / 10);
+      }
+      S._vert3dDirty = false;
+    },
+  };
+}
+
+function _ensureVert3dLayer() {
+  if (!S.map3d) return;
+  try {
+    if (!S.map3d.getLayer(VERT3D_LAYER_ID)) {
+      if (!S._vert3dLayer) S._vert3dLayer = _vert3dMakeLayer();
+      S.map3d.addLayer(S._vert3dLayer);
+    }
+  } catch (e) {
+    // Style still loading — add once it settles.
+    try { S.map3d.once('styledata', () => { if (S.is3D) _ensureVert3dLayer(); }); } catch (err) { /* give up */ }
+  }
+}
+
+// Rebuild the GL vertex buffer from the current vertical segments. Ground
+// elevation comes from the rendered terrain (queryTerrainElevation); segments
+// over not-yet-loaded terrain get a bounded re-run once the map goes idle.
+function _updateVert3dVerts() {
+  if (!S.map3d || !S.is3D || typeof maplibregl === 'undefined') return;
+  const segs = collectVerticalSegments(collect3dVectorGroups());
+  const thin = [];
+  const thick = [];
+  let missing = false;
+  const groundOf = (lat, lng) => {
+    try {
+      const e = S.map3d.queryTerrainElevation([lng, lat]);
+      if (Number.isFinite(e)) return e;
+    } catch (err) { /* terrain not ready */ }
+    missing = true;
+    return 0;
+  };
+  const mcOf = (lng, lat, altM) => maplibregl.MercatorCoordinate.fromLngLat([lng, lat], altM);
+  const pushThin = (mc, c) => { thin.push(mc.x, mc.y, mc.z, c[0], c[1], c[2]); };
+  // One quad (2 triangles) per thick line; each vertex carries its endpoint,
+  // the opposite endpoint, and the expansion side for the billboard shader.
+  const pushThickLine = (a, b, c) => {
+    const v = (p, o, side) => { thick.push(p.x, p.y, p.z, o.x, o.y, o.z, side, c[0], c[1], c[2]); };
+    v(a, b, 1); v(a, b, -1); v(b, a, -1);
+    v(a, b, -1); v(b, a, 1); v(b, a, -1);
+  };
+  segs.forEach(sg => {
+    const g = groundOf(sg.lat, sg.lng);
+    if (sg.type === 'line') {
+      const a = mcOf(sg.lng, sg.lat, g + sg.fromM);
+      const b = mcOf(sg.lng, sg.lat, g + sg.toM);
+      if (sg.thin) { pushThin(a, sg.color); pushThin(b, sg.color); }
+      else pushThickLine(a, b, sg.color);
+    } else if (sg.type === 'cross') {
+      const alt = g + sg.atM;
+      const arm = sg.armM || 50;
+      const dLat = arm / 111320;
+      const dLng = arm / (111320 * Math.cos(sg.lat * Math.PI / 180));
+      pushThin(mcOf(sg.lng - dLng, sg.lat, alt), sg.color);
+      pushThin(mcOf(sg.lng + dLng, sg.lat, alt), sg.color);
+      pushThin(mcOf(sg.lng, sg.lat - dLat, alt), sg.color);
+      pushThin(mcOf(sg.lng, sg.lat + dLat, alt), sg.color);
+    }
+  });
+  S._vert3dVerts = new Float32Array(thin);
+  S._vert3dThickVerts = new Float32Array(thick);
+  S._vert3dDirty = true;
+  S.map3d.triggerRepaint();
+  if (missing && (S._vert3dRetry || 0) < 4) {
+    S._vert3dRetry = (S._vert3dRetry || 0) + 1;
+    try { S.map3d.once('idle', () => { if (S.is3D) _updateVert3dVerts(); }); } catch (e) { /* skip */ }
+  } else if (!missing) {
+    S._vert3dRetry = 0;
+  }
+}
+
+// Debounced: buildLayerControl fires in bursts while an area's data loads, and
+// each sync re-harvests every visible vector layer — coalesce to one restyle.
+function sync3d() {
+  if (!S.map3d || !S.is3D) return;
+  clearTimeout(S._sync3dTimer);
+  S._sync3dTimer = setTimeout(_sync3dNow, 150);
+}
+
+// --- 3D aggregated popup (mirrors the 2D "← n/N →" pager) ---
+function _vec3dLayerIds() {
+  try {
+    return S.map3d.getStyle().layers.map(l => l.id).filter(id => id.indexOf('vec_') === 0);
+  } catch (e) { return []; }
+}
+
+function _agg3dHtml() {
+  const st = S._agg3d;
+  const n = st.items.length, i = ((st.index % n) + n) % n;
+  st.index = i;
+  const item = st.items[i];
+  const btn = 'background:rgba(128,128,128,0.16);border:1px solid rgba(128,128,128,0.5);color:inherit;border-radius:4px;cursor:pointer;font:600 14px/1 monospace;padding:1px 9px';
+  let html = '';
+  if (n > 1) {
+    html += `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 6px;padding-bottom:5px;border-bottom:1px solid rgba(128,128,128,0.3)">`
+      + `<button type="button" title="Previous" onclick="agg3dStep(-1)" style="${btn}">&#8592;</button>`
+      + `<span style="font:600 11px/1.25 monospace;opacity:0.8;text-align:center">${i + 1} / ${n}`
+      + (item.label ? `<br><span style="opacity:0.6;font-weight:400">${item.label}</span>` : '')
+      + `</span>`
+      + `<button type="button" title="Next" onclick="agg3dStep(1)" style="${btn}">&#8594;</button>`
+      + `</div>`;
+  } else if (item.label) {
+    html += `<div style="font:600 10px/1.2 monospace;opacity:0.55;margin-bottom:4px">${item.label}</div>`;
+  }
+  html += `<div class="agg-popup-body">${item.content}</div>`;
+  return html;
+}
+
+function agg3dStep(dir) {
+  const st = S._agg3d;
+  if (!st || !st.items || !st.items.length || !st.popup) return;
+  st.index += dir;
+  st.popup.setHTML(_agg3dHtml());
+}
+
+function _open3dPopup(e) {
+  if (!S.map3d) return;
+  const pad = 6;
+  const box = [[e.point.x - pad, e.point.y - pad], [e.point.x + pad, e.point.y + pad]];
+  let feats = [];
+  try { feats = S.map3d.queryRenderedFeatures(box, { layers: _vec3dLayerIds() }); } catch (err) { return; }
+  const seen = new Set();
+  const items = [];
+  feats.forEach(f => {
+    const p = f.properties || {};
+    if (!p.popupHtml || seen.has(p.popupHtml)) return; // dedupe fill/line double-hits + tiered airspace
+    seen.add(p.popupHtml);
+    items.push({ content: p.popupHtml, label: p.label || '', pri: p.pri == null ? 7 : Number(p.pri) });
+  });
+  if (!items.length) return;
+  items.sort((a, b) => a.pri - b.pri);
+  if (!S._agg3d) S._agg3d = {};
+  const st = S._agg3d;
+  st.items = items;
+  st.index = 0;
+  if (st.popup) { try { st.popup.remove(); } catch (err) { /* already gone */ } }
+  st.popup = new maplibregl.Popup({ maxWidth: '340px', className: 'agg-popup' })
+    .setLngLat(e.lngLat)
+    .setHTML(_agg3dHtml())
+    .addTo(S.map3d);
+}
+
+async function toggle3D() {
+  if (S.is3D) { _exit3D(); return; }
+  if (_isConstrained() && !S._warned3d) {
+    const go = (typeof confirm !== 'function') || confirm('3D terrain view uses significant memory and may be unstable on phones/tablets. Continue?');
+    if (!go) return;
+    S._warned3d = true;
+  }
+  const btn = document.getElementById('view3dToggle');
+  if (btn) btn.textContent = '⛰ …';
+  try {
+    await _loadMaplibre();
+  } catch (e) {
+    if (btn) btn.textContent = '⛰ 3D';
+    if (typeof alert === 'function') alert('Could not load the 3D engine — the 3D view needs an internet connection.');
+    return;
+  }
+  _enter3D();
+}
+
+function _enter3D() {
+  const container = document.querySelector('.map-container');
+  if (!container || !S.map) return;
+  // Drop tools that depend on 2D map clicks.
+  if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; clearDrawBtns(); }
+  if (typeof cancelViewshedPick === 'function') cancelViewshedPick();
+  container.classList.add('mode-3d');
+  S.is3D = true;
+  const c = S.map.getCenter();
+  const cam = leafletToMaplibreCamera(c.lat, c.lng, S.map.getZoom());
+  if (!S.map3d) {
+    try {
+      S.map3d = new maplibregl.Map({
+        container: 'map3d',
+        style: build3dStyle(collect3dState()),
+        center: cam.center, zoom: cam.zoom, pitch: 60, bearing: 0,
+        maxPitch: 80, maxZoom: MAX_MAP_ZOOM - 1,
+        attributionControl: false,
+      });
+      S.map3d.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
+      S.map3d.on('mousemove', e => {
+        const el = document.getElementById('cursorCoord');
+        if (el) el.textContent = `${e.lngLat.lat.toFixed(5)}°, ${e.lngLat.lng.toFixed(5)}°`;
+      });
+      S.map3d.on('click', _open3dPopup);
+      S.map3d.on('load', () => { _ensureVert3dLayer(); _updateVert3dVerts(); });
+      S.map3d.on('error', ev => {
+        try { Diag.noteThrottled('3d.err', 5000, { m: String(ev && ev.error && ev.error.message).slice(0, 120) }); } catch (_) {}
+      });
+    } catch (e) {
+      container.classList.remove('mode-3d');
+      S.is3D = false;
+      S.map3d = null;
+      if (typeof alert === 'function') alert('3D view failed to start (WebGL unavailable?).');
+      return;
+    }
+  } else {
+    S.map3d.jumpTo({ center: cam.center, zoom: cam.zoom });
+    _sync3dNow();
+    S.map3d.resize();
+  }
+  const btn = document.getElementById('view3dToggle');
+  if (btn) { btn.textContent = '▦ 2D'; btn.classList.add('active'); btn.title = 'Return to 2D map'; }
+  try { Diag.note('3d.enter', { z: Math.round(cam.zoom * 10) / 10 }); } catch (_) {}
+}
+
+function _exit3D() {
+  const container = document.querySelector('.map-container');
+  if (S._agg3d && S._agg3d.popup) { try { S._agg3d.popup.remove(); } catch (e) { /* already gone */ } S._agg3d.popup = null; }
+  if (S.map3d && S.map) {
+    const c = S.map3d.getCenter();
+    const cam = maplibreToLeafletCamera(c.lng, c.lat, S.map3d.getZoom());
+    S.map.setView([cam.lat, cam.lng], Math.round(cam.zoom), { animate: false });
+  }
+  if (container) container.classList.remove('mode-3d');
+  S.is3D = false;
+  const btn = document.getElementById('view3dToggle');
+  if (btn) {
+    btn.textContent = '⛰ 3D';
+    btn.classList.remove('active');
+    btn.title = '3D terrain view — imagery layers drape on real terrain (data overlays stay in 2D)';
+  }
+  if (S.map) setTimeout(() => S.map.invalidateSize(), 50);
+  try { Diag.note('3d.exit', {}); } catch (_) {}
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -10090,6 +10638,9 @@ if (typeof module !== 'undefined' && module.exports) {
     cacheCurrentView, gridForView, _cacheViewRaster, getSelectedTileProviders,
     initMap, startDraw, clearDrawBtns, clearArea, enterCoords,
     getStoredTheme, applyTheme, cycleTheme,
+    toggle3D, collect3dState, sync3d, _enter3D, _exit3D, _loadMaplibre,
+    collect3dVectorGroups, _vec3dRecords, _open3dPopup, agg3dStep, _agg3dHtml, VEC3D_SKIP,
+    _aircraft3dGroup, _refresh3dAircraft, _adsbPopupHtml,
     scrollTabs, updateScrollBtns,
     importKML, handleKMLFile, parseKML,
     copyBriefing, buildBriefingText,

@@ -19,6 +19,35 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.17-g',
+    date: '2026-07-17',
+    changes: [
+      '3D view phase 3 — vertical hazards and live traffic: FAA obstacles, towers, and dams with known heights now rise from the terrain as bold vertical height lines at their true AGL height (colored by the same hazard scale as their 2D markers). Live ADS-B aircraft appear in 3D at their actual altitude above the terrain — each plane is an X marker at its AGL altitude with a thin drop line to the ground so you can judge its height and position at a glance — updating with every 5-second traffic poll, with a clickable ground dot for the full aircraft popup. The weather radar layer now also drapes in 3D (current frame, follows the frame stepper).',
+    ],
+  },
+  {
+    version: '2026.07.17-f',
+    date: '2026-07-17',
+    changes: [
+      'Fixed: viewshed and canopy overlays rendered wrong in the 3D view — large chunks were sliced off along straight tile-boundary lines (the 2D view was always correct). Cause was a terrain-draping bug in the 3D engine version the app was loading; upgrading the engine (MapLibre GL 4.7.1 → 5.24.0) fixes it. Overlays now drape completely and match the 2D view exactly.',
+    ],
+  },
+  {
+    version: '2026.07.17-e',
+    date: '2026-07-17',
+    changes: [
+      '3D view phase 2 — data overlays now appear in 3D: TFRs, NOTAMs, airspace, LAANC, obstacles, wires, power lines, towers, airports, NWS alerts, fire perimeters, trails, water, hospitals/LZs, land status, observers, and the drawn ops area all drape onto the 3D terrain with their 2D colors. Clicking features in 3D opens the same paginated multi-feature popup as the 2D map. Icon markers (airports, towers, etc.) render as colored dots in 3D for now; live aircraft and radar remain 2D-only until phase 3.',
+      'Update reliability fix: installing an app update could silently keep stale copies of the app files if the browser\'s HTTP cache still held them (the update banner would show the new version but old code kept running). The service worker now bypasses the HTTP cache when downloading an update, so "Reload & Update" always installs the code it says it does.',
+    ],
+  },
+  {
+    version: '2026.07.17-d',
+    date: '2026-07-17',
+    changes: [
+      'New 3D terrain view: the "⛰ 3D" button (under the theme toggle) switches the map to a tilt-and-rotate 3D view with real terrain relief. Whatever imagery the 2D map is showing — satellite, topo, FAA sectional, hillshade, parcels, streets, and the canopy/viewshed overlays — drapes over the terrain, and the camera position carries over when switching between 2D and 3D. Data overlays (TFRs, wires, airports, etc.) and the drawing tools remain 2D for now; starting a draw or viewshed pick automatically returns to 2D. The 3D engine loads on first use and needs an internet connection.',
+    ],
+  },
+  {
     version: '2026.07.17-c',
     date: '2026-07-17',
     changes: [
@@ -2692,6 +2721,316 @@ function metaToneClass(tone) {
   return 'section-meta-muted';
 }
 
+// ============================================================
+// 3D TERRAIN VIEW — pure style + camera helpers (MapLibre)
+// The 3D toggle drapes the raster layers the 2D map is showing over real
+// terrain. These builders are pure (no DOM/MapLibre) so they are testable
+// in Node; sar-preflight.js snapshots the live 2D layer state and feeds it
+// to build3dStyle().
+// ============================================================
+// AWS Open Data terrain tiles (Mapzen/Terrarium encoding — global, free, no key).
+const TERRAIN_DEM_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png';
+
+// Leaflet zoom is defined against 256 px tiles, MapLibre style zoom against
+// 512 px — the same view scale is one zoom level apart.
+function leafletToMaplibreCamera(lat, lng, zoom) {
+  return { center: [lng, lat], zoom: Math.max(0, (zoom || 0) - 1) };
+}
+function maplibreToLeafletCamera(lng, lat, zoom) {
+  return { lat, lng, zoom: (zoom || 0) + 1 };
+}
+
+function _raster3dSource(urls, maxzoom) {
+  return { type: 'raster', tiles: Array.isArray(urls) ? urls : [urls], tileSize: 256, maxzoom };
+}
+
+// Build a complete MapLibre style document from a snapshot of 2D layer state.
+// opts: {
+//   theme: 'dark'|'light',
+//   base: null|'satellite'|'topo'|'sectional',
+//   sectionalUrl: FAA sectional XYZ template (used only when base==='sectional'),
+//   overlays: { slope, parcels, streets } booleans,
+//   rasters: [{ id, url, bounds:{west,south,east,north}, opacity }],  // canopy/viewshed data-URL images
+//   exaggeration: vertical terrain exaggeration (default 1),
+// }
+function build3dStyle(opts) {
+  const o = opts || {};
+  const theme = o.theme === 'light' ? 'light' : 'dark';
+  const cartoSubs = ['a', 'b', 'c', 'd'];
+  const sources = {
+    dem: {
+      type: 'raster-dem', tiles: [TERRAIN_DEM_URL], encoding: 'terrarium',
+      tileSize: 256, maxzoom: 15, attribution: 'Terrain: Mapzen/AWS, USGS 3DEP',
+    },
+    basemap: _raster3dSource(
+      cartoSubs.map(s => `https://${s}.basemaps.cartocdn.com/${theme === 'light' ? 'light_all' : 'dark_all'}/{z}/{x}/{y}.png`), 19),
+  };
+  const layers = [
+    { id: 'bg', type: 'background', paint: { 'background-color': theme === 'light' ? '#dfe8f0' : '#0a0e14' } },
+    { id: 'basemap', type: 'raster', source: 'basemap' },
+  ];
+  // Mutually exclusive base overlay (same trio as the 2D layer control).
+  if (o.base === 'satellite') {
+    sources.satellite = _raster3dSource('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', 19);
+    layers.push({ id: 'satellite', type: 'raster', source: 'satellite' });
+  } else if (o.base === 'topo') {
+    sources.topo = _raster3dSource(['a', 'b', 'c'].map(s => `https://${s}.tile.opentopomap.org/{z}/{x}/{y}.png`), 17);
+    layers.push({ id: 'topo', type: 'raster', source: 'topo' });
+  } else if (o.base === 'sectional' && o.sectionalUrl) {
+    sources.sectional = _raster3dSource(o.sectionalUrl, 12); // native z12 — MapLibre overzooms past it
+    layers.push({ id: 'sectional', type: 'raster', source: 'sectional' });
+  }
+  const ov = o.overlays || {};
+  if (ov.slope) {
+    sources.slope = _raster3dSource('https://server.arcgisonline.com/ArcGIS/rest/services/Elevation/World_Hillshade/MapServer/tile/{z}/{y}/{x}', 19);
+    layers.push({ id: 'slope', type: 'raster', source: 'slope', paint: { 'raster-opacity': 0.6 } });
+  }
+  if (ov.parcels) {
+    sources.parcels = _raster3dSource('https://tiles.arcgis.com/tiles/KzeiCaQsMoeCfoCq/arcgis/rest/services/Regrid_Nationwide_Parcel_Boundaries_v1/MapServer/tile/{z}/{y}/{x}', 17);
+    layers.push({ id: 'parcels', type: 'raster', source: 'parcels', paint: { 'raster-opacity': 0.85 } });
+  }
+  if (ov.streets) {
+    sources.streets_roads = _raster3dSource('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}', 15);
+    sources.streets_places = _raster3dSource('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', 15);
+    layers.push({ id: 'streets_roads', type: 'raster', source: 'streets_roads' });
+    layers.push({ id: 'streets_places', type: 'raster', source: 'streets_places' });
+  }
+  // Canopy / viewshed data-URL rasters draped as georeferenced images.
+  (o.rasters || []).forEach(r => {
+    if (!r || !r.url || !r.bounds) return;
+    const b = r.bounds;
+    sources['img_' + r.id] = {
+      type: 'image', url: r.url,
+      coordinates: [[b.west, b.north], [b.east, b.north], [b.east, b.south], [b.west, b.south]],
+    };
+    layers.push({
+      id: 'img_' + r.id, type: 'raster', source: 'img_' + r.id,
+      paint: { 'raster-opacity': r.opacity == null ? 0.7 : r.opacity },
+    });
+  });
+  // Live weather radar (current frame only) drapes above imagery, below the
+  // analysis rasters and vectors. RainViewer tiles are native z7.
+  if (o.radarUrl) {
+    sources.radar = _raster3dSource(o.radarUrl, 7);
+    layers.push({ id: 'radar', type: 'raster', source: 'radar', paint: { 'raster-opacity': 0.5 } });
+  }
+  // Vector overlay groups (Phase 2) draw on top of every raster. Less-important
+  // groups (higher pri) first, so safety-critical ones (TFRs etc.) paint on top.
+  (o.vectors || [])
+    .slice()
+    .sort((a, b) => (b.pri == null ? 7 : b.pri) - (a.pri == null ? 7 : a.pri))
+    .forEach(g => {
+      const built = vector3dSourceAndLayers(g);
+      if (!built) return;
+      sources[built.srcId] = built.source;
+      built.layers.forEach(l => layers.push(l));
+    });
+  return {
+    version: 8,
+    name: 'sar-3d',
+    sources,
+    layers,
+    terrain: { source: 'dem', exaggeration: o.exaggeration == null ? 1 : o.exaggeration },
+  };
+}
+
+// --- 3D vector overlays -------------------------------------------------
+// Leaflet path options → the flat style props stored on each GeoJSON feature
+// for data-driven paint (Leaflet's own defaults where unset).
+function leafletStyleTo3d(opts) {
+  const o = opts || {};
+  const stroke = o.color || '#3388ff';
+  return {
+    stroke,
+    strokeWidth: o.weight == null ? 3 : o.weight,
+    strokeOpacity: o.opacity == null ? 1 : o.opacity,
+    fill: o.fillColor || stroke,
+    fillOpacity: o.fillOpacity == null ? 0.2 : o.fillOpacity,
+  };
+}
+
+function _isLatLngLike(p) { return !!p && typeof p.lat === 'number' && typeof p.lng === 'number'; }
+
+function _ring3dCoords(ring) {
+  const out = ring.map(p => [p.lng, p.lat]);
+  if (out.length && (out[0][0] !== out[out.length - 1][0] || out[0][1] !== out[out.length - 1][1])) {
+    out.push([out[0][0], out[0][1]]);
+  }
+  return out;
+}
+
+// Normalize Leaflet Polygon.getLatLngs() nesting ({lat,lng} objects — a bare
+// ring, a [ring,holes...] polygon, or a multi-polygon) into closed GeoJSON
+// MultiPolygon coordinates ([[[ [lng,lat], ... ]]]).
+function latlngsToMultiPolygon(latlngs) {
+  if (!Array.isArray(latlngs) || !latlngs.length) return [];
+  if (_isLatLngLike(latlngs[0])) return [[_ring3dCoords(latlngs)]];
+  if (Array.isArray(latlngs[0]) && _isLatLngLike(latlngs[0][0])) return [latlngs.map(_ring3dCoords)];
+  return latlngs.map(poly => (Array.isArray(poly) ? poly.map(_ring3dCoords) : [])).filter(p => p.length);
+}
+
+// Normalize Polyline.getLatLngs() (flat or nested) into MultiLineString coords.
+function latlngsToMultiLine(latlngs) {
+  const segs = [];
+  const collect = a => {
+    if (!Array.isArray(a) || !a.length) return;
+    if (_isLatLngLike(a[0])) segs.push(a.map(p => [p.lng, p.lat]));
+    else a.forEach(collect);
+  };
+  collect(latlngs);
+  return segs;
+}
+
+// Leaflet dashArray ("6,4", px) → MapLibre line-dasharray (multiples of line width).
+function dashArrayTo3d(dashArray, strokeWidth) {
+  if (!dashArray) return null;
+  const w = strokeWidth > 0 ? strokeWidth : 3;
+  const parts = String(dashArray).split(/[\s,]+/).map(Number).filter(n => Number.isFinite(n) && n >= 0);
+  if (parts.length < 2) return null;
+  return parts.map(n => n / w);
+}
+
+// Cylinder footprint radius for an extruded obstacle/tower of height hM —
+// wide enough to see at VLOS-planning zooms, never absurd for tall towers.
+function cylRadiusForHeightM(hM) {
+  const h = Number(hM);
+  if (!Number.isFinite(h) || h <= 0) return 8;
+  return Math.min(40, Math.max(8, h * 0.15));
+}
+
+function hexToRgb01(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || '').trim());
+  if (!m) return [0.24, 0.55, 0.99]; // accent blue fallback
+  const n = parseInt(m[1], 16);
+  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+}
+
+// Pull the vertical (cylinder) records out of harvested vector groups into
+// renderable segments for the custom 3D layer: narrow records (obstacle/tower
+// heights, aircraft drop lines) become vertical lines; wide records (the
+// aircraft position slab) become an X marker at that altitude. Heights are
+// metres above the terrain surface at the feature.
+function collectVerticalSegments(groups) {
+  const out = [];
+  (groups || []).forEach(g => ((g && g.features) || []).forEach(f => {
+    if (!f || f.kind !== 'cylinder' || !(f.topM > 0)) return;
+    const color = hexToRgb01(f.style && (f.style.fill || f.style.stroke));
+    if (f.radiusM >= 20) {
+      out.push({ type: 'cross', lat: f.lat, lng: f.lng, atM: Math.max(0, f.baseM || 0), armM: f.radiusM, color, thin: !!f.thin });
+    } else {
+      out.push({ type: 'line', lat: f.lat, lng: f.lng, fromM: Math.max(0, f.baseM || 0), toM: f.topM, color, thin: !!f.thin });
+    }
+  }));
+  return out;
+}
+
+// ADS-B aircraft → cylinder records for the 3D view: a floating slab at the
+// aircraft's AGL altitude plus a thin full-height "how high is it" drop line.
+// MapLibre renders fill-extrusions relative to the terrain surface when
+// terrain is enabled, so base 0 = the ground beneath the aircraft; aglM
+// should already carry the terrain exaggeration for a matched vertical scale.
+// aircraft: [{ lat, lng, aglM, color, popupHtml }]
+function aircraft3dRecords(aircraft) {
+  const out = [];
+  (aircraft || []).forEach(ac => {
+    if (!ac || !Number.isFinite(ac.lat) || !Number.isFinite(ac.lng)) return;
+    const aglM = Number(ac.aglM);
+    if (!Number.isFinite(aglM) || aglM <= 0) return;
+    const style = { stroke: ac.color || '#06b6d4', fill: ac.color || '#06b6d4' };
+    const common = { popupHtml: ac.popupHtml || '', label: 'Aircraft', pri: 2, style };
+    // thin: aircraft verticals stay 1px; obstacle/tower lines render as thick quads
+    out.push(Object.assign({ kind: 'cylinder', lat: ac.lat, lng: ac.lng, radiusM: 3, baseM: 0, topM: aglM, thin: true }, common));
+    out.push(Object.assign({ kind: 'cylinder', lat: ac.lat, lng: ac.lng, radiusM: 50, baseM: aglM, topM: aglM + 25, thin: true }, common));
+  });
+  return out;
+}
+
+// One harvested overlay group → a MapLibre geojson source + fill/line/circle
+// style layers with data-driven paint. Returns null when the group has no
+// flat geometry. 'cylinder' records (vertical extents) are NOT styled here —
+// MapLibre's fill-extrusion misplaces GeoJSON extrusions over high terrain
+// (elevation sampling bug, maplibre-gl-js#2560 family), so verticals render
+// via the custom WebGL layer instead (collectVerticalSegments + _vert3dLayer).
+// group: { id, features: [{ kind:'polygon'|'line'|'point'|'cylinder',
+//   multiPolygon?|multiLine?|point:[lng,lat]|lat+lng+radiusM+baseM+topM,
+//   radius?, dashArray?, style:{stroke,strokeWidth,strokeOpacity,fill,fillOpacity},
+//   popupHtml, label, pri }] }
+function vector3dSourceAndLayers(group) {
+  const g = group || {};
+  const feats = [];
+  let hasPoly = false, hasLine = false, hasPoint = false, dash = null;
+  (g.features || []).forEach(f => {
+    if (!f) return;
+    let geometry = null;
+    if (f.kind === 'polygon' && f.multiPolygon && f.multiPolygon.length) {
+      geometry = { type: 'MultiPolygon', coordinates: f.multiPolygon };
+      hasPoly = true; hasLine = true;
+    } else if (f.kind === 'line' && f.multiLine && f.multiLine.length) {
+      geometry = { type: 'MultiLineString', coordinates: f.multiLine };
+      hasLine = true;
+    } else if (f.kind === 'point' && f.point) {
+      geometry = { type: 'Point', coordinates: f.point };
+      hasPoint = true;
+    }
+    if (!geometry) return;
+    const s = f.style || {};
+    if (!dash && f.dashArray) dash = dashArrayTo3d(f.dashArray, s.strokeWidth);
+    feats.push({
+      type: 'Feature',
+      geometry,
+      properties: {
+        stroke: s.stroke || '#3388ff',
+        strokeWidth: s.strokeWidth == null ? 3 : s.strokeWidth,
+        strokeOpacity: s.strokeOpacity == null ? 1 : s.strokeOpacity,
+        fill: s.fill || s.stroke || '#3388ff',
+        fillOpacity: s.fillOpacity == null ? 0.2 : s.fillOpacity,
+        radius: f.radius == null ? 6 : f.radius,
+        popupHtml: f.popupHtml || '',
+        label: f.label || '',
+        pri: f.pri == null ? 7 : f.pri,
+      },
+    });
+  });
+  if (!feats.length) return null;
+  const srcId = 'vec_' + g.id;
+  const layers = [];
+  if (hasPoly) {
+    layers.push({
+      id: srcId + '_fill', type: 'fill', source: srcId,
+      filter: ['==', ['geometry-type'], 'Polygon'],
+      paint: { 'fill-color': ['get', 'fill'], 'fill-opacity': ['get', 'fillOpacity'] },
+    });
+  }
+  if (hasLine) {
+    const paint = {
+      'line-color': ['get', 'stroke'],
+      'line-width': ['get', 'strokeWidth'],
+      'line-opacity': ['get', 'strokeOpacity'],
+    };
+    if (dash) paint['line-dasharray'] = dash;
+    layers.push({
+      id: srcId + '_line', type: 'line', source: srcId,
+      filter: ['!=', ['geometry-type'], 'Point'],
+      paint,
+    });
+  }
+  if (hasPoint) {
+    layers.push({
+      id: srcId + '_pt', type: 'circle', source: srcId,
+      filter: ['==', ['geometry-type'], 'Point'],
+      paint: {
+        'circle-radius': ['get', 'radius'],
+        'circle-color': ['get', 'fill'],
+        'circle-opacity': ['get', 'fillOpacity'],
+        'circle-stroke-color': ['get', 'stroke'],
+        'circle-stroke-width': 1.5,
+        'circle-stroke-opacity': ['get', 'strokeOpacity'],
+      },
+    });
+  }
+  return { srcId, source: { type: 'geojson', data: { type: 'FeatureCollection', features: feats } }, layers };
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -2730,5 +3069,8 @@ if (typeof module !== 'undefined' && module.exports) {
     KML_ICON_BASE, kmlColorToRgba, caltopoStyleProps, geojsonFolderFeature, geojsonMarkerFeature,
     geojsonShapeFeature, geojsonLineGeometry, geojsonPolygonGeometry, geojsonFeatureCollection,
     formatStamp, relAge, buildSectionMetaLine, rollupSources, metaToneClass,
+    TERRAIN_DEM_URL, leafletToMaplibreCamera, maplibreToLeafletCamera, build3dStyle,
+    leafletStyleTo3d, latlngsToMultiPolygon, latlngsToMultiLine, dashArrayTo3d, vector3dSourceAndLayers,
+    cylRadiusForHeightM, aircraft3dRecords, hexToRgb01, collectVerticalSegments,
   };
 }

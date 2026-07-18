@@ -72,6 +72,32 @@
   text-transform: uppercase; white-space: nowrap; transition: all 0.15s;
 }
 .theme-toggle:hover { border-color: var(--accent-blue); color: var(--text-primary); }
+/* 3D terrain view toggle — sits under the theme toggle */
+.view3d-toggle {
+  position: absolute; top: 54px; left: 72px; z-index: 800;
+  background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px;
+  padding: 9px 11px; color: var(--text-secondary); cursor: pointer;
+  font-family: var(--font-mono); font-size: 10px; font-weight: 600; letter-spacing: 1px;
+  text-transform: uppercase; white-space: nowrap; transition: all 0.15s;
+}
+.view3d-toggle:hover { border-color: var(--accent-blue); color: var(--text-primary); }
+.view3d-toggle.active { border-color: var(--accent-cyan); color: var(--accent-cyan); }
+/* MapLibre 3D canvas overlays the Leaflet map; toolbars (z-index 800) stay on top */
+#map3d { position: absolute; inset: 0; display: none; background: var(--bg-primary); }
+.map-container.mode-3d #map3d { display: block; }
+.map-container.mode-3d #map { visibility: hidden; }
+/* 3D feature popups — match the app HUD (id prefix outweighs the lazily-loaded maplibre CSS) */
+#map3d .maplibregl-popup-content {
+  background: var(--bg-secondary); color: var(--text-primary);
+  border: 1px solid var(--border); border-radius: 6px;
+  font-family: var(--font-sans); font-size: 12px; padding: 10px 12px;
+  max-height: 320px; overflow-y: auto; box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+}
+#map3d .maplibregl-popup-anchor-bottom .maplibregl-popup-tip { border-top-color: var(--bg-secondary); }
+#map3d .maplibregl-popup-anchor-top .maplibregl-popup-tip { border-bottom-color: var(--bg-secondary); }
+#map3d .maplibregl-popup-anchor-left .maplibregl-popup-tip { border-right-color: var(--bg-secondary); }
+#map3d .maplibregl-popup-anchor-right .maplibregl-popup-tip { border-left-color: var(--bg-secondary); }
+#map3d .maplibregl-popup-close-button { color: var(--text-secondary); font-size: 16px; right: 4px; top: 2px; }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
   font-family: var(--font-sans);
@@ -625,6 +651,7 @@ select.api-input { cursor: pointer; }
 <div class="main">
   <div class="map-container">
     <div id="map"></div>
+    <div id="map3d"></div>
     <div class="draw-toolbar" id="drawToolbar">
       <div class="draw-toolbar-head" onclick="toggleDrawToolbar()">OPS</div>
       <div class="draw-toolbar-body">
@@ -651,6 +678,7 @@ select.api-input { cursor: pointer; }
       </div>
     </div>
     <button class="theme-toggle" id="themeToggle" onclick="cycleTheme()" title="Cycle map theme: Dark → Light Map → Light">☾ DARK</button>
+    <button class="view3d-toggle" id="view3dToggle" onclick="toggle3D()" title="3D terrain view — imagery layers drape on real terrain (data overlays stay in 2D)">⛰ 3D</button>
     <div class="map-info">
       <span>CURSOR </span><span class="coord" id="cursorCoord">--°, --°</span>
       <span style="margin:0 8px;color:var(--border);">|</span>
