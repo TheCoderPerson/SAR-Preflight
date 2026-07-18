@@ -51,7 +51,11 @@ const CDN_ASSETS = [
 self.addEventListener('install', event => {
   event.waitUntil(
     Promise.all([
-      caches.open(CACHE_STATIC).then(cache => cache.addAll(APP_SHELL)),
+      // cache:'reload' bypasses the browser HTTP cache for the shell files: a
+      // just-updated SW must never install the stale copies it was updated to
+      // replace (shell files can sit in the HTTP cache for their full max-age).
+      caches.open(CACHE_STATIC).then(cache => cache.addAll(APP_SHELL.map(u => new Request(u, { cache: 'reload' })))),
+      // CDN assets are version-pinned URLs — immutable, HTTP cache is fine.
       caches.open(CACHE_CDN).then(cache => cache.addAll(CDN_ASSETS)),
     ]).then(() => self.skipWaiting())
   );

@@ -4,6 +4,11 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.17-e — 2026-07-17
+
+- 3D view phase 2 — data overlays now appear in 3D: TFRs, NOTAMs, airspace, LAANC, obstacles, wires, power lines, towers, airports, NWS alerts, fire perimeters, trails, water, hospitals/LZs, land status, observers, and the drawn ops area all drape onto the 3D terrain with their 2D colors. Clicking features in 3D opens the same paginated multi-feature popup as the 2D map. Icon markers (airports, towers, etc.) render as colored dots in 3D for now; live aircraft and radar remain 2D-only until phase 3.
+- Update reliability fix: installing an app update could silently keep stale copies of the app files if the browser's HTTP cache still held them (the update banner would show the new version but old code kept running). The service worker now bypasses the HTTP cache when downloading an update, so "Reload & Update" always installs the code it says it does.
+
 ## v2026.07.17-d — 2026-07-17
 
 - New 3D terrain view: the "⛰ 3D" button (under the theme toggle) switches the map to a tilt-and-rotate 3D view with real terrain relief. Whatever imagery the 2D map is showing — satellite, topo, FAA sectional, hillshade, parcels, streets, and the canopy/viewshed overlays — drapes over the terrain, and the camera position carries over when switching between 2D and 3D. Data overlays (TFRs, wires, airports, etc.) and the drawing tools remain 2D for now; starting a draw or viewshed pick automatically returns to 2D. The 3D engine loads on first use and needs an internet connection.

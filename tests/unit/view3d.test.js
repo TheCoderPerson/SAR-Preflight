@@ -1,5 +1,6 @@
 const {
   TERRAIN_DEM_URL, leafletToMaplibreCamera, maplibreToLeafletCamera, build3dStyle,
+  leafletStyleTo3d, latlngsToMultiPolygon, latlngsToMultiLine, dashArrayTo3d, vector3dSourceAndLayers,
 } = require('../../sar-preflight-core.js');
 
 // ============================================================
@@ -115,5 +116,128 @@ describe('build3dStyle', () => {
     const style = build3dStyle({ base: 'satellite', overlays: { slope: true } });
     expect(style.layers[0].type).toBe('background');
     expect(style.layers[1].id).toBe('basemap');
+  });
+});
+
+// ============================================================
+// Vector mirroring (Phase 2)
+// ============================================================
+
+describe('leafletStyleTo3d', () => {
+  it('applies Leaflet path defaults', () => {
+    expect(leafletStyleTo3d({})).toEqual({
+      stroke: '#3388ff', strokeWidth: 3, strokeOpacity: 1, fill: '#3388ff', fillOpacity: 0.2,
+    });
+  });
+
+  it('fill falls back to stroke color, zero values survive', () => {
+    const s = leafletStyleTo3d({ color: '#ef4444', weight: 0, opacity: 0.5, fillOpacity: 0 });
+    expect(s.fill).toBe('#ef4444');
+    expect(s.strokeWidth).toBe(0);
+    expect(s.fillOpacity).toBe(0);
+  });
+});
+
+describe('latlngsToMultiPolygon / latlngsToMultiLine', () => {
+  const p = (lat, lng) => ({ lat, lng });
+
+  it('closes a bare ring into [lng,lat] MultiPolygon coords', () => {
+    const mp = latlngsToMultiPolygon([p(38, -121), p(38, -120), p(39, -120)]);
+    expect(mp).toEqual([[[[-121, 38], [-120, 38], [-120, 39], [-121, 38]]]]);
+  });
+
+  it('preserves holes as additional rings of the same polygon', () => {
+    const outer = [p(0, 0), p(0, 10), p(10, 10), p(10, 0)];
+    const hole = [p(2, 2), p(2, 4), p(4, 4), p(4, 2)];
+    const mp = latlngsToMultiPolygon([outer, hole]);
+    expect(mp.length).toBe(1);
+    expect(mp[0].length).toBe(2);
+  });
+
+  it('handles Leaflet multi-polygon nesting', () => {
+    const a = [[p(0, 0), p(0, 1), p(1, 1)]];
+    const b = [[p(5, 5), p(5, 6), p(6, 6)]];
+    const mp = latlngsToMultiPolygon([a, b]);
+    expect(mp.length).toBe(2);
+  });
+
+  it('flattens polyline nesting into MultiLineString segments', () => {
+    expect(latlngsToMultiLine([p(1, 2), p(3, 4)])).toEqual([[[2, 1], [4, 3]]]);
+    expect(latlngsToMultiLine([[p(1, 2), p(3, 4)], [p(5, 6), p(7, 8)]]).length).toBe(2);
+    expect(latlngsToMultiLine([])).toEqual([]);
+  });
+});
+
+describe('dashArrayTo3d', () => {
+  it('converts px dashes to line-width multiples', () => {
+    expect(dashArrayTo3d('6,4', 2)).toEqual([3, 2]);
+    expect(dashArrayTo3d('6 4', 3)).toEqual([2, 4 / 3]);
+  });
+  it('rejects unusable input', () => {
+    expect(dashArrayTo3d(null, 2)).toBeNull();
+    expect(dashArrayTo3d('abc', 2)).toBeNull();
+  });
+});
+
+describe('vector3dSourceAndLayers', () => {
+  const polyFeat = {
+    kind: 'polygon',
+    multiPolygon: [[[[-121, 38], [-120, 38], [-120, 39], [-121, 38]]]],
+    style: { stroke: '#ef4444', strokeWidth: 2, strokeOpacity: 0.9, fill: '#ef4444', fillOpacity: 0.15 },
+    popupHtml: '<b>TFR</b>', label: 'TFR', pri: 0,
+  };
+  const pointFeat = { kind: 'point', point: [-120.5, 38.5], radius: 5, style: {}, popupHtml: 'apt', label: 'Airport', pri: 3 };
+  const lineFeat = { kind: 'line', multiLine: [[[-121, 38], [-120, 39]]], style: {}, popupHtml: 'wire', label: 'Wire', pri: 5, dashArray: '6,3' };
+
+  it('returns null for an empty group', () => {
+    expect(vector3dSourceAndLayers({ id: 'x', features: [] })).toBeNull();
+    expect(vector3dSourceAndLayers({ id: 'x', features: [{ kind: 'line', multiLine: [] }] })).toBeNull();
+  });
+
+  it('emits only the style layers matching the geometry kinds present', () => {
+    const lineOnly = vector3dSourceAndLayers({ id: 'wires', features: [lineFeat] });
+    expect(lineOnly.layers.map(l => l.type)).toEqual(['line']);
+    const all = vector3dSourceAndLayers({ id: 'mix', features: [polyFeat, pointFeat, lineFeat] });
+    expect(all.layers.map(l => l.type)).toEqual(['fill', 'line', 'circle']);
+    expect(all.srcId).toBe('vec_mix');
+    expect(all.source.data.features.length).toBe(3);
+  });
+
+  it('carries popup/label/pri and style props on feature properties', () => {
+    const built = vector3dSourceAndLayers({ id: 'tfr', features: [polyFeat] });
+    const props = built.source.data.features[0].properties;
+    expect(props.popupHtml).toBe('<b>TFR</b>');
+    expect(props.pri).toBe(0);
+    expect(props.stroke).toBe('#ef4444');
+    expect(props.fillOpacity).toBe(0.15);
+    expect(built.layers[0].paint['fill-color']).toEqual(['get', 'fill']);
+  });
+
+  it('applies the group dash pattern to the line layer', () => {
+    const built = vector3dSourceAndLayers({ id: 'w', features: [lineFeat] });
+    expect(built.layers[0].paint['line-dasharray']).toEqual([2, 1]);
+  });
+});
+
+describe('build3dStyle with vectors', () => {
+  it('draws vector groups above rasters, most important (lowest pri) last', () => {
+    const mk = (id, pri) => ({
+      id, pri,
+      features: [{ kind: 'point', point: [0, 0], style: {}, popupHtml: 'x', label: id, pri }],
+    });
+    const style = build3dStyle({
+      base: 'satellite',
+      rasters: [{ id: 'viewshed', url: 'data:x', bounds: { west: 0, south: 0, east: 1, north: 1 } }],
+      vectors: [mk('faa_tfr', 0), mk('trails', 7)],
+    });
+    const ids = style.layers.map(l => l.id);
+    expect(ids.indexOf('vec_trails_pt')).toBeGreaterThan(ids.indexOf('img_viewshed'));
+    expect(ids.indexOf('vec_faa_tfr_pt')).toBeGreaterThan(ids.indexOf('vec_trails_pt'));
+    expect(style.sources.vec_faa_tfr.type).toBe('geojson');
+  });
+
+  it('skips empty vector groups without breaking the style', () => {
+    const style = build3dStyle({ vectors: [{ id: 'empty', pri: 1, features: [] }] });
+    expect(style.sources.vec_empty).toBeUndefined();
   });
 });

@@ -19,6 +19,14 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.17-e',
+    date: '2026-07-17',
+    changes: [
+      '3D view phase 2 — data overlays now appear in 3D: TFRs, NOTAMs, airspace, LAANC, obstacles, wires, power lines, towers, airports, NWS alerts, fire perimeters, trails, water, hospitals/LZs, land status, observers, and the drawn ops area all drape onto the 3D terrain with their 2D colors. Clicking features in 3D opens the same paginated multi-feature popup as the 2D map. Icon markers (airports, towers, etc.) render as colored dots in 3D for now; live aircraft and radar remain 2D-only until phase 3.',
+      'Update reliability fix: installing an app update could silently keep stale copies of the app files if the browser\'s HTTP cache still held them (the update banner would show the new version but old code kept running). The service worker now bypasses the HTTP cache when downloading an update, so "Reload & Update" always installs the code it says it does.',
+    ],
+  },
+  {
     version: '2026.07.17-d',
     date: '2026-07-17',
     changes: [
@@ -2786,6 +2794,17 @@ function build3dStyle(opts) {
       paint: { 'raster-opacity': r.opacity == null ? 0.7 : r.opacity },
     });
   });
+  // Vector overlay groups (Phase 2) draw on top of every raster. Less-important
+  // groups (higher pri) first, so safety-critical ones (TFRs etc.) paint on top.
+  (o.vectors || [])
+    .slice()
+    .sort((a, b) => (b.pri == null ? 7 : b.pri) - (a.pri == null ? 7 : a.pri))
+    .forEach(g => {
+      const built = vector3dSourceAndLayers(g);
+      if (!built) return;
+      sources[built.srcId] = built.source;
+      built.layers.forEach(l => layers.push(l));
+    });
   return {
     version: 8,
     name: 'sar-3d',
@@ -2793,6 +2812,144 @@ function build3dStyle(opts) {
     layers,
     terrain: { source: 'dem', exaggeration: o.exaggeration == null ? 1 : o.exaggeration },
   };
+}
+
+// --- 3D vector overlays -------------------------------------------------
+// Leaflet path options → the flat style props stored on each GeoJSON feature
+// for data-driven paint (Leaflet's own defaults where unset).
+function leafletStyleTo3d(opts) {
+  const o = opts || {};
+  const stroke = o.color || '#3388ff';
+  return {
+    stroke,
+    strokeWidth: o.weight == null ? 3 : o.weight,
+    strokeOpacity: o.opacity == null ? 1 : o.opacity,
+    fill: o.fillColor || stroke,
+    fillOpacity: o.fillOpacity == null ? 0.2 : o.fillOpacity,
+  };
+}
+
+function _isLatLngLike(p) { return !!p && typeof p.lat === 'number' && typeof p.lng === 'number'; }
+
+function _ring3dCoords(ring) {
+  const out = ring.map(p => [p.lng, p.lat]);
+  if (out.length && (out[0][0] !== out[out.length - 1][0] || out[0][1] !== out[out.length - 1][1])) {
+    out.push([out[0][0], out[0][1]]);
+  }
+  return out;
+}
+
+// Normalize Leaflet Polygon.getLatLngs() nesting ({lat,lng} objects — a bare
+// ring, a [ring,holes...] polygon, or a multi-polygon) into closed GeoJSON
+// MultiPolygon coordinates ([[[ [lng,lat], ... ]]]).
+function latlngsToMultiPolygon(latlngs) {
+  if (!Array.isArray(latlngs) || !latlngs.length) return [];
+  if (_isLatLngLike(latlngs[0])) return [[_ring3dCoords(latlngs)]];
+  if (Array.isArray(latlngs[0]) && _isLatLngLike(latlngs[0][0])) return [latlngs.map(_ring3dCoords)];
+  return latlngs.map(poly => (Array.isArray(poly) ? poly.map(_ring3dCoords) : [])).filter(p => p.length);
+}
+
+// Normalize Polyline.getLatLngs() (flat or nested) into MultiLineString coords.
+function latlngsToMultiLine(latlngs) {
+  const segs = [];
+  const collect = a => {
+    if (!Array.isArray(a) || !a.length) return;
+    if (_isLatLngLike(a[0])) segs.push(a.map(p => [p.lng, p.lat]));
+    else a.forEach(collect);
+  };
+  collect(latlngs);
+  return segs;
+}
+
+// Leaflet dashArray ("6,4", px) → MapLibre line-dasharray (multiples of line width).
+function dashArrayTo3d(dashArray, strokeWidth) {
+  if (!dashArray) return null;
+  const w = strokeWidth > 0 ? strokeWidth : 3;
+  const parts = String(dashArray).split(/[\s,]+/).map(Number).filter(n => Number.isFinite(n) && n >= 0);
+  if (parts.length < 2) return null;
+  return parts.map(n => n / w);
+}
+
+// One harvested overlay group → a MapLibre geojson source + fill/line/circle
+// style layers with data-driven paint. Returns null when the group is empty.
+// group: { id, features: [{ kind:'polygon'|'line'|'point',
+//   multiPolygon?|multiLine?|point:[lng,lat], radius?, dashArray?,
+//   style:{stroke,strokeWidth,strokeOpacity,fill,fillOpacity},
+//   popupHtml, label, pri }] }
+function vector3dSourceAndLayers(group) {
+  const g = group || {};
+  const feats = [];
+  let hasPoly = false, hasLine = false, hasPoint = false, dash = null;
+  (g.features || []).forEach(f => {
+    if (!f) return;
+    let geometry = null;
+    if (f.kind === 'polygon' && f.multiPolygon && f.multiPolygon.length) {
+      geometry = { type: 'MultiPolygon', coordinates: f.multiPolygon };
+      hasPoly = true; hasLine = true;
+    } else if (f.kind === 'line' && f.multiLine && f.multiLine.length) {
+      geometry = { type: 'MultiLineString', coordinates: f.multiLine };
+      hasLine = true;
+    } else if (f.kind === 'point' && f.point) {
+      geometry = { type: 'Point', coordinates: f.point };
+      hasPoint = true;
+    }
+    if (!geometry) return;
+    const s = f.style || {};
+    if (!dash && f.dashArray) dash = dashArrayTo3d(f.dashArray, s.strokeWidth);
+    feats.push({
+      type: 'Feature',
+      geometry,
+      properties: {
+        stroke: s.stroke || '#3388ff',
+        strokeWidth: s.strokeWidth == null ? 3 : s.strokeWidth,
+        strokeOpacity: s.strokeOpacity == null ? 1 : s.strokeOpacity,
+        fill: s.fill || s.stroke || '#3388ff',
+        fillOpacity: s.fillOpacity == null ? 0.2 : s.fillOpacity,
+        radius: f.radius == null ? 6 : f.radius,
+        popupHtml: f.popupHtml || '',
+        label: f.label || '',
+        pri: f.pri == null ? 7 : f.pri,
+      },
+    });
+  });
+  if (!feats.length) return null;
+  const srcId = 'vec_' + g.id;
+  const layers = [];
+  if (hasPoly) {
+    layers.push({
+      id: srcId + '_fill', type: 'fill', source: srcId,
+      filter: ['==', ['geometry-type'], 'Polygon'],
+      paint: { 'fill-color': ['get', 'fill'], 'fill-opacity': ['get', 'fillOpacity'] },
+    });
+  }
+  if (hasLine) {
+    const paint = {
+      'line-color': ['get', 'stroke'],
+      'line-width': ['get', 'strokeWidth'],
+      'line-opacity': ['get', 'strokeOpacity'],
+    };
+    if (dash) paint['line-dasharray'] = dash;
+    layers.push({
+      id: srcId + '_line', type: 'line', source: srcId,
+      filter: ['!=', ['geometry-type'], 'Point'],
+      paint,
+    });
+  }
+  if (hasPoint) {
+    layers.push({
+      id: srcId + '_pt', type: 'circle', source: srcId,
+      filter: ['==', ['geometry-type'], 'Point'],
+      paint: {
+        'circle-radius': ['get', 'radius'],
+        'circle-color': ['get', 'fill'],
+        'circle-opacity': ['get', 'fillOpacity'],
+        'circle-stroke-color': ['get', 'stroke'],
+        'circle-stroke-width': 1.5,
+        'circle-stroke-opacity': ['get', 'strokeOpacity'],
+      },
+    });
+  }
+  return { srcId, source: { type: 'geojson', data: { type: 'FeatureCollection', features: feats } }, layers };
 }
 
 // --- CJS export for Node/Vitest ---
@@ -2834,5 +2991,6 @@ if (typeof module !== 'undefined' && module.exports) {
     geojsonShapeFeature, geojsonLineGeometry, geojsonPolygonGeometry, geojsonFeatureCollection,
     formatStamp, relAge, buildSectionMetaLine, rollupSources, metaToneClass,
     TERRAIN_DEM_URL, leafletToMaplibreCamera, maplibreToLeafletCamera, build3dStyle,
+    leafletStyleTo3d, latlngsToMultiPolygon, latlngsToMultiLine, dashArrayTo3d, vector3dSourceAndLayers,
   };
 }

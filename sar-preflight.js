@@ -7390,6 +7390,8 @@ function buildLayerControl() {
   // buildLayerControl runs after virtually every layer (re)render, so use it as
   // the chokepoint to (re)wire feature clicks into the aggregated popup system.
   wirePopupAggregation();
+  // Same chokepoint keeps the 3D view's mirrored vectors current as data loads.
+  if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 function toggleLayer(id, el) {
   el.classList.toggle('active');
@@ -10079,6 +10081,59 @@ function _loadMaplibre() {
   return _mlLoadPromise;
 }
 
+// Vector layers mirrored into 3D: everything the popup aggregation covers,
+// minus live ADS-B (Phase 3 — needs per-poll updates + altitude placement).
+const VEC3D_SKIP = new Set([...AGG_SKIP_LAYERS, 'adsb_aircraft']);
+
+// Walk a Leaflet layer tree and emit neutral geometry records for the 3D
+// mirror. A popup bound on a group (L.geoJSON wrapper) is inherited by its
+// leaf geometries, mirroring how eachPopupLayer/_aggLayerHit treat hits.
+function _vec3dRecords(root, meta, out, inheritedPopup) {
+  if (!root) return;
+  let popupHtml = inheritedPopup || '';
+  if (root.getPopup && root.getPopup()) popupHtml = _aggContentToHtml(root.getPopup().getContent());
+  const common = { popupHtml, label: meta.label, pri: meta.pri };
+  if (L.Circle && root instanceof L.Circle) {
+    const c = root.getLatLng();
+    const ring = circleToPolygon(c.lat, c.lng, root.getRadius()).map(p => ({ lat: p[0], lng: p[1] }));
+    out.push(Object.assign({ kind: 'polygon', multiPolygon: latlngsToMultiPolygon(ring), style: leafletStyleTo3d(root.options), dashArray: root.options && root.options.dashArray }, common));
+  } else if (L.CircleMarker && root instanceof L.CircleMarker) {
+    const c = root.getLatLng();
+    out.push(Object.assign({ kind: 'point', point: [c.lng, c.lat], radius: Math.min(root.getRadius ? root.getRadius() : 6, 10), style: leafletStyleTo3d(root.options) }, common));
+  } else if (L.Polygon && root instanceof L.Polygon) {
+    out.push(Object.assign({ kind: 'polygon', multiPolygon: latlngsToMultiPolygon(root.getLatLngs()), style: leafletStyleTo3d(root.options), dashArray: root.options && root.options.dashArray }, common));
+  } else if (L.Polyline && root instanceof L.Polyline) {
+    out.push(Object.assign({ kind: 'line', multiLine: latlngsToMultiLine(root.getLatLngs()), style: leafletStyleTo3d(root.options), dashArray: root.options && root.options.dashArray }, common));
+  } else if (root.getLatLng) {
+    // Icon markers (divIcon SVGs) render as a uniform dot in 3D for now.
+    const c = root.getLatLng();
+    out.push(Object.assign({ kind: 'point', point: [c.lng, c.lat], radius: 6, style: { stroke: '#e2e8f0', strokeWidth: 1.5, strokeOpacity: 1, fill: '#3d8bfd', fillOpacity: 0.9 } }, common));
+  } else if (root.getLayers) {
+    root.getLayers().forEach(c => _vec3dRecords(c, meta, out, popupHtml));
+  }
+}
+
+function collect3dVectorGroups() {
+  const groups = [];
+  if (!S.map || !S.mapLayers || typeof L === 'undefined') return groups;
+  for (const key of Object.keys(S.mapLayers)) {
+    if (VEC3D_SKIP.has(key)) continue;
+    const group = S.mapLayers[key];
+    if (!group || !S.map.hasLayer(group)) continue;
+    const meta = _aggMeta(key);
+    const feats = [];
+    try { _vec3dRecords(group, meta, feats, ''); } catch (e) { /* malformed layer — skip group */ }
+    if (feats.length) groups.push({ id: key, pri: meta.pri, features: feats });
+  }
+  // The drawn ops area lives outside S.mapLayers.
+  if (S.drawnItems) {
+    const feats = [];
+    try { _vec3dRecords(S.drawnItems, { label: 'Ops Area', pri: 8 }, feats, ''); } catch (e) { /* skip */ }
+    if (feats.length) groups.push({ id: 'ops_area', pri: 8, features: feats });
+  }
+  return groups;
+}
+
 // Snapshot the live 2D layer state into the shape build3dStyle() consumes.
 function collect3dState() {
   const active = id => !!(S.map && S.mapLayers[id] && S.map.hasLayer(S.mapLayers[id]));
@@ -10098,17 +10153,89 @@ function collect3dState() {
     sectionalUrl: sectionalTileUrl(getStoredSectionalEdition()),
     overlays: { slope: active('slope'), parcels: active('parcels'), streets: active('streets') },
     rasters,
+    vectors: collect3dVectorGroups(),
     exaggeration: TERRAIN_EXAGGERATION,
   };
 }
 
-function sync3d() {
+function _sync3dNow() {
   if (!S.map3d || !S.is3D) return;
   try {
     S.map3d.setStyle(build3dStyle(collect3dState()), { diff: true });
   } catch (e) {
     try { Diag.note('3d.sync.err', { m: String(e && e.message).slice(0, 120) }); } catch (_) {}
   }
+}
+
+// Debounced: buildLayerControl fires in bursts while an area's data loads, and
+// each sync re-harvests every visible vector layer — coalesce to one restyle.
+function sync3d() {
+  if (!S.map3d || !S.is3D) return;
+  clearTimeout(S._sync3dTimer);
+  S._sync3dTimer = setTimeout(_sync3dNow, 150);
+}
+
+// --- 3D aggregated popup (mirrors the 2D "← n/N →" pager) ---
+function _vec3dLayerIds() {
+  try {
+    return S.map3d.getStyle().layers.map(l => l.id).filter(id => id.indexOf('vec_') === 0);
+  } catch (e) { return []; }
+}
+
+function _agg3dHtml() {
+  const st = S._agg3d;
+  const n = st.items.length, i = ((st.index % n) + n) % n;
+  st.index = i;
+  const item = st.items[i];
+  const btn = 'background:rgba(128,128,128,0.16);border:1px solid rgba(128,128,128,0.5);color:inherit;border-radius:4px;cursor:pointer;font:600 14px/1 monospace;padding:1px 9px';
+  let html = '';
+  if (n > 1) {
+    html += `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 6px;padding-bottom:5px;border-bottom:1px solid rgba(128,128,128,0.3)">`
+      + `<button type="button" title="Previous" onclick="agg3dStep(-1)" style="${btn}">&#8592;</button>`
+      + `<span style="font:600 11px/1.25 monospace;opacity:0.8;text-align:center">${i + 1} / ${n}`
+      + (item.label ? `<br><span style="opacity:0.6;font-weight:400">${item.label}</span>` : '')
+      + `</span>`
+      + `<button type="button" title="Next" onclick="agg3dStep(1)" style="${btn}">&#8594;</button>`
+      + `</div>`;
+  } else if (item.label) {
+    html += `<div style="font:600 10px/1.2 monospace;opacity:0.55;margin-bottom:4px">${item.label}</div>`;
+  }
+  html += `<div class="agg-popup-body">${item.content}</div>`;
+  return html;
+}
+
+function agg3dStep(dir) {
+  const st = S._agg3d;
+  if (!st || !st.items || !st.items.length || !st.popup) return;
+  st.index += dir;
+  st.popup.setHTML(_agg3dHtml());
+}
+
+function _open3dPopup(e) {
+  if (!S.map3d) return;
+  const pad = 6;
+  const box = [[e.point.x - pad, e.point.y - pad], [e.point.x + pad, e.point.y + pad]];
+  let feats = [];
+  try { feats = S.map3d.queryRenderedFeatures(box, { layers: _vec3dLayerIds() }); } catch (err) { return; }
+  const seen = new Set();
+  const items = [];
+  feats.forEach(f => {
+    const p = f.properties || {};
+    if (!p.popupHtml || seen.has(p.popupHtml)) return; // dedupe fill/line double-hits + tiered airspace
+    seen.add(p.popupHtml);
+    items.push({ content: p.popupHtml, label: p.label || '', pri: p.pri == null ? 7 : Number(p.pri) });
+  });
+  if (!items.length) return;
+  items.sort((a, b) => a.pri - b.pri);
+  if (!S._agg3d) S._agg3d = {};
+  const st = S._agg3d;
+  st.items = items;
+  st.index = 0;
+  if (st.popup) { try { st.popup.remove(); } catch (err) { /* already gone */ } }
+  st.popup = new maplibregl.Popup({ maxWidth: '340px', className: 'agg-popup' })
+    .setLngLat(e.lngLat)
+    .setHTML(_agg3dHtml())
+    .addTo(S.map3d);
 }
 
 async function toggle3D() {
@@ -10154,6 +10281,7 @@ function _enter3D() {
         const el = document.getElementById('cursorCoord');
         if (el) el.textContent = `${e.lngLat.lat.toFixed(5)}°, ${e.lngLat.lng.toFixed(5)}°`;
       });
+      S.map3d.on('click', _open3dPopup);
       S.map3d.on('error', ev => {
         try { Diag.noteThrottled('3d.err', 5000, { m: String(ev && ev.error && ev.error.message).slice(0, 120) }); } catch (_) {}
       });
@@ -10166,7 +10294,7 @@ function _enter3D() {
     }
   } else {
     S.map3d.jumpTo({ center: cam.center, zoom: cam.zoom });
-    sync3d();
+    _sync3dNow();
     S.map3d.resize();
   }
   const btn = document.getElementById('view3dToggle');
@@ -10176,6 +10304,7 @@ function _enter3D() {
 
 function _exit3D() {
   const container = document.querySelector('.map-container');
+  if (S._agg3d && S._agg3d.popup) { try { S._agg3d.popup.remove(); } catch (e) { /* already gone */ } S._agg3d.popup = null; }
   if (S.map3d && S.map) {
     const c = S.map3d.getCenter();
     const cam = maplibreToLeafletCamera(c.lng, c.lat, S.map3d.getZoom());
@@ -10249,6 +10378,7 @@ if (typeof module !== 'undefined' && module.exports) {
     initMap, startDraw, clearDrawBtns, clearArea, enterCoords,
     getStoredTheme, applyTheme, cycleTheme,
     toggle3D, collect3dState, sync3d, _enter3D, _exit3D, _loadMaplibre,
+    collect3dVectorGroups, _vec3dRecords, _open3dPopup, agg3dStep, _agg3dHtml, VEC3D_SKIP,
     scrollTabs, updateScrollBtns,
     importKML, handleKMLFile, parseKML,
     copyBriefing, buildBriefingText,

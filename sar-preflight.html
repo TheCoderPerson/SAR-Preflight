@@ -86,6 +86,18 @@
 #map3d { position: absolute; inset: 0; display: none; background: var(--bg-primary); }
 .map-container.mode-3d #map3d { display: block; }
 .map-container.mode-3d #map { visibility: hidden; }
+/* 3D feature popups — match the app HUD (id prefix outweighs the lazily-loaded maplibre CSS) */
+#map3d .maplibregl-popup-content {
+  background: var(--bg-secondary); color: var(--text-primary);
+  border: 1px solid var(--border); border-radius: 6px;
+  font-family: var(--font-sans); font-size: 12px; padding: 10px 12px;
+  max-height: 320px; overflow-y: auto; box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+}
+#map3d .maplibregl-popup-anchor-bottom .maplibregl-popup-tip { border-top-color: var(--bg-secondary); }
+#map3d .maplibregl-popup-anchor-top .maplibregl-popup-tip { border-bottom-color: var(--bg-secondary); }
+#map3d .maplibregl-popup-anchor-left .maplibregl-popup-tip { border-right-color: var(--bg-secondary); }
+#map3d .maplibregl-popup-anchor-right .maplibregl-popup-tip { border-left-color: var(--bg-secondary); }
+#map3d .maplibregl-popup-close-button { color: var(--text-secondary); font-size: 16px; right: 4px; top: 2px; }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
   font-family: var(--font-sans);
