@@ -4,9 +4,13 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.17-i — 2026-07-17
+
+- Wording cleanup: the built-in data proxy and the PDF briefing header are now described generically (no team-specific naming).
+
 ## v2026.07.17-h — 2026-07-17
 
-- Works out of the box — no proxy setup needed: the app now ships with a built-in EDSAR data proxy, so the vegetation overlay, viewshed canopy, live TFRs/NOTAMs, ADS-B proxy route, and USFS/BLM layers work immediately without deploying your own Cloudflare Worker. Entering your own Worker URL in Config still overrides the default (needed for forks hosted on other origins); clearing the field returns to the built-in proxy.
+- Works out of the box — no proxy setup needed: the app now ships with a built-in default data proxy, so the vegetation overlay, viewshed canopy, live TFRs/NOTAMs, ADS-B proxy route, and USFS/BLM layers work immediately without deploying your own Cloudflare Worker. Entering your own Worker URL in Config still overrides the default (needed for forks hosted on other origins); clearing the field returns to the built-in proxy.
 - If the shared proxy briefly rate-limits heavy use, an amber "⚠ PROXY LIMIT" indicator now appears in the header status bar (hover it for details) and clears automatically after about a minute — affected fetches can be retried with REFRESH.
 
 ## v2026.07.17-g — 2026-07-17

@@ -26,7 +26,7 @@ Usage:
   # Skip utility poles (lines only, smaller file)
   python3 sar_wire_hazards_kml.py --no-poles
 
-Author: Built for EDSAR UAS Team
+Author: Built for SAR UAS operations
 """
 
 import argparse

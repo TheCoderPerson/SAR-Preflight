@@ -31,7 +31,7 @@ const OUTPUT_DIR = join(REPO_ROOT, 'data', 'cell');
 
 const CARRIERS = ['att', 'tmobile', 'verizon'];
 
-// EDSAR operating region (El Dorado / Placer + neighbors): [south, west, north, east].
+// Default operating region (El Dorado / Placer + neighbors): [south, west, north, east].
 // Override with --region=S,W,N,E. Features fully outside this box are dropped.
 let REGION = { south: 38.0, west: -121.7, north: 39.7, east: -119.6 };
 const SIMPLIFY_TOL_DEG = 0.0015; // ~150 m — LTE coverage edges are fuzzy

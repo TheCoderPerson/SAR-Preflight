@@ -1,7 +1,7 @@
 // ============================================================
 // SAR Preflight — Raster & Viewshed Math (pure, DOM/Leaflet/fetch-free)
 // Vegetation-height handling + line-of-sight viewshed.
-// Ported from the EDSAR SAR_UAS_Segment tool (raster/los.py, raster/dsm.py).
+// Ported from the companion SAR_UAS_Segment tool (raster/los.py, raster/dsm.py).
 // Testable in Node (CJS export at the bottom).
 // ============================================================
 

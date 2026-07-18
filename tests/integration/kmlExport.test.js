@@ -130,7 +130,7 @@ describe('airport icons by type', () => {
     S.mapLayers.airports = new MockGroup([]);
     S.nearbyAirports = [
       { icao: 'KPVF', name: 'Placerville', type: 'small_airport', lat: 38.72, lng: -120.75, distKm: 5 },
-      { icao: 'EDSAR', name: 'Hospital Helipad', type: 'heliport', lat: 38.70, lng: -120.80, distKm: 6 },
+      { icao: 'HELI1', name: 'Hospital Helipad', type: 'heliport', lat: 38.70, lng: -120.80, distKm: 6 },
     ];
     const kml = gatherVisibleLayerFolders(new Set(['airports']));
     expect(kml).toContain('<styleUrl>#airport</styleUrl>');

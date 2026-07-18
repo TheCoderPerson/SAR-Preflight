@@ -151,7 +151,7 @@ describe('fetchNWSAlerts()', () => {
       expect(globalThis.fetch).toHaveBeenCalledWith(
         expect.stringContaining('api.weather.gov/alerts/active'),
         expect.objectContaining({
-          headers: { 'User-Agent': '(SAR-Preflight-Tool, contact@edsar.org)' },
+          headers: { 'User-Agent': '(SAR-Preflight-Tool, github.com/TheCoderPerson/SAR-Preflight)' },
         })
       );
     });
