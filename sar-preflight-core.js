@@ -19,6 +19,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.17-j',
+    date: '2026-07-17',
+    changes: [
+      'Fixed: the "Update Available" modal could loop — clicking "Reload & Update" reloaded back into the old version (typically within ~10 minutes of a release, when the browser\'s HTTP cache still held the old files). Applying an update now refreshes the offline app cache directly from the network before reloading, instead of dropping it and re-reading the stale HTTP cache.',
+    ],
+  },
+  {
     version: '2026.07.17-i',
     date: '2026-07-17',
     changes: [
