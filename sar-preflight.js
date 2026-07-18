@@ -3452,7 +3452,7 @@ async function fetchNWSAlerts(lat, lng) {
   setStatus('alertStatus', 'loading', 'Checking...');
   try {
     const res = await fetch(`https://api.weather.gov/alerts/active?point=${lat},${lng}`, {
-      headers: { 'User-Agent': '(SAR-Preflight-Tool, contact@edsar.org)' },
+      headers: { 'User-Agent': '(SAR-Preflight-Tool, github.com/TheCoderPerson/SAR-Preflight)' },
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
@@ -8643,7 +8643,7 @@ function _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic
     <div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #111;padding-bottom:10px;margin-bottom:15px;">
       <div>
         <h1 style="margin:0;font-size:20px;letter-spacing:2px;">SAR UAS PRE-FLIGHT BRIEFING</h1>
-        <div style="font-size:11px;color:#555;margin-top:4px;">EDSAR UAS Team</div>
+        <div style="font-size:11px;color:#555;margin-top:4px;">SAR UAS Team</div>
       </div>
       <div style="text-align:right;">
         <div style="font-size:18px;font-weight:bold;padding:4px 14px;border-radius:4px;background:${badgeColor};color:#fff;display:inline-block;">${assessBadge}</div>
@@ -8765,7 +8765,7 @@ function _openEmailBriefingWindow(mapDataUrl) {
     .sig-line{border-top:1px solid #333;padding-top:25px;width:45%;display:inline-block;margin-right:5%}
     @media print{body{margin:0;font-size:11px}}</style></head><body>
     <div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #111;padding-bottom:10px;margin-bottom:15px;">
-      <div><h1>SAR UAS PRE-FLIGHT BRIEFING</h1><div style="font-size:11px;color:#555;">EDSAR UAS Team</div></div>
+      <div><h1>SAR UAS PRE-FLIGHT BRIEFING</h1><div style="font-size:11px;color:#555;">SAR UAS Team</div></div>
       <div><span class="badge" style="background:${badgeColor}">${assessBadge}</span></div>
     </div>
     <table style="width:100%;font-size:12px;margin-bottom:10px;"><tr>
@@ -9431,7 +9431,7 @@ function saveCanopyProxy(url) {
     else localStorage.removeItem('sar_canopy_proxy');
   } catch (_) {}
   const hint = document.getElementById('canopyProxyHint');
-  if (hint) hint.textContent = getCustomProxy() ? 'Custom data proxy configured ✓' : 'Using built-in EDSAR data proxy (default)';
+  if (hint) hint.textContent = getCustomProxy() ? 'Custom data proxy configured ✓' : 'Using built-in default data proxy';
 }
 
 // Quantized AOI key for the processed-raster cache (~100 m).
