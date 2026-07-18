@@ -1,6 +1,7 @@
 const {
   TERRAIN_DEM_URL, leafletToMaplibreCamera, maplibreToLeafletCamera, build3dStyle,
   leafletStyleTo3d, latlngsToMultiPolygon, latlngsToMultiLine, dashArrayTo3d, vector3dSourceAndLayers,
+  cylRadiusForHeightM, aircraft3dRecords, hexToRgb01, collectVerticalSegments,
 } = require('../../sar-preflight-core.js');
 
 // ============================================================
@@ -239,5 +240,104 @@ describe('build3dStyle with vectors', () => {
   it('skips empty vector groups without breaking the style', () => {
     const style = build3dStyle({ vectors: [{ id: 'empty', pri: 1, features: [] }] });
     expect(style.sources.vec_empty).toBeUndefined();
+  });
+
+  it('adds a half-opacity radar layer above imagery when a frame URL is given', () => {
+    const style = build3dStyle({ radarUrl: 'https://tilecache.rainviewer.com/x/256/{z}/{x}/{y}/6/1_1.png' });
+    expect(style.sources.radar.maxzoom).toBe(7);
+    const ids = style.layers.map(l => l.id);
+    expect(ids.indexOf('radar')).toBeGreaterThan(ids.indexOf('basemap'));
+    expect(style.layers.find(l => l.id === 'radar').paint['raster-opacity']).toBe(0.5);
+    expect(build3dStyle({}).sources.radar).toBeUndefined();
+  });
+});
+
+// ============================================================
+// Phase 3: extruded cylinders + ADS-B aircraft
+// ============================================================
+
+describe('cylRadiusForHeightM', () => {
+  it('scales with height between sane bounds', () => {
+    expect(cylRadiusForHeightM(20)).toBe(8);      // short obstacle → floor
+    expect(cylRadiusForHeightM(100)).toBe(15);    // 15% of height
+    expect(cylRadiusForHeightM(1000)).toBe(40);   // capped
+    expect(cylRadiusForHeightM(null)).toBe(8);
+  });
+});
+
+describe('vertical segments (custom-layer verticals)', () => {
+  const cyl = {
+    kind: 'cylinder', lat: 38.7, lng: -120.8, radiusM: 10, baseM: 0, topM: 60,
+    style: { fill: '#ef4444' }, popupHtml: 'obstacle', label: 'Obstacle', pri: 4,
+  };
+  const flat = {
+    kind: 'polygon', multiPolygon: [[[[-121, 38], [-120, 38], [-120, 39], [-121, 38]]]],
+    style: {}, popupHtml: 'area', label: 'Area', pri: 8,
+  };
+
+  it('keeps cylinders OUT of the geojson style (fill-extrusion is buggy on terrain)', () => {
+    expect(vector3dSourceAndLayers({ id: 'obs', features: [cyl] })).toBeNull();
+    const mixed = vector3dSourceAndLayers({ id: 'mix', features: [cyl, flat] });
+    expect(mixed.source.data.features.length).toBe(1);
+    expect(mixed.layers.some(l => l.type === 'fill-extrusion')).toBe(false);
+  });
+
+  it('turns narrow cylinders into vertical lines and wide ones into altitude crosses', () => {
+    const segs = collectVerticalSegments([
+      { id: 'obs', features: [cyl] },
+      { id: 'adsb3d', features: aircraft3dRecords([{ lat: 38.9, lng: -120.5, aglM: 900, color: '#22c55e', popupHtml: 'x' }]) },
+    ]);
+    expect(segs.length).toBe(3);
+    const [obst, drop, cross] = segs;
+    expect(obst.type).toBe('line');
+    expect(obst.toM).toBe(60);
+    expect(obst.thin).toBe(false); // obstacles draw as thick quads
+    expect(obst.color).toEqual(hexToRgb01('#ef4444'));
+    expect(drop.type).toBe('line');
+    expect(drop.fromM).toBe(0);
+    expect(drop.toM).toBe(900);
+    expect(drop.thin).toBe(true); // aircraft verticals stay 1px
+    expect(cross.type).toBe('cross');
+    expect(cross.atM).toBe(900);
+    expect(cross.armM).toBe(50);
+    expect(cross.thin).toBe(true);
+  });
+
+  it('skips heightless cylinders and non-cylinder records', () => {
+    expect(collectVerticalSegments([{ id: 'x', features: [{ kind: 'cylinder', lat: 1, lng: 1, radiusM: 5, baseM: 0, topM: 0 }, flat, null] }])).toEqual([]);
+    expect(collectVerticalSegments(null)).toEqual([]);
+  });
+});
+
+describe('hexToRgb01', () => {
+  it('parses hex colors to 0..1 rgb', () => {
+    expect(hexToRgb01('#ff0000')).toEqual([1, 0, 0]);
+    expect(hexToRgb01('00CCFF')).toEqual([0, 204 / 255, 1]);
+    expect(hexToRgb01('junk').length).toBe(3);
+  });
+});
+
+describe('aircraft3dRecords', () => {
+  it('builds a drop line (ground→AGL) and a floating slab per aircraft', () => {
+    const recs = aircraft3dRecords([{ lat: 38.7, lng: -120.8, aglM: 900, color: '#22c55e', popupHtml: '<b>N123</b>' }]);
+    expect(recs.length).toBe(2);
+    const [drop, slab] = recs;
+    expect(drop.baseM).toBe(0);
+    expect(drop.topM).toBe(900);
+    expect(drop.radiusM).toBe(3);
+    expect(slab.baseM).toBe(900);
+    expect(slab.topM).toBe(925);
+    expect(slab.radiusM).toBe(50);
+    recs.forEach(r => {
+      expect(r.kind).toBe('cylinder');
+      expect(r.style.fill).toBe('#22c55e');
+      expect(r.popupHtml).toBe('<b>N123</b>');
+      expect(r.label).toBe('Aircraft');
+    });
+  });
+
+  it('skips aircraft without a usable AGL', () => {
+    expect(aircraft3dRecords([{ lat: 1, lng: 1, aglM: null }, { lat: 1, lng: 1, aglM: -50 }, null])).toEqual([]);
+    expect(aircraft3dRecords(null)).toEqual([]);
   });
 });

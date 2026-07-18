@@ -19,6 +19,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.17-g',
+    date: '2026-07-17',
+    changes: [
+      '3D view phase 3 — vertical hazards and live traffic: FAA obstacles, towers, and dams with known heights now rise from the terrain as bold vertical height lines at their true AGL height (colored by the same hazard scale as their 2D markers). Live ADS-B aircraft appear in 3D at their actual altitude above the terrain — each plane is an X marker at its AGL altitude with a thin drop line to the ground so you can judge its height and position at a glance — updating with every 5-second traffic poll, with a clickable ground dot for the full aircraft popup. The weather radar layer now also drapes in 3D (current frame, follows the frame stepper).',
+    ],
+  },
+  {
     version: '2026.07.17-f',
     date: '2026-07-17',
     changes: [
@@ -2801,6 +2808,12 @@ function build3dStyle(opts) {
       paint: { 'raster-opacity': r.opacity == null ? 0.7 : r.opacity },
     });
   });
+  // Live weather radar (current frame only) drapes above imagery, below the
+  // analysis rasters and vectors. RainViewer tiles are native z7.
+  if (o.radarUrl) {
+    sources.radar = _raster3dSource(o.radarUrl, 7);
+    layers.push({ id: 'radar', type: 'raster', source: 'radar', paint: { 'raster-opacity': 0.5 } });
+  }
   // Vector overlay groups (Phase 2) draw on top of every raster. Less-important
   // groups (higher pri) first, so safety-critical ones (TFRs etc.) paint on top.
   (o.vectors || [])
@@ -2877,11 +2890,70 @@ function dashArrayTo3d(dashArray, strokeWidth) {
   return parts.map(n => n / w);
 }
 
+// Cylinder footprint radius for an extruded obstacle/tower of height hM —
+// wide enough to see at VLOS-planning zooms, never absurd for tall towers.
+function cylRadiusForHeightM(hM) {
+  const h = Number(hM);
+  if (!Number.isFinite(h) || h <= 0) return 8;
+  return Math.min(40, Math.max(8, h * 0.15));
+}
+
+function hexToRgb01(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || '').trim());
+  if (!m) return [0.24, 0.55, 0.99]; // accent blue fallback
+  const n = parseInt(m[1], 16);
+  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+}
+
+// Pull the vertical (cylinder) records out of harvested vector groups into
+// renderable segments for the custom 3D layer: narrow records (obstacle/tower
+// heights, aircraft drop lines) become vertical lines; wide records (the
+// aircraft position slab) become an X marker at that altitude. Heights are
+// metres above the terrain surface at the feature.
+function collectVerticalSegments(groups) {
+  const out = [];
+  (groups || []).forEach(g => ((g && g.features) || []).forEach(f => {
+    if (!f || f.kind !== 'cylinder' || !(f.topM > 0)) return;
+    const color = hexToRgb01(f.style && (f.style.fill || f.style.stroke));
+    if (f.radiusM >= 20) {
+      out.push({ type: 'cross', lat: f.lat, lng: f.lng, atM: Math.max(0, f.baseM || 0), armM: f.radiusM, color, thin: !!f.thin });
+    } else {
+      out.push({ type: 'line', lat: f.lat, lng: f.lng, fromM: Math.max(0, f.baseM || 0), toM: f.topM, color, thin: !!f.thin });
+    }
+  }));
+  return out;
+}
+
+// ADS-B aircraft → cylinder records for the 3D view: a floating slab at the
+// aircraft's AGL altitude plus a thin full-height "how high is it" drop line.
+// MapLibre renders fill-extrusions relative to the terrain surface when
+// terrain is enabled, so base 0 = the ground beneath the aircraft; aglM
+// should already carry the terrain exaggeration for a matched vertical scale.
+// aircraft: [{ lat, lng, aglM, color, popupHtml }]
+function aircraft3dRecords(aircraft) {
+  const out = [];
+  (aircraft || []).forEach(ac => {
+    if (!ac || !Number.isFinite(ac.lat) || !Number.isFinite(ac.lng)) return;
+    const aglM = Number(ac.aglM);
+    if (!Number.isFinite(aglM) || aglM <= 0) return;
+    const style = { stroke: ac.color || '#06b6d4', fill: ac.color || '#06b6d4' };
+    const common = { popupHtml: ac.popupHtml || '', label: 'Aircraft', pri: 2, style };
+    // thin: aircraft verticals stay 1px; obstacle/tower lines render as thick quads
+    out.push(Object.assign({ kind: 'cylinder', lat: ac.lat, lng: ac.lng, radiusM: 3, baseM: 0, topM: aglM, thin: true }, common));
+    out.push(Object.assign({ kind: 'cylinder', lat: ac.lat, lng: ac.lng, radiusM: 50, baseM: aglM, topM: aglM + 25, thin: true }, common));
+  });
+  return out;
+}
+
 // One harvested overlay group → a MapLibre geojson source + fill/line/circle
-// style layers with data-driven paint. Returns null when the group is empty.
-// group: { id, features: [{ kind:'polygon'|'line'|'point',
-//   multiPolygon?|multiLine?|point:[lng,lat], radius?, dashArray?,
-//   style:{stroke,strokeWidth,strokeOpacity,fill,fillOpacity},
+// style layers with data-driven paint. Returns null when the group has no
+// flat geometry. 'cylinder' records (vertical extents) are NOT styled here —
+// MapLibre's fill-extrusion misplaces GeoJSON extrusions over high terrain
+// (elevation sampling bug, maplibre-gl-js#2560 family), so verticals render
+// via the custom WebGL layer instead (collectVerticalSegments + _vert3dLayer).
+// group: { id, features: [{ kind:'polygon'|'line'|'point'|'cylinder',
+//   multiPolygon?|multiLine?|point:[lng,lat]|lat+lng+radiusM+baseM+topM,
+//   radius?, dashArray?, style:{stroke,strokeWidth,strokeOpacity,fill,fillOpacity},
 //   popupHtml, label, pri }] }
 function vector3dSourceAndLayers(group) {
   const g = group || {};
@@ -2999,5 +3071,6 @@ if (typeof module !== 'undefined' && module.exports) {
     formatStamp, relAge, buildSectionMetaLine, rollupSources, metaToneClass,
     TERRAIN_DEM_URL, leafletToMaplibreCamera, maplibreToLeafletCamera, build3dStyle,
     leafletStyleTo3d, latlngsToMultiPolygon, latlngsToMultiLine, dashArrayTo3d, vector3dSourceAndLayers,
+    cylRadiusForHeightM, aircraft3dRecords, hexToRgb01, collectVerticalSegments,
   };
 }

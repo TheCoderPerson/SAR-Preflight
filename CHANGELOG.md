@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.17-g — 2026-07-17
+
+- 3D view phase 3 — vertical hazards and live traffic: FAA obstacles, towers, and dams with known heights now rise from the terrain as bold vertical height lines at their true AGL height (colored by the same hazard scale as their 2D markers). Live ADS-B aircraft appear in 3D at their actual altitude above the terrain — each plane is an X marker at its AGL altitude with a thin drop line to the ground so you can judge its height and position at a glance — updating with every 5-second traffic poll, with a clickable ground dot for the full aircraft popup. The weather radar layer now also drapes in 3D (current frame, follows the frame stepper).
+
 ## v2026.07.17-f — 2026-07-17
 
 - Fixed: viewshed and canopy overlays rendered wrong in the 3D view — large chunks were sliced off along straight tile-boundary lines (the 2D view was always correct). Cause was a terrain-draping bug in the 3D engine version the app was loading; upgrading the engine (MapLibre GL 4.7.1 → 5.24.0) fixes it. Overlays now drape completely and match the 2D view exactly.
