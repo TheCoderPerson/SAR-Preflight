@@ -19,6 +19,14 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.18-c',
+    date: '2026-07-18',
+    changes: [
+      'Observer perspective view (3D): tap an observer dot in the 3D view to stand at that observer — the camera drops to the observer\'s position at eye height (ground + 5.5 ft, the same eye the viewshed uses) so you can preview exactly what a visual observer would see. Drag or scroll to look around in any direction from the fixed position; terrain, canopy, and buildings render right up close (the render clip plane is pulled to arm\'s length while in this view). Tap the ground (or the EXIT VIEW button) to return to the normal 3D view; tap a different observer dot to jump to that perspective. Entering also switches the draped viewshed overlay to that observer.',
+      '2D map: tapping an observer marker now switches the displayed viewshed to that observer instantly (previously only the Terrain-tab list could switch).',
+    ],
+  },
+  {
     version: '2026.07.18-b',
     date: '2026-07-18',
     changes: [
@@ -2885,6 +2893,52 @@ function maplibreToLeafletCamera(lng, lat, zoom) {
   return { lat, lng, zoom: (zoom || 0) + 1 };
 }
 
+// --- Observer perspective view (first-person free-look) math ---
+// Pitch here is MapLibre camera pitch: 0 = straight down, 90 = horizon.
+// >90 looks above the horizon (MapLibre >=4.2 allows maxPitch up to 180).
+const OBSERVER_PITCH_MIN = 5;
+const OBSERVER_PITCH_MAX = 110;
+const OBSERVER_MAX_PITCH = 110;   // map maxPitch while in observer mode
+const OBSERVER_START_PITCH = 88;  // just below the horizon
+
+// Normalize a bearing to [-180, 180).
+function wrapBearing(deg) {
+  const d = Number(deg) || 0;
+  return ((d + 180) % 360 + 360) % 360 - 180;
+}
+
+function clampObserverPitch(pitch) {
+  if (!Number.isFinite(pitch)) return OBSERVER_START_PITCH;
+  return Math.min(OBSERVER_PITCH_MAX, Math.max(OBSERVER_PITCH_MIN, pitch));
+}
+
+// "Drag the world" convention (Street View feel): drag right -> look left,
+// drag down -> look up. Sign constants live only here.
+function applyLookDrag(pitch, bearing, dxPx, dyPx, degPerPx) {
+  const k = degPerPx == null ? 0.25 : degPerPx;
+  return {
+    pitch: clampObserverPitch(pitch + (dyPx || 0) * k),
+    bearing: wrapBearing(bearing - (dxPx || 0) * k),
+  };
+}
+
+// Wheel/trackpad look: scroll up -> look up, horizontal scroll -> turn.
+function wheelLook(pitch, bearing, deltaX, deltaY, degPerDelta) {
+  const k = degPerDelta == null ? 0.12 : degPerDelta;
+  return {
+    pitch: clampObserverPitch(pitch - (deltaY || 0) * k),
+    bearing: wrapBearing(bearing + (deltaX || 0) * k),
+  };
+}
+
+// Camera altitude for an eye standing on (exaggerated) rendered ground.
+// groundM comes from queryTerrainElevation (already exaggerated), so only
+// the eye offset itself gets scaled by the exaggeration factor.
+function observerEyeAltitudeM(groundM, eyeM, exaggeration) {
+  const g = Number.isFinite(groundM) ? groundM : 0;
+  return g + (eyeM || 0) * (exaggeration || 1);
+}
+
 function _raster3dSource(urls, maxzoom) {
   return { type: 'raster', tiles: Array.isArray(urls) ? urls : [urls], tileSize: 256, maxzoom };
 }
@@ -3316,6 +3370,7 @@ function vector3dSourceAndLayers(group) {
         popupHtml: f.popupHtml || '',
         label: f.label || '',
         pri: f.pri == null ? 7 : f.pri,
+        ...(f.featId != null ? { featId: f.featId } : {}),
       },
     });
   });
@@ -3399,6 +3454,8 @@ if (typeof module !== 'undefined' && module.exports) {
     geojsonShapeFeature, geojsonLineGeometry, geojsonPolygonGeometry, geojsonFeatureCollection,
     formatStamp, relAge, buildSectionMetaLine, rollupSources, metaToneClass,
     TERRAIN_DEM_URL, leafletToMaplibreCamera, maplibreToLeafletCamera, build3dStyle,
+    OBSERVER_PITCH_MIN, OBSERVER_PITCH_MAX, OBSERVER_MAX_PITCH, OBSERVER_START_PITCH,
+    wrapBearing, clampObserverPitch, applyLookDrag, wheelLook, observerEyeAltitudeM,
     leafletStyleTo3d, latlngsToMultiPolygon, latlngsToMultiLine, dashArrayTo3d, vector3dSourceAndLayers,
     cylRadiusForHeightM, aircraft3dRecords, hexToRgb01, collectVerticalSegments,
     AIRSPACE_CLASS_COLORS, SUA_COLORS, LAANC_COLORS, laancCeilingColor,
