@@ -478,6 +478,159 @@ function canopyGridToRGBA(grid, canopyFlat) {
 }
 
 // ============================================================
+// CANOPY EDITING — user corrections to the canopy raster (delete polygons +
+// paint strokes). Edits are stored as geographic OPERATIONS, not rasters, so
+// they replay identically onto any grid (overlay, viewshed, 3D, export).
+// Op shapes (plain JSON):
+//   { t:'del',   poly: [[lat,lng],...] }               zero cells inside polygon
+//   { t:'paint', pts: [[lat,lng],...], rM, hM }        stamp stroke at height hM
+// ============================================================
+const CANOPY_PAINT_DEFAULT_M = 10; // paint height when the raster has no trees to average
+
+// Mean height of tree cells (finite, >0). count 0 → default paint height.
+function canopyAvgHeight(canopyFlat) {
+  let sum = 0, count = 0;
+  if (canopyFlat) {
+    for (let i = 0; i < canopyFlat.length; i++) {
+      const v = canopyFlat[i];
+      if (Number.isFinite(v) && v > 0) { sum += v; count++; }
+    }
+  }
+  return { avgM: count ? sum / count : CANOPY_PAINT_DEFAULT_M, count };
+}
+
+// Circular brush stamp. Mutates canopyFlat; records FIRST-TOUCH old values into
+// `diff` (Map<idx, oldVal>) so a whole stroke reverts to pre-stroke state.
+// Guarantees >=1 cell when the point is inside the grid (radius may be < resM).
+// Returns the number of cells painted by this stamp.
+function canopyStampBrush(grid, canopyFlat, lat, lng, radiusM, heightM, diff) {
+  const dLat = radiusM / grid.mPerDegLat;
+  const dLng = radiusM / grid.mPerDegLng;
+  const r0 = gridLatToRow(grid, lat + dLat), r1 = gridLatToRow(grid, lat - dLat);
+  const c0 = gridLngToCol(grid, lng - dLng), c1 = gridLngToCol(grid, lng + dLng);
+  const r2 = radiusM * radiusM;
+  let painted = 0;
+  for (let row = r0; row <= r1; row++) {
+    const dy = (gridRowToLat(grid, row) - lat) * grid.mPerDegLat;
+    for (let col = c0; col <= c1; col++) {
+      const dx = (gridColToLng(grid, col) - lng) * grid.mPerDegLng;
+      if (dx * dx + dy * dy > r2) continue;
+      const idx = row * grid.cols + col;
+      if (diff && !diff.has(idx)) diff.set(idx, canopyFlat[idx]);
+      canopyFlat[idx] = heightM;
+      painted++;
+    }
+  }
+  if (!painted && lat >= grid.south && lat <= grid.north && lng >= grid.west && lng <= grid.east) {
+    const idx = gridLatToRow(grid, lat) * grid.cols + gridLngToCol(grid, lng);
+    if (diff && !diff.has(idx)) diff.set(idx, canopyFlat[idx]);
+    canopyFlat[idx] = heightM;
+    painted = 1;
+  }
+  return painted;
+}
+
+// Finalize a stroke's Map diff into compact typed arrays for the undo stack.
+function canopyDiffToSparse(diffMap) {
+  const n = diffMap ? diffMap.size : 0;
+  const indices = new Uint32Array(n), oldValues = new Float32Array(n);
+  let i = 0;
+  if (diffMap) for (const [idx, v] of diffMap) { indices[i] = idx; oldValues[i] = v; i++; }
+  return { indices, oldValues };
+}
+
+// Stamp a full polyline stroke, interpolating between points at radiusM/2 steps
+// so fast drags leave no gaps. Returns a sparse diff of pre-stroke values.
+function canopyApplyStroke(grid, canopyFlat, pts, radiusM, heightM) {
+  const diff = new Map();
+  if (pts && pts.length) {
+    canopyStampBrush(grid, canopyFlat, pts[0][0], pts[0][1], radiusM, heightM, diff);
+    const step = Math.max(radiusM / 2, 0.5);
+    for (let i = 1; i < pts.length; i++) {
+      const aLat = pts[i - 1][0], aLng = pts[i - 1][1];
+      const bLat = pts[i][0], bLng = pts[i][1];
+      const dist = Math.hypot((bLat - aLat) * grid.mPerDegLat, (bLng - aLng) * grid.mPerDegLng);
+      const nSteps = Math.max(1, Math.ceil(dist / step));
+      for (let s = 1; s <= nSteps; s++) {
+        const t = s / nSteps;
+        canopyStampBrush(grid, canopyFlat, aLat + (bLat - aLat) * t, aLng + (bLng - aLng) * t, radiusM, heightM, diff);
+      }
+    }
+  }
+  return canopyDiffToSparse(diff);
+}
+
+// Zero every cell whose CENTER falls inside the polygon (loop bounded by the
+// polygon bbox). insideFn(lat,lng,poly) is injectable for Node tests; in the
+// browser it defaults to the global pointInPolygon from core.js.
+// Returns a sparse diff listing only previously-nonzero cells.
+function canopyApplyDelete(grid, canopyFlat, poly, insideFn) {
+  const inside = insideFn || (typeof pointInPolygon !== 'undefined' ? pointInPolygon : null);
+  const diff = new Map();
+  if (poly && poly.length >= 3 && inside) {
+    let s = Infinity, n = -Infinity, w = Infinity, e = -Infinity;
+    for (const p of poly) {
+      if (p[0] < s) s = p[0]; if (p[0] > n) n = p[0];
+      if (p[1] < w) w = p[1]; if (p[1] > e) e = p[1];
+    }
+    const r0 = gridLatToRow(grid, n), r1 = gridLatToRow(grid, s);
+    const c0 = gridLngToCol(grid, w), c1 = gridLngToCol(grid, e);
+    for (let row = r0; row <= r1; row++) {
+      const lat = gridRowToLat(grid, row);
+      for (let col = c0; col <= c1; col++) {
+        const idx = row * grid.cols + col;
+        const v = canopyFlat[idx];
+        if (!(Number.isFinite(v) && v > 0)) continue;
+        if (!inside(lat, gridColToLng(grid, col), poly)) continue;
+        diff.set(idx, v);
+        canopyFlat[idx] = 0;
+      }
+    }
+  }
+  return canopyDiffToSparse(diff);
+}
+
+// Restore pre-op values recorded in a sparse diff.
+function canopyRevertDiff(canopyFlat, diff) {
+  if (!diff || !diff.indices) return;
+  for (let i = 0; i < diff.indices.length; i++) canopyFlat[diff.indices[i]] = diff.oldValues[i];
+}
+
+// Geographic bbox of an op (paint strokes inflated by their brush radius).
+function canopyOpBBox(op) {
+  const pts = op ? (op.t === 'del' ? op.poly : op.pts) : null;
+  if (!pts || !pts.length) return null;
+  let w = Infinity, s = Infinity, e = -Infinity, n = -Infinity;
+  for (const p of pts) {
+    if (p[0] < s) s = p[0]; if (p[0] > n) n = p[0];
+    if (p[1] < w) w = p[1]; if (p[1] > e) e = p[1];
+  }
+  if (op.t === 'paint' && op.rM > 0) {
+    const dLat = op.rM / 111320;
+    const dLng = op.rM / (111320 * Math.cos((s + n) / 2 * Math.PI / 180) || 111320);
+    s -= dLat; n += dLat; w -= dLng; e += dLng;
+  }
+  return { west: w, south: s, east: e, north: n };
+}
+
+// Ordered replay of an op log onto a grid's raster, skipping ops whose bbox
+// misses the grid entirely. Returns how many ops touched this grid.
+function canopyApplyOps(grid, canopyFlat, ops, insideFn) {
+  if (!ops || !ops.length || !canopyFlat) return 0;
+  const gb = grid.bounds;
+  let applied = 0;
+  for (const op of ops) {
+    const bb = canopyOpBBox(op);
+    if (!bb || bb.west > gb.east || bb.east < gb.west || bb.south > gb.north || bb.north < gb.south) continue;
+    if (op.t === 'del') canopyApplyDelete(grid, canopyFlat, op.poly, insideFn);
+    else if (op.t === 'paint') canopyApplyStroke(grid, canopyFlat, op.pts, op.rM, op.hM);
+    else continue;
+    applied++;
+  }
+  return applied;
+}
+
+// ============================================================
 // 3D CANOPY SURFACE MESH — decimate the canopy grid to a renderable vertex
 // count and triangulate it into a surface for the custom WebGL layer.
 // ============================================================
@@ -912,6 +1065,8 @@ if (typeof module !== 'undefined' && module.exports) {
     curvatureDrop, isVisible, computeViewshed, viewshedCoverage,
     computeShadowMask, shadowColorRamp, shadowMaskToRGBA,
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,
+    CANOPY_PAINT_DEFAULT_M, canopyAvgHeight, canopyStampBrush, canopyDiffToSparse,
+    canopyApplyStroke, canopyApplyDelete, canopyRevertDiff, canopyOpBBox, canopyApplyOps,
     decimateCanopyMesh, canopyMeshIndexed, normalFromSlopes,
     encodeGeoTiffRGBA, reprojectRgbaTo3857, worldFileForBounds, WGS84_WKT, WEBMERC_WKT, crc32, zipStore,
     makeViewshedRecord, viewshedFilenameSlug, uniqueViewshedName, observerKmlDescription,

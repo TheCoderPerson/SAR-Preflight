@@ -4,6 +4,11 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.18-d — 2026-07-18
+
+- Canopy editing (Terrain tab → EDIT next to the vegetation overlay): correct the canopy data where it is wrong — draw a polygon (drag its corners to refine, then DELETE) to remove phantom trees, or paint missing trees in with a brush (S/M/L sizes, painted at the average tree height of the current view). UNDO reverts the last 20 paints/deletes. Edit mode pins the satellite basemap under the canopy so you can trace what is actually on the ground, and works with touch.
+- Saved canopy edits persist offline and apply everywhere the canopy is used — the map overlay, NEW viewshed computations (recompute existing observers to pick them up), the 3D vegetation surface, and GeoTIFF/KMZ exports — and survive re-downloads of the source data. "Clear Canopy Edits" in Config → Cache Status restores the original data.
+
 ## v2026.07.18-c — 2026-07-18
 
 - Observer perspective view (3D): tap an observer dot in the 3D view to stand at that observer — the camera drops to the observer's position at eye height (ground + 5.5 ft, the same eye the viewshed uses) so you can preview exactly what a visual observer would see. Drag or scroll to look around in any direction from the fixed position; terrain, canopy, and buildings render right up close (the render clip plane is pulled to arm's length while in this view). Tap the ground (or the EXIT VIEW button) to return to the normal 3D view; tap a different observer dot to jump to that perspective. Entering also switches the draped viewshed overlay to that observer.

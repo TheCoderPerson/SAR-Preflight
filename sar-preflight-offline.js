@@ -21,6 +21,7 @@ const ENDPOINT_TTL = {
   canopytile: 90 * 24 * 60 * 60000, // 90 days — Meta canopy COG byte-range blocks (offline tile cache)
   canopy:     90 * 24 * 60 * 60000, // 90 days — resampled canopy grids per AOI
   dem:        90 * 24 * 60 * 60000, // 90 days — 3DEP DEM rasters per AOI
+  canopyedit: 365 * 24 * 60 * 60000, // 1 yr — user canopy-edit op log (kept until cache clear)
   // Ground access / land / water / hospitals — slow-changing infrastructure (30 days)
   usfs_roads:  30 * 24 * 60 * 60000,
   usfs_trails: 30 * 24 * 60 * 60000,
