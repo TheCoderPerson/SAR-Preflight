@@ -4,6 +4,11 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.18-c — 2026-07-18
+
+- Observer perspective view (3D): tap an observer dot in the 3D view to stand at that observer — the camera drops to the observer's position at eye height (ground + 5.5 ft, the same eye the viewshed uses) so you can preview exactly what a visual observer would see. Drag or scroll to look around in any direction from the fixed position; terrain, canopy, and buildings render right up close (the render clip plane is pulled to arm's length while in this view). Tap the ground (or the EXIT VIEW button) to return to the normal 3D view; tap a different observer dot to jump to that perspective. Entering also switches the draped viewshed overlay to that observer.
+- 2D map: tapping an observer marker now switches the displayed viewshed to that observer instantly (previously only the Terrain-tab list could switch).
+
 ## v2026.07.18-b — 2026-07-18
 
 - New Sun Shadow overlay (Terrain tab): shows which terrain is in shade vs. direct sun at the selected hour. Shadows are cast from real 3DEP terrain using the computed sun position, and scrubbing the forecast time bar re-casts them instantly, so you can preview how shade moves across the search area through the day. Toggleable with its own opacity slider (layer list → Analysis → "Sun Shadow"), works in both the 2D map and the 3D view, and shows the % of the view in shade. Shadow edges render as a soft graded penumbra (marginal cells fade instead of flickering), so low-sun shade over rough terrain looks natural rather than speckled. After sunset the whole area reads as shaded (night). Bare-earth terrain only — tree and building shade are not modeled.

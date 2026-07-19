@@ -82,6 +82,17 @@
 }
 .view3d-toggle:hover { border-color: var(--accent-blue); color: var(--text-primary); }
 .view3d-toggle.active { border-color: var(--accent-cyan); color: var(--accent-cyan); }
+/* Observer perspective view (first-person from an observer point in 3D) */
+.observer-exit { top: 96px; display: none; border-color: var(--accent-cyan); color: var(--accent-cyan); }
+.map-container.mode-observer .observer-exit { display: block; }
+.map-container.mode-observer .maplibregl-ctrl-bottom-right { display: none; } /* compass/zoom fight the free camera */
+#observerHint {
+  position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 850;
+  display: none; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 12px; font-family: var(--font-mono); font-size: 10px;
+  color: var(--text-secondary); letter-spacing: 0.5px; white-space: nowrap; pointer-events: none;
+}
+.map-container.mode-observer #observerHint { display: block; }
 /* 3D canopy mesh build progress — floats over the map in 3D mode */
 #canopy3dProgress {
   position: absolute; bottom: 52px; left: 50%; transform: translateX(-50%); z-index: 850;
@@ -705,6 +716,8 @@ select.api-input { cursor: pointer; }
     </div>
     <button class="theme-toggle" id="themeToggle" onclick="cycleTheme()" title="Cycle map theme: Dark → Light Map → Light">☾ DARK</button>
     <button class="view3d-toggle" id="view3dToggle" onclick="toggle3D()" title="3D terrain view — imagery layers drape on real terrain (data overlays stay in 2D)">⛰ 3D</button>
+    <button class="view3d-toggle observer-exit" id="observerExitBtn" onclick="exitObserverView()" title="Exit observer view — drag or scroll to look around; tap the ground to exit; tap another observer dot to switch">⮌ EXIT VIEW</button>
+    <div id="observerHint">DRAG / SCROLL TO LOOK · TAP GROUND TO EXIT</div>
     <div class="map-info">
       <span>CURSOR </span><span class="coord" id="cursorCoord">--°, --°</span>
       <span style="margin:0 8px;color:var(--border);">|</span>

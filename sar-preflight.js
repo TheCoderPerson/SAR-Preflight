@@ -10126,7 +10126,7 @@ function _observerPopupHtml(rec) {
 function _addObserverMarker(rec) {
   if (typeof L === 'undefined' || !L.marker) return null;
   _ensureObserverLayer();
-  const m = L.marker([rec.observer.lat, rec.observer.lng], { draggable: true, title: rec.name || 'Observer' });
+  const m = L.marker([rec.observer.lat, rec.observer.lng], { draggable: true, title: rec.name || 'Observer', featId: rec.id });
   if (m.bindPopup) m.bindPopup(_observerPopupHtml(rec));
   if (m.on) m.on('dragend', () => {
     const p = m.getLatLng();
@@ -10135,6 +10135,10 @@ function _addObserverMarker(rec) {
     r.observer = { lat: p.lat, lng: p.lng };
     setActiveViewshed(r.id);
     runViewshed(r.id);
+  });
+  if (m.on) m.on('click', () => {
+    if (S._viewshedPicking) return; // pick-mode click places a NEW observer
+    setActiveViewshed(rec.id);
   });
   rec._marker = m;
   S.mapLayers.observers.addLayer(m);
@@ -10236,6 +10240,7 @@ function renameViewshedPrompt(id) {
 function removeViewshed(id) {
   const idx = S.viewsheds.findIndex(r => r.id === id);
   if (idx < 0) return;
+  if (S.observerView && S.observerView.id === id) exitObserverView();
   const rec = S.viewsheds[idx];
   if (rec._marker && S.mapLayers.observers) S.mapLayers.observers.removeLayer(rec._marker);
   S.viewsheds.splice(idx, 1);
@@ -10251,6 +10256,7 @@ function removeViewshed(id) {
 }
 
 function clearAllViewsheds() {
+  if (S.observerView) exitObserverView();
   if (S.mapLayers.observers) S.mapLayers.observers.clearLayers();
   if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
   if (typeof clearViewsheds === 'function') clearViewsheds(_currentAreaKey());
@@ -10468,7 +10474,8 @@ function _vec3dRecords(root, meta, out, inheritedPopup) {
   } else if (root.getLatLng) {
     // Icon markers (divIcon SVGs) render as a uniform dot in 3D for now.
     const c = root.getLatLng();
-    out.push(Object.assign({ kind: 'point', point: [c.lng, c.lat], radius: 6, style: { stroke: '#e2e8f0', strokeWidth: 1.5, strokeOpacity: 1, fill: '#3d8bfd', fillOpacity: 0.9 } }, common));
+    const featId = (root.options && root.options.featId) || undefined;
+    out.push(Object.assign({ kind: 'point', point: [c.lng, c.lat], radius: 6, featId, style: { stroke: '#e2e8f0', strokeWidth: 1.5, strokeOpacity: 1, fill: '#3d8bfd', fillOpacity: 0.9 } }, common));
   } else if (root.getLayers) {
     root.getLayers().forEach(c => _vec3dRecords(c, meta, out, popupHtml));
     return;
@@ -11249,6 +11256,188 @@ function _open3dPopup(e) {
     .addTo(S.map3d);
 }
 
+// ============================================================
+// OBSERVER PERSPECTIVE VIEW — first-person from an observer point.
+// Tap an observer dot in 3D to stand at that observer (bare ground +
+// PILOT_EYE_M, same eye the viewshed kernel uses) and drag/scroll to look
+// around from the fixed camera position (MapLibre FreeCameraOptions).
+// Tap the ground (or the EXIT VIEW button) to return; tap another observer
+// dot to switch perspective.
+// ============================================================
+
+// MapLibre handlers that fight a fixed free camera while in observer mode.
+const _OBS_HANDLERS = ['dragPan', 'dragRotate', 'scrollZoom', 'doubleClickZoom', 'keyboard', 'boxZoom', 'touchZoomRotate', 'touchPitch'];
+
+// MapLibre auto-computes the near clip plane as canvasHeight/50 projected
+// units, which at the eye camera's derived zoom lands ~200 m in front of the
+// observer — nearby terrain/canopy/buildings vanish until you look up. While
+// in observer mode we override near/far to human-scale distances (converted
+// via transform.pixelsPerMeter, which tracks the current zoom).
+const OBSERVER_NEAR_M = 1.0;
+const OBSERVER_FAR_M = 150000; // distant Sierra ridgelines stay visible
+
+function _observer3dFeatureAt(point) {
+  if (!S.map3d || !point) return null;
+  try {
+    if (!S.map3d.getLayer('vec_observers_pt')) return null;
+    const pad = 8; // draped dots are nearly edge-on at horizon pitch — be generous
+    const box = [[point.x - pad, point.y - pad], [point.x + pad, point.y + pad]];
+    const feats = S.map3d.queryRenderedFeatures(box, { layers: ['vec_observers_pt'] });
+    for (const f of feats) {
+      const id = f && f.properties && f.properties.featId;
+      if (id) return id;
+    }
+  } catch (e) { /* style mid-rebuild */ }
+  return null;
+}
+
+function enterObserverView(id) {
+  if (!S.map3d || !S.is3D) return;
+  const rec = S.viewsheds.find(r => r.id === id);
+  if (!rec || !rec.observer) return;
+  const switching = !!S.observerView;
+  if (!switching) {
+    const m = S.map3d;
+    const prevCam = { center: m.getCenter(), zoom: m.getZoom(), pitch: m.getPitch(), bearing: m.getBearing() };
+    _OBS_HANDLERS.forEach(h => { try { m[h] && m[h].disable(); } catch (e) { /* handler absent */ } });
+    try { m.setMaxPitch(OBSERVER_MAX_PITCH); } catch (e) { try { m.setMaxPitch(85); } catch (e2) { /* keep default */ } }
+    // The eye camera carries its own elevation — terrain must not re-clamp it.
+    try { m.setCenterClampedToGround(false); } catch (e) { /* older engine */ }
+    S.observerView = { id, pitch: OBSERVER_START_PITCH, bearing: prevCam.bearing, prevCam, eyeLngLat: null, eyeAltM: null, dragPx: 0 };
+    const container = document.querySelector('.map-container');
+    if (container) container.classList.add('mode-observer');
+    _attachObserverInput();
+  } else {
+    // Keep the ORIGINAL prevCam — exit restores the pre-observer camera.
+    S.observerView.id = id;
+    S.observerView.pitch = OBSERVER_START_PITCH;
+    S.observerView.eyeLngLat = null;
+    S.observerView.eyeAltM = null;
+  }
+  if (S._agg3d && S._agg3d.popup) { try { S._agg3d.popup.remove(); } catch (e) { /* already gone */ } S._agg3d.popup = null; }
+  setActiveViewshed(id); // drape this observer's viewshed
+  // Force terrain tiles at the observer before sampling ground height.
+  try { S.map3d.jumpTo({ center: [rec.observer.lng, rec.observer.lat], zoom: 14 }); } catch (e) { /* camera race */ }
+  _lockObserverCamera(rec, 0);
+  try { Diag.note('3d.obsview.enter', { sw: switching ? 1 : 0 }); } catch (_) {}
+}
+
+function _lockObserverCamera(rec, attempt) {
+  const ov = S.observerView;
+  if (!ov || ov.id !== rec.id || !S.map3d) return; // exited/switched while waiting
+  const lng = rec.observer.lng, lat = rec.observer.lat;
+  let g = null;
+  try { g = S.map3d.queryTerrainElevation([lng, lat]); } catch (e) { /* terrain not ready */ }
+  if (!Number.isFinite(g) && (attempt || 0) < 4) {
+    S.map3d.once('idle', () => _lockObserverCamera(rec, (attempt || 0) + 1));
+    return;
+  }
+  if (!Number.isFinite(g)) { try { Diag.note('3d.obsview.noterrain', {}); } catch (_) {} }
+  // queryTerrainElevation returns the exaggerated rendered ground, so the eye
+  // lands exactly eye-height above the terrain the user sees.
+  ov.eyeLngLat = [lng, lat];
+  ov.eyeAltM = observerEyeAltitudeM(g, PILOT_EYE_M, TERRAIN_EXAGGERATION);
+  _applyObserverLook();
+}
+
+function _applyObserverLook() {
+  const ov = S.observerView;
+  if (!ov || !ov.eyeLngLat || !S.map3d) return;
+  try {
+    const cam = S.map3d.calculateCameraOptionsFromCameraLngLatAltRotation(
+      ov.eyeLngLat, ov.eyeAltM, ov.bearing, ov.pitch, 0);
+    // maplibre 5.24 returns a `roll: undefined` key here; jumpTo then calls
+    // setRoll(undefined), which NaNs the view matrix and permanently wedges
+    // the transform (every later jumpTo throws). Force a real number.
+    if (!Number.isFinite(cam.roll)) cam.roll = 0;
+    S.map3d.jumpTo(cam);
+    // Re-apply per look change: pixelsPerMeter shifts with the derived zoom.
+    const tr = S.map3d.transform;
+    if (tr && typeof tr.overrideNearFarZ === 'function' && Number.isFinite(tr.pixelsPerMeter)) {
+      tr.overrideNearFarZ(OBSERVER_NEAR_M * tr.pixelsPerMeter, OBSERVER_FAR_M * tr.pixelsPerMeter);
+    }
+  } catch (e) { /* mid-teardown */ }
+}
+
+function _attachObserverInput() {
+  const canvas = S.map3d && S.map3d.getCanvas && S.map3d.getCanvas();
+  if (!canvas) return;
+  const ov = S.observerView;
+  let last = null;
+  const down = (e) => {
+    if (!S.observerView) return;
+    last = { x: e.clientX, y: e.clientY };
+    S.observerView.dragPx = 0;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* mouse w/o capture */ }
+  };
+  const move = (e) => {
+    if (!last || !S.observerView) return;
+    const dx = e.clientX - last.x, dy = e.clientY - last.y;
+    last = { x: e.clientX, y: e.clientY };
+    S.observerView.dragPx += Math.abs(dx) + Math.abs(dy);
+    const look = applyLookDrag(S.observerView.pitch, S.observerView.bearing, dx, dy);
+    S.observerView.pitch = look.pitch;
+    S.observerView.bearing = look.bearing;
+    _applyObserverLook();
+  };
+  const up = () => { last = null; };
+  const wheel = (e) => {
+    if (!S.observerView) return;
+    e.preventDefault();
+    const look = wheelLook(S.observerView.pitch, S.observerView.bearing, e.deltaX, e.deltaY);
+    S.observerView.pitch = look.pitch;
+    S.observerView.bearing = look.bearing;
+    _applyObserverLook();
+  };
+  canvas.addEventListener('pointerdown', down);
+  canvas.addEventListener('pointermove', move);
+  canvas.addEventListener('pointerup', up);
+  canvas.addEventListener('pointercancel', up);
+  canvas.addEventListener('wheel', wheel, { passive: false });
+  ov._detachInput = () => {
+    canvas.removeEventListener('pointerdown', down);
+    canvas.removeEventListener('pointermove', move);
+    canvas.removeEventListener('pointerup', up);
+    canvas.removeEventListener('pointercancel', up);
+    canvas.removeEventListener('wheel', wheel);
+  };
+}
+
+function exitObserverView() {
+  const ov = S.observerView;
+  if (!ov) return;
+  S.observerView = null;
+  const container = document.querySelector('.map-container');
+  if (container) container.classList.remove('mode-observer');
+  if (ov._detachInput) { try { ov._detachInput(); } catch (e) { /* canvas gone */ } }
+  const m = S.map3d;
+  if (m) {
+    _OBS_HANDLERS.forEach(h => { try { m[h] && m[h].enable(); } catch (e) { /* handler absent */ } });
+    try { if (m.transform && m.transform.clearNearFarZOverride) m.transform.clearNearFarZOverride(); } catch (e) { /* older engine */ }
+    try { m.setCenterClampedToGround(true); } catch (e) { /* older engine */ }
+    try {
+      const p = ov.prevCam;
+      m.jumpTo({ center: p.center, zoom: p.zoom, pitch: p.pitch, bearing: p.bearing });
+    } catch (e) { /* mid-teardown */ }
+    try { m.setMaxPitch(80); } catch (e) { /* keep raised */ }
+  }
+  try { Diag.note('3d.obsview.exit', {}); } catch (_) {}
+}
+
+// 3D click router: observer taps take precedence over the aggregate popup.
+function _on3dClick(e) {
+  if (S.observerView) {
+    if (S.observerView.dragPx > 5) { S.observerView.dragPx = 0; return; } // DOM click still fires after our manual drags
+    const id = _observer3dFeatureAt(e.point);
+    if (id && id !== S.observerView.id) enterObserverView(id); // switch perspective
+    else if (!id) exitObserverView();                          // tap anywhere else → exit
+    return;                                                    // same-observer tap: no-op
+  }
+  const id = _observer3dFeatureAt(e.point);
+  if (id) { enterObserverView(id); return; }
+  _open3dPopup(e);
+}
+
 async function toggle3D() {
   if (S.is3D) { _exit3D(); return; }
   if (_isConstrained() && !S._warned3d) {
@@ -11292,7 +11481,7 @@ function _enter3D() {
         const el = document.getElementById('cursorCoord');
         if (el) el.textContent = `${e.lngLat.lat.toFixed(5)}°, ${e.lngLat.lng.toFixed(5)}°`;
       });
-      S.map3d.on('click', _open3dPopup);
+      S.map3d.on('click', _on3dClick);
       S.map3d.on('load', () => { _ensureVert3dLayer(); _updateVert3dVerts(); });
       S.map3d.on('error', ev => {
         try { Diag.noteThrottled('3d.err', 5000, { m: String(ev && ev.error && ev.error.message).slice(0, 120) }); } catch (_) {}
@@ -11322,6 +11511,7 @@ function _enter3D() {
 }
 
 function _exit3D() {
+  if (S.observerView) exitObserverView(); // restore the orbit camera BEFORE the 2D copy-back below
   const container = document.querySelector('.map-container');
   if (S._agg3d && S._agg3d.popup) { try { S._agg3d.popup.remove(); } catch (e) { /* already gone */ } S._agg3d.popup = null; }
   if (S.map3d && S.map) {
@@ -11414,6 +11604,7 @@ if (typeof module !== 'undefined' && module.exports) {
     getStoredTheme, applyTheme, cycleTheme,
     toggle3D, collect3dState, sync3d, _enter3D, _exit3D, _loadMaplibre,
     collect3dVectorGroups, _vec3dRecords, _open3dPopup, agg3dStep, _agg3dHtml, VEC3D_SKIP,
+    enterObserverView, exitObserverView, _on3dClick, _observer3dFeatureAt, _lockObserverCamera, _applyObserverLook,
     _aircraft3dGroup, _refresh3dAircraft, _adsbPopupHtml,
     _overpassFetch, fetchBuildings, renderBuildingsLayer, _buildingsCap,
     getBuildings3dSetting, setBuildings3dMode, _buildings3dMode,

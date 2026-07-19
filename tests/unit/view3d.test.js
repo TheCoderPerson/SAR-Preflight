@@ -2,6 +2,8 @@ const {
   TERRAIN_DEM_URL, leafletToMaplibreCamera, maplibreToLeafletCamera, build3dStyle,
   leafletStyleTo3d, latlngsToMultiPolygon, latlngsToMultiLine, dashArrayTo3d, vector3dSourceAndLayers,
   cylRadiusForHeightM, aircraft3dRecords, hexToRgb01, collectVerticalSegments,
+  OBSERVER_PITCH_MIN, OBSERVER_PITCH_MAX, OBSERVER_START_PITCH,
+  wrapBearing, clampObserverPitch, applyLookDrag, wheelLook, observerEyeAltitudeM,
 } = require('../../sar-preflight-core.js');
 
 // ============================================================
@@ -354,5 +356,99 @@ describe('aircraft3dRecords', () => {
   it('skips aircraft without a usable AGL', () => {
     expect(aircraft3dRecords([{ lat: 1, lng: 1, aglM: null }, { lat: 1, lng: 1, aglM: -50 }, null])).toEqual([]);
     expect(aircraft3dRecords(null)).toEqual([]);
+  });
+});
+
+// ============================================================
+// Observer perspective view — free-look math
+// ============================================================
+
+describe('wrapBearing', () => {
+  it('normalizes to [-180, 180)', () => {
+    expect(wrapBearing(190)).toBe(-170);
+    expect(wrapBearing(-190)).toBe(170);
+    expect(wrapBearing(360)).toBe(0);
+    expect(wrapBearing(540)).toBe(-180);
+    expect(wrapBearing(0)).toBe(0);
+    expect(wrapBearing(-180)).toBe(-180);
+    expect(wrapBearing(180)).toBe(-180);
+  });
+
+  it('treats non-numeric input as 0', () => {
+    expect(wrapBearing(undefined)).toBe(0);
+    expect(wrapBearing(NaN)).toBe(0);
+  });
+});
+
+describe('clampObserverPitch', () => {
+  it('clamps to the observer pitch range', () => {
+    expect(clampObserverPitch(-20)).toBe(OBSERVER_PITCH_MIN);
+    expect(clampObserverPitch(500)).toBe(OBSERVER_PITCH_MAX);
+    expect(clampObserverPitch(90)).toBe(90);
+  });
+
+  it('falls back to the start pitch for non-finite input', () => {
+    expect(clampObserverPitch(NaN)).toBe(OBSERVER_START_PITCH);
+    expect(clampObserverPitch(undefined)).toBe(OBSERVER_START_PITCH);
+  });
+});
+
+describe('applyLookDrag', () => {
+  it('drags the world: drag right looks left, drag down looks up', () => {
+    const r = applyLookDrag(88, 0, 40, 20);
+    expect(r.bearing).toBe(-10);  // dx 40px * 0.25°/px, negated
+    expect(r.pitch).toBe(93);     // dy 20px * 0.25°/px, added
+  });
+
+  it('clamps pitch and wraps bearing', () => {
+    const r = applyLookDrag(108, 175, -40, 400);
+    expect(r.pitch).toBe(OBSERVER_PITCH_MAX);
+    expect(r.bearing).toBe(-175); // 175 + 10 wraps
+  });
+
+  it('honors a custom sensitivity', () => {
+    expect(applyLookDrag(88, 0, 10, 0, 1).bearing).toBe(-10);
+  });
+});
+
+describe('wheelLook', () => {
+  it('scroll up looks up, horizontal wheel turns', () => {
+    const r = wheelLook(88, 10, 50, -100);
+    expect(r.pitch).toBe(100);   // -(-100) * 0.12
+    expect(r.bearing).toBe(16);  // 10 + 50*0.12
+  });
+
+  it('clamps and wraps', () => {
+    expect(wheelLook(88, 0, 0, -10000).pitch).toBe(OBSERVER_PITCH_MAX);
+    expect(wheelLook(88, 179, 100, 0, 1).bearing).toBe(-81);
+  });
+});
+
+describe('observerEyeAltitudeM', () => {
+  it('adds the exaggerated eye height to the rendered ground', () => {
+    expect(observerEyeAltitudeM(1000, 1.6764, 1.15)).toBeCloseTo(1001.928, 2);
+  });
+
+  it('treats missing ground as 0 and missing exaggeration as 1', () => {
+    expect(observerEyeAltitudeM(NaN, 1.6764, 1.15)).toBeCloseTo(1.928, 2);
+    expect(observerEyeAltitudeM(undefined, 2, undefined)).toBe(2);
+  });
+});
+
+describe('vector3dSourceAndLayers featId passthrough', () => {
+  it('carries featId into point feature properties when present', () => {
+    const built = vector3dSourceAndLayers({
+      id: 'observers',
+      features: [{ kind: 'point', point: [-120.5, 38.5], style: {}, popupHtml: 'o', label: 'Observer', pri: 3, featId: 'vs_abc' }],
+    });
+    expect(built.source.data.features[0].properties.featId).toBe('vs_abc');
+  });
+
+  it('omits the featId key entirely when absent', () => {
+    const built = vector3dSourceAndLayers({
+      id: 'airports',
+      features: [{ kind: 'point', point: [0, 0], style: {}, popupHtml: 'a', label: 'Airport', pri: 3 }],
+    });
+    expect('featId' in built.source.data.features[0].properties).toBe(false);
   });
 });
