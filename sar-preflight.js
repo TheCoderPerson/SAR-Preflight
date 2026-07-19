@@ -52,6 +52,9 @@ const S = {
   activeViewshedId: null,   // the one currently displayed (only one overlay at a time)
   _viewshedRunningId: null, // id currently computing (serializes the kernel)
   _viewshedPicking: false,
+  // Canopy edit mode (user corrections to the canopy raster)
+  _canopyEditing: false,
+  canopyEdit: null,         // session state — see startCanopyEdit()
   // Automatic FAA TFR/NOTAM check status (for the NOTAMs-tab indicator)
   autoCheck: { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 },
   // Per-section data freshness, keyed by SECTION_DEFS key:
@@ -721,6 +724,7 @@ function initMap() {
     }, 300);
   });
   S.map.on(L.Draw.Event.CREATED, e => {
+    if (S._canopyEditing) { onCanopyEditPolygon(e.layer); return; } // edit-mode polygon, not an ops area
     S.drawnItems.clearLayers();
     e.layer.setStyle({ color: '#3d8bfd', weight: 2, fillColor: '#3d8bfd', fillOpacity: 0.08, dashArray: '6,4' });
     S.drawnItems.addLayer(e.layer);
@@ -734,6 +738,7 @@ function initMap() {
   // are routed here too (see wirePopupAggregation), so this catches clicks that
   // land between features but still inside a polygon.
   S.map.on('click', e => {
+    if (S._canopyEditing) return; // no aggregate popups while editing canopy
     if (S._viewshedPicking) { onViewshedMapClick(e.latlng); return; }
     openAggregatePopup(e.latlng, e);
   });
@@ -786,6 +791,7 @@ function initMap() {
 // DRAW
 // ============================================================
 function startDraw(type) {
+  if (S._canopyEditing) return; // ops-area drawing is disabled in canopy edit mode
   if (S.is3D && typeof _exit3D === 'function') _exit3D(); // drawing happens on the 2D map
   if (typeof cancelViewshedPick === 'function') cancelViewshedPick(); // draw + viewshed-pick are mutually exclusive
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
@@ -7533,6 +7539,8 @@ function buildLayerControl() {
   if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 function toggleLayer(id, el) {
+  // Canopy edit mode pins the satellite base + edit canvas — ignore toggles that would fight it.
+  if (S._canopyEditing && ['satellite', 'topo', 'sectional', 'canopy'].includes(id)) return;
   el.classList.toggle('active');
   const on = el.classList.contains('active');
   const overlayIds = ['satellite', 'topo', 'sectional'];
@@ -9627,6 +9635,23 @@ async function fetch3DEPDEM(grid) {
   return { demFlat, source: '3DEP ~' + Math.round(grid.resM) + ' m' };
 }
 
+// Replay the user's saved canopy edits (delete polygons + paint strokes) onto a
+// fetched raster. Ops are geographic, so they apply to ANY grid that overlaps —
+// the view overlay, every viewshed grid, 3D, exports. Works on a COPY when ops
+// apply so the pristine array (possibly queued for an async IndexedDB cache
+// write) is never mutated. Returns { flat, edited }.
+async function _applyCanopyEdits(grid, flat) {
+  try {
+    if (!flat || typeof getCachedRaster !== 'function') return { flat, edited: false };
+    const rec = await getCachedRaster('canopyedit', 'global');
+    const ops = rec && rec.data && rec.data.ops;
+    if (!Array.isArray(ops) || !ops.length) return { flat, edited: false };
+    const copy = flat.slice();
+    const n = canopyApplyOps(grid, copy, ops, pointInPolygon);
+    return n > 0 ? { flat: copy, edited: true } : { flat, edited: false };
+  } catch (_) { return { flat, edited: false }; }
+}
+
 // --- Canopy: Meta 1 m COG tiles via the proxy (online), else IndexedDB cache ---
 async function fetchCanopyRaster(grid) {
   const base = getCanopyProxyBase();
@@ -9639,7 +9664,8 @@ async function fetchCanopyRaster(grid) {
         if (typeof cacheRaster === 'function') cacheRaster('canopy', cacheKey, { canopyArr: res.canopy });
         if (res.tilesFailed > 0) recordDataSourceError('Canopy', new Error(`${res.tilesFailed} of ${res.tilesTotal} canopy tiles failed to load (proxy/data-service errors)`));
         else clearDataSourceError('Canopy');
-        return { canopyFlat: res.canopy, source: 'Meta 1 m', tilesTotal: res.tilesTotal, tilesLoaded: res.tilesLoaded, tilesFailed: res.tilesFailed };
+        const ed = await _applyCanopyEdits(grid, res.canopy);
+        return { canopyFlat: ed.flat, source: 'Meta 1 m' + (ed.edited ? ' (edited)' : ''), tilesTotal: res.tilesTotal, tilesLoaded: res.tilesLoaded, tilesFailed: res.tilesFailed };
       }
     } catch (e) {
       recordDataSourceError('Canopy', e);
@@ -9647,7 +9673,10 @@ async function fetchCanopyRaster(grid) {
   }
   if (typeof getCachedRaster === 'function') {
     const c = await getCachedRaster('canopy', cacheKey);
-    if (c && c.data && c.data.canopyArr) return { canopyFlat: c.data.canopyArr, source: 'Meta 1 m (cached)' };
+    if (c && c.data && c.data.canopyArr) {
+      const ed = await _applyCanopyEdits(grid, c.data.canopyArr);
+      return { canopyFlat: ed.flat, source: 'Meta 1 m (cached)' + (ed.edited ? ' (edited)' : '') };
+    }
   }
   return { canopyFlat: null, source: base ? 'unavailable' : 'no proxy' };
 }
@@ -9847,6 +9876,7 @@ function renderRasterOverlay(layerId, rgba, grid, opacity) {
 function setCanopyOpacity(v) {
   const o = parseFloat(v);
   if (S.mapLayers.canopy && S.mapLayers.canopy.setOpacity) S.mapLayers.canopy.setOpacity(o);
+  if (S._canopyEditing && S.canopyEdit && S.canopyEdit.canvas) S.canopyEdit.canvas.style.opacity = o;
   const span = document.getElementById('canopyOpacityVal');
   if (span) span.textContent = Math.round(o * 100) + '%';
   // 2D drape only — the 3D canopy surface renders fully opaque by design.
@@ -9861,6 +9891,7 @@ function setViewshedOpacity(v) {
 }
 
 async function toggleCanopyOverlay() {
+  if (S._canopyEditing) return; // edit mode owns the canopy display
   const cb = document.getElementById('canopyToggle');
   const on = cb ? cb.checked : !(S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy));
   if (!on) {
@@ -9896,6 +9927,7 @@ async function toggleCanopyOverlay() {
 
 async function loadCanopyForView() {
   if (!S.map) return;
+  if (S._canopyEditing) return; // grid must not change mid-edit
   trackFetchStart('Canopy');
   setStatus('canopyStatus', 'loading', 'Fetching...');
   try {
@@ -9920,6 +9952,7 @@ async function loadCanopyForView() {
     const grid = makeGrid(center.lat, center.lng, halfWidthM, resM);
     try { Diag.note('canopy.start', { z: S.map.getZoom(), cols: grid.cols, rows: grid.rows, halfKm: Math.round(halfWidthM / 100) / 10 }); } catch (_) {}
     const { canopyFlat, source, tilesFailed, tilesLoaded, tilesTotal } = await fetchCanopyRaster(grid);
+    if (S._canopyEditing) return; // user entered edit mode while this load was in flight — don't fight the edit canvas
     if (!canopyFlat) {
       setStatus('canopyStatus', 'error', source === 'no proxy' ? 'NO PROXY' : 'NO DATA');
       markSection('canopy', { status: 'error', error: source === 'no proxy' ? 'No canopy proxy configured' : 'No canopy data for this view' });
@@ -9950,6 +9983,428 @@ async function loadCanopyForView() {
   } finally {
     trackFetchEnd('Canopy');
   }
+}
+
+// ============================================================
+// CANOPY EDIT MODE — user corrections to the canopy raster.
+// Entered from the Terrain tab. Satellite base + a live edit canvas replace the
+// normal canopy imageOverlay; the user deletes trees inside drawn polygons or
+// paints them in with a brush. Edits are stored as geographic OPS (see
+// sar-preflight-raster.js) and replayed by fetchCanopyRaster onto any grid.
+// ============================================================
+const CANOPY_EDIT_BRUSH_SIZES = { S: 5, M: 10, L: 20 }; // ground radius, metres
+
+// Show exactly one of the mutually-exclusive base overlays (null → none).
+function _setBaseOverlay(id) {
+  ['satellite', 'topo', 'sectional'].forEach(x => {
+    const layer = S.mapLayers[x];
+    if (!layer) return;
+    const on = x === id;
+    if (on && !S.map.hasLayer(layer)) layer.addTo(S.map);
+    if (!on && S.map.hasLayer(layer)) S.map.removeLayer(layer);
+    document.querySelector(`[data-layer="${x}"]`)?.classList.toggle('active', on);
+  });
+}
+
+async function startCanopyEdit() {
+  if (S._canopyEditing || !S.map) return;
+  if (S.is3D && typeof _exit3D === 'function') _exit3D();
+  if (typeof cancelViewshedPick === 'function') cancelViewshedPick();
+  if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; clearDrawBtns(); }
+  if (!S.canopy || !S.canopy.canopyFlat) await loadCanopyForView();
+  if (!S.canopy || !S.canopy.canopyFlat) {
+    if (typeof alert === 'function') alert('Canopy data is not loaded for this view — load the vegetation overlay first, then edit.');
+    return;
+  }
+  S.map.closePopup();
+  const prevBase = ['satellite', 'topo', 'sectional'].find(id => S.mapLayers[id] && S.map.hasLayer(S.mapLayers[id])) || null;
+  _setBaseOverlay('satellite');
+  // The edit canvas replaces the normal canopy overlay while editing.
+  if (S._overlayWanted) S._overlayWanted.canopy = false;
+  if (S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
+  const grid = S.canopy.grid;
+  const workFlat = S.canopy.canopyFlat.slice();
+  const avg = canopyAvgHeight(workFlat);
+  S.canopyEdit = {
+    subMode: null, grid, workFlat,
+    avgM: avg.avgM, brushRadiusM: CANOPY_EDIT_BRUSH_SIZES.M,
+    sessionOps: [], undoStack: [],
+    polyLayer: null, drawHandler: null, prevBase,
+    canvas: null, off: null, _stroke: null, _raf: 0,
+  };
+  S._canopyEditing = true;
+  try { Diag.alloc('canopyEditWork', workFlat.byteLength); Diag.note('canopyEdit.start', { cells: workFlat.length, avgM: Math.round(avg.avgM * 10) / 10 }); } catch (_) {}
+  _canopyEditCanvasCreate();
+  _canopyEditPointerAttach();
+  document.querySelector('.map-container')?.classList.add('mode-canopy-edit');
+  setCanopyEditSubMode('pan');
+  _canopyEditFlash('BRUSH paints trees at ' + Math.round(mToFt(S.canopyEdit.avgM)) + ' ft · POLY deletes them');
+}
+
+function exitCanopyEdit(force) {
+  const ce = S.canopyEdit;
+  if (!ce) return;
+  if (!force && ce.sessionOps.length && typeof confirm === 'function'
+      && !confirm('Discard unsaved canopy edits?')) return;
+  _canopyEditPointerDetach();
+  if (ce.drawHandler) { try { ce.drawHandler.disable(); } catch (_) {} ce.drawHandler = null; }
+  _canopyEditDiscardPoly();
+  if (ce._raf) { cancelAnimationFrame(ce._raf); ce._raf = 0; }
+  if (ce._onMapMove) { S.map.off('move resize', ce._onMapMove); S.map.off('zoomstart', ce._onZoomStart); S.map.off('zoomend', ce._onZoomEnd); }
+  if (ce.canvas) ce.canvas.remove();
+  const el = S.map.getContainer();
+  S.map.dragging.enable();
+  if (S.map.touchZoom) S.map.touchZoom.enable();
+  if (S.map.doubleClickZoom) S.map.doubleClickZoom.enable();
+  el.style.cursor = ''; el.style.touchAction = '';
+  _setBaseOverlay(ce.prevBase);
+  document.querySelector('.map-container')?.classList.remove('mode-canopy-edit');
+  try { Diag.free('canopyEditWork', ce.workFlat.byteLength); Diag.note('canopyEdit.exit', { saved: !ce.sessionOps.length }); } catch (_) {}
+  S._canopyEditing = false;
+  S.canopyEdit = null;
+  _canopyEditBarSync(); // hides the toolbar
+  // Restore the normal canopy overlay from app state (reflects edits iff saved).
+  if (S.canopy && S.canopy.canopyFlat) {
+    const op = parseFloat((document.getElementById('canopyOpacity') || {}).value) || CANOPY_OVERLAY_OPACITY;
+    renderRasterOverlay('canopy', canopyGridToRGBA(S.canopy.grid, S.canopy.canopyFlat), S.canopy.grid, op);
+    const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = true;
+  }
+  buildLayerControl();
+}
+
+function setCanopyEditSubMode(mode) {
+  const ce = S.canopyEdit;
+  if (!ce) return;
+  if (ce.drawHandler) { try { ce.drawHandler.disable(); } catch (_) {} ce.drawHandler = null; }
+  if (mode !== 'polygonEdit') _canopyEditDiscardPoly();
+  ce.subMode = mode;
+  ce._stroke = null;
+  const el = S.map.getContainer();
+  if (mode === 'brush') {
+    S.map.dragging.disable();
+    if (S.map.touchZoom) S.map.touchZoom.disable();
+    if (S.map.doubleClickZoom) S.map.doubleClickZoom.disable();
+    el.style.cursor = 'crosshair';
+    el.style.touchAction = 'none';
+  } else {
+    S.map.dragging.enable();
+    if (S.map.touchZoom) S.map.touchZoom.enable();
+    if (S.map.doubleClickZoom) S.map.doubleClickZoom.enable();
+    el.style.cursor = mode === 'polygon' ? 'crosshair' : '';
+    el.style.touchAction = '';
+  }
+  if (mode === 'polygon') {
+    ce.drawHandler = new L.Draw.Polygon(S.map, {
+      shapeOptions: { color: '#f59e0b', weight: 2, fillColor: '#f59e0b', fillOpacity: 0.1, dashArray: '6,4' },
+      allowIntersection: false,
+    });
+    ce.drawHandler.enable();
+  }
+  _canopyEditBarSync();
+}
+
+function setCanopyBrushSize(radiusM) {
+  const ce = S.canopyEdit;
+  if (!ce) return;
+  ce.brushRadiusM = radiusM;
+  _canopyEditBarSync();
+}
+
+// Completed edit-mode polygon (routed from the global CREATED handler):
+// keep it on the map with draggable vertices until DELETE or CANCEL.
+function onCanopyEditPolygon(layer) {
+  const ce = S.canopyEdit;
+  if (!ce) return;
+  ce.drawHandler = null; // L.Draw disables itself after CREATED
+  layer.setStyle({ color: '#f59e0b', weight: 2, fillColor: '#f59e0b', fillOpacity: 0.12, dashArray: '6,4' });
+  layer.addTo(S.map);
+  if (layer.editing && layer.editing.enable) layer.editing.enable(); // draggable vertex handles
+  ce.polyLayer = layer;
+  ce.subMode = 'polygonEdit';
+  S.map.getContainer().style.cursor = '';
+  _canopyEditBarSync();
+  _canopyEditFlash('Drag vertices to refine, then DELETE trees inside — or CANCEL');
+}
+
+function canopyEditDelete() {
+  const ce = S.canopyEdit;
+  if (!ce || !ce.polyLayer) return;
+  const ring = (ce.polyLayer.getLatLngs()[0] || []).map(p => [p.lat, p.lng]);
+  _canopyEditDiscardPoly();
+  if (ring.length >= 3) {
+    const diff = canopyApplyDelete(ce.grid, ce.workFlat, ring, pointInPolygon);
+    // Keep the op even when no displayed cells changed: finer viewshed grids may
+    // still have (1 m source) trees inside this polygon that the op must clear.
+    _canopyEditPushOp({ t: 'del', poly: ring }, diff);
+    _canopyEditRepaintIndices(diff.indices);
+    _canopyEditFlash(diff.indices.length ? 'Deleted ' + diff.indices.length + ' tree cells' : 'No trees in polygon (delete saved for finer grids)');
+  }
+  setCanopyEditSubMode('pan');
+}
+
+function canopyEditCancelPoly() {
+  const ce = S.canopyEdit;
+  if (!ce) return;
+  setCanopyEditSubMode('pan'); // discards the pending polygon / in-progress draw
+}
+
+function _canopyEditDiscardPoly() {
+  const ce = S.canopyEdit;
+  if (!ce || !ce.polyLayer) return;
+  try {
+    if (ce.polyLayer.editing && ce.polyLayer.editing.disable) ce.polyLayer.editing.disable();
+    S.map.removeLayer(ce.polyLayer);
+  } catch (_) {}
+  ce.polyLayer = null;
+}
+
+function _canopyEditPushOp(op, sparseDiff) {
+  const ce = S.canopyEdit;
+  ce.sessionOps.push(op);
+  ce.undoStack.push({ op, diff: sparseDiff });
+  if (ce.undoStack.length > 20) ce.undoStack.shift(); // oldest becomes un-undoable; op itself stays
+  _canopyEditBarSync();
+}
+
+function canopyEditUndo() {
+  const ce = S.canopyEdit;
+  if (!ce || !ce.undoStack.length) return;
+  const entry = ce.undoStack.pop();
+  canopyRevertDiff(ce.workFlat, entry.diff);
+  const i = ce.sessionOps.indexOf(entry.op);
+  if (i >= 0) ce.sessionOps.splice(i, 1);
+  _canopyEditRepaintIndices(entry.diff.indices);
+  _canopyEditBarSync();
+}
+
+async function canopyEditSave() {
+  const ce = S.canopyEdit;
+  if (!ce) return;
+  if (!ce.sessionOps.length) { _canopyEditFlash('No changes to save'); return; }
+  try {
+    let ops = [];
+    if (typeof getCachedRaster === 'function') {
+      const rec = await getCachedRaster('canopyedit', 'global');
+      if (rec && rec.data && Array.isArray(rec.data.ops)) ops = rec.data.ops;
+    }
+    ops = ops.concat(ce.sessionOps);
+    if (typeof cacheRaster === 'function') await cacheRaster('canopyedit', 'global', { ops });
+    // Adopt the edited raster into app state. New object identity on purpose —
+    // the 3D canopy mesh cache is keyed by it and must invalidate.
+    const src = (S.canopy && S.canopy.source) || 'Meta 1 m';
+    S.canopy = { grid: ce.grid, source: src.includes('(edited)') ? src : src + ' (edited)', canopyFlat: ce.workFlat.slice() };
+    const n = ce.sessionOps.length;
+    ce.sessionOps = [];
+    ce.undoStack = [];
+    try { Diag.note('canopyEdit.save', { ops: n, total: ops.length }); } catch (_) {}
+    setStatus('canopyStatus', 'cached', 'EDITED');
+    _canopyEditFlash('Saved ' + n + ' edit' + (n === 1 ? '' : 's') + ' — recompute viewsheds to apply' + (ops.length > 400 ? ' (many edits stored — consider Clear canopy edits in Config)' : ''));
+  } catch (e) {
+    console.error('Canopy edit save failed:', e);
+    _canopyEditFlash('SAVE FAILED — edits kept in this session');
+  }
+  _canopyEditBarSync();
+}
+
+// Config-tab escape hatch: forget every saved edit and restore original data.
+async function clearCanopyEdits() {
+  if (S._canopyEditing) { if (typeof alert === 'function') alert('Exit canopy edit mode first.'); return; }
+  if (typeof confirm === 'function' && !confirm('Remove ALL saved canopy edits and restore original vegetation data?')) return;
+  try { if (typeof cacheRaster === 'function') await cacheRaster('canopyedit', 'global', { ops: [] }); } catch (_) {}
+  try { Diag.note('canopyEdit.clear', {}); } catch (_) {}
+  // Re-fetch the current view so the overlay reverts immediately.
+  if (S.canopy && S.canopy.canopyFlat) await loadCanopyForView();
+}
+
+// --- Edit canvas: container-anchored <canvas> painted from an offscreen
+// grid-resolution canvas. Replaces the imageOverlay while editing so brush
+// strokes repaint in ~0 ms (no PNG encode) and deep zoom is exempt from the
+// mobile overlay display-size cap (the screen canvas never exceeds the view).
+function _canopyEditCanvasCreate() {
+  const ce = S.canopyEdit;
+  const off = document.createElement('canvas');
+  off.width = ce.grid.cols; off.height = ce.grid.rows;
+  off.getContext('2d').putImageData(new ImageData(canopyGridToRGBA(ce.grid, ce.workFlat), ce.grid.cols, ce.grid.rows), 0, 0);
+  ce.off = off;
+  // The canvas must live INSIDE the map pane: the pane's transform creates a
+  // stacking context, so a sibling of it can only render fully above or fully
+  // below the whole map. A custom pane at z 350 sits above base tiles (200)
+  // but below vector overlays (400), keeping the edit polygon + its vertex
+  // handles visible on top of the drape.
+  let pane = S.map.getPane && S.map.getPane('canopyEditPane');
+  if (!pane && S.map.createPane) {
+    pane = S.map.createPane('canopyEditPane');
+    pane.style.zIndex = 350;
+    pane.style.pointerEvents = 'none';
+  }
+  const canvas = document.createElement('canvas');
+  canvas.id = 'canopyEditCanvas';
+  canvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;';
+  canvas.style.opacity = parseFloat((document.getElementById('canopyOpacity') || {}).value) || CANOPY_OVERLAY_OPACITY;
+  (pane || S.map.getContainer()).appendChild(canvas);
+  ce.canvas = canvas;
+  ce._onMapMove = () => _canopyEditRedraw();
+  ce._onZoomStart = () => { if (ce.canvas) ce.canvas.style.visibility = 'hidden'; };
+  ce._onZoomEnd = () => { if (ce.canvas) { ce.canvas.style.visibility = ''; _canopyEditRedraw(); } };
+  S.map.on('move resize', ce._onMapMove);
+  S.map.on('zoomstart', ce._onZoomStart);
+  S.map.on('zoomend', ce._onZoomEnd);
+  _canopyEditRedraw();
+}
+
+function _canopyEditRedraw() {
+  const ce = S.canopyEdit;
+  if (!ce || !ce.canvas) return;
+  const el = S.map.getContainer();
+  const w = el.clientWidth, h = el.clientHeight;
+  if (ce.canvas.width !== w) ce.canvas.width = w;
+  if (ce.canvas.height !== h) ce.canvas.height = h;
+  // The pane is positioned in layer coords — re-pin the canvas to the viewport
+  // so drawing can use plain container coordinates.
+  if (L.DomUtil && L.DomUtil.setPosition && S.map.containerPointToLayerPoint) {
+    L.DomUtil.setPosition(ce.canvas, S.map.containerPointToLayerPoint([0, 0]));
+  }
+  const ctx = ce.canvas.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  const b = ce.grid.bounds;
+  const nw = S.map.latLngToContainerPoint([b.north, b.west]);
+  const se = S.map.latLngToContainerPoint([b.south, b.east]);
+  ctx.imageSmoothingEnabled = false; // crisp cells, no blur between tree/no-tree
+  ctx.drawImage(ce.off, nw.x, nw.y, se.x - nw.x, se.y - nw.y);
+}
+
+// Refresh offscreen pixels for a dirty cell rect from workFlat, then redraw.
+function _canopyEditRepaintRect(r0, r1, c0, c1) {
+  const ce = S.canopyEdit;
+  if (!ce || !ce.off || r1 < r0 || c1 < c0) return;
+  const g = ce.grid;
+  const w = c1 - c0 + 1, h = r1 - r0 + 1;
+  const ctx = ce.off.getContext('2d');
+  const img = ctx.getImageData(c0, r0, w, h);
+  for (let r = r0; r <= r1; r++) {
+    for (let c = c0; c <= c1; c++) {
+      const col = canopyColorRamp(ce.workFlat[r * g.cols + c]);
+      const o = ((r - r0) * w + (c - c0)) * 4;
+      img.data[o] = col[0]; img.data[o + 1] = col[1]; img.data[o + 2] = col[2]; img.data[o + 3] = col[3];
+    }
+  }
+  ctx.putImageData(img, c0, r0);
+  if (!ce._raf) ce._raf = requestAnimationFrame(() => { ce._raf = 0; _canopyEditRedraw(); });
+}
+
+function _canopyEditRepaintIndices(indices) {
+  const ce = S.canopyEdit;
+  if (!ce || !indices || !indices.length) return;
+  const cols = ce.grid.cols;
+  let r0 = Infinity, r1 = -1, c0 = Infinity, c1 = -1;
+  for (let i = 0; i < indices.length; i++) {
+    const r = (indices[i] / cols) | 0, c = indices[i] % cols;
+    if (r < r0) r0 = r; if (r > r1) r1 = r;
+    if (c < c0) c0 = c; if (c > c1) c1 = c;
+  }
+  _canopyEditRepaintRect(r0, r1, c0, c1);
+}
+
+// --- Brush: capture-phase pointer handlers on the map container. Only active
+// in the brush sub-mode; PAN/POLY sub-modes let events flow to Leaflet.
+function _canopyEditPointerAttach() {
+  const ce = S.canopyEdit;
+  const el = S.map.getContainer();
+  const stampRect = (aLat, aLng, bLat, bLng) => {
+    const g = ce.grid;
+    const dLat = ce.brushRadiusM / g.mPerDegLat, dLng = ce.brushRadiusM / g.mPerDegLng;
+    _canopyEditRepaintRect(
+      gridLatToRow(g, Math.max(aLat, bLat) + dLat), gridLatToRow(g, Math.min(aLat, bLat) - dLat),
+      gridLngToCol(g, Math.min(aLng, bLng) - dLng), gridLngToCol(g, Math.max(aLng, bLng) + dLng));
+  };
+  ce._onDown = e => {
+    if (!S._canopyEditing || ce.subMode !== 'brush' || e.isPrimary === false) return;
+    e.preventDefault(); e.stopPropagation();
+    try { el.setPointerCapture(e.pointerId); } catch (_) {}
+    const ll = S.map.mouseEventToLatLng(e);
+    ce._stroke = { pts: [[ll.lat, ll.lng]], diff: new Map(), last: ll, lastRec: ll };
+    canopyStampBrush(ce.grid, ce.workFlat, ll.lat, ll.lng, ce.brushRadiusM, ce.avgM, ce._stroke.diff);
+    stampRect(ll.lat, ll.lng, ll.lat, ll.lng);
+  };
+  ce._onMove = e => {
+    const st = ce._stroke;
+    if (!st) return;
+    e.preventDefault(); e.stopPropagation();
+    const ll = S.map.mouseEventToLatLng(e);
+    const g = ce.grid, a = st.last;
+    const dist = Math.hypot((ll.lat - a.lat) * g.mPerDegLat, (ll.lng - a.lng) * g.mPerDegLng);
+    if (dist <= 0) return;
+    // Stamp along the segment at radius/2 steps — same spacing canopyApplyStroke
+    // uses on replay, so the live result matches the persisted op.
+    const step = Math.max(ce.brushRadiusM / 2, 0.5);
+    const nSteps = Math.max(1, Math.ceil(dist / step));
+    for (let s = 1; s <= nSteps; s++) {
+      const t = s / nSteps;
+      canopyStampBrush(g, ce.workFlat, a.lat + (ll.lat - a.lat) * t, a.lng + (ll.lng - a.lng) * t, ce.brushRadiusM, ce.avgM, st.diff);
+    }
+    stampRect(a.lat, a.lng, ll.lat, ll.lng);
+    st.last = ll;
+    // Thin the recorded polyline — replay interpolates, so radius/4 spacing is enough.
+    const recDist = Math.hypot((ll.lat - st.lastRec.lat) * g.mPerDegLat, (ll.lng - st.lastRec.lng) * g.mPerDegLng);
+    if (recDist >= ce.brushRadiusM / 4) { st.pts.push([ll.lat, ll.lng]); st.lastRec = ll; }
+  };
+  ce._onUp = e => {
+    const st = ce._stroke;
+    if (!st) return;
+    e.preventDefault(); e.stopPropagation();
+    ce._stroke = null;
+    if (st.last !== st.lastRec) st.pts.push([st.last.lat, st.last.lng]);
+    _canopyEditPushOp({ t: 'paint', pts: st.pts, rM: ce.brushRadiusM, hM: Math.round(ce.avgM * 100) / 100 }, canopyDiffToSparse(st.diff));
+  };
+  ce._onTouchGuard = e => { if (S._canopyEditing && ce.subMode === 'brush') e.preventDefault(); };
+  el.addEventListener('pointerdown', ce._onDown, true);
+  el.addEventListener('pointermove', ce._onMove, true);
+  el.addEventListener('pointerup', ce._onUp, true);
+  el.addEventListener('pointercancel', ce._onUp, true);
+  el.addEventListener('touchstart', ce._onTouchGuard, { capture: true, passive: false });
+}
+
+function _canopyEditPointerDetach() {
+  const ce = S.canopyEdit;
+  if (!ce || !ce._onDown || !S.map) return;
+  const el = S.map.getContainer();
+  el.removeEventListener('pointerdown', ce._onDown, true);
+  el.removeEventListener('pointermove', ce._onMove, true);
+  el.removeEventListener('pointerup', ce._onUp, true);
+  el.removeEventListener('pointercancel', ce._onUp, true);
+  el.removeEventListener('touchstart', ce._onTouchGuard, { capture: true });
+}
+
+// --- Toolbar state sync + transient messages ---
+function _canopyEditBarSync() {
+  const ce = S.canopyEdit;
+  const bar = document.getElementById('canopyEditBar');
+  if (!bar) return;
+  if (!ce) { bar.style.display = 'none'; return; }
+  bar.style.display = 'flex';
+  const mode = ce.subMode;
+  document.getElementById('ceBtnPan')?.classList.toggle('active', mode === 'pan');
+  document.getElementById('ceBtnBrush')?.classList.toggle('active', mode === 'brush');
+  document.getElementById('ceBtnPoly')?.classList.toggle('active', mode === 'polygon' || mode === 'polygonEdit');
+  const sizes = document.getElementById('ceBrushSizes');
+  if (sizes) sizes.style.display = mode === 'brush' ? 'flex' : 'none';
+  Object.entries(CANOPY_EDIT_BRUSH_SIZES).forEach(([k, m]) =>
+    document.getElementById('ceSize' + k)?.classList.toggle('active', ce.brushRadiusM === m));
+  const polyActions = document.getElementById('cePolyActions');
+  if (polyActions) polyActions.style.display = mode === 'polygonEdit' ? 'flex' : 'none';
+  const undo = document.getElementById('ceBtnUndo');
+  if (undo) undo.disabled = !ce.undoStack.length;
+  const save = document.getElementById('ceBtnSave');
+  if (save) save.disabled = !ce.sessionOps.length;
+}
+
+function _canopyEditFlash(msg) {
+  const el = document.getElementById('canopyEditMsg');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.style.display = 'none'; }, 5000);
 }
 
 // ============================================================
@@ -10081,6 +10536,7 @@ function _readVsInputs() {
 }
 
 function startViewshedPick() {
+  if (S._canopyEditing) return; // observer pick is disabled in canopy edit mode
   if (S.is3D && typeof _exit3D === 'function') _exit3D(); // observer pick is a 2D map tap
   // Mutually exclusive with the draw tools.
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
@@ -11439,6 +11895,7 @@ function _on3dClick(e) {
 }
 
 async function toggle3D() {
+  if (S._canopyEditing) return; // finish/exit canopy editing first
   if (S.is3D) { _exit3D(); return; }
   if (_isConstrained() && !S._warned3d) {
     const go = (typeof confirm !== 'function') || confirm('3D terrain view uses significant memory and may be unstable on phones/tablets. Continue?');
@@ -11631,5 +12088,10 @@ if (typeof module !== 'undefined' && module.exports) {
     refineLowCloseAdsbAgl, fetch3DEPPointElevations, _parseGetSamples, _adsbHiresKey, _isAdsbLowClose,
     // Per-section data freshness
     SECTION_DEFS, markSection, renderSectionMeta, renderAllSectionMeta, updateSection, _sectionUpdatable,
+    // Canopy edit mode
+    CANOPY_EDIT_BRUSH_SIZES, _setBaseOverlay, _applyCanopyEdits,
+    startCanopyEdit, exitCanopyEdit, setCanopyEditSubMode, setCanopyBrushSize,
+    onCanopyEditPolygon, canopyEditDelete, canopyEditCancelPoly, canopyEditUndo, canopyEditSave,
+    clearCanopyEdits, _canopyEditPushOp, _canopyEditBarSync,
   };
 }

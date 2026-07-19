@@ -19,6 +19,14 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.18-d',
+    date: '2026-07-18',
+    changes: [
+      'Canopy editing (Terrain tab → EDIT next to the vegetation overlay): correct the canopy data where it is wrong — draw a polygon (drag its corners to refine, then DELETE) to remove phantom trees, or paint missing trees in with a brush (S/M/L sizes, painted at the average tree height of the current view). UNDO reverts the last 20 paints/deletes. Edit mode pins the satellite basemap under the canopy so you can trace what is actually on the ground, and works with touch.',
+      'Saved canopy edits persist offline and apply everywhere the canopy is used — the map overlay, NEW viewshed computations (recompute existing observers to pick them up), the 3D vegetation surface, and GeoTIFF/KMZ exports — and survive re-downloads of the source data. "Clear Canopy Edits" in Config → Cache Status restores the original data.',
+    ],
+  },
+  {
     version: '2026.07.18-c',
     date: '2026-07-18',
     changes: [
