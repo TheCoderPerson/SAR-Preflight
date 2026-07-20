@@ -6672,6 +6672,29 @@ function _exportObserverRecords() {
   return recs;
 }
 
+// Low-poly vector polygons of every COMPUTED viewshed (same rule as the GeoTIFF
+// export: r.grid && r.mask, map visibility ignored). One 'polygon' record per
+// visible-region blob (holes ride along as inner rings) so the serializers'
+// single-Polygon shape is enough — no MultiPolygon needed.
+function _exportViewshedPolygonRecords() {
+  const recs = [];
+  (S.viewsheds || []).filter(r => r.grid && r.mask).forEach(rec => {
+    let parts = [];
+    try { parts = viewshedToPolygons(rec.grid, rec.mask); }
+    catch (e) { console.error('viewshed polygonize error:', e); return; }
+    const n = parts.length;
+    parts.forEach((p, i) => {
+      const base = `${rec.name || 'Observer'} viewshed`;
+      recs.push({ kind: 'polygon',
+        name: n > 1 ? `${base} (part ${i + 1}/${n})` : base,
+        styleId: 'viewshed',
+        description: viewshedPolygonDescription(rec, { index: i + 1, count: n, areaM2: p.areaM2 }),
+        rings: p.rings });
+    });
+  });
+  return recs;
+}
+
 // Emergency LZ points — a SYNTHETIC source. The emergency_lz map layer is left
 // empty on purpose (see renderLZMarkers): these are terrain-suitability estimates
 // from a coarse 25-point elevation grid, NOT verified landing zones. So we harvest
@@ -7000,6 +7023,10 @@ function populateExportModal() {
   if (vt) vt.textContent = `Viewsheds (${nViewsheds}) → GeoTIFF, Web Mercator (CalTopo Map Sheet / QGIS)`;
   const vk = document.getElementById('expViewshedKmzLabel');
   if (vk) vk.textContent = `Viewsheds (${nViewsheds}) → KMZ overlay (Google Earth)`;
+  // Low-poly vector polygons ride inside the KML/GeoJSON file itself.
+  _setExportRasterRow('expViewshedVec', 'expViewshedVecRow', nViewsheds > 0, true);
+  const vv = document.getElementById('expViewshedVecLabel');
+  if (vv) vv.textContent = `Viewsheds (${nViewsheds}) → vector polygons (in the KML / GeoJSON file)`;
 }
 
 function doExport() {
@@ -7026,6 +7053,13 @@ function doExport() {
 
   // 3. Every currently-visible map overlay as real geometry
   folders += gatherVisibleLayerFolders(_exportSelectedLayerKeys());
+
+  // 3b. Low-poly vector polygons of each computed viewshed
+  if (document.getElementById('expViewshedVec')?.checked) {
+    const vrecs = _exportViewshedPolygonRecords();
+    if (vrecs.length) folders += kmlFolder('Viewshed Polygons', vrecs.map(recordToKml).join(''),
+      { description: 'Simplified vector outlines of each observer viewshed. Low-poly by design — the GeoTIFF/KMZ raster export is authoritative.' });
+  }
 
   // 4. Hourly sun + wind bearing lines
   folders += buildSunWindFolders();
@@ -7076,6 +7110,16 @@ function doExportGeoJson() {
   // 3. Every currently-visible map overlay as real geometry, one folder per layer.
   folderGroupsToGeoJsonFeatures(collectExportFolderGroups(_exportSelectedLayerKeys()), _uuid)
     .forEach(f => features.push(f));
+
+  // 3b. Low-poly vector polygons of each computed viewshed (own folder).
+  if (document.getElementById('expViewshedVec')?.checked) {
+    const vrecs = _exportViewshedPolygonRecords();
+    if (vrecs.length) {
+      const fid = _uuid();
+      features.push(geojsonFolderFeature(fid, 'Viewshed Polygons'));
+      vrecs.forEach(r => { const f = recordToGeoJsonFeature(r, fid, _uuid()); if (f) features.push(f); });
+    }
+  }
 
   const fc = geojsonFeatureCollection(features);
   downloadBlob(new Blob([JSON.stringify(fc)], { type: 'application/geo+json' }), `SAR_Preflight_${ts}.geojson`);
@@ -12246,7 +12290,7 @@ if (typeof module !== 'undefined' && module.exports) {
     radarToggle, radarStep, updateRadarTime,
     openExport, closeExport, doExport, doExportGeoJson, getKMLCoords, populateExportModal,
     downloadBlob, exportRasterGeoTiff, exportRasterKmz, gatherVisibleLayerFolders, buildSunWindFolders,
-    exportAllViewshedGeoTiffs, exportAllViewshedKmz, _exportObserverRecords,
+    exportAllViewshedGeoTiffs, exportAllViewshedKmz, _exportObserverRecords, _exportViewshedPolygonRecords,
     _exportLayerRecords, _polyRingsGroups, _exportStyleForLayer, _exportNeedsDisclaimer,
     _exportSelectedLayerKeys, _exportArrowLengthM, EXPORT_DISCLAIMER, EXPORT_SUMMARY_SECTIONS,
     _exportNotamRecords, _exportTfrRecords, _exportAirportRecords, _exportLZRecords, _exportRasterData,

@@ -4,6 +4,34 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.20-e — 2026-07-20
+
+- Viewsheds now export as vector polygons inside the KML/GeoJSON file itself (new "Viewshed Polygons" folder, on by default in the export dialog) — real geometry CalTopo and Google Earth treat like any drawn shape, alongside the existing GeoTIFF/KMZ rasters. Each computed observer contributes simplified low-poly outlines of its visible regions (holes included); tiny fragments and holes are dropped and parts are capped, so the raster export remains the authoritative representation.
+
+## v2026.07.20-d — 2026-07-20
+
+- Observer popups now carry two visual-observation advisories: today's sun-glare windows (with a bearing range, e.g. "06:10–08:40 brg 050°–115°" — looking that way then means tracking the drone in/near the sun's glare), and terrain-backdrop sectors (compass directions where the drone would appear below the terrain/canopy skyline instead of against open sky). The glare sun-elevation cutoff is derived from each observer's AGL + VLOS (the band the drone actually occupies over ~90% of the flight area, plus a 15° glare cone) instead of a fixed angle; near-overhead passes can glare any time the sun is up, and the popup says so.
+- Glare windows are terrain-aware: a bare-earth horizon profile out to ~10 km around each observer masks times when a ridge actually hides the sun (a mountain on the sunrise bearing delays the morning window until the sun clears it). When terrain shields the low sun entirely — a deep canyon or cirque — the popup says so explicitly instead of staying silent. Trees are not in the horizon, so glare can be over-reported near cover — never silently under-reported.
+- Terrain-backdrop sectors count only drone positions the observer can actually SEE (hidden positions are a coverage problem, not a backdrop problem), and the skyline behind them now extends past the VLOS grid using the same ~10 km horizon — a mountainside rising beyond VLOS backdrops the drone correctly.
+- Both advisories also ride along in the KML/GeoJSON (CalTopo) observer placemark descriptions, with glare computed for the export day. Backdrop sectors use the same terrain+canopy+buildings surface as the viewshed and are computed per observer — recompute existing observers to add them; backdrop skyline is only assessed out to the VLOS range.
+- The briefing (Copy / PDF / Email) gains an OBSERVERS section: each observer's position, AGL/VLOS profile, viewshed coverage, and the sun-glare + terrain-backdrop advisories.
+
+## v2026.07.20-c — 2026-07-20
+
+- The "Enter Coordinates" tool now accepts DD (38.78673, -120.61770), DDM (38°47.204', -120°37.062'), DMS (38°47'12", -120°37'04"), and UTM (10S 0706918E 4295806N). Degree/minute/second symbols and UTM E/N letters are optional — "38 47 12, -120 37 04" works too, as do N/S/E/W hemisphere letters.
+- The radius is now optional in coordinate entry: with a radius (meters) an operational area is created as before; without one the map simply moves to that coordinate.
+
+## v2026.07.20-b — 2026-07-20
+
+- Viewsheds now treat OSM buildings as sight-line obstacles, using the same footprints and heights as the 3D building prisms (measured heights where OSM has them, estimates otherwise). The result line and observer export note how many buildings were included; if OSM is unreachable the viewshed still computes from terrain + canopy only. Recompute existing observers to pick up buildings. Coverage is only as complete as OSM building data for the area.
+
+## v2026.07.20-a — 2026-07-20
+
+- Multiple observer viewsheds can now be shown at the same time: tapping an observer marker (or the ◉/○ button in the Terrain-tab observer list) toggles that viewshed on/off instead of switching, and every shown viewshed drapes together on the map, in 3D, and behind the opacity slider. Previously only one viewshed could display at a time.
+- The observer info popup now opens above the marker pin instead of covering it, so the pin stays visible and tappable for the next toggle.
+- Where shown viewsheds overlap, the overlay shades darker green — mid green where 2 observers can see the drone, deep green for 3 or more.
+- Fixed: adding several observers in quick succession could silently skip computing the later ones — queued viewshed computes now always run when the current one finishes.
+
 ## v2026.07.18-d — 2026-07-18
 
 - Canopy editing (Terrain tab → EDIT next to the vegetation overlay): correct the canopy data where it is wrong — draw a polygon (drag its corners to refine, then DELETE) to remove phantom trees, or paint missing trees in with a brush (S/M/L sizes, painted at the average tree height of the current view). UNDO reverts the last 20 paints/deletes. Edit mode pins the satellite basemap under the canopy so you can trace what is actually on the ground, and works with touch.

@@ -45,6 +45,13 @@ describe('caltopoStyleProps', () => {
     expect(p.fill).toBeUndefined();
     expect(p['marker-symbol']).toBeUndefined();
   });
+  it('derives the viewshed polygon style (green stroke + translucent fill)', () => {
+    const p = caltopoStyleProps('viewshed');
+    expect(p.stroke).toBe('#22c55e');
+    expect(p.fill).toBe('#22c55e');
+    expect(p['fill-opacity']).toBeCloseTo(0x30 / 255, 6);
+    expect(p['marker-symbol']).toBeUndefined();
+  });
 });
 
 describe('geojson feature builders', () => {

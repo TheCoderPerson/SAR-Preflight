@@ -113,7 +113,8 @@ describe('doExportGeoJson', () => {
       '<input type="checkbox" id="expOpsArea" checked>' +
       '<input type="checkbox" id="expWxData" checked>' +
       '<input type="checkbox" id="expCanopyTiff"><input type="checkbox" id="expCanopyKmz">' +
-      '<input type="checkbox" id="expViewshedTiff"><input type="checkbox" id="expViewshedKmz">';
+      '<input type="checkbox" id="expViewshedTiff"><input type="checkbox" id="expViewshedKmz">' +
+      '<input type="checkbox" id="expViewshedVec">';
     S.mapLayers.faa_obstacles = new MockGroup([new L.Marker(LL(38.7, -120.99), 'Tower 200 ft AGL')]);
   });
 
@@ -137,5 +138,23 @@ describe('doExportGeoJson', () => {
     const folderIds = new Set(folders.map(f => f.id));
     fc.features.filter(f => f.properties.class !== 'Folder')
       .forEach(f => expect(folderIds.has(f.properties.folderId)).toBe(true));
+  });
+
+  it('includes low-poly viewshed polygons in their own folder when the box is checked', async () => {
+    document.getElementById('expViewshedVec').checked = true;
+    S.viewsheds = [{
+      id: 'vs1', name: 'Ridge', observer: { lat: 38.705, lng: -120.995 }, aglFt: 200, vlosFt: 2500,
+      grid: { cols: 4, rows: 4, resM: 250, bounds: { west: -121, east: -120.99, south: 38.7, north: 38.71 } },
+      mask: new Uint8Array(16).fill(1), coverage: 1, computedAt: 1,
+    }];
+    const fc = JSON.parse(await captureBlobs(() => doExportGeoJson())[0].text());
+    const folder = fc.features.find(f => f.properties.class === 'Folder' && f.properties.title === 'Viewshed Polygons');
+    expect(folder).toBeTruthy();
+    const poly = fc.features.find(f => f.properties.folderId === folder.id);
+    expect(poly.geometry.type).toBe('Polygon');
+    expect(poly.properties.title).toBe('Ridge viewshed');
+    expect(poly.properties.stroke).toBe('#22c55e');
+    const ring = poly.geometry.coordinates[0];
+    expect(ring[0]).toEqual(ring[ring.length - 1]); // closed
   });
 });

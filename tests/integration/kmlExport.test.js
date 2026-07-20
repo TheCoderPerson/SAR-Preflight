@@ -22,6 +22,7 @@ const app = require('../../sar-preflight.js');
 const {
   S, gatherVisibleLayerFolders, buildSunWindFolders, populateExportModal,
   exportRasterGeoTiff, exportAllViewshedGeoTiffs, EXPORT_DISCLAIMER,
+  _exportViewshedPolygonRecords,
 } = app;
 
 // Capture every Blob handed to the downloader (URL.createObjectURL).
@@ -145,7 +146,8 @@ describe('populateExportModal', () => {
       '<label id="expCanopyKmzRow"><input type="checkbox" id="expCanopyKmz"></label>' +
       '<label id="expCanopyRow"><input type="checkbox" id="expCanopyTiff"></label>' +
       '<label id="expViewshedKmzRow"><input type="checkbox" id="expViewshedKmz"></label>' +
-      '<label id="expViewshedRow"><input type="checkbox" id="expViewshedTiff"></label>';
+      '<label id="expViewshedRow"><input type="checkbox" id="expViewshedTiff"></label>' +
+      '<label id="expViewshedVecRow"><input type="checkbox" id="expViewshedVec"></label>';
     S.mapLayers.faa_obstacles = new MockGroup([new L.Marker(LL(38.7, -120.99), 'Tower')]);
     S.canopy = { grid: {}, canopyFlat: new Float32Array(1) };
     S.viewshed = {}; // no mask -> viewshed export disabled
@@ -157,9 +159,10 @@ describe('populateExportModal', () => {
     expect(document.getElementById('expCanopyTiff').checked).toBe(true);
     expect(document.getElementById('expCanopyKmz').disabled).toBe(false);
     expect(document.getElementById('expCanopyKmz').checked).toBe(false);
-    // Viewshed unavailable -> both disabled.
+    // Viewshed unavailable -> all three disabled.
     expect(document.getElementById('expViewshedKmz').disabled).toBe(true);
     expect(document.getElementById('expViewshedTiff').disabled).toBe(true);
+    expect(document.getElementById('expViewshedVec').disabled).toBe(true);
   });
 });
 
@@ -201,5 +204,28 @@ describe('observer + multi-viewshed export', () => {
     const blobs = captureDownloads(() => exportAllViewshedGeoTiffs());
     expect(blobs.length).toBe(2);
     expect(blobs.every(b => b.type === 'image/tiff')).toBe(true);
+  });
+
+  it('builds one low-poly polygon record per computed viewshed, skipping uncomputed ones', () => {
+    S.viewsheds = [
+      rec('vs1', 'Ridge', 38.72, -120.75, true),
+      rec('vs2', 'Valley', 38.70, -120.80, true),
+      rec('vs3', 'Pending', 38.69, -120.81, false), // no mask -> skipped
+    ];
+    const recs = _exportViewshedPolygonRecords();
+    expect(recs).toHaveLength(2); // full-grid mask -> single blob each
+    expect(recs.map(r => r.name)).toEqual(['Ridge viewshed', 'Valley viewshed']);
+    recs.forEach(r => {
+      expect(r.kind).toBe('polygon');
+      expect(r.styleId).toBe('viewshed');
+      expect(r.rings[0].length).toBeGreaterThanOrEqual(3);
+    });
+    // Full 4x4 mask -> the outer ring spans the grid bounds exactly (cell-edge math)
+    const lngs = recs[0].rings[0].map(p => p[1]), lats = recs[0].rings[0].map(p => p[0]);
+    expect(Math.min(...lngs)).toBeCloseTo(grid.bounds.west, 10);
+    expect(Math.max(...lngs)).toBeCloseTo(grid.bounds.east, 10);
+    expect(Math.min(...lats)).toBeCloseTo(grid.bounds.south, 10);
+    expect(Math.max(...lats)).toBeCloseTo(grid.bounds.north, 10);
+    expect(recs[0].description).toContain('Viewshed (vector): Ridge');
   });
 });

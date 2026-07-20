@@ -86,4 +86,10 @@ describe('observer KML style', () => {
     expect(KML_STYLE_DEFS.observer).toBeTruthy();
     expect(kmlStyles()).toContain('<Style id="observer">');
   });
+
+  it('defines a filled viewshed polygon style that kmlStyles() emits', () => {
+    expect(KML_STYLE_DEFS.viewshed).toBeTruthy();
+    expect(KML_STYLE_DEFS.viewshed.fill).toBeTruthy();
+    expect(kmlStyles()).toContain('<Style id="viewshed">');
+  });
 });
