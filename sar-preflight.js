@@ -868,18 +868,30 @@ function clearArea() {
   if (forecastSection) forecastSection.style.display = 'none';
 }
 function enterCoords() {
-  const defaultLat = S.map.getCenter().lat.toFixed(3);
-  const defaultLng = S.map.getCenter().lng.toFixed(3);
-  const input = prompt(`Enter center lat, lng, radius_meters:\nExample: ${defaultLat}, ${defaultLng}, 2000`);
+  const c0 = S.map.getCenter();
+  const input = prompt(
+    'Enter coordinates in DD, DDM, DMS, or UTM — symbols optional.\n'
+    + 'Add a radius in meters to create an operational area; without one the map just moves there.\n'
+    + `  ${c0.lat.toFixed(5)}, ${c0.lng.toFixed(5)}, 2000\n`
+    + '  38°47.204\', -120°37.062\'\n'
+    + '  38 47 12, -120 37 04\n'
+    + '  10S 0706918E 4295806N, 2000');
   if (!input) return;
-  const p = input.split(',').map(s => parseFloat(s.trim()));
-  if (p.length === 3 && !p.some(isNaN)) {
-    S.drawnItems.clearLayers();
-    const c = L.circle([p[0], p[1]], { radius: p[2], color: '#3d8bfd', weight: 2, fillColor: '#3d8bfd', fillOpacity: 0.08, dashArray: '6,4' });
-    S.drawnItems.addLayer(c);
-    S.map.fitBounds(c.getBounds(), { padding: [40, 40] });
-    processArea(c, 'circle');
+  const p = parseCoordinateInput(input);
+  if (!p) {
+    alert('Could not parse that coordinate.\nSupported: DD ("38.78673, -120.61770"), DDM ("38 47.204, -120 37.062"), DMS ("38 47 12, -120 37 04"), or UTM ("10S 0706918E 4295806N") — with an optional trailing radius in meters.');
+    return;
   }
+  if (!p.radiusM) {
+    // No radius → don't create an area; just move the map to the point.
+    S.map.setView([p.lat, p.lng], Math.max(S.map.getZoom(), 13));
+    return;
+  }
+  S.drawnItems.clearLayers();
+  const c = L.circle([p.lat, p.lng], { radius: p.radiusM, color: '#3d8bfd', weight: 2, fillColor: '#3d8bfd', fillOpacity: 0.08, dashArray: '6,4' });
+  S.drawnItems.addLayer(c);
+  S.map.fitBounds(c.getBounds(), { padding: [40, 40] });
+  processArea(c, 'circle');
 }
 
 // ============================================================
@@ -6642,13 +6654,20 @@ function _exportAirportRecords() {
   return recs;
 }
 
-// Observer points (one per viewshed record) — name + AGL/VLOS/coverage description.
+// Observer points (one per viewshed record) — name + AGL/VLOS/coverage plus
+// the visual-observation advisories (sun-glare windows for the export day,
+// terrain-backdrop sectors) so they survive into CalTopo/Google Earth.
 function _exportObserverRecords() {
   const recs = [];
   (S.viewsheds || []).forEach(rec => {
     if (!rec.observer || rec.observer.lat == null || rec.observer.lng == null) return;
+    let glareText = '';
+    try { glareText = _glareAdvisoryText(rec); } catch (e) { /* advisory only */ }
+    const backdropText = rec.backdrop
+      ? formatSectorRanges(rec.backdrop.map(f => f >= BACKDROP_SECTOR_MIN_FRAC)) : '';
     recs.push({ kind: 'point', name: rec.name || 'Observer', styleId: 'observer',
-      description: observerKmlDescription(rec), lat: rec.observer.lat, lng: rec.observer.lng });
+      description: observerKmlDescription(rec, { glareText, backdropText }),
+      lat: rec.observer.lat, lng: rec.observer.lng });
   });
   return recs;
 }
@@ -8590,6 +8609,29 @@ function parseKML(kmlText) {
 // ============================================================
 // COPY BRIEFING TO CLIPBOARD
 // ============================================================
+// Plain-text observer block for the briefing/PDF/email exports: one entry per
+// observer with position, profile, coverage, and the visual-observation
+// advisories (sun glare for today + terrain-backdrop sectors).
+function _briefingObserverLines() {
+  const out = [];
+  (S.viewsheds || []).forEach(rec => {
+    if (!rec || !rec.observer || rec.observer.lat == null || rec.observer.lng == null) return;
+    const cov = rec.coverage == null
+      ? (rec.computedAt ? 'no terrain data' : 'not computed')
+      : Math.round(rec.coverage * 100) + '% of VLOS visible';
+    out.push(`  ${rec.name || 'Observer'}: ${(+rec.observer.lat).toFixed(5)}, ${(+rec.observer.lng).toFixed(5)} | Drone ${rec.aglFt} ft AGL | VLOS ${rec.vlosFt} ft | ${cov}`);
+    try {
+      const glare = _glareAdvisoryText(rec);
+      if (glare) out.push(`    Sun glare today: ${glare} (near-overhead passes can glare any time the sun is up)`);
+    } catch (e) { /* advisory only */ }
+    if (rec.backdrop) {
+      const ranges = formatSectorRanges(rec.backdrop.map(f => f >= BACKDROP_SECTOR_MIN_FRAC));
+      if (ranges) out.push(`    Terrain backdrop toward ${ranges} — drone below skyline, hard to see`);
+    }
+  });
+  return out;
+}
+
 function buildBriefingText() {
   const sections = [
     { name: 'WEATHER', fields: ['wxTemp','wxFeels','wxDew','wxHumidity','wxPressure','wxDensity','wxVis','wxCloud','wxCeiling','wxConditions','wxPrecip','wxLightning','wxUV','wxKp','wxIcing','wxFire','wxAQI'] },
@@ -8632,6 +8674,14 @@ function buildBriefingText() {
     });
     lines.push('');
   });
+
+  // Observers (viewshed records) — only when any are placed.
+  const obsLines = _briefingObserverLines();
+  if (obsLines.length) {
+    lines.push('--- OBSERVERS ---');
+    obsLines.forEach(l => lines.push(l));
+    lines.push('');
+  }
 
   return lines.join('\n');
 }
@@ -10583,12 +10633,60 @@ function _ensureObserverLayer() {
   return S.mapLayers.observers;
 }
 
+const BACKDROP_SECTOR_MIN_FRAC = 0.5; // sector flagged when most in-VLOS positions sit below the skyline
+const HORIZON_RADIUS_M = 10000;       // terrain-horizon DEM reach (sun-blocking ridges)
+const HORIZON_RES_M = 40;             // coarse is fine for skyline angles at km ranges
+
+// Today's sun-glare windows formatted for the observer popup:
+// "06:10–08:40 brg 050°–115°". The sun-elevation ceiling comes from the
+// observer's own AGL/VLOS (glareMaxElevation); the bearing range is the
+// sun's azimuth track across the window widened by the glare cone on each
+// side — looking anywhere in that range during the window means tracking
+// the drone in/near the glare disc.
+// → { text } (windows exist), { shielded: true } (the sun crosses the glare
+// band astronomically but surrounding terrain hides it the whole time — a
+// deep canyon/cirque), or null (no low-sun crossing at all, e.g. polar day).
+function _glareAdvisory(rec) {
+  const day = new Date(); day.setHours(0, 0, 0, 0);
+  const maxEl = glareMaxElevation(ftToM(rec.aglFt), ftToM(rec.vlosFt));
+  const open = sunGlareWindows(rec.observer.lat, rec.observer.lng, day, { maxElDeg: maxEl });
+  if (!open.length) return null;
+  const wins = sunGlareWindows(rec.observer.lat, rec.observer.lng, day, { maxElDeg: maxEl, horizon: rec.horizon || null });
+  if (!wins.length) return { shielded: true };
+  const tz = (typeof _localTZ === 'function') ? _localTZ() : undefined;
+  const fmt = t => t.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: tz });
+  const brg = b => String(Math.round(((b % 360) + 360) % 360)).padStart(3, '0') + '°';
+  return { text: wins.map(w =>
+    `${fmt(w.start)}–${fmt(w.end)} brg ${brg(w.azStart - GLARE_CONE_DEG)}–${brg(w.azEnd + GLARE_CONE_DEG)}`
+  ).join(' · ') };
+}
+
+// String form for the briefing and CalTopo export descriptions.
+function _glareAdvisoryText(rec) {
+  const g = _glareAdvisory(rec);
+  if (!g) return '';
+  return g.shielded ? 'none — surrounding terrain hides the low sun' : g.text;
+}
+
 function _observerPopupHtml(rec) {
   const cov = rec.coverage == null
     ? (rec.computedAt && !(rec.grid && rec.mask) ? 'no terrain (not computed)' : '')
     : Math.round(rec.coverage * 100) + '% of VLOS visible';
-  return `<b>${_esc(rec.name || 'Observer')}</b><br>Drone ${rec.aglFt} ft AGL · VLOS ${rec.vlosFt} ft`
+  let html = `<b>${_esc(rec.name || 'Observer')}</b><br>Drone ${rec.aglFt} ft AGL · VLOS ${rec.vlosFt} ft`
     + (cov ? `<br>${_esc(cov)}` : '');
+  try {
+    const glare = _glareAdvisory(rec);
+    if (glare && glare.shielded) {
+      html += `<br>☀ No low-sun glare today — surrounding terrain hides the sun below the glare band<br><span style="opacity:0.65">(near-overhead passes can still glare)</span>`;
+    } else if (glare && glare.text) {
+      html += `<br>☀ Glare risk today ${_esc(glare.text)}<br><span style="opacity:0.65">(near-overhead passes can glare any time the sun is up)</span>`;
+    }
+  } catch (e) { /* advisory only */ }
+  if (rec.backdrop) {
+    const ranges = formatSectorRanges(rec.backdrop.map(f => f >= BACKDROP_SECTOR_MIN_FRAC));
+    if (ranges) html += `<br>⛰ Terrain backdrop toward ${_esc(ranges)} — drone below skyline, hard to see`;
+  }
+  return html;
 }
 
 function _addObserverMarker(rec) {
@@ -10620,6 +10718,8 @@ function _toPersistable(rec) {
     aglFt: rec.aglFt, vlosFt: rec.vlosFt, grid: rec.grid, mask: rec.mask,
     coverage: rec.coverage, demSource: rec.demSource, canopySource: rec.canopySource,
     buildingCount: rec.buildingCount != null ? rec.buildingCount : null,
+    backdrop: rec.backdrop || null,
+    horizon: rec.horizon || null,
     computedAt: rec.computedAt, visible: rec.visible !== false,
   };
 }
@@ -10868,16 +10968,23 @@ async function runViewshed(id) {
     const halfWidthM = vlosM + 50;
     const resM = Math.max(WORK_RES_M, (2 * halfWidthM) / MAX_GRID);
     const grid = makeGrid(obs.lat, obs.lng, halfWidthM, resM);
+    // Wide, coarse bare-earth grid (~10 km) purely for the terrain horizon —
+    // a ridge well beyond VLOS can still hide the rising/setting sun.
+    const hGrid = makeGrid(obs.lat, obs.lng, HORIZON_RADIUS_M, HORIZON_RES_M);
     _vsProgress(0.05);
-    const [demRes, canRes, bldRes] = await Promise.allSettled([fetch3DEPDEM(grid), fetchCanopyRaster(grid), fetchBuildingsForGrid(grid)]);
+    const [demRes, canRes, bldRes, horRes] = await Promise.allSettled([
+      fetch3DEPDEM(grid), fetchCanopyRaster(grid), fetchBuildingsForGrid(grid), fetch3DEPDEM(hGrid)]);
     const dem = demRes.status === 'fulfilled' ? demRes.value : { demFlat: null, source: 'unavailable' };
     const can = canRes.status === 'fulfilled' ? canRes.value : { canopyFlat: null, source: 'unavailable' };
     const blds = bldRes.status === 'fulfilled' ? bldRes.value : null; // null = OSM unavailable
+    const horDem = (horRes.status === 'fulfilled' && horRes.value && horRes.value.demFlat) ? horRes.value.demFlat : null;
     if (!dem.demFlat) {
       setStatus('viewshedStatus', 'error', 'NO DEM');
       rec.grid = null; rec.mask = null; rec.coverage = null;
       rec.demSource = 'unavailable'; rec.canopySource = can.canopyFlat ? can.source : null;
       rec.buildingCount = null;
+      rec.backdrop = null;
+      rec.horizon = null;
       rec.computedAt = Date.now();
       if (typeof saveViewshed === 'function') await saveViewshed(_toPersistable(rec));
       if (rec.visible !== false) _renderVisibleViewsheds();
@@ -10892,6 +10999,18 @@ async function runViewshed(id) {
     const dsm = sanitizeForKernel(dsmRaw, n);
     const { col: obsCol, row: obsRow } = latLngToCell(grid, obs.lat, obs.lng);
     const mask = await _runViewshedKernel({ grid, dem: dem.demFlat, dsm, obsCol, obsRow, aglM, vlosRangeM: vlosM });
+    // Sectors where a VISIBLE drone would sit below the terrain skyline
+    // (terrain backdrop — hard to keep in sight). The skyline is seeded per
+    // sector with the bare-earth horizon BEYOND the viewshed grid (from the
+    // wide DEM) so a mountainside rising past VLOS still counts. Cheap: 16 rays.
+    const farHor = horDem ? computeHorizonProfile(hGrid, horDem, obs.lat, obs.lng, undefined, 22.5, halfWidthM) : null;
+    rec.backdrop = computeBackdropSectors({
+      grid, dem: dem.demFlat, dsm, obsCol, obsRow, aglM, vlosRangeM: vlosM,
+      mask, farHorizonDeg: farHor ? farHor.angles : null,
+    });
+    // Terrain horizon out to ~10 km — masks glare windows where a ridge
+    // actually hides the sun. Advisory: null when the wide DEM didn't load.
+    rec.horizon = horDem ? computeHorizonProfile(hGrid, horDem, obs.lat, obs.lng) : null;
     try { if (rec.mask && rec.mask.length) Diag.free('viewshedMask', rec.mask.length); } catch (_) {}
     rec.grid = grid;
     rec.mask = mask;

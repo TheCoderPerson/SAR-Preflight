@@ -19,6 +19,25 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.20-d',
+    date: '2026-07-20',
+    changes: [
+      'Observer popups now carry two visual-observation advisories: today\'s sun-glare windows (with a bearing range, e.g. "06:10–08:40 brg 050°–115°" — looking that way then means tracking the drone in/near the sun\'s glare), and terrain-backdrop sectors (compass directions where the drone would appear below the terrain/canopy skyline instead of against open sky). The glare sun-elevation cutoff is derived from each observer\'s AGL + VLOS (the band the drone actually occupies over ~90% of the flight area, plus a 15° glare cone) instead of a fixed angle; near-overhead passes can glare any time the sun is up, and the popup says so.',
+      'Glare windows are terrain-aware: a bare-earth horizon profile out to ~10 km around each observer masks times when a ridge actually hides the sun (a mountain on the sunrise bearing delays the morning window until the sun clears it). When terrain shields the low sun entirely — a deep canyon or cirque — the popup says so explicitly instead of staying silent. Trees are not in the horizon, so glare can be over-reported near cover — never silently under-reported.',
+      'Terrain-backdrop sectors count only drone positions the observer can actually SEE (hidden positions are a coverage problem, not a backdrop problem), and the skyline behind them now extends past the VLOS grid using the same ~10 km horizon — a mountainside rising beyond VLOS backdrops the drone correctly.',
+      'Both advisories also ride along in the KML/GeoJSON (CalTopo) observer placemark descriptions, with glare computed for the export day. Backdrop sectors use the same terrain+canopy+buildings surface as the viewshed and are computed per observer — recompute existing observers to add them; backdrop skyline is only assessed out to the VLOS range.',
+      'The briefing (Copy / PDF / Email) gains an OBSERVERS section: each observer\'s position, AGL/VLOS profile, viewshed coverage, and the sun-glare + terrain-backdrop advisories.',
+    ],
+  },
+  {
+    version: '2026.07.20-c',
+    date: '2026-07-20',
+    changes: [
+      'The "Enter Coordinates" tool now accepts DD (38.78673, -120.61770), DDM (38°47.204\', -120°37.062\'), DMS (38°47\'12", -120°37\'04"), and UTM (10S 0706918E 4295806N). Degree/minute/second symbols and UTM E/N letters are optional — "38 47 12, -120 37 04" works too, as do N/S/E/W hemisphere letters.',
+      'The radius is now optional in coordinate entry: with a radius (meters) an operational area is created as before; without one the map simply moves to that coordinate.',
+    ],
+  },
+  {
     version: '2026.07.20-b',
     date: '2026-07-20',
     changes: [
@@ -3439,6 +3458,199 @@ function vector3dSourceAndLayers(group) {
   return { srcId, source: { type: 'geojson', data: { type: 'FeatureCollection', features: feats } }, layers };
 }
 
+// ============================================================
+// OBSERVER VISIBILITY ADVISORIES — sun glare windows + sector-range text.
+// ============================================================
+
+// Veiling-glare half-angle: looking within ~this many degrees of the sun
+// disc washes out a small airframe (human-factors ballpark for discomfort
+// glare). Used both as the vertical margin in glareMaxElevation and the
+// horizontal widening of the reported bearing range.
+const GLARE_CONE_DEG = 15;
+
+// Sun-elevation ceiling for the glare advisory, derived from the flight
+// profile instead of a fixed number. The drone's apparent elevation is
+// atan(AGL/distance) — hyperbolic: tiny at range, rising steeply only close
+// in. atan(AGL / 0.316·VLOS) is its apparent elevation at the radius that
+// encloses the inner ~10% of the VLOS disc — outside that small circle the
+// drone never appears above this angle — plus the glare cone on top.
+// Clamped 20–60°. (Sun higher than this can still glare, but only during
+// close/overhead passes — the advisory covers the bulk of the flight area.)
+function glareMaxElevation(aglM, vlosM, coneDeg) {
+  const cone = coneDeg != null ? coneDeg : GLARE_CONE_DEG;
+  if (!(aglM > 0) || !(vlosM > 0)) return 30;
+  const r90 = Math.sqrt(0.1) * vlosM; // radius enclosing 10% of the disc area
+  const el = Math.atan2(aglM, r90) * 180 / Math.PI;
+  return Math.min(60, Math.max(20, el + cone));
+}
+
+// Windows during the 24 h starting at `dayStart` when the sun is up but low
+// (0° < elevation <= maxElDeg, default 30° — pass glareMaxElevation(...) to
+// match a flight profile). A drone flown toward the sun's azimuth in these
+// windows sits in/near the glare disc and is very hard for the observer to
+// keep in sight. opts.horizon ({ stepDeg, angles } from computeHorizonProfile)
+// masks samples where terrain hides the actual sun — a ridge on the sunrise
+// bearing delays the morning window until the sun clears it. Returns
+// [{ start, end, azStart, azEnd }] (Dates + sun azimuth in degrees at each
+// end) — typically one morning and one evening window at mid latitudes.
+function sunGlareWindows(lat, lng, dayStart, opts) {
+  opts = opts || {};
+  const maxEl = opts.maxElDeg != null ? opts.maxElDeg : 30;
+  const stepMin = opts.stepMin != null ? opts.stepMin : 10;
+  const hor = (opts.horizon && Array.isArray(opts.horizon.angles) && opts.horizon.angles.length) ? opts.horizon : null;
+  let t0;
+  if (dayStart != null) t0 = new Date(dayStart).getTime();
+  else { const d = new Date(); d.setHours(0, 0, 0, 0); t0 = d.getTime(); }
+  if (!Number.isFinite(t0)) return [];
+  const out = [];
+  let cur = null;
+  for (let m = 0; m <= 24 * 60; m += stepMin) {
+    const t = new Date(t0 + m * 60000);
+    const sp = calcSunPosition(lat, lng, t);
+    let minEl = 0; // sun must be above the horizon...
+    if (hor) {     // ...the TERRAIN horizon on its bearing, when known
+      const bin = Math.round((((sp.azimuth % 360) + 360) % 360) / hor.stepDeg) % hor.angles.length;
+      const h = hor.angles[bin];
+      if (Number.isFinite(h) && h > 0) minEl = h;
+    }
+    if (sp.elevation > minEl && sp.elevation <= maxEl) {
+      if (!cur) cur = { start: t, end: t, azStart: sp.azimuth, azEnd: sp.azimuth };
+      else { cur.end = t; cur.azEnd = sp.azimuth; }
+    } else if (cur) { out.push(cur); cur = null; }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+// Compass-sector flags (sector 0 = N, clockwise) → compact wraparound-aware
+// text: [NE,ENE,E] → "NE–E"; disjoint runs comma-joined; all set →
+// "all directions"; none → ''.
+function formatSectorRanges(flags) {
+  const n = (flags && flags.length) || 0;
+  if (!n || !flags.some(Boolean)) return '';
+  if (flags.every(Boolean)) return 'all directions';
+  const name = i => degToCompass(i * 360 / n);
+  const runs = [];
+  for (let i = 0; i < n; i++) {
+    if (flags[i] && !flags[(i + n - 1) % n]) {
+      let len = 1;
+      while (flags[(i + len) % n] && len < n) len++;
+      runs.push([i, len]);
+    }
+  }
+  return runs.map(([s, len]) => (len === 1 ? name(s) : `${name(s)}–${name((s + len - 1) % n)}`)).join(', ');
+}
+
+// ============================================================
+// FLEXIBLE COORDINATE ENTRY — the "Enter Coordinates" tool accepts DD, DDM,
+// DMS (degree/minute/second symbols optional) and UTM (zone+band easting
+// northing), each with an optional trailing radius in meters.
+// ============================================================
+
+// Inverse Transverse Mercator (WGS84, Snyder series) — UTM grid → lat/lng.
+// `band` is the MGRS latitude band letter (C–X, no I/O); C–M = southern
+// hemisphere, N–X = northern. Returns { lat, lng } degrees or null.
+function utmToLatLng(zone, band, easting, northing) {
+  zone = +zone;
+  const B = String(band || '').toUpperCase();
+  const e = +easting, n = +northing;
+  if (!Number.isFinite(zone) || zone < 1 || zone > 60) return null;
+  if (!/^[C-HJ-NP-X]$/.test(B)) return null;
+  if (!Number.isFinite(e) || e < 100000 || e > 900000) return null;
+  if (!Number.isFinite(n) || n < 0 || n > 10000000) return null;
+  const a = 6378137, f = 1 / 298.257223563;
+  const e2 = f * (2 - f), ep2 = e2 / (1 - e2), k0 = 0.9996;
+  const x = e - 500000;
+  const y = B >= 'N' ? n : n - 10000000; // southern rows carry the 10,000 km false northing
+  const M = y / k0;
+  const mu = M / (a * (1 - e2 / 4 - 3 * e2 * e2 / 64 - 5 * e2 * e2 * e2 / 256));
+  const e1 = (1 - Math.sqrt(1 - e2)) / (1 + Math.sqrt(1 - e2));
+  const phi1 = mu
+    + (3 * e1 / 2 - 27 * Math.pow(e1, 3) / 32) * Math.sin(2 * mu)
+    + (21 * e1 * e1 / 16 - 55 * Math.pow(e1, 4) / 32) * Math.sin(4 * mu)
+    + (151 * Math.pow(e1, 3) / 96) * Math.sin(6 * mu)
+    + (1097 * Math.pow(e1, 4) / 512) * Math.sin(8 * mu);
+  const sin1 = Math.sin(phi1), cos1 = Math.cos(phi1), tan1 = Math.tan(phi1);
+  const C1 = ep2 * cos1 * cos1;
+  const T1 = tan1 * tan1;
+  const N1 = a / Math.sqrt(1 - e2 * sin1 * sin1);
+  const R1 = a * (1 - e2) / Math.pow(1 - e2 * sin1 * sin1, 1.5);
+  const D = x / (N1 * k0);
+  const lat = phi1 - (N1 * tan1 / R1) * (
+    D * D / 2
+    - (5 + 3 * T1 + 10 * C1 - 4 * C1 * C1 - 9 * ep2) * Math.pow(D, 4) / 24
+    + (61 + 90 * T1 + 298 * C1 + 45 * T1 * T1 - 252 * ep2 - 3 * C1 * C1) * Math.pow(D, 6) / 720);
+  const lng0 = ((zone - 1) * 6 - 180 + 3) * Math.PI / 180;
+  const lng = lng0 + (
+    D - (1 + 2 * T1 + C1) * Math.pow(D, 3) / 6
+    + (5 - 2 * C1 + 28 * T1 - 3 * C1 * C1 + 8 * ep2 + 24 * T1 * T1) * Math.pow(D, 5) / 120) / cos1;
+  const latDeg = lat * 180 / Math.PI, lngDeg = lng * 180 / Math.PI;
+  if (!Number.isFinite(latDeg) || !Number.isFinite(lngDeg)) return null;
+  return { lat: latDeg, lng: lngDeg };
+}
+
+// One angle in DD ("38.78673"), DDM ("38°47.204'" / "38 47.204") or DMS
+// ("38°47'12\"" / "38 47 12"). Symbols optional; sign or a hemisphere letter
+// (N/S/E/W, leading or trailing) sets the direction. Returns
+// { value, parts } (parts = token count → 1 DD, 2 DDM, 3 DMS) or null.
+function parseAngleFlexible(str) {
+  let s = String(str == null ? '' : str).trim();
+  if (!s) return null;
+  let hemi = 0;
+  const first = s[0].toUpperCase(), last = s[s.length - 1].toUpperCase();
+  if ('NSEW'.indexOf(last) >= 0) { hemi = (last === 'S' || last === 'W') ? -1 : 1; s = s.slice(0, -1); }
+  else if ('NSEW'.indexOf(first) >= 0) { hemi = (first === 'S' || first === 'W') ? -1 : 1; s = s.slice(1); }
+  s = s.trim();
+  let neg = false;
+  if (s[0] === '-') { neg = true; s = s.slice(1); }
+  else if (s[0] === '+') s = s.slice(1);
+  // Degree/minute/second marks (incl. unicode variants) become separators.
+  s = s.replace(/[°º′’'″”"]/g, ' ').trim();
+  if (!s) return null;
+  const toks = s.split(/\s+/);
+  if (toks.length > 3) return null;
+  const nums = toks.map(Number);
+  if (nums.some(v => !Number.isFinite(v) || v < 0)) return null;
+  const d = nums[0], m = nums[1] || 0, sec = nums[2] || 0;
+  if (toks.length >= 2 && (m >= 60 || d !== Math.trunc(d))) return null;
+  if (toks.length === 3 && (sec >= 60 || m !== Math.trunc(m))) return null;
+  let value = d + m / 60 + sec / 3600;
+  if (neg) value = -value;
+  if (hemi) value = Math.abs(value) * hemi;
+  return { value, parts: toks.length };
+}
+
+// Full "Enter Coordinates" input: a coordinate in any supported format,
+// optionally followed by a radius in meters ("m" suffix allowed). Returns
+// { lat, lng, radiusM: number|null, format: 'UTM'|'DD'|'DDM'|'DMS' } or null.
+function parseCoordinateInput(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return null;
+  // UTM first: "10S 0706918E 4295806N[, 2000]" — E/N letters and commas optional.
+  const utm = s.match(/^(\d{1,2})\s*([C-HJ-NP-X])\s+(\d+(?:\.\d+)?)[E]?[\s,]+(\d+(?:\.\d+)?)[N]?(?:[\s,]+(\d+(?:\.\d+)?)\s*[M]?)?$/i);
+  if (utm) {
+    const ll = utmToLatLng(+utm[1], utm[2], +utm[3], +utm[4]);
+    if (!ll) return null;
+    return { lat: ll.lat, lng: ll.lng, radiusM: utm[5] != null ? +utm[5] : null, format: 'UTM' };
+  }
+  // Everything else needs a comma between latitude and longitude (spaces
+  // separate DDM/DMS components inside each half).
+  const segs = s.split(',').map(x => x.trim()).filter(Boolean);
+  if (segs.length < 2 || segs.length > 3) return null;
+  const latA = parseAngleFlexible(segs[0]);
+  const lngA = parseAngleFlexible(segs[1]);
+  if (!latA || !lngA) return null;
+  if (Math.abs(latA.value) > 90 || Math.abs(lngA.value) > 180) return null;
+  let radiusM = null;
+  if (segs.length === 3) {
+    const r = segs[2].match(/^(\d+(?:\.\d+)?)\s*[Mm]?$/);
+    if (!r) return null;
+    radiusM = +r[1];
+  }
+  const format = latA.parts === 1 ? 'DD' : latA.parts === 2 ? 'DDM' : 'DMS';
+  return { lat: latA.value, lng: lngA.value, radiusM, format };
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -3464,6 +3676,8 @@ if (typeof module !== 'undefined' && module.exports) {
     computeAdsbSearchRadius, parseAdsbAircraft, formatAltitudeAgl,
     pointInPolygon, pointInRings, distPointToSegment, polygonBBox, bboxesOverlap, segmentsIntersect, polygonsIntersect,
     circleToPolygon, parseFaaCoord, normalizeFaaDate, geoJsonOuterRings,
+    utmToLatLng, parseAngleFlexible, parseCoordinateInput,
+    sunGlareWindows, formatSectorRanges, glareMaxElevation, GLARE_CONE_DEG,
     parseTfrGeoJson, parseTfrList, normalizeTfrDetailDoc, parseTfrDetailXml,
     filterTfrsIntersectingArea, isTfrActiveNow, parseNotamText, geolocateNotam,
     parseNotamSearchResponse, parseNotamSearchItem,

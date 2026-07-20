@@ -1,5 +1,7 @@
 const core = require('../../sar-preflight-core.js');
 Object.assign(globalThis, core);
+const raster = require('../../sar-preflight-raster.js'); // ftToM etc. for the observer advisory lines
+Object.assign(globalThis, raster);
 
 globalThis.L = { map: vi.fn(), tileLayer: vi.fn(), control: { zoom: vi.fn() }, Draw: { Event: {} }, FeatureGroup: vi.fn() };
 
@@ -145,6 +147,26 @@ describe('buildBriefingText()', () => {
     expect(text).toContain('--- OPS ---');
     expect(text).toContain('Est. Flight Time: ~34 min');
     expect(text).toContain('Effective Capacity: 90% of nominal');
+  });
+
+  it('omits the OBSERVERS section when none are placed', () => {
+    S.viewsheds = [];
+    expect(buildBriefingText()).not.toContain('--- OBSERVERS ---');
+  });
+
+  it('includes an OBSERVERS section with coverage and advisories when observers exist', () => {
+    const backdrop = new Array(16).fill(0); backdrop[4] = 0.9; backdrop[5] = 0.8;
+    S.viewsheds = [
+      { id: 'a', name: 'Ridge Top', observer: { lat: 38.7, lng: -120.9 }, aglFt: 200, vlosFt: 2500, coverage: 0.87, computedAt: 1, backdrop },
+      { id: 'b', name: 'Staging', observer: { lat: 38.71, lng: -120.91 }, aglFt: 300, vlosFt: 2000, coverage: null, computedAt: 0, backdrop: null },
+    ];
+    const text = buildBriefingText();
+    S.viewsheds = [];
+    expect(text).toContain('--- OBSERVERS ---');
+    expect(text).toContain('Ridge Top: 38.70000, -120.90000 | Drone 200 ft AGL | VLOS 2500 ft | 87% of VLOS visible');
+    expect(text).toContain('Sun glare today:'); // 38.7°N crosses the glare band every day
+    expect(text).toContain('Terrain backdrop toward E–ESE');
+    expect(text).toContain('Staging: 38.71000, -120.91000 | Drone 300 ft AGL | VLOS 2000 ft | not computed');
   });
 
   it('handles missing elements gracefully', () => {

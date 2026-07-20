@@ -500,6 +500,114 @@ function viewshedCoverage(grid, mask, obsCol, obsRow, vlosRangeM) {
 }
 
 // ============================================================
+// TERRAIN HORIZON PROFILE — max apparent elevation angle of the bare-earth
+// skyline around the observer, one value per azimuth bin (stepDeg apart,
+// bin 0 centered on North, clockwise). Computed from a WIDE, coarse DEM
+// (several km — far beyond the viewshed grid) so a ridge on the sunrise
+// bearing is known to block the actual sun. Bare earth only: trees would
+// raise the true horizon, so glare can be over-reported near cover, never
+// silently under-reported. Returns { stepDeg, angles: number[] } (degrees;
+// -90 where no data) or null when the observer ground is unknown.
+// ============================================================
+// Optional `minDistM` skips terrain nearer than that distance — used to build
+// a "beyond the viewshed grid" skyline that seeds the backdrop analysis.
+function computeHorizonProfile(grid, demFlat, obsLat, obsLng, eyeM, stepDeg, minDistM) {
+  if (!grid || !demFlat) return null;
+  const step = stepDeg || 3;
+  const eye = eyeM != null ? eyeM : PILOT_EYE_M;
+  const g0 = sampleGridBilinear(grid, demFlat, obsLat, obsLng);
+  if (!Number.isFinite(g0)) return null;
+  const eyeZ = g0 + eye;
+  const maxD = Math.hypot(
+    Math.max(grid.north - obsLat, obsLat - grid.south) * grid.mPerDegLat,
+    Math.max(grid.east - obsLng, obsLng - grid.west) * grid.mPerDegLng);
+  const startD = Math.max(grid.resM, minDistM || 0);
+  const n = Math.round(360 / step);
+  const angles = new Array(n).fill(-90);
+  for (let i = 0; i < n; i++) {
+    const az = i * step * Math.PI / 180;
+    const sinA = Math.sin(az), cosA = Math.cos(az);
+    let best = -90;
+    for (let d = startD; d <= maxD; d += grid.resM) {
+      const z = sampleGridBilinear(grid, demFlat, obsLat + (cosA * d) / grid.mPerDegLat, obsLng + (sinA * d) / grid.mPerDegLng);
+      if (!Number.isFinite(z)) continue; // nodata hole — keep walking to the edge
+      const a = Math.atan2(z - eyeZ, d) * 180 / Math.PI;
+      if (a > best) best = a;
+    }
+    angles[i] = best;
+  }
+  return { stepDeg: step, angles };
+}
+
+// ============================================================
+// TERRAIN-BACKDROP SECTORS — for each of `sectors` compass sectors (default
+// 16, sector 0 = North, clockwise), the fraction of in-VLOS drone positions
+// along the sector's center ray that would appear BELOW the terrain/canopy
+// skyline behind them, seen from the observer's eye. A drone against a
+// terrain backdrop (instead of open sky) is far harder to keep in sight.
+// Uses the same DSM the viewshed kernel tests against (terrain + canopy +
+// buildings, NaN already replaced by the sentinel).
+// opts.farHorizonDeg — per-sector skyline angle (deg) of terrain BEYOND the
+//   grid edge (computeHorizonProfile with minDistM), so a mountain rising
+//   past VLOS still backdrops the drone. Without it the skyline is only
+//   known to the grid edge.
+// opts.mask — the viewshed mask on the same grid; when given, only positions
+//   where the drone is actually VISIBLE are counted (a drone hidden behind a
+//   crest is a coverage problem, not a backdrop problem).
+// Returns Array(sectors) of fractions 0..1, or null when the observer's
+// ground elevation is unknown.
+// ============================================================
+function computeBackdropSectors(opts) {
+  const grid = opts.grid, dem = opts.dem, dsm = opts.dsm;
+  const obsCol = opts.obsCol, obsRow = opts.obsRow, aglM = opts.aglM;
+  const vlosRangeM = opts.vlosRangeM != null ? opts.vlosRangeM : VLOS_DEFAULT_M;
+  const nSec = opts.sectors || 16;
+  const eyeM = opts.pilotEyeM != null ? opts.pilotEyeM : PILOT_EYE_M;
+  const far = opts.farHorizonDeg || null;
+  const mask = opts.mask || null;
+  const obsGround = dem[obsRow * grid.cols + obsCol];
+  if (!Number.isFinite(obsGround)) return null;
+  const eyeZ = obsGround + eyeM;
+  const obsLat = gridRowToLat(grid, obsRow), obsLng = gridColToLng(grid, obsCol);
+  const step = grid.resM;
+  // Farthest possible in-grid distance from the observer (to walk each ray
+  // all the way out — skyline BEYOND the VLOS ring still matters).
+  const maxD = Math.hypot(
+    Math.max((grid.north - obsLat), (obsLat - grid.south)) * grid.mPerDegLat,
+    Math.max((grid.east - obsLng), (obsLng - grid.west)) * grid.mPerDegLng);
+  const fracs = new Array(nSec).fill(0);
+  for (let s = 0; s < nSec; s++) {
+    const az = s * 2 * Math.PI / nSec; // 0 = north, clockwise
+    const sinA = Math.sin(az), cosA = Math.cos(az);
+    const terr = [], drone = [], dist = [], vis = [];
+    for (let d = step; d <= maxD; d += step) {
+      const lat = obsLat + (cosA * d) / grid.mPerDegLat;
+      const lng = obsLng + (sinA * d) / grid.mPerDegLng;
+      const z = sampleGridBilinear(grid, dsm, lat, lng);
+      if (!Number.isFinite(z)) break; // sanitized DSM has no NaN → left the grid
+      const g = sampleGridBilinear(grid, dem, lat, lng);
+      terr.push(Math.atan2(z - eyeZ, d));                                  // skyline candidate
+      drone.push(Number.isFinite(g) ? Math.atan2(g + aglM - eyeZ, d) : NaN); // drone apparent angle
+      dist.push(d);
+      vis.push(mask ? !!mask[gridLatToRow(grid, lat) * grid.cols + gridLngToCol(grid, lng)] : true);
+    }
+    // Walk far → near so each drone position is compared against the highest
+    // terrain angle strictly BEYOND it — seeded with the beyond-grid skyline.
+    let total = 0, hidden = 0;
+    let skyline = (far && Number.isFinite(far[s])) ? far[s] * Math.PI / 180 : -Infinity;
+    for (let i = terr.length - 1; i >= 0; i--) {
+      if (dist[i] <= vlosRangeM && Number.isFinite(drone[i]) && vis[i]) {
+        total++;
+        if (drone[i] < skyline) hidden++;
+      }
+      if (terr[i] > skyline) skyline = terr[i];
+    }
+    fracs[s] = total ? hidden / total : 0;
+  }
+  return fracs;
+}
+
+// ============================================================
 // Composite N computed viewsheds into ONE union grid + mask so several
 // observers can drape through the app's single viewshed overlay (2D + 3D).
 // The output mask holds the COUNT of observers that see each cell (0 = none),
@@ -1126,6 +1234,10 @@ function makeViewshedRecord(opts) {
     demSource: opts.demSource || null,
     canopySource: opts.canopySource || null,
     buildingCount: Number.isFinite(+opts.buildingCount) ? +opts.buildingCount : null, // null = OSM buildings not included in this compute
+    backdrop: Array.isArray(opts.backdrop) ? Array.from(opts.backdrop, Number) : null, // per-sector terrain-backdrop fractions (computeBackdropSectors)
+    horizon: (opts.horizon && Array.isArray(opts.horizon.angles))
+      ? { stepDeg: +opts.horizon.stepDeg || 3, angles: Array.from(opts.horizon.angles, Number) }
+      : null, // terrain horizon per azimuth (computeHorizonProfile) — masks sun-glare windows
     computedAt: opts.computedAt != null ? opts.computedAt : null,
     visible: opts.visible !== false, // shown on the map (multiple may be on at once)
   };
@@ -1153,7 +1265,10 @@ function uniqueViewshedName(base, existingNames) {
 }
 
 // Plain-text KML <description> for an observer point (no HTML — reads cleanly in CalTopo).
-function observerKmlDescription(rec) {
+// `extras` (optional, app-supplied — they need core.js helpers):
+//   glareText:    formatted sun-glare windows for the export day
+//   backdropText: formatted terrain-backdrop compass ranges
+function observerKmlDescription(rec, extras) {
   if (!rec) return '';
   const o = rec.observer || {};
   const cov = (rec.coverage == null) ? (rec.grid && rec.mask ? '--' : 'not computed')
@@ -1167,6 +1282,8 @@ function observerKmlDescription(rec) {
     rec.demSource ? `Terrain: ${rec.demSource}` : '',
     rec.canopySource ? `Canopy: ${rec.canopySource}` : '',
     rec.buildingCount != null ? `Buildings: ${rec.buildingCount} OSM footprints as obstacles` : '',
+    (extras && extras.glareText) ? `Sun glare (export day): ${extras.glareText} — near-overhead passes can glare any time the sun is up` : '',
+    (extras && extras.backdropText) ? `Terrain backdrop toward ${extras.backdropText} — drone below skyline, hard to see` : '',
     rec.computedAt ? `Computed: ${new Date(rec.computedAt).toISOString()}` : '',
   ];
   return lines.filter(Boolean).join('\n');
@@ -1183,7 +1300,7 @@ if (typeof module !== 'undefined' && module.exports) {
     makeGrid, gridColToLng, gridRowToLat, gridLngToCol, gridLatToRow, latLngToCell,
     sampleGridBilinear,
     resampleToGrid, buildDSM, sanitizeForKernel, stampBuildingsOnDSM,
-    curvatureDrop, isVisible, computeViewshed, viewshedCoverage, compositeViewsheds,
+    curvatureDrop, isVisible, computeViewshed, viewshedCoverage, compositeViewsheds, computeBackdropSectors, computeHorizonProfile,
     computeShadowMask, shadowColorRamp, shadowMaskToRGBA,
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,
     CANOPY_PAINT_DEFAULT_M, canopyAvgHeight, canopyStampBrush, canopyDiffToSparse,
