@@ -19,6 +19,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.20-e',
+    date: '2026-07-20',
+    changes: [
+      'Viewsheds now export as vector polygons inside the KML/GeoJSON file itself (new "Viewshed Polygons" folder, on by default in the export dialog) — real geometry CalTopo and Google Earth treat like any drawn shape, alongside the existing GeoTIFF/KMZ rasters. Each computed observer contributes simplified low-poly outlines of its visible regions (holes included); tiny fragments and holes are dropped and parts are capped, so the raster export remains the authoritative representation.',
+    ],
+  },
+  {
     version: '2026.07.20-d',
     date: '2026-07-20',
     changes: [
@@ -2613,6 +2620,7 @@ const KML_STYLE_DEFS = {
   dam:       { color: 'ffd4b606', width: 2, icon: 'water.png' },     // cyan — dams
   aircraft:  { color: 'ffd4b606', width: 2, icon: 'airports.png' },  // cyan — ADS-B (plane)
   observer:  { color: 'ff5ec522', width: 2, icon: 'placemark_circle.png' }, // green — viewshed observer
+  viewshed:  { color: 'ff5ec522', fill: '305ec522', width: 2 }, // green — viewshed visibility polygon (matches observer)
   trail:     { color: 'ffb672f4', width: 2 },                   // pink — OSM named trails
   generic:   { color: 'ffffffff', fill: '20ffffff', width: 2 }, // white — fallback
   sunArrow:  { color: 'ff00ccff', width: 3 },                   // gold — sun

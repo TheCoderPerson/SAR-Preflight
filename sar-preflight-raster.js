@@ -1289,6 +1289,270 @@ function observerKmlDescription(rec, extras) {
   return lines.filter(Boolean).join('\n');
 }
 
+// ============================================================
+// VIEWSHED -> VECTOR POLYGONS (pure) — low-poly polygon outlines of a binary
+// viewshed mask for KML/GeoJSON export. Pipeline: 4-connected component
+// labeling -> exact cell-edge boundary tracing (axis-aligned staircase rings,
+// holes classified by shoelace sign) -> Douglas-Peucker simplification in cell
+// space (grid cells are square in metres, so no lat/lng anisotropy) -> lattice
+// vertices to lat/lng on cell EDGES. Deliberately coarse: small blobs/holes are
+// dropped and part counts capped so exports stay light — the raster export is
+// the authoritative representation.
+// ============================================================
+
+const VIEWSHED_POLY_TOL_CELLS      = 1.25;  // DP tolerance: collapses staircases, outline stays within ~1 cell
+const VIEWSHED_POLY_MIN_BLOB_CELLS = 12;    // absolute blob floor (~100 m2 at 3 m res — too small to act on)
+const VIEWSHED_POLY_MIN_BLOB_FRAC  = 0.005; // also drop blobs < 0.5% of total visible area
+const VIEWSHED_POLY_MIN_HOLE_CELLS = 12;    // smaller holes are filled (treated visible)
+const VIEWSHED_POLY_MAX_BLOBS      = 12;    // parts per observer, largest first
+const VIEWSHED_POLY_MAX_HOLES     = 8;      // holes per part, largest first
+
+// Label 4-connected components of a mask (any value >= 1 counts as visible —
+// composite masks hold observer counts). Iterative flood fill, no recursion.
+// Returns { labels: Int32Array (0 = background, 1..count), count, areas } where
+// areas[L] = cell count of component L (areas[0] unused).
+function labelMaskComponents(mask, rows, cols) {
+  const n = rows * cols;
+  const labels = new Int32Array(n);
+  const areas = [0];
+  let count = 0;
+  const stack = [];
+  for (let i = 0; i < n; i++) {
+    if (!mask[i] || labels[i]) continue;
+    count++;
+    let area = 0;
+    labels[i] = count;
+    stack.push(i);
+    while (stack.length) {
+      const idx = stack.pop();
+      area++;
+      const r = (idx / cols) | 0, c = idx - r * cols;
+      if (c > 0        && mask[idx - 1]    && !labels[idx - 1])    { labels[idx - 1] = count;    stack.push(idx - 1); }
+      if (c < cols - 1 && mask[idx + 1]    && !labels[idx + 1])    { labels[idx + 1] = count;    stack.push(idx + 1); }
+      if (r > 0        && mask[idx - cols] && !labels[idx - cols]) { labels[idx - cols] = count; stack.push(idx - cols); }
+      if (r < rows - 1 && mask[idx + cols] && !labels[idx + cols]) { labels[idx + cols] = count; stack.push(idx + cols); }
+    }
+    areas.push(area);
+  }
+  return { labels, count, areas: Int32Array.from(areas) };
+}
+
+// Signed shoelace area of an open ring of [x,y] points. With traceLabelRings'
+// interior-left convention (x=col east, y=row south), outer rings are NEGATIVE
+// and hole rings positive; |area| = enclosed cells.
+function _ringSignedArea(ring) {
+  let a = 0;
+  for (let i = 0, n = ring.length; i < n; i++) {
+    const p = ring[i], q = ring[(i + 1) % n];
+    a += p[0] * q[1] - q[0] * p[1];
+  }
+  return a / 2;
+}
+
+// Ray-cast point-in-polygon on an open [x,y] ring.
+function _pointInRing(p, ring) {
+  const x = p[0], y = p[1];
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+// Trace every closed boundary ring of one labeled component on the
+// (rows+1)x(cols+1) vertex lattice. Each boundary cell side becomes a directed
+// edge that keeps the component on the LEFT of travel; walking edges (left ->
+// straight -> right turn preference at diagonal-pinch vertices, which keeps
+// rings simple and deterministic) yields open rings of [col,row] lattice
+// vertices with collinear vertices merged. Returns
+// [{ ring, areaCells, isOuter }] — outers have negative shoelace sign.
+function traceLabelRings(labels, rows, cols, label) {
+  const VW = cols + 1;                     // lattice width
+  const DR = [0, 1, 0, -1], DC = [1, 0, -1, 0]; // dir codes: 0=E 1=S 2=W 3=N
+  const edges = new Map();                 // start vertex key -> outgoing dir codes
+  const addEdge = (r, c, dir) => {
+    const k = r * VW + c;
+    const a = edges.get(k);
+    if (a) a.push(dir); else edges.set(k, [dir]);
+  };
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      if (labels[r * cols + c] !== label) continue;
+      if (r === 0        || labels[(r - 1) * cols + c] !== label) addEdge(r, c + 1, 2);     // N side: travel W
+      if (r === rows - 1 || labels[(r + 1) * cols + c] !== label) addEdge(r + 1, c, 0);     // S side: travel E
+      if (c === 0        || labels[r * cols + c - 1] !== label)   addEdge(r, c, 1);         // W side: travel S
+      if (c === cols - 1 || labels[r * cols + c + 1] !== label)   addEdge(r + 1, c + 1, 3); // E side: travel N
+    }
+  }
+
+  const rings = [];
+  for (const startKey of edges.keys()) {
+    for (let avail0 = edges.get(startKey); avail0.length; ) {
+      const startR = (startKey / VW) | 0, startC = startKey - startR * VW;
+      const ring = [[startC, startR]];
+      let key = startKey, prevDir = -1, firstDir = -1;
+      do {
+        const avail = edges.get(key);
+        let dir;
+        if (prevDir < 0 || avail.length === 1) dir = avail[0];
+        else {
+          const pref = [(prevDir + 3) % 4, prevDir, (prevDir + 1) % 4]; // left, straight, right
+          dir = pref.find(d => avail.includes(d));
+          if (dir === undefined) dir = avail[0];
+        }
+        avail.splice(avail.indexOf(dir), 1);
+        if (firstDir < 0) firstDir = dir;
+        const r = (key / VW) | 0, c = key - r * VW;
+        const nr = r + DR[dir], nc = c + DC[dir];
+        if (dir === prevDir) ring[ring.length - 1] = [nc, nr]; // collinear merge
+        else ring.push([nc, nr]);
+        prevDir = dir;
+        key = nr * VW + nc;
+      } while (key !== startKey);
+      ring.pop();                                        // last vertex duplicates the start
+      if (prevDir === firstDir && ring.length) ring.shift(); // start vertex itself collinear
+      if (ring.length < 3) continue;
+      const a = _ringSignedArea(ring);
+      rings.push({ ring, areaCells: Math.abs(a), isOuter: a < 0 });
+    }
+  }
+  return rings;
+}
+
+// Endpoint-anchored Douglas-Peucker on an open chain of [x,y] points (iterative).
+function _dpSimplify(pts, tol) {
+  const n = pts.length;
+  if (n < 3) return pts.slice();
+  const keep = new Uint8Array(n);
+  keep[0] = keep[n - 1] = 1;
+  const tol2 = tol * tol;
+  const stack = [[0, n - 1]];
+  while (stack.length) {
+    const seg = stack.pop();
+    const a = seg[0], b = seg[1];
+    if (b - a < 2) continue;
+    const ax = pts[a][0], ay = pts[a][1], bx = pts[b][0], by = pts[b][1];
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    let maxD = -1, maxI = -1;
+    for (let i = a + 1; i < b; i++) {
+      const px = pts[i][0], py = pts[i][1];
+      let d2;
+      if (!len2) { const ex = px - ax, ey = py - ay; d2 = ex * ex + ey * ey; }
+      else { const cross = dx * (py - ay) - dy * (px - ax); d2 = cross * cross / len2; }
+      if (d2 > maxD) { maxD = d2; maxI = i; }
+    }
+    if (maxD > tol2) { keep[maxI] = 1; stack.push([a, maxI], [maxI, b]); }
+  }
+  const out = [];
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(pts[i]);
+  return out;
+}
+
+// Douglas-Peucker for a CLOSED ring (given open): split at the vertex farthest
+// from vertex 0 into two anchored chains, simplify each, rejoin. `tol` in the
+// ring's own units. Returns a simplified open ring, or null if it degenerates
+// (fewer than 3 vertices or zero area).
+function simplifyRing(ring, tol) {
+  if (!ring || ring.length < 3) return null;
+  if (!(tol > 0)) return ring.slice();
+  let j = 0, best = -1;
+  const x0 = ring[0][0], y0 = ring[0][1];
+  for (let i = 1; i < ring.length; i++) {
+    const dx = ring[i][0] - x0, dy = ring[i][1] - y0;
+    const d = dx * dx + dy * dy;
+    if (d > best) { best = d; j = i; }
+  }
+  const a = _dpSimplify(ring.slice(0, j + 1), tol);
+  const b = _dpSimplify(ring.slice(j).concat([ring[0]]), tol);
+  const out = a.slice(0, -1).concat(b.slice(0, -1));
+  if (out.length < 3 || Math.abs(_ringSignedArea(out)) < 1e-9) return null;
+  return out;
+}
+
+// Binary viewshed mask -> low-poly vector polygons in [lat,lng].
+// opts (all optional): { tolCells, minBlobCells, minBlobFrac, minHoleCells, maxBlobs, maxHolesPerBlob }
+// Returns [{ rings: [outerRing, ...holeRings], areaCells, areaM2 }] sorted
+// largest first; each ring is an open array of [lat,lng] on CELL EDGES.
+function viewshedToPolygons(grid, mask, opts) {
+  if (!grid || !mask || !grid.rows || !grid.cols) return [];
+  opts = opts || {};
+  const rows = grid.rows, cols = grid.cols;
+  const tol         = opts.tolCells        != null ? +opts.tolCells        : VIEWSHED_POLY_TOL_CELLS;
+  const minBlobCells= opts.minBlobCells    != null ? +opts.minBlobCells    : VIEWSHED_POLY_MIN_BLOB_CELLS;
+  const minBlobFrac = opts.minBlobFrac     != null ? +opts.minBlobFrac     : VIEWSHED_POLY_MIN_BLOB_FRAC;
+  const minHoleCells= opts.minHoleCells    != null ? +opts.minHoleCells    : VIEWSHED_POLY_MIN_HOLE_CELLS;
+  const maxBlobs    = opts.maxBlobs        != null ? +opts.maxBlobs        : VIEWSHED_POLY_MAX_BLOBS;
+  const maxHoles    = opts.maxHolesPerBlob != null ? +opts.maxHolesPerBlob : VIEWSHED_POLY_MAX_HOLES;
+
+  const comp = labelMaskComponents(mask, rows, cols);
+  if (!comp.count) return [];
+  let total = 0;
+  for (let L = 1; L <= comp.count; L++) total += comp.areas[L];
+  const minBlob = Math.max(minBlobCells, Math.ceil(minBlobFrac * total));
+  const keep = [];
+  for (let L = 1; L <= comp.count; L++) if (comp.areas[L] >= minBlob) keep.push(L);
+  keep.sort((a, b) => comp.areas[b] - comp.areas[a]);
+  if (keep.length > maxBlobs) keep.length = maxBlobs;
+
+  const b = (grid.west != null) ? grid : (grid.bounds || {});
+  const lngSpan = b.east - b.west, latSpan = b.north - b.south;
+  // Lattice vertex -> lat/lng on cell EDGES (gridColToLng/gridRowToLat are +0.5 cell-CENTRE).
+  const toLatLng = v => [b.north - (v[1] / rows) * latSpan, b.west + (v[0] / cols) * lngSpan];
+
+  const parts = [];
+  for (const L of keep) {
+    const traced = traceLabelRings(comp.labels, rows, cols, L);
+    const outers = traced.filter(t => t.isOuter);
+    const holes = traced.filter(t => !t.isOuter && t.areaCells >= minHoleCells)
+      .sort((a, b) => b.areaCells - a.areaCells);
+    for (const outer of outers) {
+      // A pinched component can yield several outers; give each hole to the
+      // outer that contains it (offset off the lattice to dodge on-edge ties).
+      const myHoles = (outers.length === 1 ? holes
+        : holes.filter(h => _pointInRing([h.ring[0][0] + 0.25, h.ring[0][1] + 0.25], outer.ring))
+      ).slice(0, maxHoles);
+      const so = simplifyRing(outer.ring, tol);
+      if (!so) continue;
+      const rings = [so.map(toLatLng)];
+      let holeArea = 0;
+      for (const h of myHoles) {
+        const sh = simplifyRing(h.ring, tol);
+        if (sh) { rings.push(sh.map(toLatLng)); holeArea += h.areaCells; }
+      }
+      const areaCells = outer.areaCells - holeArea; // area of the polygon as drawn
+      parts.push({ rings, areaCells, areaM2: (+grid.resM > 0) ? areaCells * grid.resM * grid.resM : null });
+    }
+  }
+  parts.sort((a, b) => b.areaCells - a.areaCells);
+  if (parts.length > maxBlobs) parts.length = maxBlobs;
+  return parts;
+}
+
+// Plain-text KML/GeoJSON description for one viewshed polygon part.
+// part = { index, count, areaM2 }.
+function viewshedPolygonDescription(rec, part) {
+  if (!rec) return '';
+  part = part || {};
+  const areaM2 = +part.areaM2;
+  const areaTxt = Number.isFinite(areaM2)
+    ? (areaM2 >= 1e6 ? `${(areaM2 / 1e6).toFixed(2)} km2` : `${(areaM2 / 1e4).toFixed(1)} ha`)
+    : '';
+  const lines = [
+    `Viewshed (vector): ${rec.name || 'Observer'}`,
+    part.count > 1 ? `Part ${part.index} of ${part.count} (largest visible regions)` : '',
+    `Drone AGL: ${rec.aglFt} ft / VLOS range: ${rec.vlosFt} ft`,
+    rec.coverage != null ? `Viewshed: ${Math.round(rec.coverage * 100)}% of VLOS visible` : '',
+    rec.demSource ? `Terrain: ${rec.demSource}` : '',
+    rec.canopySource ? `Canopy: ${rec.canopySource}` : '',
+    areaTxt ? `Approx. area: ${areaTxt}` : '',
+    'Simplified low-poly outline — small fragments and holes are dropped. The GeoTIFF/KMZ raster export is authoritative.',
+    rec.computedAt ? `Computed: ${new Date(rec.computedAt).toISOString()}` : '',
+  ];
+  return lines.filter(Boolean).join('\n');
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -1308,5 +1572,8 @@ if (typeof module !== 'undefined' && module.exports) {
     decimateCanopyMesh, canopyMeshIndexed, normalFromSlopes,
     encodeGeoTiffRGBA, reprojectRgbaTo3857, worldFileForBounds, WGS84_WKT, WEBMERC_WKT, crc32, zipStore,
     makeViewshedRecord, viewshedFilenameSlug, uniqueViewshedName, observerKmlDescription,
+    labelMaskComponents, traceLabelRings, simplifyRing, viewshedToPolygons, viewshedPolygonDescription,
+    VIEWSHED_POLY_TOL_CELLS, VIEWSHED_POLY_MIN_BLOB_CELLS, VIEWSHED_POLY_MIN_BLOB_FRAC,
+    VIEWSHED_POLY_MIN_HOLE_CELLS, VIEWSHED_POLY_MAX_BLOBS, VIEWSHED_POLY_MAX_HOLES,
   };
 }
