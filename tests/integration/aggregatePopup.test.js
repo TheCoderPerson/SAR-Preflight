@@ -49,7 +49,7 @@ globalThis.L = {
   Marker: class {},
   DomEvent: { stopPropagation: () => {} },
   popup: (opts) => ({
-    _opts: opts, _latlng: null, _content: null,
+    _opts: opts, options: opts || {}, _latlng: null, _content: null,
     setLatLng(ll) { this._latlng = ll; return this; },
     setContent(c) { this._content = c; return this; },
     openOn() { this._open = true; return this; },
@@ -57,7 +57,7 @@ globalThis.L = {
   }),
 };
 
-const { S, collectFeaturesAt, openAggregatePopup, aggPopupStep, renderAggregatePopup, wirePopupAggregation } = require('../../sar-preflight.js');
+const { S, collectFeaturesAt, openAggregatePopup, aggPopupStep, renderAggregatePopup, wirePopupAggregation, _aggFeatureClick } = require('../../sar-preflight.js');
 
 const LL = (lat, lng) => ({ lat, lng });
 const ring = (cLat, cLng, d) => [LL(cLat - d, cLng - d), LL(cLat - d, cLng + d), LL(cLat + d, cLng + d), LL(cLat + d, cLng - d)];
@@ -177,6 +177,32 @@ describe('aggregate popup rendering + pagination', () => {
     openAggregatePopup(click, { originalEvent: { target: arrow } });
     expect(S._aggPopup.index).toBe(3); // unchanged — handler bailed out
     document.body.removeChild(popupEl);
+  });
+});
+
+describe('observer marker popup lift', () => {
+  beforeEach(() => {
+    S.map = { latLngToLayerPoint: project, hasLayer: () => true, distance: () => 0 };
+    S._aggPopup = { items: [], index: 0, popup: null };
+    S._viewshedPicking = false;
+  });
+  afterEach(() => { S.viewsheds = []; });
+
+  it('a tap on an observer marker anchors the popup at the pin, lifted above the icon', () => {
+    const pin = new MockCircleMarker(LL(38.7, -120.99), 5, '<b>Observer 1</b>');
+    S.viewsheds = [{ id: 'vs1', _marker: pin }];
+    S.mapLayers = { observers: new MockGroup([pin]) };
+    _aggFeatureClick({ latlng: LL(38.70001, -120.98999), target: pin, originalEvent: {} });
+    expect(S._aggPopup.popup._latlng).toEqual(LL(38.7, -120.99)); // pin position, not click
+    expect(S._aggPopup.popup.options.offset.y).toBeLessThan(-40); // lifted clear of the icon
+  });
+
+  it('ordinary feature clicks keep the stock popup offset', () => {
+    const a = new MockPolygon([ring(38.7, -120.99, 0.1)], 'AIRSPACE');
+    S.viewsheds = [];
+    S.mapLayers = { faa_class_airspace: new MockGroup([a]) };
+    _aggFeatureClick({ latlng: LL(38.7, -120.99), target: a, originalEvent: {} });
+    expect(S._aggPopup.popup.options.offset.y).toBe(7);
   });
 });
 

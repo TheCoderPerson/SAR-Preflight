@@ -23,11 +23,18 @@ describe('canopyColorRamp', () => {
 });
 
 describe('viewshedColorRamp', () => {
-  it('visible → opaque accent green', () => {
+  it('visible to one observer → opaque accent green', () => {
     expect(viewshedColorRamp(1)).toEqual([34, 197, 94, 255]);
   });
   it('not visible → transparent', () => {
     expect(viewshedColorRamp(0)[3]).toBe(0);
+  });
+  it('overlap steps to darker greens (2 observers, then 3+)', () => {
+    const one = viewshedColorRamp(1), two = viewshedColorRamp(2), three = viewshedColorRamp(3);
+    expect(two[3]).toBe(255);
+    expect(two[1]).toBeLessThan(one[1]);   // darker than single coverage
+    expect(three[1]).toBeLessThan(two[1]); // darker still
+    expect(viewshedColorRamp(7)).toEqual(three); // clamps at the 3+ tier
   });
 });
 
