@@ -10619,6 +10619,7 @@ function _toPersistable(rec) {
     id: rec.id, areaKey: rec.areaKey, name: rec.name, observer: rec.observer,
     aglFt: rec.aglFt, vlosFt: rec.vlosFt, grid: rec.grid, mask: rec.mask,
     coverage: rec.coverage, demSource: rec.demSource, canopySource: rec.canopySource,
+    buildingCount: rec.buildingCount != null ? rec.buildingCount : null,
     computedAt: rec.computedAt, visible: rec.visible !== false,
   };
 }
@@ -10671,7 +10672,8 @@ function _renderVisibleViewsheds() {
   if (r) {
     const rec = computed.find(x => x.id === S.activeViewshedId) || computed[computed.length - 1];
     const canLabel = rec.canopySource ? ('canopy ' + rec.canopySource) : 'bare earth (no canopy)';
-    r.textContent = `${rec.name}: ${Math.round((rec.coverage || 0) * 100)}% of ${rec.vlosFt} ft VLOS visible @ ${rec.aglFt} ft AGL · DEM ${rec.demSource} · ${canLabel}`
+    const bldLabel = rec.buildingCount != null ? ` · ${rec.buildingCount} OSM bldgs` : '';
+    r.textContent = `${rec.name}: ${Math.round((rec.coverage || 0) * 100)}% of ${rec.vlosFt} ft VLOS visible @ ${rec.aglFt} ft AGL · DEM ${rec.demSource} · ${canLabel}${bldLabel}`
       + (computed.length > 1 ? ` · ${computed.length} viewsheds shown (darker green = overlap)` : '');
   }
   buildLayerControl();
@@ -10821,6 +10823,36 @@ async function restoreViewsheds() {
   buildLayerControl();
 }
 
+// OSM buildings for a viewshed grid — stamped onto the DSM as solid obstacles.
+// Separate from the 3D view's fetchBuildings state machine (different bbox,
+// no layer side effects) but shares the Overpass helper, parser, and the
+// osm_buildings IndexedDB cache. Buildings are an advisory enhancement, so
+// the wait is hard-capped: _overpassFetch walks 3 mirrors with no client
+// timeout and must never stall the viewshed. Resolves null when OSM can't
+// answer in time and nothing is cached — the compute then runs terrain +
+// canopy only.
+const BUILDINGS_FETCH_TIMEOUT_MS = 12000;
+async function fetchBuildingsForGrid(grid) {
+  const gb = grid.bounds;
+  const bboxKey = `${gb.south.toFixed(3)}_${gb.west.toFixed(3)}_${gb.north.toFixed(3)}_${gb.east.toFixed(3)}`;
+  // Short server-side timeout too — a busy mirror should fail fast, not queue.
+  const query = `[out:json][timeout:10];way["building"](${gb.south},${gb.west},${gb.north},${gb.east});out body ${_buildingsCap()};>;out skel qt;`;
+  try {
+    const data = await Promise.race([
+      _overpassFetch(query),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('buildings fetch timed out')), BUILDINGS_FETCH_TIMEOUT_MS)),
+    ]);
+    if (typeof cacheApiResponse === 'function') cacheApiResponse('osm_buildings', bboxKey, data);
+    return parseOverpassBuildings(data, _buildingsCap());
+  } catch (err) {
+    try {
+      const cached = (typeof getCachedApiResponse === 'function') ? await getCachedApiResponse('osm_buildings', bboxKey) : null;
+      if (cached && cached.data) return parseOverpassBuildings(cached.data, _buildingsCap());
+    } catch (cacheErr) { /* fall through */ }
+    return null; // unavailable — advisory enhancement only
+  }
+}
+
 async function runViewshed(id) {
   const rec = S.viewsheds.find(r => r.id === id);
   if (!rec) return;
@@ -10837,13 +10869,15 @@ async function runViewshed(id) {
     const resM = Math.max(WORK_RES_M, (2 * halfWidthM) / MAX_GRID);
     const grid = makeGrid(obs.lat, obs.lng, halfWidthM, resM);
     _vsProgress(0.05);
-    const [demRes, canRes] = await Promise.allSettled([fetch3DEPDEM(grid), fetchCanopyRaster(grid)]);
+    const [demRes, canRes, bldRes] = await Promise.allSettled([fetch3DEPDEM(grid), fetchCanopyRaster(grid), fetchBuildingsForGrid(grid)]);
     const dem = demRes.status === 'fulfilled' ? demRes.value : { demFlat: null, source: 'unavailable' };
     const can = canRes.status === 'fulfilled' ? canRes.value : { canopyFlat: null, source: 'unavailable' };
+    const blds = bldRes.status === 'fulfilled' ? bldRes.value : null; // null = OSM unavailable
     if (!dem.demFlat) {
       setStatus('viewshedStatus', 'error', 'NO DEM');
       rec.grid = null; rec.mask = null; rec.coverage = null;
       rec.demSource = 'unavailable'; rec.canopySource = can.canopyFlat ? can.source : null;
+      rec.buildingCount = null;
       rec.computedAt = Date.now();
       if (typeof saveViewshed === 'function') await saveViewshed(_toPersistable(rec));
       if (rec.visible !== false) _renderVisibleViewsheds();
@@ -10852,7 +10886,10 @@ async function runViewshed(id) {
     }
     _vsProgress(0.2);
     const n = grid.rows * grid.cols;
-    const dsm = sanitizeForKernel(buildDSM(dem.demFlat, can.canopyFlat, n), n);
+    const dsmRaw = buildDSM(dem.demFlat, can.canopyFlat, n);
+    // Buildings become solid obstacles: dsm = max(dsm, ground + building height).
+    rec.buildingCount = blds ? stampBuildingsOnDSM(grid, dsmRaw, dem.demFlat, blds) : null;
+    const dsm = sanitizeForKernel(dsmRaw, n);
     const { col: obsCol, row: obsRow } = latLngToCell(grid, obs.lat, obs.lng);
     const mask = await _runViewshedKernel({ grid, dem: dem.demFlat, dsm, obsCol, obsRow, aglM, vlosRangeM: vlosM });
     try { if (rec.mask && rec.mask.length) Diag.free('viewshedMask', rec.mask.length); } catch (_) {}

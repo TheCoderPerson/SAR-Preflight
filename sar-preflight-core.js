@@ -19,6 +19,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.20-b',
+    date: '2026-07-20',
+    changes: [
+      'Viewsheds now treat OSM buildings as sight-line obstacles, using the same footprints and heights as the 3D building prisms (measured heights where OSM has them, estimates otherwise). The result line and observer export note how many buildings were included; if OSM is unreachable the viewshed still computes from terrain + canopy only. Recompute existing observers to pick up buildings. Coverage is only as complete as OSM building data for the area.',
+    ],
+  },
+  {
     version: '2026.07.20-a',
     date: '2026-07-20',
     changes: [
