@@ -14,6 +14,12 @@ describe('makeViewshedRecord', () => {
     expect(r.mask).toBeNull();
     expect(r.coverage).toBeNull();
     expect(r.visible).toBe(true); // new observers show immediately
+    expect(r.buildingCount).toBeNull(); // buildings not included until a compute stamps them
+  });
+
+  it('keeps a persisted buildingCount (including 0)', () => {
+    expect(makeViewshedRecord({ id: 'x', observer: { lat: 1, lng: 2 }, buildingCount: 37 }).buildingCount).toBe(37);
+    expect(makeViewshedRecord({ id: 'x', observer: { lat: 1, lng: 2 }, buildingCount: 0 }).buildingCount).toBe(0);
   });
 
   it('keeps a persisted visible:false (toggled-off viewshed)', () => {

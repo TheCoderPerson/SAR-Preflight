@@ -246,6 +246,55 @@ function sanitizeForKernel(arr, n, sentinel) {
 }
 
 // ============================================================
+// Stamp OSM building footprints onto the DSM as solid obstacles:
+// dsm = max(dsm, dem + heightM) for every cell whose CENTER falls inside a
+// footprint (same cell-center rule as the canopy ops). `buildings` is the
+// parseOverpassBuildings shape — footprint is an open ring of [lon, lat]
+// pairs. Cells with unknown ground (NaN dem) are left alone so the kernel's
+// missing-data sentinel handling stays intact; call BEFORE sanitizeForKernel.
+// Returns the number of buildings that stamped at least one cell.
+// ============================================================
+function stampBuildingsOnDSM(grid, dsm, demFlat, buildings) {
+  if (!grid || !dsm || !demFlat || !buildings || !buildings.length) return 0;
+  let stamped = 0;
+  for (const b of buildings) {
+    const fp = b && b.footprint;
+    const hM = b && b.heightM;
+    if (!fp || fp.length < 3 || !Number.isFinite(hM) || hM <= 0) continue;
+    let w = Infinity, e = -Infinity, s = Infinity, n = -Infinity;
+    for (const p of fp) {
+      if (p[0] < w) w = p[0]; if (p[0] > e) e = p[0];
+      if (p[1] < s) s = p[1]; if (p[1] > n) n = p[1];
+    }
+    if (e < grid.west || w > grid.east || n < grid.south || s > grid.north) continue;
+    const r0 = gridLatToRow(grid, n), r1 = gridLatToRow(grid, s);
+    const c0 = gridLngToCol(grid, w), c1 = gridLngToCol(grid, e);
+    let hit = false;
+    for (let row = r0; row <= r1; row++) {
+      const lat = gridRowToLat(grid, row);
+      for (let col = c0; col <= c1; col++) {
+        const lng = gridColToLng(grid, col);
+        // Ray-cast in lon/lat space against the [lon, lat] ring.
+        let inside = false;
+        for (let i = 0, j = fp.length - 1; i < fp.length; j = i++) {
+          const xi = fp[i][0], yi = fp[i][1], xj = fp[j][0], yj = fp[j][1];
+          if ((yi > lat) !== (yj > lat) && lng < (xj - xi) * (lat - yi) / (yj - yi) + xi) inside = !inside;
+        }
+        if (!inside) continue;
+        const idx = row * grid.cols + col;
+        const g = demFlat[idx];
+        if (!Number.isFinite(g)) continue;
+        const z = g + hM;
+        if (!(dsm[idx] >= z)) dsm[idx] = z; // NaN-safe max
+        hit = true;
+      }
+    }
+    if (hit) stamped++;
+  }
+  return stamped;
+}
+
+// ============================================================
 // VIEWSHED KERNEL — faithful port of los.py is_visible / coverage_from_station.
 // Observer eye = DEM[obs] + eye height (bare ground); target (drone) = DEM[cell] + AGL;
 // obstructions tested against DSM (terrain + vegetation) with Earth-curvature drop.
@@ -1076,6 +1125,7 @@ function makeViewshedRecord(opts) {
     coverage: opts.coverage != null ? opts.coverage : null,
     demSource: opts.demSource || null,
     canopySource: opts.canopySource || null,
+    buildingCount: Number.isFinite(+opts.buildingCount) ? +opts.buildingCount : null, // null = OSM buildings not included in this compute
     computedAt: opts.computedAt != null ? opts.computedAt : null,
     visible: opts.visible !== false, // shown on the map (multiple may be on at once)
   };
@@ -1116,6 +1166,7 @@ function observerKmlDescription(rec) {
     `Viewshed: ${cov}`,
     rec.demSource ? `Terrain: ${rec.demSource}` : '',
     rec.canopySource ? `Canopy: ${rec.canopySource}` : '',
+    rec.buildingCount != null ? `Buildings: ${rec.buildingCount} OSM footprints as obstacles` : '',
     rec.computedAt ? `Computed: ${new Date(rec.computedAt).toISOString()}` : '',
   ];
   return lines.filter(Boolean).join('\n');
@@ -1131,7 +1182,7 @@ if (typeof module !== 'undefined' && module.exports) {
     lngLatToTileXY, tileXYToQuadkey, quadkeyToTileXY, tileXYBounds, quadkeyBounds, metaQuadkeysForBBox,
     makeGrid, gridColToLng, gridRowToLat, gridLngToCol, gridLatToRow, latLngToCell,
     sampleGridBilinear,
-    resampleToGrid, buildDSM, sanitizeForKernel,
+    resampleToGrid, buildDSM, sanitizeForKernel, stampBuildingsOnDSM,
     curvatureDrop, isVisible, computeViewshed, viewshedCoverage, compositeViewsheds,
     computeShadowMask, shadowColorRamp, shadowMaskToRGBA,
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,

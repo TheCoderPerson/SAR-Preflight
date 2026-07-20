@@ -1,6 +1,7 @@
 const {
   curvatureDrop, isVisible, computeViewshed, viewshedCoverage, compositeViewsheds,
-  buildDSM, sanitizeForKernel, makeGrid, latLngToCell, PILOT_EYE_M, KERNEL_SENTINEL,
+  buildDSM, sanitizeForKernel, stampBuildingsOnDSM, makeGrid, latLngToCell,
+  PILOT_EYE_M, KERNEL_SENTINEL,
 } = require('../../sar-preflight-raster.js');
 
 // ============================================================
@@ -221,5 +222,86 @@ describe('compositeViewsheds', () => {
     expect(Math.max(out.grid.rows, out.grid.cols)).toBeLessThanOrEqual(256);
     const inA = latLngToCell(out.grid, 38.5, -120.9);
     expect(out.mask[inA.row * out.grid.cols + inA.col]).toBe(1);
+  });
+});
+
+// ============================================================
+// stampBuildingsOnDSM — OSM footprints as solid viewshed obstacles
+// ============================================================
+
+describe('stampBuildingsOnDSM', () => {
+  // 50x50 grid, 10 m cells, centered at 38.7,-120.9; flat ground at 0 m.
+  const mk = () => {
+    const grid = makeGrid(38.7, -120.9, 250, 10);
+    const n = grid.rows * grid.cols;
+    return { grid, n, dem: new Float32Array(n), dsm: new Float32Array(n) };
+  };
+  // ~40 m square footprint (open [lon,lat] ring) centered on a point.
+  const sq = (lat, lng, hM) => ({
+    footprint: [
+      [lng - 0.0002, lat - 0.0002], [lng + 0.0002, lat - 0.0002],
+      [lng + 0.0002, lat + 0.0002], [lng - 0.0002, lat + 0.0002],
+    ],
+    heightM: hM,
+  });
+
+  it('raises DSM to ground + height inside the footprint, leaves outside alone', () => {
+    const { grid, dem, dsm } = mk();
+    const count = stampBuildingsOnDSM(grid, dsm, dem, [sq(38.7, -120.9, 12)]);
+    expect(count).toBe(1);
+    const inC = latLngToCell(grid, 38.7, -120.9);
+    expect(dsm[inC.row * grid.cols + inC.col]).toBe(12);
+    const outC = latLngToCell(grid, 38.7015, -120.9); // ~165 m north, outside
+    expect(dsm[outC.row * grid.cols + outC.col]).toBe(0);
+  });
+
+  it('is a max — never lowers taller existing canopy DSM', () => {
+    const { grid, dem, dsm } = mk();
+    dsm.fill(30); // canopy already 30 m everywhere
+    const count = stampBuildingsOnDSM(grid, dsm, dem, [sq(38.7, -120.9, 12)]);
+    expect(count).toBe(1); // in-bounds building still counts
+    const inC = latLngToCell(grid, 38.7, -120.9);
+    expect(dsm[inC.row * grid.cols + inC.col]).toBe(30);
+  });
+
+  it('skips buildings outside the grid and invalid heights', () => {
+    const { grid, dem, dsm } = mk();
+    expect(stampBuildingsOnDSM(grid, dsm, dem, [sq(39.5, -120.9, 12)])).toBe(0);
+    expect(stampBuildingsOnDSM(grid, dsm, dem, [sq(38.7, -120.9, 0)])).toBe(0);
+    expect(stampBuildingsOnDSM(grid, dsm, dem, [sq(38.7, -120.9, NaN)])).toBe(0);
+    expect(dsm.every(v => v === 0)).toBe(true);
+    expect(stampBuildingsOnDSM(grid, dsm, dem, null)).toBe(0);
+  });
+
+  it('leaves cells with unknown ground (NaN dem) untouched', () => {
+    const { grid, dem, dsm } = mk();
+    const inC = latLngToCell(grid, 38.7, -120.9);
+    dem[inC.row * grid.cols + inC.col] = NaN;
+    dsm[inC.row * grid.cols + inC.col] = NaN;
+    stampBuildingsOnDSM(grid, dsm, dem, [sq(38.7, -120.9, 12)]);
+    expect(Number.isNaN(dsm[inC.row * grid.cols + inC.col])).toBe(true);
+  });
+
+  it('a stamped building blocks line of sight behind it in the full kernel', () => {
+    const grid = makeGrid(38.7, -120.9, 250, 10);
+    const n = grid.rows * grid.cols;
+    const dem = new Float32Array(n); // flat ground
+    const dsmRaw = buildDSM(dem, null, n);
+    // 50 m tall wall spanning the full grid width, ~90-135 m north of center.
+    const wall = {
+      footprint: [
+        [-120.904, 38.7008], [-120.896, 38.7008],
+        [-120.896, 38.7012], [-120.904, 38.7012],
+      ],
+      heightM: 50,
+    };
+    expect(stampBuildingsOnDSM(grid, dsmRaw, dem, [wall])).toBe(1);
+    const dsm = sanitizeForKernel(dsmRaw, n);
+    const obs = latLngToCell(grid, 38.7, -120.9);
+    const mask = computeViewshed({ grid, dem, dsm, obsCol: obs.col, obsRow: obs.row, aglM: 2, vlosRangeM: 240 });
+    const south = latLngToCell(grid, 38.699, -120.9);   // open ground
+    const beyond = latLngToCell(grid, 38.7018, -120.9); // behind the wall
+    expect(mask[south.row * grid.cols + south.col]).toBe(1);
+    expect(mask[beyond.row * grid.cols + beyond.col]).toBe(0);
   });
 });
