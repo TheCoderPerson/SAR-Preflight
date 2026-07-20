@@ -49,7 +49,7 @@ const S = {
   // Vegetation overlay + viewshed
   canopy: {},
   viewsheds: [],            // saved observer viewshed records (see makeViewshedRecord)
-  activeViewshedId: null,   // the one currently displayed (only one overlay at a time)
+  activeViewshedId: null,   // last-selected observer (status line / export default); display = every record with visible !== false
   _viewshedRunningId: null, // id currently computing (serializes the kernel)
   _viewshedPicking: false,
   // Canopy edit mode (user corrections to the canopy raster)
@@ -7772,7 +7772,10 @@ function collectFeaturesAt(latlng) {
 }
 
 let _aggLastEvent = null;
-function openAggregatePopup(latlng, ev) {
+// Lift the popup clear of an observer pin (25x41 default icon anchored at its
+// tip) so the pin stays tappable underneath — tapping it toggles the viewshed.
+const OBSERVER_POPUP_LIFT_PX = -46;
+function openAggregatePopup(latlng, ev, offsetY) {
   if (!S.map || !latlng) return;
   // Don't hijack clicks while a draw tool is placing points.
   if (typeof document !== 'undefined' && document.querySelector('.draw-btn.active')) return;
@@ -7790,6 +7793,9 @@ function openAggregatePopup(latlng, ev) {
   S._aggPopup.items = hits;
   S._aggPopup.index = 0;
   if (!S._aggPopup.popup) S._aggPopup.popup = L.popup({ maxWidth: 340, minWidth: 180, autoPan: true, className: 'agg-popup' });
+  // The popup is shared across every open — set the anchor offset each time
+  // (7 is Leaflet's stock popup offset; observer taps pass a lift instead).
+  S._aggPopup.popup.options.offset = L.point(0, offsetY != null ? offsetY : 7);
   S._aggPopup.popup.setLatLng(latlng);
   renderAggregatePopup();
   S._aggPopup.popup.openOn(S.map);
@@ -7841,6 +7847,12 @@ function _aggFeatureClick(e) {
   // feature (TFR/NOTAM polygon) must still place the observer — the feature
   // handler stops propagation, so the map-level click handler never sees it.
   if (S._viewshedPicking) { onViewshedMapClick(e.latlng); return; }
+  // An observer-marker tap toggles its viewshed (the marker's own click
+  // handler) — anchor the popup at the pin and lift it above the icon so the
+  // pin stays visible and tappable for the next toggle.
+  const t = e && e.target;
+  const obs = t && (S.viewsheds || []).some(r => r._marker === t);
+  if (obs && t.getLatLng) { openAggregatePopup(t.getLatLng(), e, OBSERVER_POPUP_LIFT_PX); return; }
   openAggregatePopup(e.latlng, e);
 }
 
@@ -10594,7 +10606,7 @@ function _addObserverMarker(rec) {
   });
   if (m.on) m.on('click', () => {
     if (S._viewshedPicking) return; // pick-mode click places a NEW observer
-    setActiveViewshed(rec.id);
+    toggleViewshedVisible(rec.id);
   });
   rec._marker = m;
   S.mapLayers.observers.addLayer(m);
@@ -10607,7 +10619,7 @@ function _toPersistable(rec) {
     id: rec.id, areaKey: rec.areaKey, name: rec.name, observer: rec.observer,
     aglFt: rec.aglFt, vlosFt: rec.vlosFt, grid: rec.grid, mask: rec.mask,
     coverage: rec.coverage, demSource: rec.demSource, canopySource: rec.canopySource,
-    computedAt: rec.computedAt,
+    computedAt: rec.computedAt, visible: rec.visible !== false,
   };
 }
 
@@ -10635,33 +10647,62 @@ function _vsProgress(frac) {
   if (pb) pb.style.width = Math.round(frac * 100) + '%';
 }
 
-// Paint ONLY the active record's stored mask — no recompute. Removes the overlay
-// when there is no active record (or it has no computed mask yet).
-function _renderActiveViewshed() {
-  const rec = S.viewsheds.find(r => r.id === S.activeViewshedId);
+// Paint the union of every visible record's stored mask into the single
+// viewshed overlay (compositeViewsheds — no recompute). Removes the overlay
+// when no visible record has a computed mask yet.
+function _renderVisibleViewsheds() {
+  const vis = S.viewsheds.filter(rec => rec.visible !== false);
+  const computed = vis.filter(rec => rec.grid && rec.mask);
   const r = document.getElementById('vsResult');
-  if (!rec || !rec.grid || !rec.mask) {
+  if (!computed.length) {
     if (S._overlayWanted) S._overlayWanted.viewshed = false;
     if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
     if (S.is3D && typeof sync3d === 'function') sync3d();
-    if (r) r.textContent = rec ? `${rec.name}: ${rec.computedAt ? 'terrain unavailable — no viewshed' : 'computing…'}` : '';
+    if (r) {
+      const rec = vis.find(x => x.id === S.activeViewshedId) || vis[0] || null;
+      r.textContent = rec ? `${rec.name}: ${rec.computedAt ? 'terrain unavailable — no viewshed' : 'computing…'}` : '';
+    }
     buildLayerControl();
     return;
   }
+  const comp = compositeViewsheds(computed);
   const op = parseFloat((document.getElementById('vsOpacity') || {}).value) || VIEWSHED_OVERLAY_OPACITY;
-  renderRasterOverlay('viewshed', viewshedMaskToRGBA(rec.grid, rec.mask), rec.grid, op);
+  renderRasterOverlay('viewshed', viewshedMaskToRGBA(comp.grid, comp.mask), comp.grid, op);
   if (r) {
+    const rec = computed.find(x => x.id === S.activeViewshedId) || computed[computed.length - 1];
     const canLabel = rec.canopySource ? ('canopy ' + rec.canopySource) : 'bare earth (no canopy)';
-    r.textContent = `${rec.name}: ${Math.round((rec.coverage || 0) * 100)}% of ${rec.vlosFt} ft VLOS visible @ ${rec.aglFt} ft AGL · DEM ${rec.demSource} · ${canLabel}`;
+    r.textContent = `${rec.name}: ${Math.round((rec.coverage || 0) * 100)}% of ${rec.vlosFt} ft VLOS visible @ ${rec.aglFt} ft AGL · DEM ${rec.demSource} · ${canLabel}`
+      + (computed.length > 1 ? ` · ${computed.length} viewsheds shown (darker green = overlap)` : '');
   }
   buildLayerControl();
 }
 
-// Switch which observer's viewshed is shown (instant — reads the stored mask).
+// Select an observer and make sure its viewshed is shown (instant — reads the
+// stored mask). Other visible viewsheds stay on.
 function setActiveViewshed(id) {
+  const rec = S.viewsheds.find(r => r.id === id);
+  if (rec && rec.visible === false) {
+    rec.visible = true;
+    if (typeof saveViewshed === 'function') saveViewshed(_toPersistable(rec));
+  }
   S.activeViewshedId = id;
   if (typeof saveAppState === 'function') saveAppState('activeViewshedId', id);
-  _renderActiveViewshed();
+  _renderVisibleViewsheds();
+  renderObserverList();
+}
+
+// Marker/list tap: toggle this observer's viewshed on/off — several can be
+// shown at once (the overlay drapes their union).
+function toggleViewshedVisible(id) {
+  const rec = S.viewsheds.find(r => r.id === id);
+  if (!rec) return;
+  rec.visible = rec.visible === false;
+  if (rec.visible) {
+    S.activeViewshedId = id;
+    if (typeof saveAppState === 'function') saveAppState('activeViewshedId', id);
+  }
+  if (typeof saveViewshed === 'function') saveViewshed(_toPersistable(rec));
+  _renderVisibleViewsheds();
   renderObserverList();
 }
 
@@ -10682,7 +10723,7 @@ function renameViewshed(id, name) {
   if (rec._marker && rec._marker.setPopupContent) rec._marker.setPopupContent(_observerPopupHtml(rec));
   if (typeof saveViewshed === 'function') saveViewshed(_toPersistable(rec));
   renderObserverList();
-  if (id === S.activeViewshedId) _renderActiveViewshed();
+  if (rec.visible !== false) _renderVisibleViewsheds(); // name shows in the result line
 }
 
 function renameViewshedPrompt(id) {
@@ -10705,8 +10746,8 @@ function removeViewshed(id) {
     const next = S.viewsheds[idx] || S.viewsheds[idx - 1] || null;
     S.activeViewshedId = next ? next.id : null;
     if (typeof saveAppState === 'function') saveAppState('activeViewshedId', S.activeViewshedId);
-    _renderActiveViewshed();
   }
+  _renderVisibleViewsheds(); // repaint the composite without the removed mask
   renderObserverList();
   buildLayerControl();
 }
@@ -10735,15 +10776,15 @@ function renderObserverList() {
     return;
   }
   el.innerHTML = S.viewsheds.map(r => {
-    const active = r.id === S.activeViewshedId;
+    const shown = r.visible !== false;
     const cov = r.coverage == null
       ? (r.computedAt ? (r.grid && r.mask ? '' : 'no DEM') : 'pending…')
       : Math.round(r.coverage * 100) + '%';
-    return `<div class="vs-obs-row${active ? ' active' : ''}" data-id="${r.id}">`
+    return `<div class="vs-obs-row${shown ? ' active' : ''}" data-id="${r.id}">`
       + `<span class="vs-obs-name" title="Rename" onclick="renameViewshedPrompt('${r.id}')">${_esc(r.name)}</span>`
       + `<span class="vs-obs-cov">${_esc(cov)}</span>`
       + `<span class="vs-obs-actions">`
-      + `<button title="Show" onclick="setActiveViewshed('${r.id}')">${active ? '◉' : '○'}</button>`
+      + `<button title="${shown ? 'Hide' : 'Show'}" onclick="toggleViewshedVisible('${r.id}')">${shown ? '◉' : '○'}</button>`
       + `<button title="Recompute" onclick="recomputeViewshed('${r.id}')">↻</button>`
       + `<button title="Delete" onclick="removeViewshed('${r.id}')">✕</button>`
       + `</span></div>`;
@@ -10760,9 +10801,11 @@ async function restoreViewsheds() {
   S.viewsheds = [];
   let recs = [];
   try { recs = await getAllViewsheds(ak); } catch (e) { recs = []; }
+  const legacy = []; // records saved before the visible flag existed
   recs.forEach(raw => {
     const rec = makeViewshedRecord(raw);
     if (!rec) return;
+    if (raw.visible === undefined) legacy.push(rec);
     S.viewsheds.push(rec);
     try { if (rec.mask && rec.mask.length) Diag.alloc('viewshedMask', rec.mask.length); } catch (_) {}
     _addObserverMarker(rec);
@@ -10772,7 +10815,8 @@ async function restoreViewsheds() {
   if (typeof getAppState === 'function') { try { activeId = await getAppState('activeViewshedId'); } catch (e) { /* ignore */ } }
   if (!S.viewsheds.find(r => r.id === activeId)) activeId = S.viewsheds.length ? S.viewsheds[S.viewsheds.length - 1].id : null;
   S.activeViewshedId = activeId;
-  _renderActiveViewshed();
+  legacy.forEach(rec => { rec.visible = rec.id === activeId; }); // preserve the old single-overlay look
+  _renderVisibleViewsheds();
   renderObserverList();
   buildLayerControl();
 }
@@ -10802,7 +10846,7 @@ async function runViewshed(id) {
       rec.demSource = 'unavailable'; rec.canopySource = can.canopyFlat ? can.source : null;
       rec.computedAt = Date.now();
       if (typeof saveViewshed === 'function') await saveViewshed(_toPersistable(rec));
-      if (id === S.activeViewshedId) _renderActiveViewshed();
+      if (rec.visible !== false) _renderVisibleViewsheds();
       renderObserverList();
       return;
     }
@@ -10821,7 +10865,7 @@ async function runViewshed(id) {
     rec.computedAt = Date.now();
     if (rec._marker && rec._marker.setPopupContent) rec._marker.setPopupContent(_observerPopupHtml(rec));
     if (typeof saveViewshed === 'function') await saveViewshed(_toPersistable(rec));
-    if (id === S.activeViewshedId) _renderActiveViewshed();
+    if (rec.visible !== false) _renderVisibleViewsheds();
     setStatus('viewshedStatus', 'live', 'DONE');
     _vsProgress(1);
     renderObserverList();
@@ -10834,7 +10878,10 @@ async function runViewshed(id) {
     S._viewshedRunningId = null;
     trackFetchEnd('Viewshed');
     try { Diag.note('viewshed.end', { n: S.viewsheds.length }); } catch (_) {}
-    if (rec._pendingRecompute) { rec._pendingRecompute = false; runViewshed(id); }
+    // Run the next queued compute — ANY record, not just this one (a second
+    // observer added while this one computed queues on its own record).
+    const next = S.viewsheds.find(r => r._pendingRecompute);
+    if (next) { next._pendingRecompute = false; runViewshed(next.id); }
   }
 }
 
@@ -12016,7 +12063,7 @@ if (typeof module !== 'undefined' && module.exports) {
     setShadowOpacity, toggleShadowOverlay, loadShadowForView, _renderShadowForTime, _updateShadowForTime, _shadowTime,
     startViewshedPick, cancelViewshedPick, onViewshedMapClick, runViewshed, clearAllViewsheds,
     genViewshedId, _ensureObserverLayer, _addObserverMarker, _observerPopupHtml, _toPersistable,
-    _renderActiveViewshed, setActiveViewshed, recomputeViewshed, renameViewshed, renameViewshedPrompt,
+    _renderVisibleViewsheds, setActiveViewshed, toggleViewshedVisible, recomputeViewshed, renameViewshed, renameViewshedPrompt,
     removeViewshed, renderObserverList, restoreViewsheds,
     buildLayerControl, toggleLayer, updateWireDisplay,
     openAggregatePopup, aggPopupStep, renderAggregatePopup, collectFeaturesAt,

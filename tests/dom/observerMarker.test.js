@@ -45,7 +45,7 @@ beforeEach(() => {
   S.map3d = null;
 });
 
-describe('2D observer marker tap-to-activate', () => {
+describe('2D observer marker tap-to-toggle', () => {
   it('stamps the record id into the marker featId option', () => {
     const rec = makeRec('vs1');
     S.viewsheds = [rec];
@@ -53,21 +53,36 @@ describe('2D observer marker tap-to-activate', () => {
     expect(m.options.featId).toBe('vs1');
   });
 
-  it('activates the tapped observer viewshed', () => {
+  it('tapping a shown observer hides its viewshed without stealing the selection', () => {
     const a = makeRec('vs_a'), b = makeRec('vs_b');
     S.viewsheds = [a, b];
     S.activeViewshedId = 'vs_a';
     const m = _addObserverMarker(b);
+    m._handlers.click[0]({}); // b starts visible (default) → hide it
+    expect(b.visible).toBe(false);
+    expect(a.visible).not.toBe(false); // untouched — multiple can stay on
+    expect(S.activeViewshedId).toBe('vs_a');
+  });
+
+  it('tapping a hidden observer shows its viewshed again and selects it', () => {
+    const a = makeRec('vs_a'), b = makeRec('vs_b');
+    b.visible = false;
+    S.viewsheds = [a, b];
+    S.activeViewshedId = 'vs_a';
+    const m = _addObserverMarker(b);
     m._handlers.click[0]({});
+    expect(b.visible).toBe(true);
+    expect(a.visible).not.toBe(false); // both on at once
     expect(S.activeViewshedId).toBe('vs_b');
   });
 
-  it('does not activate while viewshed pick mode is placing a new observer', () => {
+  it('does not toggle while viewshed pick mode is placing a new observer', () => {
     const rec = makeRec('vs1');
     S.viewsheds = [rec];
     S._viewshedPicking = true;
     const m = _addObserverMarker(rec);
     m._handlers.click[0]({});
+    expect(rec.visible).not.toBe(false);
     expect(S.activeViewshedId).toBe(null);
   });
 });

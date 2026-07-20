@@ -1,6 +1,6 @@
 const {
-  curvatureDrop, isVisible, computeViewshed, viewshedCoverage,
-  buildDSM, sanitizeForKernel, PILOT_EYE_M, KERNEL_SENTINEL,
+  curvatureDrop, isVisible, computeViewshed, viewshedCoverage, compositeViewsheds,
+  buildDSM, sanitizeForKernel, makeGrid, latLngToCell, PILOT_EYE_M, KERNEL_SENTINEL,
 } = require('../../sar-preflight-raster.js');
 
 // ============================================================
@@ -149,5 +149,77 @@ describe('viewshedCoverage', () => {
     const mask = computeViewshed({ grid, dem, dsm, obsCol: 4, obsRow: 4, aglM: 2, vlosRangeM: 3 });
     // flat terrain → everything in range is visible → coverage 1.0
     expect(viewshedCoverage(grid, mask, 4, 4, 3)).toBeCloseTo(1, 5);
+  });
+});
+
+// ============================================================
+// compositeViewsheds — union of several observers' masks for the single overlay
+// ============================================================
+
+describe('compositeViewsheds', () => {
+  // A record whose whole grid is visible (mask all 1s).
+  const fullRec = (lat, lng, halfM, resM) => {
+    const grid = makeGrid(lat, lng, halfM, resM);
+    return { grid, mask: new Uint8Array(grid.rows * grid.cols).fill(1) };
+  };
+
+  it('returns null with no computed records', () => {
+    expect(compositeViewsheds([])).toBeNull();
+    expect(compositeViewsheds(null)).toBeNull();
+    expect(compositeViewsheds([{ grid: null, mask: null }])).toBeNull();
+  });
+
+  it('passes a single record through untouched (no resample)', () => {
+    const rec = fullRec(38.7, -120.9, 500, 10);
+    const out = compositeViewsheds([rec]);
+    expect(out.grid).toBe(rec.grid);
+    expect(out.mask).toBe(rec.mask);
+  });
+
+  it('unions two disjoint viewsheds into one covering grid', () => {
+    const a = fullRec(38.70, -120.90, 500, 10);
+    const b = fullRec(38.73, -120.90, 500, 10); // ~3.3 km north — no overlap
+    const out = compositeViewsheds([a, b]);
+    expect(out.grid.bounds.south).toBeCloseTo(a.grid.bounds.south, 9);
+    expect(out.grid.bounds.north).toBeCloseTo(b.grid.bounds.north, 9);
+    // Cells inside each source grid are visible…
+    const inA = latLngToCell(out.grid, 38.70, -120.90);
+    const inB = latLngToCell(out.grid, 38.73, -120.90);
+    expect(out.mask[inA.row * out.grid.cols + inA.col]).toBe(1);
+    expect(out.mask[inB.row * out.grid.cols + inB.col]).toBe(1);
+    // …and the gap between them stays empty.
+    const between = latLngToCell(out.grid, 38.715, -120.90);
+    expect(out.mask[between.row * out.grid.cols + between.col]).toBe(0);
+  });
+
+  it('counts overlapping observers per cell (2 in a pairwise overlap, 3 where all see)', () => {
+    const a = fullRec(38.70, -120.90, 500, 10);
+    const b = fullRec(38.70, -120.90, 500, 10);   // fully overlaps a
+    const c = fullRec(38.703, -120.90, 500, 10);  // offset north — partial overlap
+    const out = compositeViewsheds([a, b, c]);
+    const center = latLngToCell(out.grid, 38.70, -120.90); // inside a, b, AND c (c spans 38.6985..38.7075)
+    expect(out.mask[center.row * out.grid.cols + center.col]).toBe(3);
+    const southEdge = latLngToCell(out.grid, 38.6962, -120.90); // inside a+b only, south of c
+    expect(out.mask[southEdge.row * out.grid.cols + southEdge.col]).toBe(2);
+    const northEdge = latLngToCell(out.grid, 38.707, -120.90);  // inside c only
+    expect(out.mask[northEdge.row * out.grid.cols + northEdge.col]).toBe(1);
+  });
+
+  it('a hidden cell in one viewshed shows if any other viewshed sees it', () => {
+    const a = fullRec(38.70, -120.90, 500, 10);
+    const b = fullRec(38.70, -120.90, 500, 10);
+    b.mask = new Uint8Array(b.grid.rows * b.grid.cols); // b sees nothing
+    const out = compositeViewsheds([b, a]);
+    const c = latLngToCell(out.grid, 38.70, -120.90);
+    expect(out.mask[c.row * out.grid.cols + c.col]).toBe(1); // a still wins
+  });
+
+  it('caps the union grid dimension for far-apart observers', () => {
+    const a = fullRec(38.5, -120.9, 500, 5);
+    const b = fullRec(39.0, -120.9, 500, 5); // ~55 km apart at 5 m res → way past cap
+    const out = compositeViewsheds([a, b], 256);
+    expect(Math.max(out.grid.rows, out.grid.cols)).toBeLessThanOrEqual(256);
+    const inA = latLngToCell(out.grid, 38.5, -120.9);
+    expect(out.mask[inA.row * out.grid.cols + inA.col]).toBe(1);
   });
 });

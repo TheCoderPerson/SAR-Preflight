@@ -19,6 +19,16 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.20-a',
+    date: '2026-07-20',
+    changes: [
+      'Multiple observer viewsheds can now be shown at the same time: tapping an observer marker (or the ◉/○ button in the Terrain-tab observer list) toggles that viewshed on/off instead of switching, and every shown viewshed drapes together on the map, in 3D, and behind the opacity slider. Previously only one viewshed could display at a time.',
+      'The observer info popup now opens above the marker pin instead of covering it, so the pin stays visible and tappable for the next toggle.',
+      'Where shown viewsheds overlap, the overlay shades darker green — mid green where 2 observers can see the drone, deep green for 3 or more.',
+      'Fixed: adding several observers in quick succession could silently skip computing the later ones — queued viewshed computes now always run when the current one finishes.',
+    ],
+  },
+  {
     version: '2026.07.18-d',
     date: '2026-07-18',
     changes: [

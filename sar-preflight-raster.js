@@ -451,6 +451,70 @@ function viewshedCoverage(grid, mask, obsCol, obsRow, vlosRangeM) {
 }
 
 // ============================================================
+// Composite N computed viewsheds into ONE union grid + mask so several
+// observers can drape through the app's single viewshed overlay (2D + 3D).
+// The output mask holds the COUNT of observers that see each cell (0 = none),
+// so the color ramp can shade overlap zones darker. Render-only: each record
+// keeps its own full-resolution 0/1 grid/mask (exports are unaffected). Union
+// resolution follows the finest member grid, capped at maxDim per axis so
+// far-apart observers can't explode the canvas.
+// ============================================================
+function compositeViewsheds(records, maxDim) {
+  const recs = (records || []).filter(r => r && r.grid && r.mask);
+  if (!recs.length) return null;
+  if (recs.length === 1) return { grid: recs[0].grid, mask: recs[0].mask };
+  let west = Infinity, east = -Infinity, south = Infinity, north = -Infinity, resM = Infinity;
+  recs.forEach(r => {
+    const b = r.grid.bounds;
+    if (b.west < west) west = b.west;
+    if (b.east > east) east = b.east;
+    if (b.south < south) south = b.south;
+    if (b.north > north) north = b.north;
+    if (r.grid.resM < resM) resM = r.grid.resM;
+  });
+  const lat0 = (south + north) / 2, lng0 = (west + east) / 2;
+  const mPerDegLat = 111320;
+  const mPerDegLng = mPerDegLat * Math.cos(lat0 * Math.PI / 180);
+  const cap = maxDim || 2 * MAX_GRID;
+  let cols = Math.max(1, Math.ceil((east - west) * mPerDegLng / resM));
+  let rows = Math.max(1, Math.ceil((north - south) * mPerDegLat / resM));
+  const over = Math.max(rows, cols) / cap;
+  if (over > 1) {
+    rows = Math.max(1, Math.round(rows / over));
+    cols = Math.max(1, Math.round(cols / over));
+  }
+  const grid = {
+    lat0, lng0, west, east, south, north, rows, cols,
+    resM: ((east - west) * mPerDegLng) / cols,
+    mPerDegLat, mPerDegLng,
+    bounds: { west, south, east, north },
+  };
+  const mask = new Uint8Array(rows * cols);
+  recs.forEach(r => {
+    const g = r.grid, m = r.mask;
+    const r0 = gridLatToRow(grid, g.bounds.north);
+    const r1 = gridLatToRow(grid, g.bounds.south);
+    const c0 = gridLngToCol(grid, g.bounds.west);
+    const c1 = gridLngToCol(grid, g.bounds.east);
+    for (let row = r0; row <= r1; row++) {
+      const lat = gridRowToLat(grid, row);
+      const sy = Math.floor((g.north - lat) / (g.north - g.south) * g.rows);
+      if (sy < 0 || sy >= g.rows) continue;
+      for (let col = c0; col <= c1; col++) {
+        const lng = gridColToLng(grid, col);
+        const sx = Math.floor((lng - g.west) / (g.east - g.west) * g.cols);
+        if (sx < 0 || sx >= g.cols) continue;
+        if (m[sy * g.cols + sx]) {
+          const idx = row * cols + col;
+          if (mask[idx] < 255) mask[idx]++; // count of observers seeing this cell
+        }
+      }
+    }
+  });
+  return { grid, mask };
+}
+
+// ============================================================
 // COLOR RAMPS → RGBA (per-pixel alpha; global translucency via overlay opacity)
 // ============================================================
 function _lerp(a, b, t) { return Math.round(a + (b - a) * t); }
@@ -462,8 +526,13 @@ function canopyColorRamp(heightM) {
   return [_lerp(237, 13, t), _lerp(201, 94, t), _lerp(135, 40, t), 255];
 }
 
+// v = number of observers that see the cell (composite masks carry counts;
+// single-viewshed masks are 0/1). Overlap zones step to darker greens.
 function viewshedColorRamp(v) {
-  return v ? [34, 197, 94, 255] : [0, 0, 0, 0]; // --accent-green
+  if (!v) return [0, 0, 0, 0];
+  if (v === 1) return [34, 197, 94, 255]; // --accent-green (green-500)
+  if (v === 2) return [21, 128, 61, 255]; // 2 observers overlap (green-700)
+  return [20, 83, 45, 255];               // 3+ observers overlap (green-900)
 }
 
 function canopyGridToRGBA(grid, canopyFlat) {
@@ -1008,6 +1077,7 @@ function makeViewshedRecord(opts) {
     demSource: opts.demSource || null,
     canopySource: opts.canopySource || null,
     computedAt: opts.computedAt != null ? opts.computedAt : null,
+    visible: opts.visible !== false, // shown on the map (multiple may be on at once)
   };
 }
 
@@ -1062,7 +1132,7 @@ if (typeof module !== 'undefined' && module.exports) {
     makeGrid, gridColToLng, gridRowToLat, gridLngToCol, gridLatToRow, latLngToCell,
     sampleGridBilinear,
     resampleToGrid, buildDSM, sanitizeForKernel,
-    curvatureDrop, isVisible, computeViewshed, viewshedCoverage,
+    curvatureDrop, isVisible, computeViewshed, viewshedCoverage, compositeViewsheds,
     computeShadowMask, shadowColorRamp, shadowMaskToRGBA,
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,
     CANOPY_PAINT_DEFAULT_M, canopyAvgHeight, canopyStampBrush, canopyDiffToSparse,

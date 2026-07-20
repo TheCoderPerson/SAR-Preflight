@@ -13,6 +13,12 @@ describe('makeViewshedRecord', () => {
     expect(r.grid).toBeNull();
     expect(r.mask).toBeNull();
     expect(r.coverage).toBeNull();
+    expect(r.visible).toBe(true); // new observers show immediately
+  });
+
+  it('keeps a persisted visible:false (toggled-off viewshed)', () => {
+    const r = makeViewshedRecord({ id: 'x', observer: { lat: 1, lng: 2 }, visible: false });
+    expect(r.visible).toBe(false);
   });
 
   it('coerces mask to Uint8Array and keeps supplied params', () => {
