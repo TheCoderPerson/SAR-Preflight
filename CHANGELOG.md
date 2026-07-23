@@ -4,6 +4,12 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.23-a — 2026-07-23
+
+- The app now opens offline: the service worker previously refused to answer page-load (navigation) requests, so launching the installed PWA without connectivity failed with "not connected to the internet" even though everything was cached. Navigations are now served cache-first with an offline fallback to the cached app shell.
+- Install is more resilient: a single failed CDN download no longer aborts the entire first-visit precache (which previously left NOTHING cached), and the app fonts are now precached for offline use.
+- Enter Coordinates has a new map-waypoint (pin) icon; its old crosshair icon now lives on a new toolbar button that centers the map on the device's current GPS location.
+
 ## v2026.07.20-f — 2026-07-20
 
 - Land Ownership works again: BLM's upgraded server began rejecting the app's surface-management query outright (every fetch errored with "no data"). The query now requests server-side generalized polygons (~110 m simplification — the advisory public/private percentage and map shading are unaffected), which the server accepts.

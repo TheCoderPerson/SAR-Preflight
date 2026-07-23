@@ -19,6 +19,15 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.23-a',
+    date: '2026-07-23',
+    changes: [
+      'The app now opens offline: the service worker previously refused to answer page-load (navigation) requests, so launching the installed PWA without connectivity failed with "not connected to the internet" even though everything was cached. Navigations are now served cache-first with an offline fallback to the cached app shell.',
+      'Install is more resilient: a single failed CDN download no longer aborts the entire first-visit precache (which previously left NOTHING cached), and the app fonts are now precached for offline use.',
+      'Enter Coordinates has a new map-waypoint (pin) icon; its old crosshair icon now lives on a new toolbar button that centers the map on the device\'s current GPS location.',
+    ],
+  },
+  {
     version: '2026.07.20-f',
     date: '2026-07-20',
     changes: [

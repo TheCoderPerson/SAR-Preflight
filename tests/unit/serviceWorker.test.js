@@ -1,4 +1,4 @@
-const { routeStrategy, latlngToTile, getCacheName, CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_SECTIONAL, SAR_VERSION } = require('../../sw.js');
+const { routeStrategy, latlngToTile, getCacheName, navigationStrategy, stripRedirect, CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_SECTIONAL, SAR_VERSION } = require('../../sw.js');
 
 const SECTIONAL_TILE = 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/10/396/164?ed=2026-05-13';
 const SECTIONAL_META = 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer?f=json';
@@ -108,5 +108,105 @@ describe('getCacheName(url)', () => {
   it('CACHE_STATIC is keyed by SAR_VERSION so bumping the version invalidates it', () => {
     expect(CACHE_STATIC).toBe('sar-static-' + SAR_VERSION);
     expect(SAR_VERSION).toMatch(/^\d{4}\.\d{2}\.\d{2}(-[a-z])?$/);
+  });
+});
+
+describe('stripRedirect(response)', () => {
+  it('passes non-redirected responses through unchanged (same reference)', () => {
+    const resp = new Response('ok', { status: 200 });
+    expect(stripRedirect(resp)).toBe(resp);
+  });
+
+  it('rebuilds redirected responses with the redirected flag cleared', async () => {
+    // Response constructor can't set redirected:true, so mimic one
+    const fake = { redirected: true, body: 'shell html', status: 200, statusText: 'OK', headers: { 'content-type': 'text/html' } };
+    const out = stripRedirect(fake);
+    expect(out.redirected).toBe(false);
+    expect(out.status).toBe(200);
+    expect(await out.text()).toBe('shell html');
+  });
+});
+
+describe('navigationStrategy(request)', () => {
+  const NAV_URL = 'https://example.test/sar-preflight.html';
+  let savedCaches, savedFetch;
+
+  // caches stub: matchImpl(key, opts) -> Response | undefined; records cache.put calls
+  function stubCaches(matchImpl) {
+    const puts = [];
+    globalThis.caches = {
+      match: (key, opts) => Promise.resolve(matchImpl(key, opts)),
+      open: () => Promise.resolve({ put: (req, resp) => { puts.push([req, resp]); return Promise.resolve(); } }),
+    };
+    return puts;
+  }
+
+  beforeEach(() => {
+    savedCaches = globalThis.caches;
+    savedFetch = globalThis.fetch;
+  });
+  afterEach(() => {
+    globalThis.caches = savedCaches;
+    globalThis.fetch = savedFetch;
+  });
+
+  it('serves a cached navigation without touching the network', async () => {
+    const cached = new Response('cached shell', { status: 200 });
+    stubCaches(key => (key === NAV_URL ? cached : undefined));
+    let fetched = false;
+    globalThis.fetch = () => { fetched = true; return Promise.reject(new Error('offline')); };
+    const out = await navigationStrategy(NAV_URL);
+    expect(out).toBe(cached);
+    expect(fetched).toBe(false);
+  });
+
+  it('matches the cache ignoring query strings (e.g. ?homescreen=1 start_url)', async () => {
+    const cached = new Response('cached shell', { status: 200 });
+    let seenOpts;
+    stubCaches((key, opts) => { seenOpts = opts; return key === NAV_URL ? cached : undefined; });
+    const out = await navigationStrategy(NAV_URL);
+    expect(out).toBe(cached);
+    expect(seenOpts).toEqual({ ignoreSearch: true });
+  });
+
+  it('on cache miss fetches from network and caches a 200', async () => {
+    const puts = stubCaches(() => undefined);
+    const net = new Response('fresh shell', { status: 200 });
+    globalThis.fetch = () => Promise.resolve(net);
+    const out = await navigationStrategy(NAV_URL);
+    expect(out).toBe(net);
+    expect(puts.length).toBe(1);
+    expect(puts[0][0]).toBe(NAV_URL);
+  });
+
+  it('does not cache non-200 network responses', async () => {
+    const puts = stubCaches(() => undefined);
+    globalThis.fetch = () => Promise.resolve(new Response('nope', { status: 404 }));
+    const out = await navigationStrategy(NAV_URL);
+    expect(out.status).toBe(404);
+    expect(puts.length).toBe(0);
+  });
+
+  it('offline with no direct match falls back to the cached app shell HTML', async () => {
+    const shell = new Response('app shell', { status: 200 });
+    stubCaches(key => (key === './sar-preflight.html' ? shell : undefined));
+    globalThis.fetch = () => Promise.reject(new TypeError('Failed to fetch'));
+    const out = await navigationStrategy(NAV_URL);
+    expect(out).toBe(shell);
+  });
+
+  it('offline with nothing cached returns a 503', async () => {
+    stubCaches(() => undefined);
+    globalThis.fetch = () => Promise.reject(new TypeError('Failed to fetch'));
+    const out = await navigationStrategy(NAV_URL);
+    expect(out.status).toBe(503);
+  });
+
+  it('rebuilds a redirected cached response so navigations do not throw', async () => {
+    const fake = { redirected: true, body: 'redirected shell', status: 200, statusText: 'OK', headers: { 'content-type': 'text/html' } };
+    stubCaches(key => (key === NAV_URL ? fake : undefined));
+    const out = await navigationStrategy(NAV_URL);
+    expect(out.redirected).toBe(false);
+    expect(await out.text()).toBe('redirected shell');
   });
 });

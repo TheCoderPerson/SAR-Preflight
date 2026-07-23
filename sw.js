@@ -45,6 +45,7 @@ const CDN_ASSETS = [
   'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
   'https://cdn.jsdelivr.net/npm/geotiff@2.1.3/dist-browser/geotiff.js',
   'https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.12.1/proj4.js',
+  'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap',
 ];
 
 // --- Install: pre-cache app shell + CDN ---
@@ -56,7 +57,10 @@ self.addEventListener('install', event => {
       // replace (shell files can sit in the HTTP cache for their full max-age).
       caches.open(CACHE_STATIC).then(cache => cache.addAll(APP_SHELL.map(u => new Request(u, { cache: 'reload' })))),
       // CDN assets are version-pinned URLs — immutable, HTTP cache is fine.
-      caches.open(CACHE_CDN).then(cache => cache.addAll(CDN_ASSETS)),
+      // Best-effort per asset: one CDN hiccup must not reject the whole install
+      // (a rejected install means NOTHING gets cached and offline never works).
+      caches.open(CACHE_CDN).then(cache =>
+        Promise.allSettled(CDN_ASSETS.map(u => cache.add(u).catch(() => {})))),
     ]).then(() => self.skipWaiting())
   );
 });
@@ -79,8 +83,14 @@ self.addEventListener('fetch', event => {
   // Skip non-GET requests (POST to Overpass, Open-Elevation, etc.)
   if (event.request.method !== 'GET') return;
 
-  // Skip navigation requests to avoid redirect issues
-  if (event.request.mode === 'navigate') return;
+  // Navigation requests (PWA cold launch / page load) — cache-first so the
+  // precached app shell answers even with no connectivity. Without this the
+  // start_url navigation falls through to the dead network and iOS Safari
+  // shows "not connected to the internet" despite a fully cached shell.
+  if (event.request.mode === 'navigate') {
+    event.respondWith(navigationStrategy(event.request));
+    return;
+  }
 
   // Skip chrome-extension and other non-http(s) URLs
   if (!event.request.url.startsWith('http')) return;
@@ -173,6 +183,39 @@ async function cacheFirst(request) {
     return response;
   } catch (err) {
     return new Response('Offline — resource not cached', { status: 503 });
+  }
+}
+
+// Responding to a navigation with a Response whose redirected flag is set
+// throws in Chrome/Safari ("redirect mode is not 'follow'") — rebuild such
+// responses so the flag is cleared before they're returned.
+function stripRedirect(response) {
+  if (!response || !response.redirected) return response;
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+// --- Navigations: cache-first, offline fallback to the app shell HTML ---
+// Cache-first matches the rest of the shell (JS files are cache-first from the
+// version-keyed static cache) so the served HTML always matches the cached JS;
+// freshness comes from the SW byte-diff update flow, not from navigations.
+async function navigationStrategy(request) {
+  const cached = await caches.match(request, { ignoreSearch: true });
+  if (cached) return stripRedirect(cached);
+  try {
+    const response = await fetch(request);
+    if (response.status === 200) {
+      const cache = await caches.open(CACHE_STATIC);
+      cache.put(request, response.clone()).catch(() => {});
+    }
+    return response;
+  } catch (err) {
+    const shell = await caches.match('./sar-preflight.html');
+    if (shell) return stripRedirect(shell);
+    return new Response('Offline — app not cached yet. Connect to the internet and reload once.', { status: 503 });
   }
 }
 
@@ -355,6 +398,7 @@ async function getCacheSize() {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     routeStrategy, latlngToTile, getCacheName,
+    navigationStrategy, stripRedirect,
     CURRENT_CACHES, APP_SHELL, CDN_ASSETS,
     CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_API, CACHE_SECTIONAL,
     SAR_VERSION,

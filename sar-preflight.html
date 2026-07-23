@@ -745,6 +745,9 @@ select.api-input { cursor: pointer; }
       </button>
       <div style="height:1px;background:var(--border);margin:2px 0;"></div>
       <button class="draw-btn" id="drawCoords" title="Enter Coordinates" onclick="enterCoords()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/></svg>
+      </button>
+      <button class="draw-btn" id="drawLocate" title="Center on My Location" onclick="locateMe()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
       </button>
       <button class="draw-btn" id="drawImport" title="Import KML/KMZ" onclick="importKML()">

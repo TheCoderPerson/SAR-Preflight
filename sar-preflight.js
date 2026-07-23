@@ -898,6 +898,29 @@ function enterCoords() {
   processArea(c, 'circle');
 }
 
+function locateMe() {
+  if (!navigator.geolocation) {
+    alert('Location is not available on this device/browser.');
+    return;
+  }
+  const btn = document.getElementById('drawLocate');
+  if (btn) { btn.disabled = true; btn.style.opacity = '0.4'; }
+  const restore = () => { if (btn) { btn.disabled = false; btn.style.opacity = ''; } };
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      restore();
+      S.map.setView([pos.coords.latitude, pos.coords.longitude], Math.max(S.map.getZoom(), 13));
+    },
+    err => {
+      restore();
+      alert(err && err.code === 1
+        ? 'Location permission denied. Allow location access for this site to use this button.'
+        : 'Could not get device location (unavailable or timed out).');
+    },
+    { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
+  );
+}
+
 // ============================================================
 // PROCESS AREA — Triggers all API fetches
 // ============================================================
@@ -12471,7 +12494,7 @@ if (typeof module !== 'undefined' && module.exports) {
     _markSectionFromResults, _syncStatusFromMeta,
     loadCellCoverage, cellCoverageReadout, _pointInRegion, _ringsBBox,
     cacheCurrentView, gridForView, _cacheViewRaster, getSelectedTileProviders,
-    initMap, startDraw, clearDrawBtns, clearArea, enterCoords,
+    initMap, startDraw, clearDrawBtns, clearArea, enterCoords, locateMe,
     getStoredTheme, applyTheme, cycleTheme,
     toggle3D, collect3dState, sync3d, _enter3D, _exit3D, _loadMaplibre,
     collect3dVectorGroups, _vec3dRecords, _open3dPopup, agg3dStep, _agg3dHtml, VEC3D_SKIP,
