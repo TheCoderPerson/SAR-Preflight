@@ -4,6 +4,13 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.20-f — 2026-07-20
+
+- Land Ownership works again: BLM's upgraded server began rejecting the app's surface-management query outright (every fetch errored with "no data"). The query now requests server-side generalized polygons (~110 m simplification — the advisory public/private percentage and map shading are unaffected), which the server accepts.
+- The Parcels layer is now real parcel DATA, not just boundary lines: the ReGrid tile overlay is replaced by a live vector layer that taps El Dorado County GIS where available (APN, situs address, acreage, land use, year built, jurisdiction, fire district) and falls back to the CA statewide assessor layer (LightBox via DWR — APN + address only, quarterly) everywhere else in California. Tap any parcel for its details in the aggregated popup.
+- Parcels are planning intelligence, NOT survey data: a one-time disclaimer on first enable, a permanent "not survey accurate" line in every parcel popup, and a persistent provenance chip over the map showing which source is live, cache age when offline, and truncation when a view is too big. If parcel data cannot be loaded at all the chip says so explicitly — never interpret an empty parcel layer as public land.
+- Parcels load for the current view at zoom 15+ (the chip says "zoom in" below that), refetch as you pan, cache to IndexedDB for 90 days for offline reuse, and stay out of KML/GeoJSON exports. Neither source publishes owner names. Owner notification workflows, offline area staging, and more Tier-1 counties are future work.
+
 ## v2026.07.20-e — 2026-07-20
 
 - Viewsheds now export as vector polygons inside the KML/GeoJSON file itself (new "Viewshed Polygons" folder, on by default in the export dialog) — real geometry CalTopo and Google Earth treat like any drawn shape, alongside the existing GeoTIFF/KMZ rasters. Each computed observer contributes simplified low-poly outlines of its visible regions (holes included); tiny fragments and holes are dropped and parts are capped, so the raster export remains the authoritative representation.

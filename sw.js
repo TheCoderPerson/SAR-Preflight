@@ -271,7 +271,6 @@ async function downloadTiles(config, client) {
     topo: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
     sectional: 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}',
     hillshade: 'https://server.arcgisonline.com/ArcGIS/rest/services/Elevation/World_Hillshade/MapServer/tile/{z}/{y}/{x}',
-    parcels: 'https://tiles.arcgis.com/tiles/KzeiCaQsMoeCfoCq/arcgis/rest/services/Regrid_Nationwide_Parcel_Boundaries_v1/MapServer/tile/{z}/{y}/{x}',
     streets_roads: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}',
     streets_labels: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
   };
@@ -279,7 +278,7 @@ async function downloadTiles(config, client) {
   // Streets capped at 15: past that the service draws labels only (no road
   // lines), so the app upscales z15 tiles and never requests deeper ones.
   const providerZoom = {
-    sectional: { min: 8, max: 12 }, parcels: { min: 0, max: 17 },
+    sectional: { min: 8, max: 12 },
     streets_roads: { min: 0, max: 15 }, streets_labels: { min: 0, max: 15 },
   };
 

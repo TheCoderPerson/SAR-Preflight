@@ -1,0 +1,42 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "PRCL_ID": "003101032",
+        "PRCL_ADDR": "3211 SACRAMENTO ST  ",
+        "ACREAGE": 0.55,
+        "USE_CD_LITPRI": "SINGLE FAM. RES. <=2.5 AC.(INC. MAN. HMS",
+        "YR_BUILT": 1972,
+        "JURS_LIT": "PLACERVILLE",
+        "FIRE_DIST": "EL DORADO CO FIRE"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-120.812, 38.726], [-120.811, 38.726], [-120.811, 38.727], [-120.812, 38.727], [-120.812, 38.726]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "PRCL_ID": "003101033",
+        "PRCL_ADDR": "",
+        "ACREAGE": 1.2,
+        "USE_CD_LITPRI": "VACANT RES. LAND",
+        "YR_BUILT": null,
+        "JURS_LIT": "UNINCORPORATED",
+        "FIRE_DIST": "EL DORADO CO FIRE"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-120.810, 38.726], [-120.809, 38.726], [-120.809, 38.727], [-120.810, 38.727], [-120.810, 38.726]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "PRCL_ID": "003101034" },
+      "geometry": null
+    }
+  ]
+}

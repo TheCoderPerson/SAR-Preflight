@@ -1,0 +1,35 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "PARCEL_APN": "051-250-013",
+        "SITE_ADDR": "4210 MAIN ST",
+        "SITE_CITY": "SACRAMENTO",
+        "SITE_ZIP": "95820",
+        "FIPS_CODE": "06067",
+        "COUNTYNAME": "SACRAMENTO"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-121.442, 38.532], [-121.441, 38.532], [-121.441, 38.533], [-121.442, 38.533], [-121.442, 38.532]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "PARCEL_APN": "UN0508055",
+        "SITE_ADDR": null,
+        "SITE_CITY": null,
+        "SITE_ZIP": null,
+        "FIPS_CODE": "06017",
+        "COUNTYNAME": "EL DORADO"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-120.618, 38.786], [-120.617, 38.786], [-120.617, 38.787], [-120.618, 38.787], [-120.618, 38.786]]]
+      }
+    }
+  ]
+}

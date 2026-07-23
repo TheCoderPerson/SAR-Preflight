@@ -92,6 +92,18 @@
   padding: 6px 12px; font-family: var(--font-mono); font-size: 10px;
   color: var(--text-secondary); letter-spacing: 0.5px; white-space: nowrap; pointer-events: none;
 }
+/* Parcel provenance chip — always visible while the parcel layer is on (source
+   tier, cache age, zoom gate, and the explicit "unavailable" state). */
+.parcel-chip {
+  position: absolute; bottom: 34px; left: 10px; z-index: 850;
+  background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 10px; font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 0.3px; max-width: min(70vw, 460px); pointer-events: none;
+}
+.parcel-chip.ok    { color: var(--text-secondary); }
+.parcel-chip.muted { color: var(--text-muted); }
+.parcel-chip.warn  { color: var(--accent-amber); border-color: var(--accent-amber); }
+.parcel-chip.error { color: var(--accent-red); border-color: var(--accent-red); }
 .map-container.mode-observer #observerHint { display: block; }
 /* 3D canopy mesh build progress — floats over the map in 3D mode */
 #canopy3dProgress {
@@ -748,6 +760,7 @@ select.api-input { cursor: pointer; }
     <button class="view3d-toggle" id="view3dToggle" onclick="toggle3D()" title="3D terrain view — imagery layers drape on real terrain (data overlays stay in 2D)">⛰ 3D</button>
     <button class="view3d-toggle observer-exit" id="observerExitBtn" onclick="exitObserverView()" title="Exit observer view — drag or scroll to look around; tap the ground to exit; tap another observer dot to switch">⮌ EXIT VIEW</button>
     <div id="observerHint">DRAG / SCROLL TO LOOK · TAP GROUND TO EXIT</div>
+    <div id="parcelChip" style="display:none"></div>
     <div class="map-info">
       <span>CURSOR </span><span class="coord" id="cursorCoord">--°, --°</span>
       <span style="margin:0 8px;color:var(--border);">|</span>
@@ -1420,7 +1433,6 @@ select.api-input { cursor: pointer; }
               <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileTopo"> Topo</label>
               <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileSectional" checked> FAA Sectional</label>
               <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileHillshade"> Hillshade</label>
-              <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileParcels"> Parcels</label>
               <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfgTileStreets"> Streets/Labels</label>
             </div>
             <div class="risk-bar" style="margin-top:8px;"><div class="risk-fill" id="tileProgressBar" style="width:0;background:var(--accent-cyan);"></div></div>
@@ -1580,6 +1592,21 @@ select.api-input { cursor: pointer; }
     </div>
     <div class="modal-actions" style="margin-top:16px;">
       <button class="btn btn-primary" onclick="acceptDisclaimer()">I Understand</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="parcelDisclaimerModal">
+  <div class="modal" style="width:500px;max-height:85vh;">
+    <h3 style="color:var(--accent-amber);">Parcel Data — Planning Use Only</h3>
+    <div style="overflow-y:auto;max-height:55vh;font-size:12px;line-height:1.6;color:var(--text-secondary);">
+      <p><b>Parcel boundaries shown here are planning intelligence, not authoritative boundary data.</b></p>
+      <p style="margin-top:10px;">Lines are assessor map compilations — not survey accurate, and not an authoritative definition of any legal boundary. A displayed line can easily be tens of meters off the true boundary. <b>Field-verify before relying on it</b> for entry, launch-siting, or landowner-contact decisions.</p>
+      <p style="margin-top:10px;">Sources: El Dorado County GIS where available ("preliminary and subject to change; informational and planning purposes only; not suitable for legal, engineering, or surveying purposes"), otherwise the CA statewide assessor layer (LightBox via DWR, refreshed quarterly; "no warranties as to completeness, accuracy, or correctness"). Neither source publishes owner names.</p>
+      <p style="margin-top:10px;">If parcels fail to load, the map shows an explicit warning — <b>never interpret an empty parcel layer as public land.</b></p>
+    </div>
+    <div class="modal-actions" style="margin-top:16px;">
+      <button class="btn btn-primary" onclick="ackParcelDisclaimer()">I Understand</button>
     </div>
   </div>
 </div>

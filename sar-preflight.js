@@ -659,6 +659,8 @@ function initMap() {
   // Detach stretched canopy/viewshed image overlays during + after zoom so they
   // never get sized to a huge on-screen pixel area (iOS compositing-memory kill).
   try { S.map.on('zoomstart', _hideOverlaysForZoom); S.map.on('zoomend', _applyOverlayZoomCap); } catch (_) {}
+  // Parcels are view-driven: refetch (debounced) after every pan/zoom while on.
+  try { S.map.on('moveend', _parcelsOnMoveEnd); } catch (_) {}
   // Tracked basemaps so the theme toggle can swap between them (dark default).
   S.mapLayers.basemap_dark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
   S.mapLayers.basemap_light = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
@@ -668,8 +670,10 @@ function initMap() {
   S.mapLayers.sectional = L.tileLayer(sectionalTileUrl(getStoredSectionalEdition()), { maxNativeZoom: 12, maxZoom: 18, opacity: 1.0, attribution: 'FAA Aeronautical Information Services' });
   // Terrain hillshade (steepness) — Esri World Hillshade XYZ tiles (free, CORS-OK).
   S.mapLayers.slope = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Elevation/World_Hillshade/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, opacity: 0.6, attribution: 'USGS 3DEP / Esri' });
-  // ReGrid nationwide parcel boundaries (boundaries only — no ownership). Cached PNG, native z17.
-  S.mapLayers.parcels = L.tileLayer('https://tiles.arcgis.com/tiles/KzeiCaQsMoeCfoCq/arcgis/rest/services/Regrid_Nationwide_Parcel_Boundaries_v1/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 17, maxZoom: 19, opacity: 0.85, attribution: 'Parcels &copy; Regrid' });
+  // Assessor parcels — live vector layer (El Dorado County GIS where available,
+  // CA statewide DWR/LightBox fallback). View-driven, zoom-gated; filled by
+  // loadParcelsForView(). Replaced the ReGrid boundary-only tile layer.
+  S.mapLayers.parcels = L.layerGroup();
   // Streets/labels reference overlay — Esri transparent hybrid tiles (roads with
   // street names + town/place labels), meant for draping over World Imagery.
   // zIndex 250: above base tiles (which re-stack by DOM order on every base
@@ -4104,9 +4108,14 @@ function _arcgisGeoJsonUrl(base, layerId, bounds, outFields, opts) {
   const geom = _envelopeGeom(bounds, opts.pad);
   const where = encodeURIComponent(opts.where || '1=1');
   const count = opts.resultRecordCount || 2000;
-  return `${base}/${layerId}/query?where=${where}&geometry=${geom}`
+  let url = `${base}/${layerId}/query?where=${where}&geometry=${geom}`
     + `&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects`
     + `&outFields=${encodeURIComponent(outFields)}&outSR=4326&f=geojson&resultRecordCount=${count}`;
+  // Server-side generalization (degrees at outSR=4326). Some layers with huge
+  // multipart polygons (BLM SMA) 500 on full-resolution geometry without it.
+  if (opts.maxAllowableOffset != null) url += `&maxAllowableOffset=${opts.maxAllowableOffset}`;
+  if (opts.geometryPrecision != null) url += `&geometryPrecision=${opts.geometryPrecision}`;
+  return url;
 }
 // Same, but routed through the data proxy for a self-hosted gov ArcGIS server
 // (returns null when no proxy is configured → callers degrade gracefully).
@@ -4126,23 +4135,31 @@ async function _cachedFeatures(endpoint, cacheKey) {
   if (typeof getCachedApiResponse !== 'function') return null;
   try {
     const c = await getCachedApiResponse(endpoint, cacheKey);
-    if (c && c.data) { const gj = c.data; return { features: (gj && gj.features) ? gj.features : [], fromCache: true, cachedAt: c.timestamp }; }
+    // Skip cached ArcGIS in-body error responses (cached before that guard existed).
+    if (c && c.data && !c.data.error) { const gj = c.data; return { features: (gj && gj.features) ? gj.features : [], fromCache: true, cachedAt: c.timestamp }; }
   } catch (_) { /* ignore */ }
   return null;
 }
 // Fetch an ArcGIS GeoJSON query (direct or proxied URL), caching on success and
 // falling back to IndexedDB on error/offline. Returns {features, fromCache, error}.
-async function _fetchGeoJsonLayer(endpoint, cacheKey, url) {
+// opts.signal: AbortController signal — an aborted fetch returns error:'aborted'
+// WITHOUT consulting the cache (a superseded pan-fetch must not repaint stale data).
+async function _fetchGeoJsonLayer(endpoint, cacheKey, url, opts) {
+  opts = opts || {};
   const online = (typeof isOnline !== 'function') || isOnline();
   if (url && online) {
     try {
-      const res = await _proxyFetch(url);
+      const res = await _proxyFetch(url, opts.signal ? { signal: opts.signal } : undefined);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const gj = await res.json();
+      // ArcGIS servers report many failures as HTTP 200 + {"error":{...}} — that is
+      // an ERROR, not an empty layer, and must never be cached or rendered as data.
+      if (gj && gj.error) throw new Error('ArcGIS ' + (gj.error.code || 'error') + ': ' + (gj.error.message || 'query failed'));
       const features = (gj && gj.features) ? gj.features : [];
       if (typeof cacheApiResponse === 'function') cacheApiResponse(endpoint, cacheKey, gj);
-      return { features, fromCache: false, cachedAt: null };
+      return { features, fromCache: false, cachedAt: null, exceededTransferLimit: !!(gj && gj.exceededTransferLimit) };
     } catch (err) {
+      if (err && err.name === 'AbortError') return { features: null, error: 'aborted' };
       const cached = await _cachedFeatures(endpoint, cacheKey);
       if (cached) return cached;
       return { features: null, error: (err && err.message) || String(err) };
@@ -4520,8 +4537,13 @@ async function fetchPublicLands(bounds) {
   trackFetchStart('Public Lands');
   setStatus('publicLandsStatus', 'loading', 'Fetching...');
   const cacheKey = _bboxCacheKey(bounds);
+  // maxAllowableOffset is REQUIRED: BLM's server (ArcGIS 11.5) 500s on any
+  // full-resolution geometry query against this layer. ~110 m generalization +
+  // 5-decimal coords keeps the huge statewide SMA polygons phone-sized; fine
+  // for the advisory land-status % and map shading.
   const url = _govArcgisUrl('/blm/', 'arcgis/rest/services/lands/BLM_Natl_SMA_LimitedScale/MapServer', '1', bounds,
-    'ADMIN_AGENCY_CODE,ADMIN_DEPT_CODE,ADMIN_UNIT_NAME', { resultRecordCount: 4000 });
+    'ADMIN_AGENCY_CODE,ADMIN_DEPT_CODE,ADMIN_UNIT_NAME',
+    { resultRecordCount: 4000, maxAllowableOffset: 0.001, geometryPrecision: 5 });
   try {
     const r = await _fetchGeoJsonLayer('public_lands', cacheKey, url);
     if (r && r.features) {
@@ -7508,7 +7530,7 @@ function buildLayerControl() {
   // Reference overlays (parcels)
   if (S.mapLayers.parcels) {
     html += `<h4 style="margin-top:10px">Reference</h4>`;
-    html += _layerRow('parcels', '#9ca3af', 'Parcels (boundaries only)');
+    html += _layerRow('parcels', '#9ca3af', 'Parcels');
   }
 
   // Imported FAA charts section
@@ -7647,7 +7669,20 @@ function toggleLayer(id, el) {
   } else if (id === 'glm_lightning') {
     const layer = ensureGlmLayer();
     if (layer) { if (on) S.map.addLayer(layer); else S.map.removeLayer(layer); }
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'shadow' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'parcels' || id === 'slope' || id === 'streets' || id === 'trails' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
+  } else if (id === 'parcels') {
+    // Live vector parcels: view-driven fetch while on (moveend hook), abort +
+    // chip teardown when off. Zoom gate + tiering live in loadParcelsForView.
+    S._parcelsWanted = on;
+    if (on) {
+      S.map.addLayer(S.mapLayers.parcels);
+      maybeShowParcelDisclaimer();
+      loadParcelsForView();
+    } else {
+      S.map.removeLayer(S.mapLayers.parcels);
+      if (S._parcelAbort) { try { S._parcelAbort.abort(); } catch (_) {} }
+      _setParcelChip(null);
+    }
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'shadow' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'slope' || id === 'streets' || id === 'trails' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
     if (id === 'canopy' || id === 'viewshed' || id === 'shadow') {
       // Keep the zoom-cap's "wanted" flag in sync — otherwise _applyOverlayZoomCap
       // re-adds the overlay on the next zoomend after it was unchecked here.
@@ -7681,8 +7716,8 @@ function toggleLayer(id, el) {
 // show all matches in one popup with "<- n/N ->" pagination.
 // ============================================================
 const AGG_HIT_PX = 8; // pixel tolerance for line / point hit-testing
-const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'shadow', 'parcels', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning']);
-// Export-only exclusion set. Extends the popup-skip set (so basemaps / parcels /
+const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'shadow', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning']);
+// Export-only exclusion set. Extends the popup-skip set (so basemaps /
 // rasters stay out of the vector export) and adds layers CalTopo already provides
 // natively and that would be stale by import time. These layers remain visible and
 // clickable on the map — this set is used ONLY by the export paths, never by popup
@@ -7694,6 +7729,7 @@ const EXPORT_SKIP_LAYERS = new Set([
   'cell_att', 'cell_tmobile', 'cell_verizon',  // FCC LTE coverage polygons
   'public_lands',                              // land ownership
   'cell_towers', 'dams',                       // user-requested additions
+  'parcels',                                   // view-driven advisory data — huge, stays out of exports
 ]);
 // Layers that may be exported even when hidden on the map, provided they are built
 // and populated (e.g. LAANC is built unconditionally but off by default).
@@ -7712,6 +7748,7 @@ const AGG_LAYER_META = {
   wilderness: { label: 'Wilderness', pri: 6 },
   national_parks: { label: 'National Park', pri: 6 }, swap_radius: { label: 'Swap Radius', pri: 8 },
   observers: { label: 'Observer', pri: 3 },
+  parcels: { label: 'Parcel', pri: 8 },
   public_lands: { label: 'Land Status', pri: 6 }, nhd_water: { label: 'Water', pri: 7 },
   hospitals: { label: 'Hospital/LZ', pri: 4 }, emergency_lz: { label: 'Emergency LZ', pri: 4 },
   usfs_roads: { label: 'NFS Road', pri: 7 }, usfs_trails: { label: 'NFS Trail', pri: 7 },
@@ -8374,7 +8411,6 @@ function getSelectedTileProviders() {
   if (document.getElementById('cfgTileTopo')?.checked) providers.push('topo');
   if (document.getElementById('cfgTileSectional')?.checked) providers.push('sectional');
   if (document.getElementById('cfgTileHillshade')?.checked) providers.push('hillshade');
-  if (document.getElementById('cfgTileParcels')?.checked) providers.push('parcels');
   if (document.getElementById('cfgTileStreets')?.checked) providers.push('streets_roads', 'streets_labels');
   return providers;
 }
@@ -8402,7 +8438,7 @@ async function _cacheViewRaster(kind, bounds) {
 }
 // Pre-fetch + cache all vector layers (and optionally DEM/vegetation rasters) for
 // the CURRENT map view so they're available offline — independent of the SW tile
-// flow (which caches base/sat/topo/sectional/hillshade/parcels image tiles).
+// flow (which caches base/sat/topo/sectional/hillshade image tiles).
 async function cacheCurrentView() {
   if (!S.map) return;
   const bounds = S.map.getBounds();
@@ -10634,6 +10670,135 @@ function _updateShadowForTime() {
   S._shadowTimeTimer = setTimeout(_renderShadowForTime, 120);
 }
 
+// ============================================================
+// PARCELS — live assessor-parcel vector layer (view-driven, zoom-gated).
+// Two-tier source registry in core.js (PARCEL_REGISTRY): county GIS where a
+// verified Tier 1 endpoint exists (El Dorado), CA statewide DWR/LightBox
+// everywhere else. Both are CORS-open ArcGIS servers queried DIRECT (no proxy).
+// Degradation ladder (design §12): tier1 → tier2 → IndexedDB cache → an
+// EXPLICIT "unavailable" chip — an empty parcel layer must never read as
+// "this area is all public land". Planning intelligence only, not survey data.
+// ============================================================
+const PARCEL_DEBOUNCE_MS = 400;
+
+async function loadParcelsForView() {
+  if (!S.map || !S._parcelsWanted) return;
+  const zoom = S.map.getZoom();
+  if (zoom < PARCEL_MIN_ZOOM) { // gate: a wider view would blow past the servers' record caps
+    S.mapLayers.parcels.clearLayers();
+    _setParcelChip({ zoom, gateZoom: PARCEL_MIN_ZOOM });
+    buildLayerControl();
+    return;
+  }
+  if (S._parcelAbort) { try { S._parcelAbort.abort(); } catch (_) {} }
+  const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  S._parcelAbort = ctl;
+  const gen = S._parcelGen = (S._parcelGen || 0) + 1; // staleness guard alongside the abort
+  _setParcelChip({ zoom, gateZoom: PARCEL_MIN_ZOOM, loading: true });
+  const b = S.map.getBounds();
+  const bbox = { west: b.getWest(), south: b.getSouth(), east: b.getEast(), north: b.getNorth() };
+  const sources = parcelSourcesForBounds(PARCEL_REGISTRY, bbox);
+  let failedTier1 = false;
+  for (const cfg of sources) {
+    const cacheKey = cfg.id + '_' + _bboxCacheKey(b);
+    const r = await _fetchGeoJsonLayer('parcels', cacheKey, parcelQueryUrl(cfg, bbox), ctl ? { signal: ctl.signal } : undefined);
+    if (gen !== S._parcelGen || (r && r.error === 'aborted')) return; // superseded by a newer pan
+    if (r && r.features && r.features.length) {
+      const truncated = !!r.exceededTransferLimit || r.features.length >= cfg.maxRecordCount;
+      const n = _renderParcels(r.features, cfg);
+      _setParcelChip({ zoom, gateZoom: PARCEL_MIN_ZOOM, cfg, count: n, truncated,
+        fromCache: r.fromCache, cachedAt: r.cachedAt, failedTier1 });
+      buildLayerControl();
+      return;
+    }
+    if (r && r.features && !r.features.length && cfg.tier === 2) {
+      // Statewide layer answered with a genuine empty result — say so explicitly.
+      S.mapLayers.parcels.clearLayers();
+      _setParcelChip({ zoom, gateZoom: PARCEL_MIN_ZOOM, cfg, count: 0 });
+      buildLayerControl();
+      return;
+    }
+    if (cfg.tier === 1) failedTier1 = true; // error OR empty county result → fall through to statewide
+  }
+  // Every rung failed, cache included → explicit empty state (never silent blank).
+  S.mapLayers.parcels.clearLayers();
+  _setParcelChip({ unavailable: true });
+  buildLayerControl();
+}
+
+// Moveend hook — attached once in initMap; no-ops while the layer is off.
+function _parcelsOnMoveEnd() {
+  if (!S._parcelsWanted) return;
+  if (S._parcelMoveT) clearTimeout(S._parcelMoveT);
+  S._parcelMoveT = setTimeout(loadParcelsForView, PARCEL_DEBOUNCE_MS);
+}
+
+// Neutral thin outline + near-invisible fill (design §8): the layer must not
+// compete with hazard / land-status / terrain overlays. No labels — APN lives
+// in the tap popup only.
+const PARCEL_STYLE = { color: '#9ca3af', weight: 0.75, opacity: 0.55, fillColor: '#9ca3af', fillOpacity: 0.06 };
+
+function _renderParcels(features, cfg) {
+  const parcels = normalizeParcels(features, cfg, Date.now());
+  S.mapLayers.parcels.clearLayers();
+  parcels.forEach(p => {
+    try {
+      const layer = L.geoJSON({ type: 'Feature', geometry: p.geometry, properties: {} }, { style: PARCEL_STYLE });
+      layer.bindPopup(_parcelPopup(p)); // popup aggregation picks this up automatically
+      S.mapLayers.parcels.addLayer(layer);
+    } catch (_) { /* one bad geometry must not kill the layer */ }
+  });
+  return parcels.length;
+}
+
+function _parcelPopup(p) {
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const lines = [`<b style="color:#9ca3af">Parcel ${p.apn ? esc(p.apn) : '(no APN)'}</b>`];
+  const situs = [p.situsAddress, p.city, p.zip].filter(Boolean).map(esc).join(', ');
+  if (situs) lines.push(situs);
+  const detail = [
+    p.acreage != null ? `${p.acreage} ac` : null,
+    p.landUseDesc ? esc(p.landUseDesc) : null,
+  ].filter(Boolean).join(' · ');
+  if (detail) lines.push(detail);
+  const extras = [
+    p.yearBuilt ? `Built ${esc(p.yearBuilt)}` : null,
+    p.jurisdiction ? esc(p.jurisdiction) : null,
+    p.fireDistrict ? `Fire: ${esc(p.fireDistrict)}` : null,
+  ].filter(Boolean).join(' · ');
+  if (extras) lines.push(`<span style="font-size:10px">${extras}</span>`);
+  lines.push(`<span style="font-size:10px;opacity:0.65">${esc(p.sourceLabel)} · fetched ${relAge(p.fetchedAt, Date.now()) || '<1m'} ago</span>`);
+  lines.push(`<span style="font-size:10px;color:var(--accent-amber,#f59e0b)">Planning use only — not survey accurate. Field-verify boundaries.</span>`);
+  return lines.join('<br>');
+}
+
+// Provenance chip over the map — visible whenever the layer is on. This is the
+// §12 ladder's voice: zoom gate, loading, tier/cache provenance, truncation,
+// and the mandatory unavailable state.
+function _setParcelChip(st) {
+  const el = document.getElementById('parcelChip');
+  if (!el) return;
+  if (!st) { el.style.display = 'none'; return; }
+  const c = parcelChipState(Object.assign({ nowMs: Date.now() }, st));
+  el.textContent = c.text;
+  el.className = 'parcel-chip ' + c.tone;
+  el.style.display = '';
+}
+
+// One-time disclaimer (design §9): planning only, not survey accurate. Shown on
+// first layer enable, acknowledged forever (unlike the versioned app disclaimer).
+function maybeShowParcelDisclaimer() {
+  try {
+    if (localStorage.getItem('sar_parcel_disclaimer_ack')) return;
+  } catch (_) { return; }
+  document.getElementById('parcelDisclaimerModal')?.classList.add('active');
+}
+
+function ackParcelDisclaimer() {
+  try { localStorage.setItem('sar_parcel_disclaimer_ack', '1'); } catch (_) {}
+  document.getElementById('parcelDisclaimerModal')?.classList.remove('active');
+}
+
 // --- Viewshed: tap-to-pick observer + compute ---
 function _readVsInputs() {
   const aglFt = parseFloat((document.getElementById('vsAgl') || {}).value) || 200;
@@ -11124,7 +11289,7 @@ async function _runViewshedKernel(opts) {
 // 3D TERRAIN VIEW (MapLibre GL)
 // Opt-in second view: real terrain (AWS Terrarium DEM tiles) with the same
 // raster layers the 2D map is showing draped over it — basemap, satellite/
-// topo/sectional, hillshade, parcels, streets, canopy + viewshed. Vector
+// topo/sectional, hillshade, streets, canopy + viewshed. Vector
 // overlays, radar and the draw tools stay 2D; entering a draw/viewshed-pick
 // tool drops back to 2D automatically. Online-only planning aid: the
 // MapLibre engine + terrain tiles come from the network on first use, so
@@ -11153,7 +11318,7 @@ function _loadMaplibre() {
 
 // Vector layers mirrored into 3D: everything the popup aggregation covers,
 // minus live ADS-B (Phase 3 — needs per-poll updates + altitude placement).
-const VEC3D_SKIP = new Set([...AGG_SKIP_LAYERS, 'adsb_aircraft']);
+const VEC3D_SKIP = new Set([...AGG_SKIP_LAYERS, 'adsb_aircraft', 'parcels']); // parcels: thousands of view-driven polygons — not mirrored into 3D
 
 // Walk a Leaflet layer tree and emit neutral geometry records for the 3D
 // mirror. A popup bound on a group (L.geoJSON wrapper) is inherited by its
@@ -11297,7 +11462,7 @@ function collect3dState() {
     theme: (S.theme === 'light' || S.theme === 'light-map') ? 'light' : 'dark',
     base,
     sectionalUrl: sectionalTileUrl(getStoredSectionalEdition()),
-    overlays: { slope: active('slope'), parcels: active('parcels'), streets: active('streets') },
+    overlays: { slope: active('slope'), streets: active('streets') },
     rasters,
     radarUrl,
     vectors: collect3dVectorGroups(),
@@ -12299,6 +12464,8 @@ if (typeof module !== 'undefined' && module.exports) {
     saveConfig, updateClock, refreshData,
     proxiedArcgis, _arcgisGeoJsonUrl, _govArcgisUrl, _envelopeGeom, _bboxCacheKey, _prop,
     fetchGroundAccess, fetchPublicLands, fetchWaterFeatures, fetchHospitals,
+    loadParcelsForView, _renderParcels, _parcelPopup, _setParcelChip, _parcelsOnMoveEnd,
+    maybeShowParcelDisclaimer, ackParcelDisclaimer, PARCEL_DEBOUNCE_MS,
     _renderPublicLands, computeLandStatus, _renderHospitals,
     fetchTrails, _renderTrails, TRAILS_COLOR,
     _markSectionFromResults, _syncStatusFromMeta,
