@@ -94,10 +94,10 @@ describe('build3dStyle', () => {
     expect(style.sources.sectional).toBeUndefined();
   });
 
-  it('mirrors slope/parcels/streets overlay toggles', () => {
+  it('mirrors slope/streets overlay toggles (vector parcels are not mirrored into 3D)', () => {
     const style = build3dStyle({ overlays: { slope: true, parcels: true, streets: true } });
     expect(style.layers.find(l => l.id === 'slope').paint['raster-opacity']).toBe(0.6);
-    expect(style.layers.find(l => l.id === 'parcels').paint['raster-opacity']).toBe(0.85);
+    expect(style.layers.find(l => l.id === 'parcels')).toBeUndefined();
     expect(style.sources.streets_roads).toBeDefined();
     expect(style.sources.streets_places).toBeDefined();
     const off = build3dStyle({});

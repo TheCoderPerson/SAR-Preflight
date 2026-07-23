@@ -19,6 +19,25 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.23-a',
+    date: '2026-07-23',
+    changes: [
+      'The app now opens offline: the service worker previously refused to answer page-load (navigation) requests, so launching the installed PWA without connectivity failed with "not connected to the internet" even though everything was cached. Navigations are now served cache-first with an offline fallback to the cached app shell.',
+      'Install is more resilient: a single failed CDN download no longer aborts the entire first-visit precache (which previously left NOTHING cached), and the app fonts are now precached for offline use.',
+      'Enter Coordinates has a new map-waypoint (pin) icon; its old crosshair icon now lives on a new toolbar button that centers the map on the device\'s current GPS location.',
+    ],
+  },
+  {
+    version: '2026.07.20-f',
+    date: '2026-07-20',
+    changes: [
+      'Land Ownership works again: BLM\'s upgraded server began rejecting the app\'s surface-management query outright (every fetch errored with "no data"). The query now requests server-side generalized polygons (~110 m simplification — the advisory public/private percentage and map shading are unaffected), which the server accepts.',
+      'The Parcels layer is now real parcel DATA, not just boundary lines: the ReGrid tile overlay is replaced by a live vector layer that taps El Dorado County GIS where available (APN, situs address, acreage, land use, year built, jurisdiction, fire district) and falls back to the CA statewide assessor layer (LightBox via DWR — APN + address only, quarterly) everywhere else in California. Tap any parcel for its details in the aggregated popup.',
+      'Parcels are planning intelligence, NOT survey data: a one-time disclaimer on first enable, a permanent "not survey accurate" line in every parcel popup, and a persistent provenance chip over the map showing which source is live, cache age when offline, and truncation when a view is too big. If parcel data cannot be loaded at all the chip says so explicitly — never interpret an empty parcel layer as public land.',
+      'Parcels load for the current view at zoom 15+ (the chip says "zoom in" below that), refetch as you pan, cache to IndexedDB for 90 days for offline reuse, and stay out of KML/GeoJSON exports. Neither source publishes owner names. Owner notification workflows, offline area staging, and more Tier-1 counties are future work.',
+    ],
+  },
+  {
     version: '2026.07.20-e',
     date: '2026-07-20',
     changes: [
@@ -3036,10 +3055,6 @@ function build3dStyle(opts) {
     sources.slope = _raster3dSource('https://server.arcgisonline.com/ArcGIS/rest/services/Elevation/World_Hillshade/MapServer/tile/{z}/{y}/{x}', 19);
     layers.push({ id: 'slope', type: 'raster', source: 'slope', paint: { 'raster-opacity': 0.6 } });
   }
-  if (ov.parcels) {
-    sources.parcels = _raster3dSource('https://tiles.arcgis.com/tiles/KzeiCaQsMoeCfoCq/arcgis/rest/services/Regrid_Nationwide_Parcel_Boundaries_v1/MapServer/tile/{z}/{y}/{x}', 17);
-    layers.push({ id: 'parcels', type: 'raster', source: 'parcels', paint: { 'raster-opacity': 0.85 } });
-  }
   if (ov.streets) {
     sources.streets_roads = _raster3dSource('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}', 15);
     sources.streets_places = _raster3dSource('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', 15);
@@ -3659,6 +3674,157 @@ function parseCoordinateInput(raw) {
   return { lat: latA.value, lng: lngA.value, radiusM, format };
 }
 
+// ============================================================
+// PARCEL DATA (pure) — two-tier assessor-parcel source registry + resolver +
+// normalizer + provenance-chip state machine. Planning intelligence, NOT
+// authoritative boundary data: both sources are CORS-open ArcGIS REST services
+// queried directly (no proxy), verified live 2026-07-20. Neither source
+// publishes owner names/addresses, so the canonical schema carries none.
+// ============================================================
+
+const PARCEL_MIN_ZOOM = 15; // below this a view-sized query would blow past the servers' record caps
+
+const PARCEL_REGISTRY = {
+  // Tier 2 fallback — CA DWR statewide assessor parcels (LightBox), all 58
+  // counties, quarterly refresh. APN + situs address only.
+  fallback: {
+    id: 'ca-dwr-lightbox', tier: 2, label: 'CA statewide (DWR/LightBox)',
+    url: 'https://gis.water.ca.gov/arcgis/rest/services/Planning/i15_Parcels_Assessor_Lightbox/MapServer/0',
+    maxRecordCount: 1500, refresh: 'quarterly',
+    fields: {
+      apn: 'PARCEL_APN', situsAddress: 'SITE_ADDR', city: 'SITE_CITY', zip: 'SITE_ZIP',
+      countyFips: 'FIPS_CODE', countyName: 'COUNTYNAME',
+    },
+    attribution: 'LightBox via CA Dept. of Water Resources',
+  },
+  // Tier 1 county endpoints, keyed by FIPS. Only counties whose field map has
+  // been hand-checked against a live response belong here; everything else
+  // rides the fallback. `bbox` drives view→source resolution (no TIGER data).
+  counties: {
+    '06017': {
+      id: 'edc-parcels', tier: 1, fips: '06017', name: 'El Dorado', label: 'El Dorado County GIS',
+      url: 'https://gis.eldoradocounty.ca.gov/mapping/rest/services/Property/Parcels/MapServer/0',
+      maxRecordCount: 2000, refresh: 'unknown',
+      bbox: { west: -121.15, south: 38.50, east: -119.88, north: 39.07 },
+      fields: {
+        apn: 'PRCL_ID', situsAddress: 'PRCL_ADDR', acreage: 'ACREAGE', landUseDesc: 'USE_CD_LITPRI',
+        yearBuilt: 'YR_BUILT', jurisdiction: 'JURS_LIT', fireDistrict: 'FIRE_DIST',
+      },
+      verified: '2026-07-20', verifiedLevel: 'schema_confirmed',
+      attribution: "El Dorado County Surveyor's Office, GIS Division",
+    },
+  },
+};
+
+// Ordered source configs for a view bbox ({west,south,east,north}): every Tier 1
+// county whose bbox intersects the view, then ALWAYS the statewide fallback last
+// (the degradation ladder walks this list until one source yields data).
+function parcelSourcesForBounds(registry, bbox) {
+  const out = [];
+  if (registry && registry.counties && bbox) {
+    for (const fips of Object.keys(registry.counties)) {
+      const c = registry.counties[fips];
+      const b = c && c.bbox;
+      if (b && b.west <= bbox.east && b.east >= bbox.west && b.south <= bbox.north && b.north >= bbox.south) {
+        out.push(c);
+      }
+    }
+  }
+  if (registry && registry.fallback) out.push(registry.fallback);
+  return out;
+}
+
+// Direct ArcGIS GeoJSON query URL for a parcel source + view bbox. No
+// maxAllowableOffset — parcel boundary fidelity is the point of the layer.
+function parcelQueryUrl(cfg, bbox) {
+  const fields = Object.keys(cfg.fields).map(k => cfg.fields[k]).join(',');
+  return `${cfg.url}/query?where=1%3D1&geometry=${bbox.west},${bbox.south},${bbox.east},${bbox.north}`
+    + `&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects`
+    + `&outFields=${encodeURIComponent(fields)}&returnGeometry=true&outSR=4326&f=geojson`
+    + `&resultRecordCount=${cfg.maxRecordCount}`;
+}
+
+// Normalize raw GeoJSON features from either tier into the canonical parcel
+// shape. Fields the source lacks are null, NEVER '' — the UI must distinguish
+// "source doesn't publish acreage" from "parcel has no acreage".
+function normalizeParcels(features, cfg, fetchedAt) {
+  const f = cfg.fields || {};
+  const read = (props, key) => {
+    const name = f[key];
+    if (!name || !props) return null;
+    const v = props[name];
+    if (v == null) return null;
+    if (typeof v === 'string') { const t = v.trim(); return t === '' ? null : t; }
+    return v;
+  };
+  const out = [];
+  (features || []).forEach(feat => {
+    if (!feat || !feat.geometry) return; // geometry-less rows are useless on a map
+    const props = feat.properties || {};
+    const apn = read(props, 'apn');
+    const countyFips = cfg.fips || read(props, 'countyFips');
+    out.push({
+      id: `${countyFips || cfg.id}:${apn || 'unknown'}`,
+      countyFips: countyFips || null,
+      countyName: cfg.name || read(props, 'countyName'),
+      apn,
+      situsAddress: read(props, 'situsAddress'),
+      city: read(props, 'city'),
+      zip: read(props, 'zip'),
+      acreage: read(props, 'acreage'),
+      landUseDesc: read(props, 'landUseDesc'),
+      yearBuilt: read(props, 'yearBuilt'),
+      jurisdiction: read(props, 'jurisdiction'),
+      fireDistrict: read(props, 'fireDistrict'),
+      geometry: feat.geometry,
+      sourceTier: cfg.tier, sourceId: cfg.id, sourceLabel: cfg.label,
+      attribution: cfg.attribution || null,
+      fetchedAt: fetchedAt != null ? fetchedAt : null,
+      sourceRefresh: cfg.refresh || 'unknown',
+    });
+  });
+  return out;
+}
+
+// Provenance-chip state machine (design §9 + degradation ladder §12), pure so
+// every rung is unit-testable. st: { zoom, gateZoom, loading, cfg, count,
+// truncated, fromCache, cachedAt, failedTier1, unavailable, nowMs }.
+// Returns { text, tone: 'ok'|'warn'|'error'|'muted' }.
+// The 'unavailable' state is a safety requirement: an empty parcel layer must
+// never be visually indistinguishable from "this area is all public land".
+function parcelChipState(st) {
+  st = st || {};
+  if (st.unavailable) {
+    return { text: '⚠ Parcel data unavailable — do not interpret as public land', tone: 'error' };
+  }
+  if (st.gateZoom != null && st.zoom != null && st.zoom < st.gateZoom) {
+    return { text: `Parcels: zoom in to load (z≥${st.gateZoom})`, tone: 'muted' };
+  }
+  if (st.loading) return { text: 'Parcels: loading…', tone: 'muted' };
+  const cfg = st.cfg || {};
+  if (st.fromCache) {
+    const age = relAge(st.cachedAt, st.nowMs);
+    return { text: `⚠ Parcels: offline — ${cfg.label || 'cached'} · cached ${age || '?'} ago`, tone: 'warn' };
+  }
+  let text, tone;
+  if (cfg.tier === 1) {
+    text = `Parcels: ${cfg.label} · ${st.count} in view`;
+    tone = 'ok';
+  } else if (st.failedTier1) {
+    text = `⚠ County source unavailable — ${cfg.label || 'CA statewide (DWR/LightBox)'} · APN+address only`;
+    tone = 'warn';
+  } else {
+    text = `Parcels: ${cfg.label || 'CA statewide (DWR/LightBox)'} · ${cfg.refresh || 'quarterly'} · APN+address only`;
+    tone = 'ok';
+  }
+  if (st.count === 0) text = `Parcels: ${cfg.label || 'source'} · 0 parcels in view`;
+  if (st.truncated) {
+    text += ` · first ${st.count} only — zoom in`;
+    if (tone === 'ok') tone = 'warn';
+  }
+  return { text, tone };
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -3708,5 +3874,6 @@ if (typeof module !== 'undefined' && module.exports) {
     AIRSPACE_CLASS_COLORS, SUA_COLORS, LAANC_COLORS, laancCeilingColor,
     buildingHeightM, parseOverpassBuildings, earClipTriangulate, buildingMeshLocal, clampBBoxSpan,
     resolveBuildings3dMode,
+    PARCEL_REGISTRY, PARCEL_MIN_ZOOM, parcelSourcesForBounds, parcelQueryUrl, normalizeParcels, parcelChipState,
   };
 }
