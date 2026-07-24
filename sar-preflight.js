@@ -11,6 +11,7 @@ const S = {
   areaCenter: null, areaBounds: null, areaType: null, areaCoords: [],
   drawHandler: null, panelOpen: true, activeTab: 'wx',
   mapLayers: {}, wireHazardCounts: {}, faaCharts: {},
+  utilityWireCounts: {}, utilityWireInfo: {}, // CA utility circuits (PG&E GRIP / CEC), keyed by category / source id
   // Cached live data
   wx: {}, wind: {}, elev: {}, astro: {}, notams: [],
   metar: null,              // observed aviation weather (ceiling / vis / flight category)
@@ -856,6 +857,7 @@ function clearArea() {
   S.protectedAreas = null;
   S.lzs = [];
   S.wireHazardCounts = {};
+  S.utilityWireCounts = {}; S.utilityWireInfo = {};
   S.towerCount = 0;
   S.nwsAlerts = [];
   S.dataSourceErrors = {};
@@ -992,6 +994,7 @@ async function processArea(layer, type) {
     renderNotamsTab(center.lat, center.lng),
     fetchLiveRestrictions(center, bounds),
     fetchWireHazards(bounds),
+    fetchUtilityWires(bounds),
     fetchNWSAlerts(center.lat, center.lng),
     fetchRadar(),
     fetchFAAairspace(bounds),
@@ -1044,6 +1047,7 @@ async function retryFailedSource(source) {
     'Elevation': () => fetchElevation(S.areaCenter, bounds),
     'Sun/Moon': () => fetchSunMoon(lat, lng),
     'Wire Hazards': () => fetchWireHazards(bounds),
+    'Utility Circuits': () => fetchUtilityWires(bounds),
     'NWS Alerts': () => fetchNWSAlerts(lat, lng),
     'Radar': () => fetchRadar(),
     'FAA Airspace': () => fetchFAAairspace(bounds),
@@ -1158,7 +1162,7 @@ const SECTION_DEFS = {
   },
   obstacles: {
     label: 'Obstacles & Hazards', computes: 'ops',
-    fetch: (c, b) => Promise.allSettled([fetchWireHazards(b), fetchFaaObstacles(b), fetchProtectedAreas(b)]),
+    fetch: (c, b) => Promise.allSettled([fetchWireHazards(b), fetchUtilityWires(b), fetchFaaObstacles(b), fetchProtectedAreas(b)]),
     lines: [{ id: 'meta_obstacles', button: true }],
   },
   canopy: {
@@ -4889,7 +4893,9 @@ async function _overpassFetch(query) {
 async function fetchWireHazards(bounds) {
   trackFetchStart('Wire Hazards');
   setStatus('wireStatus', 'loading', 'Fetching...');
-  Object.keys(WIRE_CATEGORIES).forEach(k => {
+  // Only the OSM-sourced categories — the utility_* layers belong to
+  // fetchUtilityWires and must survive an independent OSM refresh.
+  Object.keys(WIRE_CATEGORIES).filter(k => WIRE_CATEGORIES[k].src === 'osm').forEach(k => {
     const lid = 'wire_' + k;
     if (S.mapLayers[lid]) { S.mapLayers[lid].clearLayers(); }
     else { S.mapLayers[lid] = L.layerGroup().addTo(S.map); }
@@ -5073,6 +5079,115 @@ async function fetchWireHazards(bounds) {
 }
 
 // ============================================================
+// API: CA UTILITY CIRCUITS — PG&E GRIP feeders + CEC transmission (FREE, no key)
+// ============================================================
+// California-only supplement to the OSM wire layers (see UTILITY_WIRE_SOURCES
+// in core.js). Ops outside every source's coverage bbox are a silent no-op —
+// the OSM Overpass fetch runs everywhere regardless, so non-PG&E territory
+// (Tahoe basin, Roseville, out of state) keeps exactly the old behavior.
+async function fetchUtilityWires(bounds) {
+  // Clear/create only the utility categories; the OSM ones belong to fetchWireHazards.
+  Object.keys(WIRE_CATEGORIES).filter(k => WIRE_CATEGORIES[k].src === 'utility').forEach(k => {
+    const lid = 'wire_' + k;
+    if (S.mapLayers[lid]) { S.mapLayers[lid].clearLayers(); }
+    else { S.mapLayers[lid] = L.layerGroup().addTo(S.map); }
+  });
+  S.utilityWireCounts = {};
+  S.utilityWireInfo = {};
+
+  const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  const pad = 0.015; // same op-area padding as the OSM wire fetch
+  const bbox = { west: sw.lng - pad, south: sw.lat - pad, east: ne.lng + pad, north: ne.lat + pad };
+  const sources = utilityWireSourcesForBounds(UTILITY_WIRE_SOURCES, bbox);
+  if (sources.length === 0) return; // out of coverage — not an error, OSM is the wire source here
+
+  trackFetchStart('Utility Circuits');
+  const cLat = (sw.lat + ne.lat) / 2, cLng = (sw.lng + ne.lng) / 2;
+  const k = typeof areaKey === 'function' ? areaKey(cLat, cLng) : `${cLat.toFixed(3)}_${cLng.toFixed(3)}`;
+  let anyLive = false, anyFailed = false, lastErr = null, oldestCache = null;
+
+  await Promise.all(sources.map(async cfg => {
+    try {
+      const res = await fetch(utilityWireQueryUrl(cfg, bbox));
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const gj = await res.json();
+      // ArcGIS can report failure inside an HTTP-200 body (same lesson as parcels).
+      if (gj && gj.error) throw new Error(gj.error.message || 'ArcGIS query error');
+      const recs = normalizeUtilityWires(gj.features, cfg, Date.now(), bbox);
+      const truncated = !!(gj.properties && gj.properties.exceededTransferLimit) || !!gj.exceededTransferLimit;
+      _renderUtilityWires(recs);
+      S.utilityWireCounts[cfg.category] = (S.utilityWireCounts[cfg.category] || 0) + recs.length;
+      S.utilityWireInfo[cfg.id] = { label: cfg.label, count: recs.length, truncated };
+      anyLive = true;
+      if (typeof cacheApiResponse === 'function') cacheApiResponse('utility_wires', `${k}:${cfg.id}`, { recs, truncated });
+    } catch (err) {
+      console.warn(`Utility circuits (${cfg.label}) fetch failed:`, err);
+      lastErr = err;
+      let served = false;
+      if (typeof getCachedApiResponse === 'function') {
+        try {
+          const cached = await getCachedApiResponse('utility_wires', `${k}:${cfg.id}`);
+          if (cached && cached.data && Array.isArray(cached.data.recs)) {
+            _renderUtilityWires(cached.data.recs);
+            S.utilityWireCounts[cfg.category] = (S.utilityWireCounts[cfg.category] || 0) + cached.data.recs.length;
+            S.utilityWireInfo[cfg.id] = {
+              label: cfg.label, count: cached.data.recs.length, truncated: !!cached.data.truncated,
+              fromCache: true, cachedAt: cached.timestamp,
+            };
+            if (oldestCache == null || cached.timestamp < oldestCache) oldestCache = cached.timestamp;
+            served = true;
+          }
+        } catch (cacheErr) { console.warn('Utility circuits cache fallback failed:', cacheErr); }
+      }
+      if (!served) { anyFailed = true; S.utilityWireInfo[cfg.id] = { label: cfg.label, failed: true }; }
+    }
+  }));
+
+  updateWireDisplay(S.wireHazardCounts, S.towerCount);
+  buildLayerControl();
+  if (anyFailed) {
+    recordDataSourceError('Utility Circuits', lastErr || new Error('fetch failed'));
+    markSection('obstacles', { source: 'utility', status: 'error', error: lastErr && lastErr.message ? lastErr.message : 'fetch failed' });
+  } else {
+    clearDataSourceError('Utility Circuits');
+    if (anyLive) markSection('obstacles', { source: 'utility', status: 'live', updatedAt: Date.now(), error: null });
+    else markSection('obstacles', { source: 'utility', status: 'cached', cachedAt: oldestCache });
+  }
+  trackFetchEnd('Utility Circuits');
+}
+
+// Draw normalized utility wire records into their category layers.
+function _renderUtilityWires(recs) {
+  (recs || []).forEach(rec => {
+    const latlngs = geojsonLineLatLngs(rec.geometry);
+    if (!latlngs || latlngs.length === 0) return;
+    const info = WIRE_CATEGORIES[rec.category];
+    const lid = 'wire_' + rec.category;
+    if (!info || !S.mapLayers[lid]) return;
+    L.polyline(latlngs, { color: info.color, weight: info.weight, opacity: 0.8 })
+      .bindPopup(_utilityWirePopup(rec, info))
+      .addTo(S.mapLayers[lid]);
+  });
+}
+
+function _utilityWirePopup(rec, info) {
+  const OHUG = { OH: 'Overhead', UG: 'Underground', UW: 'Underwater' };
+  const parts = [`<b style="color:${info.color}">${info.label}</b>`];
+  const name = rec.lineName || rec.name;
+  if (name) parts.push(name);
+  if (rec.voltageKv != null) {
+    parts.push(`${rec.voltageKv} kV` + (rec.ohUg ? ` · ${OHUG[rec.ohUg] || rec.ohUg}` : ''));
+  }
+  if (rec.substation) parts.push(`Substation: ${rec.substation}`);
+  if (rec.owner) parts.push(`Owner: ${rec.owner}`);
+  if (rec.circuit) parts.push(`Circuit: ${rec.circuit}`);
+  if (rec.status && rec.status !== 'Operational') parts.push(`Status: ${rec.status}`);
+  if (rec.caveat) parts.push(`<span style="font-size:10px;opacity:0.6">⚠ ${rec.caveat}</span>`);
+  if (rec.attribution) parts.push(`<span style="font-size:10px;opacity:0.6">${rec.attribution}</span>`);
+  return parts.join('<br>');
+}
+
+// ============================================================
 // API: OSM BUILDINGS (Overpass) — footprints for the 3D view (FREE)
 // Fetched lazily on first 3D entry: buildings only earn their keep as 3D
 // prisms, and fetching them with every area load would double Overpass
@@ -5159,11 +5274,13 @@ function renderBuildingsLayer() {
 }
 
 function updateWireDisplay(counts, towerCount) {
-  const powerCount = (counts.power_line || 0) + (counts.power_minor_line || 0) + (counts.power_cable || 0);
+  // OSM counts + CA utility-circuit counts (PG&E GRIP feeders / CEC transmission)
+  const utilityCount = Object.values(S.utilityWireCounts || {}).reduce((a, b) => a + b, 0);
+  const powerCount = (counts.power_line || 0) + (counts.power_minor_line || 0) + (counts.power_cable || 0) + utilityCount;
   const telecomCount = counts.telecom_line || 0;
   const aerialCount = counts.aerialway || 0;
   const towers = towerCount || 0;
-  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  const total = Object.values(counts).reduce((a, b) => a + b, 0) + utilityCount;
 
   if (total > 0 || towers > 0) {
     setText('terrPower', `${powerCount} lines mapped \u2014 see map`);
@@ -7508,11 +7625,12 @@ function buildLayerControl() {
     </div>`;
   }
 
-  const totalWires = Object.values(S.wireHazardCounts).reduce((a, b) => a + b, 0);
+  const wireCounts = Object.assign({}, S.wireHazardCounts, S.utilityWireCounts);
+  const totalWires = Object.values(wireCounts).reduce((a, b) => a + b, 0);
   if (totalWires > 0) {
     html += `<h4 style="margin-top:10px">Wire Hazards</h4>`;
     Object.entries(WIRE_CATEGORIES).forEach(([k, info]) => {
-      const count = S.wireHazardCounts[k] || 0;
+      const count = wireCounts[k] || 0;
       if (count === 0) return;
       const lid = 'wire_' + k;
       const on = S.map.hasLayer(S.mapLayers[lid]);
@@ -8471,6 +8589,7 @@ async function cacheCurrentView() {
   if (btn) btn.setAttribute('disabled', 'true');
   const jobs = [
     fetchFAAairspace(bounds), fetchFaaObstacles(bounds), fetchWireHazards(bounds),
+    fetchUtilityWires(bounds),
     fetchProtectedAreas(bounds), fetchNearbyAirports(center, bounds),
     fetchPublicLands(bounds), fetchGroundAccess(bounds), fetchWaterFeatures(bounds),
     fetchFireDanger(center.lat, center.lng, bounds), fetchHospitals(bounds),
@@ -9528,7 +9647,8 @@ async function logMission() {
     },
     elev: S.elev ? { center: S.elev.center, min: S.elev.min, max: S.elev.max, range: S.elev.range } : null,
     nwsAlerts: S.nwsAlerts?.length || 0,
-    wireHazards: Object.values(S.wireHazardCounts || {}).reduce((a, b) => a + b, 0),
+    wireHazards: Object.values(S.wireHazardCounts || {}).reduce((a, b) => a + b, 0)
+      + Object.values(S.utilityWireCounts || {}).reduce((a, b) => a + b, 0),
     sopProfile: S.activeProfile?.name || 'Default',
     notes: notes,
   };
@@ -12463,6 +12583,7 @@ if (typeof module !== 'undefined' && module.exports) {
     loadSopProfile, saveSopProfileFromUI, deleteSopProfileFromUI, populateSopDropdown, updateSopThresholdFields,
     fetchWeather, fetchKpIndex, fetchElevation, fetchSunMoon,
     renderNotamsTab, fetchWireHazards, processArea,
+    fetchUtilityWires, _renderUtilityWires, _utilityWirePopup,
     tfrGeoJsonUrlForBounds, fetchLiveTFRs, fetchNotams, fetchLiveRestrictions,
     renderAutoCheckStatus, reCheckRestrictionsNow, _restrictionEmptyMsg,
     toDMS, fmtTfrTime, currentAreaPolygon,

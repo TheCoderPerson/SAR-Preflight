@@ -34,6 +34,7 @@ const ENDPOINT_TTL = {
   trails:      30 * 24 * 60 * 60000,
   cell_coverage: 180 * 24 * 60 * 60000, // 180 days — bundled FCC LTE, refreshed ~2×/yr
   parcels:     90 * 24 * 60 * 60000, // 90 days — parcel fabric changes slowly; DWR refresh is quarterly
+  utility_wires: 30 * 24 * 60 * 60000, // 30 days — PG&E ICA maps are on a monthly update mandate
 };
 
 // --- Raster cache (ArrayBuffers / typed arrays — structured-cloneable) ---
