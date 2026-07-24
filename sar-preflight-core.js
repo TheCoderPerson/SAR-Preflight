@@ -4,12 +4,17 @@
 // ============================================================
 
 // --- Wire Hazard Categories ---
+// `src` partitions the categories between the two wire fetches: fetchWireHazards
+// (OSM Overpass) and fetchUtilityWires (CA utility GIS). Each fetch clears and
+// repopulates ONLY its own categories so the two can run/refresh independently.
 const WIRE_CATEGORIES = {
-  power_line:       { label: 'Power Transmission',  color: '#FF0000', weight: 3 },
-  power_minor_line: { label: 'Power Distribution',  color: '#FF8000', weight: 2 },
-  power_cable:      { label: 'Power Cables',        color: '#AA0000', weight: 2 },
-  telecom_line:     { label: 'Telecom Lines',       color: '#0088FF', weight: 2 },
-  aerialway:        { label: 'Aerialways',           color: '#AA00AA', weight: 3 },
+  power_line:       { label: 'Power Transmission',  color: '#FF0000', weight: 3, src: 'osm' },
+  power_minor_line: { label: 'Power Distribution',  color: '#FF8000', weight: 2, src: 'osm' },
+  power_cable:      { label: 'Power Cables',        color: '#AA0000', weight: 2, src: 'osm' },
+  telecom_line:     { label: 'Telecom Lines',       color: '#0088FF', weight: 2, src: 'osm' },
+  aerialway:        { label: 'Aerialways',           color: '#AA00AA', weight: 3, src: 'osm' },
+  utility_distribution: { label: 'PG&E Distribution Circuits', color: '#FFD000', weight: 2, src: 'utility' },
+  utility_transmission: { label: 'CA Transmission (CEC)',      color: '#FF4444', weight: 3, src: 'utility' },
 };
 
 // --- Changelog (single source of truth) ---
@@ -18,6 +23,14 @@ const WIRE_CATEGORIES = {
 // Keep CHANGELOG_ENTRIES[0].version in sync with SAR_VERSION in version.js.
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
+  {
+    version: '2026.07.23-b',
+    date: '2026-07-23',
+    changes: [
+      'Two new California wire-hazard layers from authoritative utility GIS: PG&E Distribution Circuits (yellow) — real primary-distribution feeder routing from PG&E\'s GRIP/ICA public portal, the rural pole lines OpenStreetMap rarely has — and CA Transmission (CEC, red) — the California Energy Commission\'s transmission layer (voltage, owner, overhead/underground), far fresher than the retired federal HIFLD data. Both load automatically for op areas in their coverage; outside it (Tahoe basin, Roseville, out of state) nothing changes and the existing OSM wire layers remain the source everywhere.',
+      'Limits, stated in every popup: PG&E feeders carry no overhead-vs-underground flag and never include service drops to individual buildings, so treat every mapped line as an overhead hazard — and never treat the absence of lines as the absence of wires. Utility circuits cache for offline reuse (30 days) and count toward the wire totals in the briefing and mission log.',
+    ],
+  },
   {
     version: '2026.07.23-a',
     date: '2026-07-23',
@@ -3825,6 +3838,192 @@ function parcelChipState(st) {
   return { text, tone };
 }
 
+// ============================================================
+// UTILITY WIRE SOURCES (California) — authoritative circuit GIS
+// ============================================================
+// California supplement to the OSM wire layers. PG&E's GRIP/ICA portal
+// publishes real primary-distribution feeder geometry (the rural pole lines
+// OSM rarely has) and the CEC maintains a fresher, richer CA transmission
+// layer than the retired HIFLD program. Both are CORS-open ArcGIS services
+// queried DIRECT (no key, no proxy) — verified live 2026-07-23.
+//
+// Coverage gating: each source carries an approximate coverage bbox; an op
+// area intersecting none of them (outside California) simply gets no utility
+// layers and the OSM Overpass fetch — which always runs everywhere — remains
+// the sole wire source, exactly as before this feature. The bboxes are gates,
+// not truth: PG&E's rectangle includes non-PG&E territory (Tahoe basin =
+// Liberty Utilities, Roseville = municipal) where the query just returns
+// nothing — OSM is the only wire source there too.
+//
+// Known limits (surfaced in every popup): GRIP feeders have NO overhead-vs-
+// underground flag and NO secondary/service drops; CEC is transmission only.
+// Absence of utility lines must never be read as absence of wires.
+
+const UTILITY_WIRE_SOURCES = [
+  {
+    id: 'pge-grip-feeders', category: 'utility_distribution', label: 'PG&E Distribution (GRIP)',
+    url: 'https://services2.arcgis.com/mJaJSax0KPHoCNB6/ArcGIS/rest/services/DRPComplianceRelProd/FeatureServer/2',
+    maxRecordCount: 2000,
+    // PG&E service territory, approximate (northern/central CA)
+    bbox: { west: -124.6, south: 34.4, east: -117.6, north: 41.6 },
+    fields: {
+      featureId: 'FeederID', name: 'Feeder_Name', voltageKv: 'Nominal_Voltage',
+      substation: 'Substation', division: 'Division',
+    },
+    // Feeders carry 10k+ vertex geometries; ~3 m server-side simplification is
+    // invisible at hazard-display scale and cuts payloads dramatically.
+    simplifyDeg: 0.00003,
+    attribution: 'PG&E GRIP / ICA public data portal',
+    caveat: 'Primary distribution only — no overhead/underground distinction, service drops not included',
+    verified: '2026-07-23', verifiedLevel: 'schema_confirmed',
+  },
+  {
+    id: 'cec-transmission', category: 'utility_transmission', label: 'CA Transmission (CEC)',
+    url: 'https://services3.arcgis.com/bWPjFyq029ChCGur/arcgis/rest/services/Transmission_Line/FeatureServer/2',
+    maxRecordCount: 2000,
+    // California
+    bbox: { west: -124.6, south: 32.4, east: -113.9, north: 42.1 },
+    fields: {
+      name: 'Name', voltageKv: 'kV', owner: 'Owner', status: 'Status',
+      circuit: 'Circuit', ohUg: 'Type', lineName: 'TLine_Name',
+    },
+    simplifyDeg: 0.00003,
+    attribution: 'California Energy Commission',
+    caveat: null,
+    verified: '2026-07-23', verifiedLevel: 'schema_confirmed',
+  },
+];
+
+// Sources whose coverage bbox intersects the op-area bbox ({west,south,east,north}).
+// Empty result = out of coverage = the OSM layers are the only wire data (by design).
+function utilityWireSourcesForBounds(sources, bbox) {
+  if (!sources || !bbox) return [];
+  return sources.filter(cfg => {
+    const b = cfg && cfg.bbox;
+    return b && b.west <= bbox.east && b.east >= bbox.west && b.south <= bbox.north && b.north >= bbox.south;
+  });
+}
+
+// Direct ArcGIS GeoJSON query URL for a utility source + op-area bbox. Unlike
+// parcels, display simplification IS wanted here (maxAllowableOffset): these are
+// hazard corridors, not survey boundaries, and feeder geometries are enormous.
+function utilityWireQueryUrl(cfg, bbox) {
+  const fields = Object.keys(cfg.fields).map(k => cfg.fields[k]).join(',');
+  return `${cfg.url}/query?where=1%3D1&geometry=${bbox.west},${bbox.south},${bbox.east},${bbox.north}`
+    + `&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects`
+    + `&outFields=${encodeURIComponent(fields)}&returnGeometry=true&outSR=4326&f=geojson`
+    + `&resultRecordCount=${cfg.maxRecordCount}`
+    + (cfg.simplifyDeg ? `&maxAllowableOffset=${cfg.simplifyDeg}&geometryPrecision=5` : '');
+}
+
+// Liang-Barsky clip of one segment (lng/lat order) to a bbox. Returns the
+// clipped [[x,y],[x,y]] or null when the segment lies entirely outside.
+function _clipSegment(x1, y1, x2, y2, b) {
+  let t0 = 0, t1 = 1;
+  const dx = x2 - x1, dy = y2 - y1;
+  const p = [-dx, dx, -dy, dy];
+  const q = [x1 - b.west, b.east - x1, y1 - b.south, b.north - y1];
+  for (let i = 0; i < 4; i++) {
+    if (p[i] === 0) { if (q[i] < 0) return null; continue; }
+    const r = q[i] / p[i];
+    if (p[i] < 0) { if (r > t1) return null; if (r > t0) t0 = r; }
+    else { if (r < t0) return null; if (r < t1) t1 = r; }
+  }
+  return [[x1 + t0 * dx, y1 + t0 * dy], [x1 + t1 * dx, y1 + t1 * dy]];
+}
+
+// Clip a GeoJSON (Multi)LineString to a bbox → MultiLineString (or null when
+// nothing remains inside). ArcGIS envelope queries return WHOLE intersecting
+// features — a single PG&E feeder is a multi-km branch network (measured:
+// ~48k vertices for 11 feeders), so without clipping the op-area fetch drags
+// in, renders, and caches an entire distribution grid. Consecutive clipped
+// segments that share an endpoint are merged into one part.
+function clipLineGeometryToBbox(geometry, bbox) {
+  if (!geometry || !geometry.coordinates) return null;
+  if (!bbox) return geometry;
+  const lines = geometry.type === 'LineString' ? [geometry.coordinates]
+    : geometry.type === 'MultiLineString' ? geometry.coordinates : null;
+  if (!lines) return null;
+  const out = [];
+  lines.forEach(line => {
+    let run = null;
+    for (let i = 0; i + 1 < (line || []).length; i++) {
+      const a = line[i], c = line[i + 1];
+      const seg = _clipSegment(a[0], a[1], c[0], c[1], bbox);
+      if (!seg) { run = null; continue; }
+      const s = seg[0], e = seg[1];
+      if (run && run[run.length - 1][0] === s[0] && run[run.length - 1][1] === s[1]) {
+        run.push(e);
+      } else {
+        run = [s, e];
+        out.push(run);
+      }
+    }
+  });
+  return out.length ? { type: 'MultiLineString', coordinates: out } : null;
+}
+
+// Normalize raw GeoJSON features into canonical wire records. Missing fields are
+// null, never ''. CEC rows with Status "Proposed" are dropped — a line that has
+// not been built is not a hazard (Closed/Unknown stay, conservatively: retired
+// corridors often still carry conductors). When clipBbox is given, geometry is
+// clipped to it and features left with no in-bbox geometry are dropped.
+function normalizeUtilityWires(features, cfg, fetchedAt, clipBbox) {
+  const f = cfg.fields || {};
+  const read = (props, key) => {
+    const name = f[key];
+    if (!name || !props) return null;
+    const v = props[name];
+    if (v == null) return null;
+    if (typeof v === 'string') { const t = v.trim(); return t === '' ? null : t; }
+    return v;
+  };
+  const out = [];
+  (features || []).forEach((feat, i) => {
+    if (!feat || !feat.geometry) return;
+    const props = feat.properties || {};
+    const status = read(props, 'status');
+    if (status && /^proposed/i.test(status)) return;
+    let geometry = feat.geometry;
+    if (clipBbox) {
+      geometry = clipLineGeometryToBbox(geometry, clipBbox);
+      if (!geometry) return;
+    }
+    const rawKv = read(props, 'voltageKv');
+    const kv = rawKv == null ? NaN : parseFloat(rawKv);
+    const featureId = read(props, 'featureId');
+    out.push({
+      id: `${cfg.id}:${featureId || i}`,
+      category: cfg.category,
+      name: read(props, 'name'),
+      lineName: read(props, 'lineName'),
+      voltageKv: isNaN(kv) ? null : kv,
+      substation: read(props, 'substation'),
+      division: read(props, 'division'),
+      owner: read(props, 'owner'),
+      status,
+      circuit: read(props, 'circuit'),
+      ohUg: read(props, 'ohUg'),
+      geometry,
+      sourceId: cfg.id, sourceLabel: cfg.label,
+      attribution: cfg.attribution || null,
+      caveat: cfg.caveat || null,
+      fetchedAt: fetchedAt != null ? fetchedAt : null,
+    });
+  });
+  return out;
+}
+
+// GeoJSON (Multi)LineString → Leaflet latlngs ([lat,lng] pairs; nested arrays
+// for multi-part lines — L.polyline accepts both shapes natively).
+function geojsonLineLatLngs(geometry) {
+  if (!geometry || !geometry.coordinates) return null;
+  const flip = line => (line || []).map(pt => [pt[1], pt[0]]);
+  if (geometry.type === 'LineString') return flip(geometry.coordinates);
+  if (geometry.type === 'MultiLineString') return geometry.coordinates.map(flip);
+  return null;
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -3875,5 +4074,7 @@ if (typeof module !== 'undefined' && module.exports) {
     buildingHeightM, parseOverpassBuildings, earClipTriangulate, buildingMeshLocal, clampBBoxSpan,
     resolveBuildings3dMode,
     PARCEL_REGISTRY, PARCEL_MIN_ZOOM, parcelSourcesForBounds, parcelQueryUrl, normalizeParcels, parcelChipState,
+    UTILITY_WIRE_SOURCES, utilityWireSourcesForBounds, utilityWireQueryUrl, normalizeUtilityWires, geojsonLineLatLngs,
+    clipLineGeometryToBbox,
   };
 }
