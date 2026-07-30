@@ -4,6 +4,19 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.29-a — 2026-07-29
+
+- Vegetation Height and Sun Shadow now switch on and off from the Map Layers panel (under Analysis) like every other overlay — their Terrain-tab checkboxes are gone. Both rows are always listed, so an overlay you turned off can be turned back on from the same place. The Terrain tab keeps the opacity sliders, Refresh-for-view and the canopy EDIT link, and the two opacity sliders for each overlay now stay in step.
+- Map Layers categories collapse: tap a heading (FACILITIES, TRAFFIC, WIRE HAZARDS, …) to fold that category away. Collapsed sections are remembered between sessions — useful on a phone now that the panel runs to 22 categories.
+- New PLANS button in the header: a pre-mission declutter that switches off and collapses Radar, Traffic, Operations and Smoke. It stays on until you press it again, so a background data refresh will not quietly put the radar back — but re-checking any layer by hand still sticks.
+- Placing a viewshed observer now draws a dashed VLOS range ring that follows the cursor, so you can see how far the range actually reaches before committing to a spot. Every placed observer keeps a ring at its own stored VLOS range (visible on touch devices too), and the rings hide with the Observers layer.
+- Fixed: clearing the operational area left the sun shadow overlay stranded on the map, where scrubbing the time bar no longer updated it.
+
+## v2026.07.23-b — 2026-07-23
+
+- Two new California wire-hazard layers from authoritative utility GIS: PG&E Distribution Circuits (yellow) — real primary-distribution feeder routing from PG&E's GRIP/ICA public portal, the rural pole lines OpenStreetMap rarely has — and CA Transmission (CEC, red) — the California Energy Commission's transmission layer (voltage, owner, overhead/underground), far fresher than the retired federal HIFLD data. Both load automatically for op areas in their coverage; outside it (Tahoe basin, Roseville, out of state) nothing changes and the existing OSM wire layers remain the source everywhere.
+- Limits, stated in every popup: PG&E feeders carry no overhead-vs-underground flag and never include service drops to individual buildings, so treat every mapped line as an overhead hazard — and never treat the absence of lines as the absence of wires. Utility circuits cache for offline reuse (30 days) and count toward the wire totals in the briefing and mission log.
+
 ## v2026.07.23-a — 2026-07-23
 
 - The app now opens offline: the service worker previously refused to answer page-load (navigation) requests, so launching the installed PWA without connectivity failed with "not connected to the internet" even though everything was cached. Navigations are now served cache-first with an offline fallback to the cached app shell.

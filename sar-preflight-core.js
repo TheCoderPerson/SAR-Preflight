@@ -24,6 +24,17 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.29-a',
+    date: '2026-07-29',
+    changes: [
+      'Vegetation Height and Sun Shadow now switch on and off from the Map Layers panel (under Analysis) like every other overlay — their Terrain-tab checkboxes are gone. Both rows are always listed, so an overlay you turned off can be turned back on from the same place. The Terrain tab keeps the opacity sliders, Refresh-for-view and the canopy EDIT link, and the two opacity sliders for each overlay now stay in step.',
+      'Map Layers categories collapse: tap a heading (FACILITIES, TRAFFIC, WIRE HAZARDS, …) to fold that category away. Collapsed sections are remembered between sessions — useful on a phone now that the panel runs to 22 categories.',
+      'New PLANS button in the header: a pre-mission declutter that switches off and collapses Radar, Traffic, Operations and Smoke. It stays on until you press it again, so a background data refresh will not quietly put the radar back — but re-checking any layer by hand still sticks.',
+      'Placing a viewshed observer now draws a dashed VLOS range ring that follows the cursor, so you can see how far the range actually reaches before committing to a spot. Every placed observer keeps a ring at its own stored VLOS range (visible on touch devices too), and the rings hide with the Observers layer.',
+      'Fixed: clearing the operational area left the sun shadow overlay stranded on the map, where scrubbing the time bar no longer updated it.',
+    ],
+  },
+  {
     version: '2026.07.23-b',
     date: '2026-07-23',
     changes: [

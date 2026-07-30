@@ -82,7 +82,7 @@ const BAR_HTML = `
     <button id="ceBtnUndo"></button><button id="ceBtnSave"></button>
   </div></div>
   <span id="canopyStatus"></span><input id="canopyOpacity" value="0.6">
-  <input type="checkbox" id="canopyToggle"><div id="layerList"></div>
+  <div id="layerList"></div>
   <span id="canopyOpacityVal"></span>`;
 
 function setupEditableState() {

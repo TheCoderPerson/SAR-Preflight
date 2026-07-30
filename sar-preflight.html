@@ -341,6 +341,10 @@ body {
 .layer-control.collapsed h4 { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
 .layer-control.collapsed h4::after { content: '▸'; }
 .layer-control.collapsed #layerList { display: none; }
+/* Per-category collapse: tap a section header to hide just that category's rows. */
+.layer-control h4.layer-section.collapsed { margin-bottom: 0; padding-bottom: 4px; }
+.layer-control h4.layer-section.collapsed::after { content: '▸'; }
+.layer-section-body.collapsed { display: none; }
 .layer-item {
   display: flex; align-items: center; gap: 8px; padding: 4px 0;
   cursor: pointer; font-size: 12px; color: var(--text-secondary); transition: color 0.15s;
@@ -702,6 +706,7 @@ select.api-input { cursor: pointer; }
   <button class="header-btn header-hamburger" onclick="toggleHeaderMenu()">&#9776;</button>
   <div class="header-actions" id="headerActions">
     <button class="header-btn" id="btnPanel" onclick="togglePanel()">DATA PANEL</button>
+    <button class="header-btn" id="btnPlans" onclick="togglePlansMode()" title="Planning declutter: turn off and collapse Radar, Traffic, Operations and Smoke layers">PLANS</button>
     <button class="header-btn" id="btnExport" onclick="openExport()">EXPORT</button>
     <button class="header-btn" id="btnCopy" onclick="copyBriefing()">COPY</button>
     <button class="header-btn" id="btnPDF" onclick="generatePDFBriefing()">PDF</button>
@@ -1101,9 +1106,8 @@ select.api-input { cursor: pointer; }
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>Canopy &amp; Visibility <span class="fetch-status" id="canopyStatus"></span></div>
           <div class="section-meta" id="meta_canopy"></div>
           <div class="api-config">
-            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--text-secondary);">
-              <input type="checkbox" id="canopyToggle" onchange="toggleCanopyOverlay()"> Vegetation height overlay (Meta 1&nbsp;m)
-            </label>
+            <div style="font-size:12px;color:var(--text-secondary);">Vegetation height overlay (Meta 1&nbsp;m)
+              <span style="font-size:10px;color:var(--text-muted);">— toggle in Map Layers &rsaquo; Analysis</span></div>
             <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
               <label style="font-size:11px;color:var(--text-secondary);white-space:nowrap;">Opacity:</label>
               <input type="range" id="canopyOpacity" min="0" max="1" step="0.05" value="0.6" style="width:110px;" oninput="setCanopyOpacity(this.value)">
@@ -1114,9 +1118,8 @@ select.api-input { cursor: pointer; }
             <div id="canopyProxyHint" style="font-size:10px;color:var(--text-muted);margin-top:4px;"></div>
           </div>
           <div class="api-config" style="margin-top:8px;">
-            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--text-secondary);">
-              <input type="checkbox" id="shadowToggle" onchange="toggleShadowOverlay()"> Sun shadow overlay (terrain shade) <span class="fetch-status" id="shadowStatus"></span>
-            </label>
+            <div style="font-size:12px;color:var(--text-secondary);">Sun shadow overlay (terrain shade) <span class="fetch-status" id="shadowStatus"></span>
+              <span style="font-size:10px;color:var(--text-muted);">— toggle in Map Layers &rsaquo; Analysis</span></div>
             <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
               <label style="font-size:11px;color:var(--text-secondary);white-space:nowrap;">Opacity:</label>
               <input type="range" id="shadowOpacity" min="0" max="1" step="0.05" value="0.45" style="width:110px;" oninput="setShadowOpacity(this.value)">
@@ -1130,7 +1133,7 @@ select.api-input { cursor: pointer; }
             <div class="data-label">Viewshed — where can I see the drone? <span class="fetch-status" id="viewshedStatus"></span></div>
             <div class="data-grid" style="margin-top:6px;">
               <div class="data-cell"><div class="data-label">Drone AGL (ft)</div><input class="api-input" id="vsAgl" type="number" value="200" style="font-size:11px;padding:3px;"></div>
-              <div class="data-cell"><div class="data-label">VLOS range (ft)</div><input class="api-input" id="vsVlos" type="number" value="2500" style="font-size:11px;padding:3px;"></div>
+              <div class="data-cell"><div class="data-label">VLOS range (ft)</div><input class="api-input" id="vsVlos" type="number" value="2500" style="font-size:11px;padding:3px;" oninput="_onVlosInputChange()"></div>
             </div>
             <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">Observer eye height: 5.5&nbsp;ft above ground (assumed).</div>
             <div style="display:flex;gap:6px;margin-top:6px;">
