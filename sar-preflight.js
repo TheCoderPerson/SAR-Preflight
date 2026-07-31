@@ -29,6 +29,16 @@ const S = {
   dataSourceErrors: {},
   // Track active fetches for header status
   _activeFetches: {},
+  // Last known real device GPS fix, captured opportunistically from the
+  // getCurrentPosition calls the app ALREADY makes (initMap centering,
+  // locateMe). Read via searchAnchor() so features that want a device position
+  // can use one WITHOUT triggering a permission prompt of their own.
+  deviceFix: null,          // { lat, lng, accM, at }
+  // Place/address search ("Go To" modal)
+  _geocodeResults: [], _geocodeAnchor: null, _geocodeQuery: '',
+  _geocodeAbort: null, _geocodeGen: 0, _geocodeLastAt: 0,
+  _geocodeSel: -1,
+  _geocodeMemo: null,       // Map<cacheKey, rawJson> — session-scoped, bounded
   // SOP Risk Profile
   activeProfile: null,
   // ADS-B live traffic
@@ -760,7 +770,7 @@ function initMap() {
   // Center map on device location if available
   if (navigator.geolocation) {
     navigator.geolocation.getCurrentPosition(
-      pos => S.map.setView([pos.coords.latitude, pos.coords.longitude], 11),
+      pos => { _noteDeviceFix(pos); S.map.setView([pos.coords.latitude, pos.coords.longitude], 11); },
       () => { /* denied or unavailable — keep default center */ },
       { timeout: 5000, maximumAge: 300000 }
     );
@@ -885,31 +895,353 @@ function clearArea() {
   const forecastSection = document.getElementById('forecastSection');
   if (forecastSection) forecastSection.style.display = 'none';
 }
+// ============================================================
+// GO TO — coordinates, place name, or address
+//
+// The input box takes all three. Coordinates are resolved SYNCHRONOUSLY and
+// never touch the network; only text that parseCoordinateInput rejects is sent
+// to the geocoder. That ordering is the contract — it keeps coordinate entry
+// fully offline-capable and keeps rate-limit budget for the searches that
+// actually need it.
+// ============================================================
+
+const DEVICE_FIX_MAX_AGE_MS = 30 * 60 * 1000; // beyond this a fix is not "where I am"
+
+// Opportunistic capture. Called from every getCurrentPosition SUCCESS callback
+// the app already has — it never adds a geolocation call of its own.
+function _noteDeviceFix(pos) {
+  if (!pos || !pos.coords) return;
+  const lat = pos.coords.latitude, lng = pos.coords.longitude;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  S.deviceFix = {
+    lat, lng,
+    accM: Number.isFinite(pos.coords.accuracy) ? pos.coords.accuracy : null,
+    at: Number.isFinite(pos.timestamp) ? pos.timestamp : Date.now(),
+  };
+}
+
+// Ranking anchor for place search. Prefers a RECENT real GPS fix if one is
+// already known, otherwise the map center. This function NEVER calls
+// navigator.geolocation: a search must not stall behind a permission dialog,
+// and a search must never be the thing that provokes one.
+function searchAnchor() {
+  const f = S.deviceFix;
+  if (f && Number.isFinite(f.lat) && Number.isFinite(f.lng)
+      && (Date.now() - f.at) < DEVICE_FIX_MAX_AGE_MS) {
+    return { lat: f.lat, lng: f.lng, source: 'gps', at: f.at };
+  }
+  if (S.map && typeof S.map.getCenter === 'function') {
+    const c = S.map.getCenter();
+    if (c && Number.isFinite(c.lat) && Number.isFinite(c.lng)) {
+      return { lat: c.lat, lng: c.lng, source: 'map', at: null };
+    }
+  }
+  return null;
+}
+
+// --- Modal open / close / input plumbing ---
+
 function enterCoords() {
-  const c0 = S.map.getCenter();
-  const input = prompt(
-    'Enter coordinates in DD, DDM, DMS, or UTM — symbols optional.\n'
-    + 'Add a radius in meters to create an operational area; without one the map just moves there.\n'
-    + `  ${c0.lat.toFixed(5)}, ${c0.lng.toFixed(5)}, 2000\n`
-    + '  38°47.204\', -120°37.062\'\n'
-    + '  38 47 12, -120 37 04\n'
-    + '  10S 0706918E 4295806N, 2000');
-  if (!input) return;
-  const p = parseCoordinateInput(input);
-  if (!p) {
-    alert('Could not parse that coordinate.\nSupported: DD ("38.78673, -120.61770"), DDM ("38 47.204, -120 37.062"), DMS ("38 47 12, -120 37 04"), or UTM ("10S 0706918E 4295806N") — with an optional trailing radius in meters.');
+  const modal = document.getElementById('coordSearchModal');
+  if (!modal) return;
+  S._geocodeResults = []; S._geocodeAnchor = null; S._geocodeQuery = ''; S._geocodeSel = -1;
+  const input = document.getElementById('coordSearchInput');
+  if (input) input.value = '';
+  const list = document.getElementById('coordSearchResults');
+  if (list) list.innerHTML = '';
+  _setGeocodeBusy(false);
+  const anchor = searchAnchor();
+  setStatus('coordSearchStatus', '', geocodeAnchorLabel(anchor, Date.now()));
+  _syncCoordRadiusRow();
+  modal.classList.add('active');
+  if (input) { try { input.focus(); } catch (_) {} }
+}
+
+function closeCoordSearch() {
+  const modal = document.getElementById('coordSearchModal');
+  if (modal) modal.classList.remove('active');
+  // Bump the generation so an in-flight search can never repaint a closed modal.
+  S._geocodeGen = (S._geocodeGen || 0) + 1;
+  if (S._geocodeAbort) { try { S._geocodeAbort.abort(); } catch (_) {} S._geocodeAbort = null; }
+  _setGeocodeBusy(false);
+}
+
+// The radius box is only meaningful when "create op area" is checked.
+function _syncCoordRadiusRow() {
+  const chk = document.getElementById('coordSearchAreaChk');
+  const rad = document.getElementById('coordSearchRadius');
+  if (rad) rad.disabled = !(chk && chk.checked);
+}
+
+// Radius in meters, or null when the operator hasn't opted into an op area.
+function _coordSearchRadiusM() {
+  const chk = document.getElementById('coordSearchAreaChk');
+  if (!chk || !chk.checked) return null;
+  const rad = document.getElementById('coordSearchRadius');
+  const v = rad ? Number(rad.value) : NaN;
+  return (Number.isFinite(v) && v > 0) ? v : null;
+}
+
+// Enter searches (or picks the highlighted row), Escape closes, arrows move.
+// NOTE: this handler must NEVER fire a search on a plain character keystroke —
+// Nominatim's usage policy forbids per-keystroke/autocomplete querying.
+function onCoordSearchKey(e) {
+  if (!e) return;
+  if (e.key === 'Escape') { closeCoordSearch(); return; }
+  const n = (S._geocodeResults || []).length;
+  if (e.key === 'ArrowDown' && n) {
+    e.preventDefault();
+    S._geocodeSel = (S._geocodeSel + 1) % n;
+    _highlightGeocodeRow();
     return;
   }
-  if (!p.radiusM) {
-    // No radius → don't create an area; just move the map to the point.
-    S.map.setView([p.lat, p.lng], Math.max(S.map.getZoom(), 13));
+  if (e.key === 'ArrowUp' && n) {
+    e.preventDefault();
+    S._geocodeSel = (S._geocodeSel <= 0 ? n : S._geocodeSel) - 1;
+    _highlightGeocodeRow();
     return;
   }
-  S.drawnItems.clearLayers();
-  const c = L.circle([p.lat, p.lng], { radius: p.radiusM, color: '#3d8bfd', weight: 2, fillColor: '#3d8bfd', fillOpacity: 0.08, dashArray: '6,4' });
-  S.drawnItems.addLayer(c);
-  S.map.fitBounds(c.getBounds(), { padding: [40, 40] });
-  processArea(c, 'circle');
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  // A highlighted row means "go there"; otherwise Enter runs the search.
+  if (S._geocodeSel >= 0 && S._geocodeSel < n) { pickGeocodeResult(S._geocodeSel); return; }
+  submitCoordSearch();
+}
+
+// --- Submit: coordinate-first, then geocode ---
+
+// Coordinates are resolved SYNCHRONOUSLY and never touch the network. If
+// parseCoordinateInput returns non-null, no fetch is issued and no await
+// happens, so the pre-existing behavior is preserved exactly (radius in the
+// string -> op area; no radius -> pan only).
+async function submitCoordSearch() {
+  const input = document.getElementById('coordSearchInput');
+  const raw = String((input && input.value) || '').trim();
+  if (!raw) {
+    setStatus('coordSearchStatus', 'error', 'Enter coordinates, a place name, or an address.');
+    return;
+  }
+  const p = parseCoordinateInput(raw);
+  if (p) {
+    _applyCoordTarget({
+      lat: p.lat, lng: p.lng, bbox: null,
+      radiusM: p.radiusM != null ? p.radiusM : _coordSearchRadiusM(),
+    });
+    closeCoordSearch();
+    return;
+  }
+  await runGeocodeSearch(raw);
+}
+
+// --- Fetch + cache ---
+
+function _memoGeocode(key, data) {
+  if (!key) return;
+  if (!S._geocodeMemo) S._geocodeMemo = new Map();
+  S._geocodeMemo.set(key, data);
+  if (S._geocodeMemo.size > 20) S._geocodeMemo.delete(S._geocodeMemo.keys().next().value);
+}
+
+async function _cachedGeocode(key) {
+  if (typeof getCachedApiResponse !== 'function' || !key) return null;
+  try {
+    const c = await getCachedApiResponse('geocode', key);
+    if (c && Array.isArray(c.data)) return { data: c.data, fromCache: true, cachedAt: c.timestamp };
+    // Exact miss: the key embeds the map anchor, so the SAME search run from a
+    // different map position lands on a different key. Offline that would read
+    // as "no such place" when we actually have the answer cached. Fall back to
+    // the newest entry for this query under ANY anchor — results are re-ranked
+    // against the current anchor on every read anyway, and the status line
+    // already labels the whole set as cached.
+    const bar = key.lastIndexOf('|');
+    if (bar > 0 && typeof getCachedApiResponsesByPrefix === 'function') {
+      const rows = await getCachedApiResponsesByPrefix('geocode', key.slice(0, bar + 1));
+      const hit = (rows || []).find(r => r && Array.isArray(r.data));
+      if (hit) return { data: hit.data, fromCache: true, cachedAt: hit.timestamp };
+    }
+  } catch (_) { /* cache is best-effort */ }
+  return null;
+}
+
+// Fetch + cache, mirroring _fetchGeoJsonLayer. Returns
+// { data, fromCache, cachedAt, error }.
+async function _fetchGeocode(query, anchor, ctl) {
+  const key = geocodeCacheKey(query, anchor);
+  if (key && S._geocodeMemo && S._geocodeMemo.has(key)) {
+    return { data: S._geocodeMemo.get(key), fromCache: false, cachedAt: null };
+  }
+  const url = geocodeQueryUrl(query, {
+    limit: GEOCODE_LIMIT,
+    viewbox: geocodeViewbox(anchor, GEOCODE_VIEWBOX_DEG),
+  });
+  const online = (typeof isOnline !== 'function') || isOnline();
+  if (url && online) {
+    try {
+      // 1 req/s, enforced app-side. Do NOT set a User-Agent header here: it is
+      // a forbidden header name in browsers and is silently dropped, so adding
+      // one would only create false confidence in compliance. The Referer the
+      // browser sends is what identifies this app to Nominatim.
+      const wait = geocodeRateLimitDelay(S._geocodeLastAt || 0, Date.now(), GEOCODE_MIN_INTERVAL_MS);
+      if (wait > 0) await new Promise(res => setTimeout(res, wait));
+      S._geocodeLastAt = Date.now();
+      const res = await _proxyFetch(url, ctl ? { signal: ctl.signal } : undefined);
+      // Treat a throttle as its own state — never auto-retry into a harder block.
+      if (res.status === 429 || res.status === 403) throw new Error('rate-limited');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!Array.isArray(data)) throw new Error('unexpected response');
+      if (typeof cacheApiResponse === 'function') cacheApiResponse('geocode', key, data);
+      _memoGeocode(key, data);
+      return { data, fromCache: false, cachedAt: null };
+    } catch (err) {
+      if (err && err.name === 'AbortError') return { data: null, error: 'aborted' };
+      const c = await _cachedGeocode(key);
+      if (c) return c;
+      return { data: null, error: (err && err.message) || String(err) };
+    }
+  }
+  const c = await _cachedGeocode(key);
+  if (c) return c;
+  return { data: null, error: 'offline' };
+}
+
+// AbortController + generation counter, the same shape as loadParcelsForView:
+// a superseded search must never repaint over a newer one.
+async function runGeocodeSearch(query) {
+  const anchor = searchAnchor();
+  const gen = S._geocodeGen = (S._geocodeGen || 0) + 1;
+  if (S._geocodeAbort) { try { S._geocodeAbort.abort(); } catch (_) {} }
+  const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  S._geocodeAbort = ctl;
+  S._geocodeQuery = query;
+  S._geocodeSel = -1;
+
+  _setGeocodeBusy(true);
+  _setGeocodeStatus({ loading: true });
+  const r = await _fetchGeocode(query, anchor, ctl);
+  if (gen !== S._geocodeGen) return;          // superseded, or the modal closed
+  S._geocodeAbort = null;
+  _setGeocodeBusy(false);
+  if (r.error === 'aborted') return;
+
+  const recs = rankGeocodeResults(normalizeGeocodeResults(r.data), anchor);
+  S._geocodeResults = recs;
+  S._geocodeAnchor = anchor;
+  _setGeocodeStatus({
+    count: recs.length, error: r.error, fromCache: r.fromCache,
+    cachedAt: r.cachedAt, nowMs: Date.now(),
+  });
+  _renderGeocodeResults(recs, { anchor, query, error: r.error });
+}
+
+function _setGeocodeBusy(on) {
+  const btn = document.getElementById('coordSearchBtn');
+  if (!btn) return;
+  btn.disabled = !!on;
+  btn.textContent = on ? '…' : 'GO';
+}
+
+// Pure tone -> the app's existing .fetch-status class vocabulary.
+const GEOCODE_TONE_CLASS = { loading: 'loading', ok: 'live', warn: 'cached', error: 'error' };
+
+function _setGeocodeStatus(st) {
+  const s = geocodeStatusText(st);
+  setStatus('coordSearchStatus', GEOCODE_TONE_CLASS[s.tone] || '', s.text);
+}
+
+// --- Render ---
+
+function _highlightGeocodeRow() {
+  const list = document.getElementById('coordSearchResults');
+  if (!list) return;
+  const rows = list.querySelectorAll('.geo-result');
+  rows.forEach((el, i) => el.classList.toggle('sel', i === S._geocodeSel));
+  const active = rows[S._geocodeSel];
+  if (active && typeof active.scrollIntoView === 'function') {
+    try { active.scrollIntoView({ block: 'nearest' }); } catch (_) {}
+  }
+}
+
+function _renderGeocodeResults(recs, opts) {
+  const list = document.getElementById('coordSearchResults');
+  if (!list) return;
+  opts = opts || {};
+  list.innerHTML = '';
+
+  if (!recs || !recs.length) {
+    // An empty result must NEVER render as a silent blank — name the query back
+    // and point at the path that always works.
+    const q = _esc(String(opts.query || ''));
+    const div = document.createElement('div');
+    div.className = 'geo-empty';
+    div.innerHTML = opts.error
+      ? `Could not search for <strong>${q}</strong>. Coordinates (DD / DDM / DMS / UTM) still work here and need no connection.`
+      : `No match for <strong>${q}</strong>. Try a nearby landmark, add the county or state, or enter coordinates directly.`;
+    list.appendChild(div);
+    return;
+  }
+
+  const warn = geocodeMatchWarning(opts.query, recs);
+  if (warn) {
+    const w = document.createElement('div');
+    w.className = 'geo-warn';
+    w.textContent = '⚠ ' + warn;
+    list.appendChild(w);
+  }
+
+  recs.forEach((rec, i) => {
+    const f = formatGeocodeResult(rec);
+    const row = document.createElement('div');
+    row.className = 'geo-result';
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
+    // The full matched string is shown verbatim and never truncated: the
+    // operator has to be able to see exactly what the search matched.
+    row.innerHTML =
+      `<div class="geo-row-top"><span class="geo-title">${_esc(f.title)}</span>`
+      + `<span class="geo-dist">${_esc(f.distance)}</span></div>`
+      + (f.meta ? `<div class="geo-meta">${_esc(f.meta)}</div>` : '')
+      + `<div class="geo-sub">${_esc(f.subtitle)}</div>`;
+    row.onclick = () => pickGeocodeResult(i);
+    list.appendChild(row);
+  });
+}
+
+// --- Selection -> pan / fit / create area ---
+
+function pickGeocodeResult(idx) {
+  const rec = (S._geocodeResults || [])[idx];
+  if (!rec) return;
+  _applyCoordTarget({
+    lat: rec.lat, lng: rec.lng,
+    bbox: geocodeFitBounds(rec),
+    radiusM: _coordSearchRadiusM(),
+  });
+  closeCoordSearch();
+}
+
+// The single apply path shared by coordinates and search hits.
+//   radius -> op area + full preflight (the pre-existing coordinate behavior)
+//   bbox   -> fit the feature's extent
+//   else   -> pan, zoom at least 13
+function _applyCoordTarget(t) {
+  if (!t || !Number.isFinite(t.lat) || !Number.isFinite(t.lng)) return;
+  if (t.radiusM) {
+    S.drawnItems.clearLayers();
+    const c = L.circle([t.lat, t.lng], { radius: t.radiusM, color: '#3d8bfd', weight: 2, fillColor: '#3d8bfd', fillOpacity: 0.08, dashArray: '6,4' });
+    S.drawnItems.addLayer(c);
+    S.map.fitBounds(c.getBounds(), { padding: [40, 40] });
+    // processArea is async and fire-and-forget; without this a throw inside it
+    // surfaces only as an unhandled rejection with no trace of where it came from.
+    const p = processArea(c, 'circle');
+    if (p && typeof p.catch === 'function') p.catch(err => console.warn('processArea failed:', err));
+    return;
+  }
+  if (t.bbox) {
+    S.map.fitBounds([[t.bbox.south, t.bbox.west], [t.bbox.north, t.bbox.east]], { padding: [40, 40] });
+    return;
+  }
+  S.map.setView([t.lat, t.lng], Math.max(S.map.getZoom(), 13));
 }
 
 function locateMe() {
@@ -923,6 +1255,7 @@ function locateMe() {
   navigator.geolocation.getCurrentPosition(
     pos => {
       restore();
+      _noteDeviceFix(pos);
       S.map.setView([pos.coords.latitude, pos.coords.longitude], Math.max(S.map.getZoom(), 13));
     },
     err => {
@@ -12857,6 +13190,12 @@ if (typeof module !== 'undefined' && module.exports) {
     loadCellCoverage, cellCoverageReadout, _pointInRegion, _ringsBBox,
     cacheCurrentView, gridForView, _cacheViewRaster, getSelectedTileProviders,
     initMap, startDraw, clearDrawBtns, clearArea, enterCoords, locateMe,
+    _noteDeviceFix, searchAnchor, DEVICE_FIX_MAX_AGE_MS,
+    closeCoordSearch, submitCoordSearch, onCoordSearchKey,
+    _syncCoordRadiusRow, _coordSearchRadiusM,
+    _memoGeocode, _cachedGeocode, _fetchGeocode, runGeocodeSearch,
+    _setGeocodeBusy, _setGeocodeStatus,
+    _renderGeocodeResults, _highlightGeocodeRow, pickGeocodeResult, _applyCoordTarget,
     getStoredTheme, applyTheme, cycleTheme,
     toggle3D, collect3dState, sync3d, _enter3D, _exit3D, _loadMaplibre,
     collect3dVectorGroups, _vec3dRecords, _open3dPopup, agg3dStep, _agg3dHtml, VEC3D_SKIP,

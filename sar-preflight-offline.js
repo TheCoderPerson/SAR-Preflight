@@ -35,6 +35,7 @@ const ENDPOINT_TTL = {
   cell_coverage: 180 * 24 * 60 * 60000, // 180 days — bundled FCC LTE, refreshed ~2×/yr
   parcels:     90 * 24 * 60 * 60000, // 90 days — parcel fabric changes slowly; DWR refresh is quarterly
   utility_wires: 30 * 24 * 60 * 60000, // 30 days — PG&E ICA maps are on a monthly update mandate
+  geocode:     30 * 24 * 60 * 60000, // 30 days — place names and street addresses change on a scale of years
 };
 
 // --- Raster cache (ArrayBuffers / typed arrays — structured-cloneable) ---
@@ -130,6 +131,34 @@ async function getCachedApiResponse(endpoint, key) {
   } catch (e) {
     console.warn('IndexedDB cache read failed:', e);
     return null;
+  }
+}
+
+// All cached records for one endpoint whose key starts with `prefix`, newest
+// first. Used where a cache key embeds context that may legitimately differ on
+// a later lookup (e.g. the geocode key embeds the map anchor, so the same
+// search from a different map position would otherwise miss offline).
+async function getCachedApiResponsesByPrefix(endpoint, prefix) {
+  try {
+    const db = await openDB();
+    const tx = db.transaction('apiCache', 'readonly');
+    const idx = tx.objectStore('apiCache').index('endpoint');
+    const req = idx.getAll(IDBKeyRange.only(endpoint));
+    return new Promise((resolve, reject) => {
+      req.onsuccess = () => {
+        const ttl = ENDPOINT_TTL[endpoint] || 30 * 60 * 1000;
+        const now = Date.now();
+        const out = (req.result || [])
+          .filter(r => r && typeof r.areaKey === 'string' && r.areaKey.indexOf(prefix) === 0)
+          .sort((a, b) => b.timestamp - a.timestamp);
+        out.forEach(r => { r.status = classifyStaleness(now - r.timestamp, ttl); });
+        resolve(out);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) {
+    console.warn('IndexedDB cache prefix read failed:', e);
+    return [];
   }
 }
 
@@ -537,6 +566,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     SAR_DB_NAME, SAR_DB_VERSION, ENDPOINT_TTL,
     openDB, areaKey, cacheApiResponse, getCachedApiResponse, clearApiCache,
+    getCachedApiResponsesByPrefix,
     cacheRaster, getCachedRaster,
     saveAppState, getAppState,
     saveTileRegion, getTileRegions, deleteTileRegion,

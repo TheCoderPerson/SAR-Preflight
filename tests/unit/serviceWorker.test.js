@@ -33,6 +33,15 @@ describe('routeStrategy(url)', () => {
     expect(routeStrategy('https://tilecache.rainviewer.com/v2/radar/123/256/11/335/785/2/1_1.png')).toBe('network-only');
   });
 
+  // Deliberately network-only, NOT network-first: the search layer keeps its own
+  // IndexedDB cache with an explicit "cached · N ago" status line. A second,
+  // invisible SW cache would render a stale hit as if it were live. Asserting the
+  // exact string makes a later "optimization" to network-first fail loudly.
+  it('routes place/address search to network-only, never network-first or cache-first', () => {
+    const url = 'https://nominatim.openstreetmap.org/search?q=Jenkinson+Lake&format=jsonv2&limit=10';
+    expect(routeStrategy(url)).toBe('network-only');
+  });
+
   it('routes API endpoints to network-first', () => {
     expect(routeStrategy('https://api.open-meteo.com/v1/forecast?lat=38')).toBe('network-first');
     expect(routeStrategy('https://air-quality-api.open-meteo.com/v1/air-quality?lat=38')).toBe('network-first');

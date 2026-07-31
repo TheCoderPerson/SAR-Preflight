@@ -647,6 +647,61 @@ select.api-input { cursor: pointer; }
   margin: 12px 0 4px; padding-bottom: 3px; border-bottom: 1px solid var(--border);
 }
 #exportLayerList { max-height: 160px; overflow-y: auto; }
+
+/* Go To modal — coordinate / place / address search */
+.geo-input {
+  width: 100%; padding: 9px 10px; border-radius: 5px;
+  background: var(--bg-tertiary); border: 1px solid var(--border);
+  color: var(--text-primary); font-family: var(--font-mono); font-size: 13px;
+}
+.geo-input:focus { outline: none; border-color: var(--accent-blue); }
+.geo-hint {
+  font-size: 10px; color: var(--text-muted); line-height: 1.5; margin: 6px 0 8px;
+}
+.geo-radius {
+  width: 68px; padding: 3px 6px; border-radius: 4px;
+  background: var(--bg-tertiary); border: 1px solid var(--border);
+  color: var(--text-primary); font-family: var(--font-mono); font-size: 11px;
+}
+.geo-radius:disabled { opacity: 0.4; }
+/* The status line carries whole sentences, so drop .fetch-status's uppercase
+   micro-label treatment while keeping its tone colors. */
+#coordSearchStatus {
+  display: block; margin: 2px 0 8px; font-size: 10px;
+  text-transform: none; letter-spacing: 0; line-height: 1.5;
+}
+#coordSearchStatus:empty { display: none; }
+#coordSearchResults { max-height: 300px; overflow-y: auto; }
+.geo-result {
+  padding: 7px 9px; margin-bottom: 4px; border-radius: 5px; cursor: pointer;
+  background: var(--bg-tertiary); border: 1px solid var(--border);
+}
+.geo-result:hover, .geo-result.sel { border-color: var(--accent-blue); background: var(--bg-secondary); }
+.geo-row-top { display: flex; align-items: baseline; gap: 8px; }
+.geo-title {
+  flex: 1; font-family: var(--font-mono); font-size: 12px; font-weight: 600;
+  color: var(--text-primary);
+}
+.geo-dist {
+  flex: none; font-family: var(--font-mono); font-size: 11px; color: var(--accent-cyan);
+}
+.geo-meta { font-size: 10px; color: var(--text-secondary); margin-top: 2px; }
+/* The full matched string, wrapped — never truncated. An operator has to be
+   able to read exactly what the search matched before acting on it. */
+.geo-sub {
+  font-size: 10px; color: var(--text-muted); margin-top: 3px;
+  line-height: 1.45; overflow-wrap: anywhere;
+}
+.geo-empty {
+  padding: 10px; border-radius: 5px; font-size: 11px; line-height: 1.6;
+  color: var(--text-secondary); background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+}
+.geo-warn {
+  padding: 7px 9px; margin-bottom: 6px; border-radius: 5px;
+  font-size: 10px; line-height: 1.5; color: var(--accent-amber);
+  background: rgba(245,158,11,0.12); border: 1px solid var(--accent-amber);
+}
 .vs-obs-row {
   display: flex; align-items: center; gap: 6px; padding: 3px 6px; margin: 2px 0;
   border: 1px solid var(--border); border-radius: 4px; font-size: 11px;
@@ -749,7 +804,7 @@ select.api-input { cursor: pointer; }
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12,2 22,8.5 18,20 6,20 2,8.5"/></svg>
       </button>
       <div style="height:1px;background:var(--border);margin:2px 0;"></div>
-      <button class="draw-btn" id="drawCoords" title="Enter Coordinates" onclick="enterCoords()">
+      <button class="draw-btn" id="drawCoords" title="Go To — coordinates, place, or address" onclick="enterCoords()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/></svg>
       </button>
       <button class="draw-btn" id="drawLocate" title="Center on My Location" onclick="locateMe()">
@@ -1636,6 +1691,34 @@ select.api-input { cursor: pointer; }
     <div class="modal-actions" style="margin-top:16px;">
       <button class="btn btn-ghost" onclick="dismissUpdateModal()">Later</button>
       <button class="btn btn-primary" onclick="applyUpdate()">Reload &amp; Update</button>
+    </div>
+  </div>
+</div>
+
+<!-- Go To: coordinates, place name, or address. Coordinates resolve locally with
+     no network call; anything else is searched. Submit-only — the provider's
+     usage policy forbids per-keystroke/autocomplete querying. -->
+<div class="modal-overlay" id="coordSearchModal">
+  <div class="modal" style="width:460px;">
+    <h3>GO TO LOCATION</h3>
+    <input type="text" id="coordSearchInput" class="geo-input" autocomplete="off"
+           spellcheck="false" placeholder="Coordinates, place name, or address"
+           onkeydown="onCoordSearchKey(event)">
+    <div class="geo-hint">
+      DD / DDM / DMS / UTM &mdash; or a place (&ldquo;Jenkinson Lake&rdquo;) or address.
+      Add a radius to coordinates (&ldquo;38.78673, -120.61770, 2000&rdquo;) to build an op area.
+    </div>
+    <div id="coordSearchStatus" class="fetch-status"></div>
+    <div id="coordSearchResults"></div>
+    <label class="export-check-row" style="margin-top:10px;">
+      <input type="checkbox" id="coordSearchAreaChk" onchange="_syncCoordRadiusRow()">
+      <span>Create op area, radius</span>
+      <input type="number" id="coordSearchRadius" class="geo-radius" value="2000" min="1" step="100" disabled>
+      <span>m</span>
+    </label>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeCoordSearch()">Cancel</button>
+      <button class="btn btn-primary" id="coordSearchBtn" onclick="submitCoordSearch()">GO</button>
     </div>
   </div>
 </div>

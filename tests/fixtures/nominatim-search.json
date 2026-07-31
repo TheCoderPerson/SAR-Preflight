@@ -1,0 +1,135 @@
+{
+  "_comment": "Real Nominatim jsonv2 responses captured live 2026-07-30 from nominatim.openstreetmap.org/search with format=jsonv2&addressdetails=1&dedupe=1 and viewbox=-122.91161,40.18500,-119.06839,37.18500 (a 1.5-degree bias box around the default El Dorado County center 38.685,-120.99). The per-row `licence` field and address keys the normalizer never reads were stripped; every other field is verbatim.",
+
+  "mountBaldy": [
+    {
+      "place_id": 320837472,
+      "osm_type": "node",
+      "osm_id": 357557559,
+      "lat": "39.2785182",
+      "lon": "-120.0001918",
+      "category": "natural",
+      "type": "peak",
+      "place_rank": 18,
+      "importance": 0.07194870560319186,
+      "addresstype": "peak",
+      "name": "Mount Baldy",
+      "display_name": "Mount Baldy, Washoe County, Nevada, 89402, United States",
+      "address": { "county": "Washoe County", "state": "Nevada", "postcode": "89402", "country_code": "us" },
+      "boundingbox": ["39.2784682", "39.2785682", "-120.0002418", "-120.0001418"]
+    },
+    {
+      "place_id": 323002894,
+      "osm_type": "node",
+      "osm_id": 358806011,
+      "lat": "40.3818066",
+      "lon": "-123.8711509",
+      "category": "natural",
+      "type": "peak",
+      "place_rank": 18,
+      "importance": 0.16000999999999999,
+      "addresstype": "peak",
+      "name": "Mount Baldy",
+      "display_name": "Mount Baldy, Humboldt County, California, United States",
+      "address": { "county": "Humboldt County", "state": "California", "country_code": "us" },
+      "boundingbox": ["40.3817566", "40.3818566", "-123.8712009", "-123.8711009"]
+    },
+    {
+      "place_id": 327957888,
+      "osm_type": "node",
+      "osm_id": 357552136,
+      "lat": "41.6565645",
+      "lon": "-118.6162796",
+      "category": "natural",
+      "type": "peak",
+      "place_rank": 18,
+      "importance": 0.16000999999999999,
+      "addresstype": "peak",
+      "name": "Mount Baldy",
+      "display_name": "Mount Baldy, Humboldt County, Nevada, United States",
+      "address": { "county": "Humboldt County", "state": "Nevada", "country_code": "us" },
+      "boundingbox": ["41.6565145", "41.6566145", "-118.6163296", "-118.6162296"]
+    },
+    {
+      "place_id": 321105266,
+      "osm_type": "node",
+      "osm_id": 1601704136,
+      "lat": "37.0363776",
+      "lon": "-122.0276344",
+      "category": "natural",
+      "type": "peak",
+      "place_rank": 18,
+      "importance": 0.16005180819409476,
+      "addresstype": "peak",
+      "name": "Mount Alexander",
+      "display_name": "Mount Alexander, Santa Cruz County, California, 95041, United States",
+      "address": { "county": "Santa Cruz County", "state": "California", "postcode": "95041", "country_code": "us" },
+      "boundingbox": ["37.0363276", "37.0364276", "-122.0276844", "-122.0275844"]
+    }
+  ],
+
+  "jenkinsonLake": [
+    {
+      "place_id": 322023737,
+      "osm_type": "relation",
+      "osm_id": 6868337,
+      "lat": "38.7258857",
+      "lon": "-120.5576049",
+      "category": "water",
+      "type": "reservoir",
+      "place_rank": 20,
+      "importance": 0.10540294855860563,
+      "addresstype": "reservoir",
+      "name": "Jenkinson Lake",
+      "display_name": "Jenkinson Lake, Sly Park, El Dorado County, California, United States",
+      "address": { "hamlet": "Sly Park", "county": "El Dorado County", "state": "California", "country_code": "us" },
+      "boundingbox": ["38.7146812", "38.7371481", "-120.5732408", "-120.5288582"]
+    }
+  ],
+
+  "addressExact": [
+    {
+      "place_id": 393073211,
+      "osm_type": "way",
+      "osm_id": 10323430,
+      "lat": "38.7281734",
+      "lon": "-120.8281002",
+      "category": "place",
+      "type": "house",
+      "place_rank": 30,
+      "importance": 0.00000999999999995449,
+      "addresstype": "place",
+      "name": "",
+      "display_name": "2850, Fairlane Court, Apex, Placerville, El Dorado County, California, 95667, United States",
+      "address": {
+        "house_number": "2850", "road": "Fairlane Court", "hamlet": "Apex", "town": "Placerville",
+        "county": "El Dorado County", "state": "California", "postcode": "95667", "country_code": "us"
+      },
+      "boundingbox": ["38.7281234", "38.7282234", "-120.8281502", "-120.8280502"]
+    }
+  ],
+
+  "addressRoadOnly": [
+    {
+      "place_id": 322873299,
+      "osm_type": "way",
+      "osm_id": 1174210621,
+      "lat": "38.6411193",
+      "lon": "-121.0659706",
+      "category": "highway",
+      "type": "residential",
+      "place_rank": 26,
+      "importance": 0.05338373617151137,
+      "addresstype": "road",
+      "name": "Golden Foothill Parkway",
+      "display_name": "Golden Foothill Parkway, Springfield Meadows, El Dorado County, California, 95762, United States",
+      "address": {
+        "road": "Golden Foothill Parkway", "hamlet": "Springfield Meadows",
+        "county": "El Dorado County", "state": "California", "postcode": "95762", "country_code": "us"
+      },
+      "boundingbox": ["38.6409277", "38.6414225", "-121.0664995", "-121.0655041"]
+    }
+  ],
+
+  "empty": []
+}

@@ -4,6 +4,14 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.30-a — 2026-07-30
+
+- The Enter Coordinates button is now Go To: the same box still takes coordinates (DD / DDM / DMS / UTM), but you can also type a place name ("Jenkinson Lake", "Pyramid Peak", "Desolation Wilderness") or a street address and the map goes there. It opens a proper dialog instead of the old browser prompt.
+- When a name matches more than one place — there are several Mount Baldys in California and Nevada — every match is listed with its type, county and state, and how far it is from you, closest first. Distances are measured from your device GPS when the app already has a fix, otherwise from the map center; searching never triggers a location permission prompt of its own.
+- Places with a real extent (a lake, a wilderness area) zoom to fit that area rather than a fixed zoom. Selecting a result only moves the map — tick "Create op area" in the dialog if you want it to build the operational area and run the full pre-flight instead.
+- Coordinates are still resolved entirely on-device: typing a coordinate makes no network request and works offline exactly as before. Searches are cached for 30 days, so a place you looked up at base can be found again in the field with no signal (flagged as cached, with its age).
+- Search results always show the full matched name, and if you type a street number that could not be matched exactly the app says so rather than silently dropping a pin on the nearest road. Place search is powered by OpenStreetMap / Nominatim.
+
 ## v2026.07.29-a — 2026-07-29
 
 - Vegetation Height and Sun Shadow now switch on and off from the Map Layers panel (under Analysis) like every other overlay — their Terrain-tab checkboxes are gone. Both rows are always listed, so an overlay you turned off can be turned back on from the same place. The Terrain tab keeps the opacity sliders, Refresh-for-view and the canopy EDIT link, and the two opacity sliders for each overlay now stay in step.
