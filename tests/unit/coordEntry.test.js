@@ -118,3 +118,51 @@ describe('parseCoordinateInput', () => {
     expect(parseCoordinateInput('hello world')).toBeNull();
   });
 });
+
+// The "Go To" box routes on this function alone: a non-null result is applied
+// synchronously with no network call, and ONLY a null sends the text to the
+// geocoder. These cases pin that boundary in both directions, because a
+// regression either way is silent — a name swallowed as coordinates would jump
+// the map somewhere arbitrary, and a coordinate leaked to the geocoder would
+// break offline coordinate entry and burn rate-limit budget.
+describe('coordinate-vs-place routing boundary', () => {
+  it('still parses every coordinate format, so these never reach the network', () => {
+    for (const s of [
+      '38.78673, -120.61770',
+      '38.78673, -120.61770, 2000',
+      "38°47.204', -120°37.062'",
+      '38 47 12, -120 37 04',
+      '10S 0706918E 4295806N',
+      '10S 0706918E 4295806N, 2000',
+      '38.78673 N, 120.61770 W',
+    ]) {
+      expect(parseCoordinateInput(s)).not.toBeNull();
+    }
+  });
+
+  it('returns null for place names and addresses, routing them to search', () => {
+    for (const s of [
+      'Jenkinson Lake',
+      'Mount Baldy',
+      'Pyramid Peak',
+      'Desolation Wilderness',
+      'Sly Park',
+      '7020 Talmage Ct, El Dorado Hills, CA 95762',
+      '2850 Fairlane Ct, Placerville, CA 95667',
+      'Ice House Road',
+      'Highway 50',
+      'Placerville, CA',
+      'Union Valley Reservoir',
+    ]) {
+      expect(parseCoordinateInput(s)).toBeNull();
+    }
+  });
+
+  it('does not mistake a comma-separated place for a coordinate pair', () => {
+    // Two comma segments is the DD shape, but neither half is an angle.
+    expect(parseCoordinateInput('Placerville, California')).toBeNull();
+    expect(parseCoordinateInput('Sly Park, CA')).toBeNull();
+    // Three segments is the DD+radius shape.
+    expect(parseCoordinateInput('El Dorado Hills, CA, 95762')).toBeNull();
+  });
+});

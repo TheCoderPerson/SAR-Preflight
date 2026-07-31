@@ -24,6 +24,28 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.07.30-a',
+    date: '2026-07-30',
+    changes: [
+      'The Enter Coordinates button is now Go To: the same box still takes coordinates (DD / DDM / DMS / UTM), but you can also type a place name ("Jenkinson Lake", "Pyramid Peak", "Desolation Wilderness") or a street address and the map goes there. It opens a proper dialog instead of the old browser prompt.',
+      'When a name matches more than one place — there are several Mount Baldys in California and Nevada — every match is listed with its type, county and state, and how far it is from you, closest first. Distances are measured from your device GPS when the app already has a fix, otherwise from the map center; searching never triggers a location permission prompt of its own.',
+      'Places with a real extent (a lake, a wilderness area) zoom to fit that area rather than a fixed zoom. Selecting a result only moves the map — tick "Create op area" in the dialog if you want it to build the operational area and run the full pre-flight instead.',
+      'Coordinates are still resolved entirely on-device: typing a coordinate makes no network request and works offline exactly as before. Searches are cached for 30 days, so a place you looked up at base can be found again in the field with no signal (flagged as cached, with its age).',
+      'Search results always show the full matched name, and if you type a street number that could not be matched exactly the app says so rather than silently dropping a pin on the nearest road. Place search is powered by OpenStreetMap / Nominatim.',
+    ],
+  },
+  {
+    version: '2026.07.29-a',
+    date: '2026-07-29',
+    changes: [
+      'Vegetation Height and Sun Shadow now switch on and off from the Map Layers panel (under Analysis) like every other overlay — their Terrain-tab checkboxes are gone. Both rows are always listed, so an overlay you turned off can be turned back on from the same place. The Terrain tab keeps the opacity sliders, Refresh-for-view and the canopy EDIT link, and the two opacity sliders for each overlay now stay in step.',
+      'Map Layers categories collapse: tap a heading (FACILITIES, TRAFFIC, WIRE HAZARDS, …) to fold that category away. Collapsed sections are remembered between sessions — useful on a phone now that the panel runs to 22 categories.',
+      'New PLANS button in the header: a pre-mission declutter that switches off and collapses Radar, Traffic, Operations and Smoke. It stays on until you press it again, so a background data refresh will not quietly put the radar back — but re-checking any layer by hand still sticks.',
+      'Placing a viewshed observer now draws a dashed VLOS range ring that follows the cursor, so you can see how far the range actually reaches before committing to a spot. Every placed observer keeps a ring at its own stored VLOS range (visible on touch devices too), and the rings hide with the Observers layer.',
+      'Fixed: clearing the operational area left the sun shadow overlay stranded on the map, where scrubbing the time bar no longer updated it.',
+    ],
+  },
+  {
     version: '2026.07.23-b',
     date: '2026-07-23',
     changes: [
@@ -3688,6 +3710,357 @@ function parseCoordinateInput(raw) {
 }
 
 // ============================================================
+// PLACE / ADDRESS SEARCH (pure) — query builder, response normalizer,
+// proximity ranker and display formatters for the "Go To" tool.
+//
+// ONE provider: Nominatim (OpenStreetMap). It is CORS-open from a browser,
+// handles BOTH place names and US street addresses, and — critically for a
+// SAR tool — degrades HONESTLY: when it cannot match a house number it
+// returns the road and SAYS SO via addresstype, instead of silently
+// substituting a different address. (Photon was evaluated and rejected: for
+// "1360 Johnson Blvd, South Lake Tahoe" it returned "3489 Lake Tahoe
+// Boulevard" — a confidently wrong address ~2 mi away. The US Census
+// geocoder is authoritative for addresses but is CORS-blocked.)
+//
+// Everything provider-specific is confined to GEOCODE_PROVIDER and
+// normalizeNominatimResult; the rest of the pipeline is provider-agnostic so
+// a second rung can be added later without touching the UI.
+//
+// USAGE POLICY (nominatim.openstreetmap.org, non-negotiable):
+//   - max 1 request/second -> GEOCODE_MIN_INTERVAL_MS, enforced app-side
+//   - NO autocomplete / per-keystroke querying -> search fires on submit ONLY.
+//     Never bind this to keyup/input. There is no debounce that makes it legal.
+//   - the app must identify itself -> browsers send Referer automatically.
+//     Do NOT try to set User-Agent: it is a forbidden header name in browsers
+//     and is silently dropped, so a client-side attempt is a no-op that just
+//     looks like compliance.
+// If we are ever blocked, the escalation is a one-const change: point
+// GEOCODE_PROVIDER.base at a /nominatim/ route on the data-proxy Worker,
+// where a real User-Agent and a shared server-side cache CAN be set.
+// ============================================================
+
+const GEOCODE_PROVIDER = {
+  id: 'nominatim',
+  label: 'OpenStreetMap / Nominatim',
+  base: 'https://nominatim.openstreetmap.org/search',
+  attribution: 'Search: OpenStreetMap / Nominatim',
+};
+
+const GEOCODE_MIN_INTERVAL_MS = 1100;  // 1 req/s policy + margin
+const GEOCODE_LIMIT = 10;              // enough that the local match survives importance ordering
+const GEOCODE_VIEWBOX_DEG = 1.5;       // half-span of the soft proximity bias box
+const GEOCODE_FIT_MIN_SPAN_M = 300;    // below this an extent is a building, not a place
+const GEOCODE_CACHE_DECIMALS = 1;      // anchor rounding for the cache key (~11 km cells)
+
+// category/type -> human label. Missing entries fall back to the raw type.
+const GEOCODE_KIND_LABELS = {
+  'natural/peak': 'Peak', 'natural/water': 'Lake', 'natural/wood': 'Forest',
+  'natural/glacier': 'Glacier', 'natural/valley': 'Valley', 'natural/ridge': 'Ridge',
+  'natural/saddle': 'Saddle', 'natural/spring': 'Spring', 'natural/cliff': 'Cliff',
+  'natural/bay': 'Bay', 'natural/beach': 'Beach',
+  'waterway/river': 'River', 'waterway/stream': 'Stream', 'waterway/waterfall': 'Waterfall',
+  'waterway/dam': 'Dam',
+  'boundary/protected_area': 'Protected Area', 'boundary/national_park': 'National Park',
+  'boundary/administrative': 'Boundary',
+  'leisure/nature_reserve': 'Nature Reserve', 'leisure/park': 'Park',
+  'landuse/reservoir': 'Reservoir', 'landuse/forest': 'Forest',
+  'place/city': 'City', 'place/town': 'Town', 'place/village': 'Village',
+  'place/hamlet': 'Hamlet', 'place/locality': 'Locality', 'place/house': 'Address',
+  'place/neighbourhood': 'Neighborhood', 'place/suburb': 'Suburb', 'place/county': 'County',
+  'place/state': 'State', 'place/isolated_dwelling': 'Dwelling',
+  'highway/trailhead': 'Trailhead', 'highway/path': 'Trail', 'highway/footway': 'Trail',
+  'highway/track': 'Track', 'highway/residential': 'Road', 'highway/unclassified': 'Road',
+  'highway/service': 'Road', 'highway/primary': 'Road', 'highway/secondary': 'Road',
+  'highway/tertiary': 'Road', 'highway/motorway': 'Highway', 'highway/trunk': 'Highway',
+  'tourism/camp_site': 'Campground', 'tourism/viewpoint': 'Viewpoint',
+  'tourism/wilderness_hut': 'Hut', 'tourism/attraction': 'Attraction',
+  'amenity/hospital': 'Hospital', 'amenity/fire_station': 'Fire Station',
+  'amenity/police': 'Police', 'amenity/ranger_station': 'Ranger Station',
+  'amenity/school': 'School', 'amenity/parking': 'Parking',
+  'aeroway/aerodrome': 'Airport', 'aeroway/helipad': 'Helipad',
+  'man_made/tower': 'Tower',
+};
+
+// Soft proximity bias box around an anchor. Longitude half-span is widened by
+// 1/cos(lat) so the box stays roughly square on the ground. Returns
+// { west, north, east, south } (Nominatim's viewbox order) or null.
+function geocodeViewbox(anchor, halfSpanDeg) {
+  if (!anchor || !Number.isFinite(anchor.lat) || !Number.isFinite(anchor.lng)) return null;
+  const half = Number.isFinite(halfSpanDeg) && halfSpanDeg > 0 ? halfSpanDeg : GEOCODE_VIEWBOX_DEG;
+  const cos = Math.max(0.05, Math.cos(anchor.lat * Math.PI / 180));
+  const dLng = Math.min(180, half / cos);
+  return {
+    west: anchor.lng - dLng,
+    north: Math.min(90, anchor.lat + half),
+    east: anchor.lng + dLng,
+    south: Math.max(-90, anchor.lat - half),
+  };
+}
+
+// Build the search URL. opts: { limit, viewbox }. The viewbox is a BIAS, not a
+// filter — `bounded` is deliberately NOT set, so a query for somewhere far away
+// still resolves. Returns null for an empty query.
+function geocodeQueryUrl(query, opts) {
+  const q = String(query == null ? '' : query).trim();
+  if (!q) return null;
+  opts = opts || {};
+  const limit = Number.isFinite(opts.limit) && opts.limit > 0 ? Math.floor(opts.limit) : GEOCODE_LIMIT;
+  const parts = [
+    'q=' + encodeURIComponent(q),
+    'format=jsonv2',
+    'addressdetails=1',
+    'dedupe=1',
+    'limit=' + limit,
+  ];
+  const vb = opts.viewbox;
+  if (vb && Number.isFinite(vb.west) && Number.isFinite(vb.north)
+      && Number.isFinite(vb.east) && Number.isFinite(vb.south)) {
+    parts.push('viewbox=' + [vb.west, vb.north, vb.east, vb.south].map(v => v.toFixed(5)).join(','));
+  }
+  return GEOCODE_PROVIDER.base + '?' + parts.join('&');
+}
+
+function geocodeKindLabel(category, type) {
+  const cat = String(category == null ? '' : category).trim();
+  const t = String(type == null ? '' : type).trim();
+  const key = cat + '/' + t;
+  if (GEOCODE_KIND_LABELS[key]) return GEOCODE_KIND_LABELS[key];
+  const raw = t || cat;
+  if (!raw) return '';
+  // "camp_site" -> "Camp Site"
+  return raw.split(/[_\s]+/).filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
+
+// Short admin line, coarse-to-fine dropped: "El Dorado County, California".
+function _geocodeAdmin(addr) {
+  if (!addr || typeof addr !== 'object') return '';
+  const city = addr.city || addr.town || addr.village || addr.hamlet || addr.municipality || '';
+  const county = addr.county || '';
+  const state = addr.state || addr.province || '';
+  const country = addr.country_code ? String(addr.country_code).toUpperCase() : '';
+  const out = [];
+  if (city) out.push(city);
+  if (county && county !== city) out.push(county);
+  if (state) out.push(state);
+  if (!out.length && country) out.push(country);
+  else if (country && country !== 'US') out.push(country);
+  return out.join(', ');
+}
+
+// One Nominatim jsonv2 row -> canonical record, or null if unusable.
+function normalizeNominatimResult(r) {
+  if (!r || typeof r !== 'object') return null;
+  const lat = Number(r.lat), lng = Number(r.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+
+  const category = r.category || r.class || '';
+  const type = r.type || '';
+  const addr = r.address || null;
+  const displayName = String(r.display_name || r.name || '').trim();
+  if (!displayName) return null;
+  // jsonv2's `name` is often '' for addresses — fall back to the leading
+  // component of display_name so a row is never blank in the list.
+  const name = String(r.name || '').trim() || displayName.split(',')[0].trim();
+
+  let bbox = null;
+  const bb = r.boundingbox;
+  if (Array.isArray(bb) && bb.length === 4) {
+    const south = Number(bb[0]), north = Number(bb[1]), west = Number(bb[2]), east = Number(bb[3]);
+    if ([south, north, west, east].every(Number.isFinite) && north > south && east > west) {
+      bbox = { south, west, north, east };
+    }
+  }
+
+  const osmType = String(r.osm_type || '').charAt(0).toUpperCase();
+  const id = (osmType && r.osm_id != null)
+    ? 'osm:' + osmType + ':' + r.osm_id
+    : (r.place_id != null ? 'place:' + r.place_id : 'll:' + lat.toFixed(6) + ',' + lng.toFixed(6));
+
+  const addressType = String(r.addresstype || '').trim();
+  return {
+    id,
+    provider: GEOCODE_PROVIDER.id,
+    name,
+    displayName,                                  // FULL, verbatim, never truncated by the UI
+    kind: (category || '') + '/' + (type || ''),
+    kindLabel: geocodeKindLabel(category, type),
+    admin: _geocodeAdmin(addr),
+    lat, lng,
+    bbox,
+    addressType,
+    // A house-number-level hit. Nominatim reports these as addresstype 'house'
+    // (or 'building'), or carries an address.house_number.
+    isExactAddress: addressType === 'house' || addressType === 'building'
+      || !!(addr && addr.house_number),
+    rank: Number.isFinite(Number(r.place_rank)) ? Number(r.place_rank) : null,
+    importance: Number.isFinite(Number(r.importance)) ? Number(r.importance) : null,
+    distanceKm: null,
+  };
+}
+
+// Full response -> canonical records. Non-array input yields []. Duplicates
+// (the same place returned as both a node and a way) collapse on name +
+// 3-decimal lat/lng, keeping whichever row carries a bbox.
+function normalizeGeocodeResults(json) {
+  if (!Array.isArray(json)) return [];
+  const out = [];
+  const seen = new Map();
+  for (const row of json) {
+    const rec = normalizeNominatimResult(row);
+    if (!rec) continue;
+    const key = rec.name.toLowerCase() + '|' + rec.lat.toFixed(3) + ',' + rec.lng.toFixed(3);
+    const prevIdx = seen.get(key);
+    if (prevIdx == null) { seen.set(key, out.length); out.push(rec); continue; }
+    // Keep the richer row: prefer one with a bbox.
+    if (!out[prevIdx].bbox && rec.bbox) out[prevIdx] = rec;
+  }
+  return out;
+}
+
+// Sort by true distance from the anchor, nearest first, filling distanceKm.
+// Nominatim orders by `importance`, which is why this exists: "Mount Baldy"
+// comes back with the far ones first. A null anchor leaves provider order
+// intact and distanceKm null. Returns a NEW array; inputs are not mutated.
+function rankGeocodeResults(records, anchor) {
+  if (!Array.isArray(records)) return [];
+  const recs = records.map(r => Object.assign({}, r));
+  if (!anchor || !Number.isFinite(anchor.lat) || !Number.isFinite(anchor.lng)) return recs;
+  for (const r of recs) {
+    r.distanceKm = (Number.isFinite(r.lat) && Number.isFinite(r.lng))
+      ? haversine(anchor.lat, anchor.lng, r.lat, r.lng)
+      : null;
+  }
+  return recs.sort((a, b) => {
+    const da = Number.isFinite(a.distanceKm) ? a.distanceKm : Infinity;
+    const db = Number.isFinite(b.distanceKm) ? b.distanceKm : Infinity;
+    if (da !== db) return da - db;
+    return (b.importance || 0) - (a.importance || 0);
+  });
+}
+
+// Map bounds to fit for a result, or null when the caller should just setView.
+// A bbox smaller than GEOCODE_FIT_MIN_SPAN_M is a building/node footprint —
+// fitting it would zoom to street level on a 15 m box.
+function geocodeFitBounds(rec, opts) {
+  if (!rec || !rec.bbox) return null;
+  const b = rec.bbox;
+  if (![b.south, b.west, b.north, b.east].every(Number.isFinite)) return null;
+  if (b.north <= b.south || b.east <= b.west) return null;
+  const minSpan = (opts && Number.isFinite(opts.minSpanM)) ? opts.minSpanM : GEOCODE_FIT_MIN_SPAN_M;
+  const latSpanM = (b.north - b.south) * 111320;
+  const lngSpanM = (b.east - b.west) * 111320 * Math.max(0.05, Math.cos(((b.north + b.south) / 2) * Math.PI / 180));
+  if (Math.max(latSpanM, lngSpanM) < minSpan) return null;
+  return { south: b.south, west: b.west, north: b.north, east: b.east };
+}
+
+// km -> display string. Imperial by default (this is a US SAR tool).
+function formatGeocodeDistance(km, opts) {
+  if (!Number.isFinite(km)) return '';
+  const metric = !!(opts && opts.metric);
+  if (metric) return km < 1 ? (km * 1000).toFixed(0) + ' m' : (km < 10 ? km.toFixed(1) : Math.round(km).toLocaleString()) + ' km';
+  const mi = km * 0.621371;
+  if (mi < 0.1) return (mi * 5280).toFixed(0) + ' ft';
+  if (mi < 10) return mi.toFixed(1) + ' mi';
+  return Math.round(mi).toLocaleString() + ' mi';
+}
+
+// Display strings for one result row. `subtitle` is the provider's FULL
+// matched string — never truncated or ellipsized, because an operator must be
+// able to read exactly what the search actually matched before acting on it.
+function formatGeocodeResult(rec, opts) {
+  if (!rec) return null;
+  const metaBits = [];
+  if (rec.kindLabel) metaBits.push(rec.kindLabel);
+  if (rec.admin) metaBits.push(rec.admin);
+  return {
+    title: rec.name || rec.displayName,
+    meta: metaBits.join(' · '),
+    subtitle: rec.displayName,
+    distance: formatGeocodeDistance(rec.distanceKm, opts),
+  };
+}
+
+// Did the operator type a street number? Leading digits followed by a word.
+// "38.78" and "38 47 12" are coordinates and must not count.
+function geocodeQueryHasHouseNumber(query) {
+  const s = String(query == null ? '' : query).trim();
+  if (!s) return false;
+  return /^\d{1,6}[a-z]?\s+[a-z]/i.test(s);
+}
+
+// Honest-degradation notice: the operator asked for a street number but the
+// best match is a whole road, so the pin is somewhere on that road — not at
+// the address. Returns a string, or null when there is nothing to warn about.
+function geocodeMatchWarning(query, records) {
+  if (!geocodeQueryHasHouseNumber(query)) return null;
+  if (!Array.isArray(records) || !records.length) return null;
+  if (records.some(r => r && r.isExactAddress)) return null;
+  return 'No exact street-number match. These are the closest roads/places — '
+    + 'the pin is somewhere along the road, not at the address. Verify before use.';
+}
+
+// Status line under the search box. Returns { text, tone } where tone is one of
+// 'loading' | 'ok' | 'warn' | 'error'.
+function geocodeStatusText(st) {
+  st = st || {};
+  if (st.loading) return { text: 'Searching…', tone: 'loading' };
+  if (st.error === 'rate-limited') {
+    return { text: 'Search service is busy. Wait a moment, or enter coordinates.', tone: 'error' };
+  }
+  if (st.error === 'offline') {
+    return { text: 'Offline — no cached result for this search. Coordinates still work.', tone: 'warn' };
+  }
+  if (st.error) return { text: 'Search failed: ' + st.error, tone: 'error' };
+  const n = Number.isFinite(st.count) ? st.count : 0;
+  if (!n) return { text: 'No matches.', tone: 'warn' };
+  const base = n === 1 ? '1 match' : n + ' matches';
+  if (st.fromCache) {
+    const age = relAge(st.cachedAt, st.nowMs);
+    return { text: base + ' · cached' + (age ? ' ' + age + ' ago' : '') + ' — may be out of date', tone: 'warn' };
+  }
+  return { text: base + ' · nearest first', tone: 'ok' };
+}
+
+// "from GPS fix (4m ago)" / "from map center" / ''.
+function geocodeAnchorLabel(anchor, nowMs) {
+  if (!anchor) return '';
+  if (anchor.source === 'gps') {
+    const age = relAge(anchor.at, nowMs);
+    return 'distances from GPS fix' + (age ? ' (' + age + ' ago)' : '');
+  }
+  if (anchor.source === 'map') return 'distances from map center';
+  return '';
+}
+
+// Cache key: normalized query + anchor quantized to ~11 km. The anchor is part
+// of the key because the viewbox is part of the request and changes what comes
+// back — a Colorado-biased result set must not be served to a California user.
+function geocodeCacheKey(query, anchor) {
+  const q = String(query == null ? '' : query).trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!q) return null;
+  let a = 'none';
+  if (anchor && Number.isFinite(anchor.lat) && Number.isFinite(anchor.lng)) {
+    a = anchor.lat.toFixed(GEOCODE_CACHE_DECIMALS) + ',' + anchor.lng.toFixed(GEOCODE_CACHE_DECIMALS);
+  }
+  return encodeURIComponent(q) + '|' + a;
+}
+
+// ms to wait before the next request may go out. Never negative; a backwards
+// clock jump (elapsed < 0) is treated as "wait the full interval" rather than
+// letting a bogus timestamp open the throttle.
+function geocodeRateLimitDelay(lastAtMs, nowMs, minIntervalMs) {
+  const interval = Number.isFinite(minIntervalMs) && minIntervalMs > 0 ? minIntervalMs : GEOCODE_MIN_INTERVAL_MS;
+  if (!Number.isFinite(lastAtMs) || lastAtMs <= 0) return 0;
+  if (!Number.isFinite(nowMs)) return 0;
+  const elapsed = nowMs - lastAtMs;
+  if (elapsed < 0) return interval;
+  if (elapsed >= interval) return 0;
+  return interval - elapsed;
+}
+
+// ============================================================
 // PARCEL DATA (pure) — two-tier assessor-parcel source registry + resolver +
 // normalizer + provenance-chip state machine. Planning intelligence, NOT
 // authoritative boundary data: both sources are CORS-open ArcGIS REST services
@@ -4050,6 +4423,13 @@ if (typeof module !== 'undefined' && module.exports) {
     pointInPolygon, pointInRings, distPointToSegment, polygonBBox, bboxesOverlap, segmentsIntersect, polygonsIntersect,
     circleToPolygon, parseFaaCoord, normalizeFaaDate, geoJsonOuterRings,
     utmToLatLng, parseAngleFlexible, parseCoordinateInput,
+    GEOCODE_PROVIDER, GEOCODE_MIN_INTERVAL_MS, GEOCODE_LIMIT, GEOCODE_VIEWBOX_DEG,
+    GEOCODE_FIT_MIN_SPAN_M, GEOCODE_KIND_LABELS,
+    geocodeViewbox, geocodeQueryUrl, geocodeKindLabel,
+    normalizeNominatimResult, normalizeGeocodeResults, rankGeocodeResults, geocodeFitBounds,
+    formatGeocodeDistance, formatGeocodeResult,
+    geocodeQueryHasHouseNumber, geocodeMatchWarning,
+    geocodeStatusText, geocodeAnchorLabel, geocodeCacheKey, geocodeRateLimitDelay,
     sunGlareWindows, formatSectorRanges, glareMaxElevation, GLARE_CONE_DEG,
     parseTfrGeoJson, parseTfrList, normalizeTfrDetailDoc, parseTfrDetailXml,
     filterTfrsIntersectingArea, isTfrActiveNow, parseNotamText, geolocateNotam,

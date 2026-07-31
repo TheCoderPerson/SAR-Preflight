@@ -102,6 +102,11 @@ describe('ENDPOINT_TTL', () => {
     expect(ENDPOINT_TTL.elevation).toBeGreaterThan(ENDPOINT_TTL.weather);
     expect(ENDPOINT_TTL.elevation).toBeGreaterThan(ENDPOINT_TTL.nws);
   });
+
+  it('geocode results are cached long — place names change on a scale of years', () => {
+    expect(ENDPOINT_TTL.geocode).toBe(30 * 24 * 60 * 60000);
+    expect(ENDPOINT_TTL.geocode).toBeGreaterThan(ENDPOINT_TTL.elevation);
+  });
 });
 
 describe('viewsheds store (v3)', () => {

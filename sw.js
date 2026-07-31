@@ -152,6 +152,15 @@ function routeStrategy(url) {
   // Radar tiles — network-only (time-sensitive)
   if (url.includes('tilecache.rainviewer.com')) return 'network-only';
 
+  // Place/address search — network-only. This layer does its OWN IndexedDB
+  // caching, with its own TTL and its own explicit "cached · N ago" status
+  // line. Letting the SW cache it too would create a second, invisible cache
+  // whose staleness the UI cannot report, so a stale hit would render as if it
+  // were live — exactly the failure mode this feature is built to avoid.
+  // (Omitting it entirely is worse still: it would fall through to the
+  // cache-first default below and pin the first response forever.)
+  if (url.includes('nominatim.openstreetmap.org')) return 'network-only';
+
   // API endpoints — network-first with cache fallback
   if (url.includes('api.open-meteo.com') ||
       url.includes('air-quality-api.open-meteo.com') ||

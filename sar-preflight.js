@@ -29,6 +29,16 @@ const S = {
   dataSourceErrors: {},
   // Track active fetches for header status
   _activeFetches: {},
+  // Last known real device GPS fix, captured opportunistically from the
+  // getCurrentPosition calls the app ALREADY makes (initMap centering,
+  // locateMe). Read via searchAnchor() so features that want a device position
+  // can use one WITHOUT triggering a permission prompt of their own.
+  deviceFix: null,          // { lat, lng, accM, at }
+  // Place/address search ("Go To" modal)
+  _geocodeResults: [], _geocodeAnchor: null, _geocodeQuery: '',
+  _geocodeAbort: null, _geocodeGen: 0, _geocodeLastAt: 0,
+  _geocodeSel: -1,
+  _geocodeMemo: null,       // Map<cacheKey, rawJson> — session-scoped, bounded
   // SOP Risk Profile
   activeProfile: null,
   // ADS-B live traffic
@@ -53,6 +63,13 @@ const S = {
   activeViewshedId: null,   // last-selected observer (status line / export default); display = every record with visible !== false
   _viewshedRunningId: null, // id currently computing (serializes the kernel)
   _viewshedPicking: false,
+  _vlosGhost: null,         // dashed VLOS ring following the cursor while picking an observer
+  _vlosMove: null,          // its map mousemove handler (attached only while picking)
+  // Layer-control UI: collapsed section keys + PLANS declutter mode. Both survive
+  // the ~50 buildLayerControl() rebuilds and persist via _persistLayerUiState().
+  layerSections: new Set(),
+  plansMode: false,
+  _plansUserOverride: null, // Set of PLANS layer ids the user has deliberately re-checked
   // Canopy edit mode (user corrections to the canopy raster)
   _canopyEditing: false,
   canopyEdit: null,         // session state — see startCanopyEdit()
@@ -650,6 +667,8 @@ function _isConstrained() {
 // stretched overlay crashed the iOS PWA), full 19 on desktop.
 const MAX_MAP_ZOOM = _isConstrained() ? 18 : 19;
 function initMap() {
+  // Collapsed layer-control sections + PLANS mode, before the first buildLayerControl.
+  restoreLayerUiState();
   // preferCanvas: render vector layers (wires, obstacles, towers, airspace,
   // ADS-B, etc.) on one GPU canvas instead of per-feature SVG — much smoother
   // panning at close zoom on high-DPR mobile (the choppiness reported on iPhone).
@@ -751,7 +770,7 @@ function initMap() {
   // Center map on device location if available
   if (navigator.geolocation) {
     navigator.geolocation.getCurrentPosition(
-      pos => S.map.setView([pos.coords.latitude, pos.coords.longitude], 11),
+      pos => { _noteDeviceFix(pos); S.map.setView([pos.coords.latitude, pos.coords.longitude], 11); },
       () => { /* denied or unavailable — keep default center */ },
       { timeout: 5000, maximumAge: 300000 }
     );
@@ -841,6 +860,7 @@ function clearArea() {
   // the layer control (clearArea intentionally leaves that to the next processArea).
   // Saved viewsheds stay in IndexedDB; restoreViewsheds re-hydrates them per area.
   if (S.mapLayers.observers) S.mapLayers.observers.clearLayers();
+  if (S.mapLayers.observer_rings) S.mapLayers.observer_rings.clearLayers();
   try {
     let freed = 0;
     (S.viewsheds || []).forEach(r => { if (r && r.mask && r.mask.length) { Diag.free('viewshedMask', r.mask.length); freed += r.mask.length; } });
@@ -849,8 +869,10 @@ function clearArea() {
   S.viewsheds = []; S.activeViewshedId = null;
   if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
   if (S.mapLayers.canopy && S.map && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
-  S._overlayWanted = { canopy: false, viewshed: false };
-  const _canopyCb = document.getElementById('canopyToggle'); if (_canopyCb) _canopyCb.checked = false;
+  // Shadow too: leaving it draped while clearing _overlayWanted.shadow stranded
+  // the raster on the map with time-bar scrubbing and the zoom cap both dead.
+  if (S.mapLayers.shadow && S.map && S.map.hasLayer(S.mapLayers.shadow)) S.map.removeLayer(S.mapLayers.shadow);
+  S._overlayWanted = { canopy: false, viewshed: false, shadow: false };
   const _vsRes = document.getElementById('vsResult'); if (_vsRes) _vsRes.textContent = '';
   S.faaAirspace = null;
   S.faaObstacles = null;
@@ -873,31 +895,353 @@ function clearArea() {
   const forecastSection = document.getElementById('forecastSection');
   if (forecastSection) forecastSection.style.display = 'none';
 }
+// ============================================================
+// GO TO — coordinates, place name, or address
+//
+// The input box takes all three. Coordinates are resolved SYNCHRONOUSLY and
+// never touch the network; only text that parseCoordinateInput rejects is sent
+// to the geocoder. That ordering is the contract — it keeps coordinate entry
+// fully offline-capable and keeps rate-limit budget for the searches that
+// actually need it.
+// ============================================================
+
+const DEVICE_FIX_MAX_AGE_MS = 30 * 60 * 1000; // beyond this a fix is not "where I am"
+
+// Opportunistic capture. Called from every getCurrentPosition SUCCESS callback
+// the app already has — it never adds a geolocation call of its own.
+function _noteDeviceFix(pos) {
+  if (!pos || !pos.coords) return;
+  const lat = pos.coords.latitude, lng = pos.coords.longitude;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  S.deviceFix = {
+    lat, lng,
+    accM: Number.isFinite(pos.coords.accuracy) ? pos.coords.accuracy : null,
+    at: Number.isFinite(pos.timestamp) ? pos.timestamp : Date.now(),
+  };
+}
+
+// Ranking anchor for place search. Prefers a RECENT real GPS fix if one is
+// already known, otherwise the map center. This function NEVER calls
+// navigator.geolocation: a search must not stall behind a permission dialog,
+// and a search must never be the thing that provokes one.
+function searchAnchor() {
+  const f = S.deviceFix;
+  if (f && Number.isFinite(f.lat) && Number.isFinite(f.lng)
+      && (Date.now() - f.at) < DEVICE_FIX_MAX_AGE_MS) {
+    return { lat: f.lat, lng: f.lng, source: 'gps', at: f.at };
+  }
+  if (S.map && typeof S.map.getCenter === 'function') {
+    const c = S.map.getCenter();
+    if (c && Number.isFinite(c.lat) && Number.isFinite(c.lng)) {
+      return { lat: c.lat, lng: c.lng, source: 'map', at: null };
+    }
+  }
+  return null;
+}
+
+// --- Modal open / close / input plumbing ---
+
 function enterCoords() {
-  const c0 = S.map.getCenter();
-  const input = prompt(
-    'Enter coordinates in DD, DDM, DMS, or UTM — symbols optional.\n'
-    + 'Add a radius in meters to create an operational area; without one the map just moves there.\n'
-    + `  ${c0.lat.toFixed(5)}, ${c0.lng.toFixed(5)}, 2000\n`
-    + '  38°47.204\', -120°37.062\'\n'
-    + '  38 47 12, -120 37 04\n'
-    + '  10S 0706918E 4295806N, 2000');
-  if (!input) return;
-  const p = parseCoordinateInput(input);
-  if (!p) {
-    alert('Could not parse that coordinate.\nSupported: DD ("38.78673, -120.61770"), DDM ("38 47.204, -120 37.062"), DMS ("38 47 12, -120 37 04"), or UTM ("10S 0706918E 4295806N") — with an optional trailing radius in meters.');
+  const modal = document.getElementById('coordSearchModal');
+  if (!modal) return;
+  S._geocodeResults = []; S._geocodeAnchor = null; S._geocodeQuery = ''; S._geocodeSel = -1;
+  const input = document.getElementById('coordSearchInput');
+  if (input) input.value = '';
+  const list = document.getElementById('coordSearchResults');
+  if (list) list.innerHTML = '';
+  _setGeocodeBusy(false);
+  const anchor = searchAnchor();
+  setStatus('coordSearchStatus', '', geocodeAnchorLabel(anchor, Date.now()));
+  _syncCoordRadiusRow();
+  modal.classList.add('active');
+  if (input) { try { input.focus(); } catch (_) {} }
+}
+
+function closeCoordSearch() {
+  const modal = document.getElementById('coordSearchModal');
+  if (modal) modal.classList.remove('active');
+  // Bump the generation so an in-flight search can never repaint a closed modal.
+  S._geocodeGen = (S._geocodeGen || 0) + 1;
+  if (S._geocodeAbort) { try { S._geocodeAbort.abort(); } catch (_) {} S._geocodeAbort = null; }
+  _setGeocodeBusy(false);
+}
+
+// The radius box is only meaningful when "create op area" is checked.
+function _syncCoordRadiusRow() {
+  const chk = document.getElementById('coordSearchAreaChk');
+  const rad = document.getElementById('coordSearchRadius');
+  if (rad) rad.disabled = !(chk && chk.checked);
+}
+
+// Radius in meters, or null when the operator hasn't opted into an op area.
+function _coordSearchRadiusM() {
+  const chk = document.getElementById('coordSearchAreaChk');
+  if (!chk || !chk.checked) return null;
+  const rad = document.getElementById('coordSearchRadius');
+  const v = rad ? Number(rad.value) : NaN;
+  return (Number.isFinite(v) && v > 0) ? v : null;
+}
+
+// Enter searches (or picks the highlighted row), Escape closes, arrows move.
+// NOTE: this handler must NEVER fire a search on a plain character keystroke —
+// Nominatim's usage policy forbids per-keystroke/autocomplete querying.
+function onCoordSearchKey(e) {
+  if (!e) return;
+  if (e.key === 'Escape') { closeCoordSearch(); return; }
+  const n = (S._geocodeResults || []).length;
+  if (e.key === 'ArrowDown' && n) {
+    e.preventDefault();
+    S._geocodeSel = (S._geocodeSel + 1) % n;
+    _highlightGeocodeRow();
     return;
   }
-  if (!p.radiusM) {
-    // No radius → don't create an area; just move the map to the point.
-    S.map.setView([p.lat, p.lng], Math.max(S.map.getZoom(), 13));
+  if (e.key === 'ArrowUp' && n) {
+    e.preventDefault();
+    S._geocodeSel = (S._geocodeSel <= 0 ? n : S._geocodeSel) - 1;
+    _highlightGeocodeRow();
     return;
   }
-  S.drawnItems.clearLayers();
-  const c = L.circle([p.lat, p.lng], { radius: p.radiusM, color: '#3d8bfd', weight: 2, fillColor: '#3d8bfd', fillOpacity: 0.08, dashArray: '6,4' });
-  S.drawnItems.addLayer(c);
-  S.map.fitBounds(c.getBounds(), { padding: [40, 40] });
-  processArea(c, 'circle');
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  // A highlighted row means "go there"; otherwise Enter runs the search.
+  if (S._geocodeSel >= 0 && S._geocodeSel < n) { pickGeocodeResult(S._geocodeSel); return; }
+  submitCoordSearch();
+}
+
+// --- Submit: coordinate-first, then geocode ---
+
+// Coordinates are resolved SYNCHRONOUSLY and never touch the network. If
+// parseCoordinateInput returns non-null, no fetch is issued and no await
+// happens, so the pre-existing behavior is preserved exactly (radius in the
+// string -> op area; no radius -> pan only).
+async function submitCoordSearch() {
+  const input = document.getElementById('coordSearchInput');
+  const raw = String((input && input.value) || '').trim();
+  if (!raw) {
+    setStatus('coordSearchStatus', 'error', 'Enter coordinates, a place name, or an address.');
+    return;
+  }
+  const p = parseCoordinateInput(raw);
+  if (p) {
+    _applyCoordTarget({
+      lat: p.lat, lng: p.lng, bbox: null,
+      radiusM: p.radiusM != null ? p.radiusM : _coordSearchRadiusM(),
+    });
+    closeCoordSearch();
+    return;
+  }
+  await runGeocodeSearch(raw);
+}
+
+// --- Fetch + cache ---
+
+function _memoGeocode(key, data) {
+  if (!key) return;
+  if (!S._geocodeMemo) S._geocodeMemo = new Map();
+  S._geocodeMemo.set(key, data);
+  if (S._geocodeMemo.size > 20) S._geocodeMemo.delete(S._geocodeMemo.keys().next().value);
+}
+
+async function _cachedGeocode(key) {
+  if (typeof getCachedApiResponse !== 'function' || !key) return null;
+  try {
+    const c = await getCachedApiResponse('geocode', key);
+    if (c && Array.isArray(c.data)) return { data: c.data, fromCache: true, cachedAt: c.timestamp };
+    // Exact miss: the key embeds the map anchor, so the SAME search run from a
+    // different map position lands on a different key. Offline that would read
+    // as "no such place" when we actually have the answer cached. Fall back to
+    // the newest entry for this query under ANY anchor — results are re-ranked
+    // against the current anchor on every read anyway, and the status line
+    // already labels the whole set as cached.
+    const bar = key.lastIndexOf('|');
+    if (bar > 0 && typeof getCachedApiResponsesByPrefix === 'function') {
+      const rows = await getCachedApiResponsesByPrefix('geocode', key.slice(0, bar + 1));
+      const hit = (rows || []).find(r => r && Array.isArray(r.data));
+      if (hit) return { data: hit.data, fromCache: true, cachedAt: hit.timestamp };
+    }
+  } catch (_) { /* cache is best-effort */ }
+  return null;
+}
+
+// Fetch + cache, mirroring _fetchGeoJsonLayer. Returns
+// { data, fromCache, cachedAt, error }.
+async function _fetchGeocode(query, anchor, ctl) {
+  const key = geocodeCacheKey(query, anchor);
+  if (key && S._geocodeMemo && S._geocodeMemo.has(key)) {
+    return { data: S._geocodeMemo.get(key), fromCache: false, cachedAt: null };
+  }
+  const url = geocodeQueryUrl(query, {
+    limit: GEOCODE_LIMIT,
+    viewbox: geocodeViewbox(anchor, GEOCODE_VIEWBOX_DEG),
+  });
+  const online = (typeof isOnline !== 'function') || isOnline();
+  if (url && online) {
+    try {
+      // 1 req/s, enforced app-side. Do NOT set a User-Agent header here: it is
+      // a forbidden header name in browsers and is silently dropped, so adding
+      // one would only create false confidence in compliance. The Referer the
+      // browser sends is what identifies this app to Nominatim.
+      const wait = geocodeRateLimitDelay(S._geocodeLastAt || 0, Date.now(), GEOCODE_MIN_INTERVAL_MS);
+      if (wait > 0) await new Promise(res => setTimeout(res, wait));
+      S._geocodeLastAt = Date.now();
+      const res = await _proxyFetch(url, ctl ? { signal: ctl.signal } : undefined);
+      // Treat a throttle as its own state — never auto-retry into a harder block.
+      if (res.status === 429 || res.status === 403) throw new Error('rate-limited');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!Array.isArray(data)) throw new Error('unexpected response');
+      if (typeof cacheApiResponse === 'function') cacheApiResponse('geocode', key, data);
+      _memoGeocode(key, data);
+      return { data, fromCache: false, cachedAt: null };
+    } catch (err) {
+      if (err && err.name === 'AbortError') return { data: null, error: 'aborted' };
+      const c = await _cachedGeocode(key);
+      if (c) return c;
+      return { data: null, error: (err && err.message) || String(err) };
+    }
+  }
+  const c = await _cachedGeocode(key);
+  if (c) return c;
+  return { data: null, error: 'offline' };
+}
+
+// AbortController + generation counter, the same shape as loadParcelsForView:
+// a superseded search must never repaint over a newer one.
+async function runGeocodeSearch(query) {
+  const anchor = searchAnchor();
+  const gen = S._geocodeGen = (S._geocodeGen || 0) + 1;
+  if (S._geocodeAbort) { try { S._geocodeAbort.abort(); } catch (_) {} }
+  const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  S._geocodeAbort = ctl;
+  S._geocodeQuery = query;
+  S._geocodeSel = -1;
+
+  _setGeocodeBusy(true);
+  _setGeocodeStatus({ loading: true });
+  const r = await _fetchGeocode(query, anchor, ctl);
+  if (gen !== S._geocodeGen) return;          // superseded, or the modal closed
+  S._geocodeAbort = null;
+  _setGeocodeBusy(false);
+  if (r.error === 'aborted') return;
+
+  const recs = rankGeocodeResults(normalizeGeocodeResults(r.data), anchor);
+  S._geocodeResults = recs;
+  S._geocodeAnchor = anchor;
+  _setGeocodeStatus({
+    count: recs.length, error: r.error, fromCache: r.fromCache,
+    cachedAt: r.cachedAt, nowMs: Date.now(),
+  });
+  _renderGeocodeResults(recs, { anchor, query, error: r.error });
+}
+
+function _setGeocodeBusy(on) {
+  const btn = document.getElementById('coordSearchBtn');
+  if (!btn) return;
+  btn.disabled = !!on;
+  btn.textContent = on ? '…' : 'GO';
+}
+
+// Pure tone -> the app's existing .fetch-status class vocabulary.
+const GEOCODE_TONE_CLASS = { loading: 'loading', ok: 'live', warn: 'cached', error: 'error' };
+
+function _setGeocodeStatus(st) {
+  const s = geocodeStatusText(st);
+  setStatus('coordSearchStatus', GEOCODE_TONE_CLASS[s.tone] || '', s.text);
+}
+
+// --- Render ---
+
+function _highlightGeocodeRow() {
+  const list = document.getElementById('coordSearchResults');
+  if (!list) return;
+  const rows = list.querySelectorAll('.geo-result');
+  rows.forEach((el, i) => el.classList.toggle('sel', i === S._geocodeSel));
+  const active = rows[S._geocodeSel];
+  if (active && typeof active.scrollIntoView === 'function') {
+    try { active.scrollIntoView({ block: 'nearest' }); } catch (_) {}
+  }
+}
+
+function _renderGeocodeResults(recs, opts) {
+  const list = document.getElementById('coordSearchResults');
+  if (!list) return;
+  opts = opts || {};
+  list.innerHTML = '';
+
+  if (!recs || !recs.length) {
+    // An empty result must NEVER render as a silent blank — name the query back
+    // and point at the path that always works.
+    const q = _esc(String(opts.query || ''));
+    const div = document.createElement('div');
+    div.className = 'geo-empty';
+    div.innerHTML = opts.error
+      ? `Could not search for <strong>${q}</strong>. Coordinates (DD / DDM / DMS / UTM) still work here and need no connection.`
+      : `No match for <strong>${q}</strong>. Try a nearby landmark, add the county or state, or enter coordinates directly.`;
+    list.appendChild(div);
+    return;
+  }
+
+  const warn = geocodeMatchWarning(opts.query, recs);
+  if (warn) {
+    const w = document.createElement('div');
+    w.className = 'geo-warn';
+    w.textContent = '⚠ ' + warn;
+    list.appendChild(w);
+  }
+
+  recs.forEach((rec, i) => {
+    const f = formatGeocodeResult(rec);
+    const row = document.createElement('div');
+    row.className = 'geo-result';
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
+    // The full matched string is shown verbatim and never truncated: the
+    // operator has to be able to see exactly what the search matched.
+    row.innerHTML =
+      `<div class="geo-row-top"><span class="geo-title">${_esc(f.title)}</span>`
+      + `<span class="geo-dist">${_esc(f.distance)}</span></div>`
+      + (f.meta ? `<div class="geo-meta">${_esc(f.meta)}</div>` : '')
+      + `<div class="geo-sub">${_esc(f.subtitle)}</div>`;
+    row.onclick = () => pickGeocodeResult(i);
+    list.appendChild(row);
+  });
+}
+
+// --- Selection -> pan / fit / create area ---
+
+function pickGeocodeResult(idx) {
+  const rec = (S._geocodeResults || [])[idx];
+  if (!rec) return;
+  _applyCoordTarget({
+    lat: rec.lat, lng: rec.lng,
+    bbox: geocodeFitBounds(rec),
+    radiusM: _coordSearchRadiusM(),
+  });
+  closeCoordSearch();
+}
+
+// The single apply path shared by coordinates and search hits.
+//   radius -> op area + full preflight (the pre-existing coordinate behavior)
+//   bbox   -> fit the feature's extent
+//   else   -> pan, zoom at least 13
+function _applyCoordTarget(t) {
+  if (!t || !Number.isFinite(t.lat) || !Number.isFinite(t.lng)) return;
+  if (t.radiusM) {
+    S.drawnItems.clearLayers();
+    const c = L.circle([t.lat, t.lng], { radius: t.radiusM, color: '#3d8bfd', weight: 2, fillColor: '#3d8bfd', fillOpacity: 0.08, dashArray: '6,4' });
+    S.drawnItems.addLayer(c);
+    S.map.fitBounds(c.getBounds(), { padding: [40, 40] });
+    // processArea is async and fire-and-forget; without this a throw inside it
+    // surfaces only as an unhandled rejection with no trace of where it came from.
+    const p = processArea(c, 'circle');
+    if (p && typeof p.catch === 'function') p.catch(err => console.warn('processArea failed:', err));
+    return;
+  }
+  if (t.bbox) {
+    S.map.fitBounds([[t.bbox.south, t.bbox.west], [t.bbox.north, t.bbox.east]], { padding: [40, 40] });
+    return;
+  }
+  S.map.setView([t.lat, t.lng], Math.max(S.map.getZoom(), 13));
 }
 
 function locateMe() {
@@ -911,6 +1255,7 @@ function locateMe() {
   navigator.geolocation.getCurrentPosition(
     pos => {
       restore();
+      _noteDeviceFix(pos);
       S.map.setView([pos.coords.latitude, pos.coords.longitude], Math.max(S.map.getZoom(), 13));
     },
     err => {
@@ -6305,7 +6650,9 @@ function computeOpsData(snap) {
         });
         circle.bindTooltip(`Swap radius: ${swap.swapRadiusKm.toFixed(1)} km`, { permanent: false, direction: 'top' });
         S.mapLayers.swap_radius.addLayer(circle);
-        if (S.map && !S.map.hasLayer(S.mapLayers.swap_radius)) {
+        // Not while PLANS owns it — computeOpsData also runs on time-bar scrubs,
+        // which do not rebuild the layer control, so the re-attach would stick.
+        if (S.map && !S.map.hasLayer(S.mapLayers.swap_radius) && !_plansSuppressed('swap_radius')) {
           S.mapLayers.swap_radius.addTo(S.map);
         }
       }
@@ -7376,6 +7723,28 @@ function _layerRow(id, color, label) {
   </div>`;
 }
 
+// --- Collapsible layer-control sections ---
+// Each generated category is <h4 data-section="key"> + a wrapping body div, so a
+// tap on the header hides just that category's rows. buildLayerControl runs after
+// virtually every fetch, so the collapsed set lives on S (not in the DOM) to
+// survive those rebuilds; _persistLayerUiState mirrors it to localStorage.
+function _sectionOpen(key, title) {
+  const c = S.layerSections && S.layerSections.has(key) ? ' collapsed' : '';
+  return `<h4 class="layer-section${c}" style="margin-top:10px" data-section="${key}" onclick="toggleLayerSection('${key}')">${title}</h4>`
+    + `<div class="layer-section-body${c}" data-section-body="${key}">`;
+}
+function _sectionClose() { return '</div>'; }
+
+function toggleLayerSection(key) {
+  if (!S.layerSections) S.layerSections = new Set();
+  if (S.layerSections.has(key)) S.layerSections.delete(key);
+  else S.layerSections.add(key);
+  // Toggle in place rather than rebuilding — no flicker, and no layer re-render.
+  document.querySelector(`#layerList [data-section="${key}"]`)?.classList.toggle('collapsed');
+  document.querySelector(`#layerList [data-section-body="${key}"]`)?.classList.toggle('collapsed');
+  _persistLayerUiState();
+}
+
 // ' · frame 22:40Z (2h 05m old)' suffix for the GOES layer row, '' until known.
 function _goesFrameLabel() {
   if (!S.goesFrameTime) return '';
@@ -7388,6 +7757,9 @@ function _goesFrameLabel() {
 }
 
 function buildLayerControl() {
+  // PLANS mode suppresses operational clutter as it arrives — do it before the
+  // rows are emitted so the panel reflects the post-suppression truth.
+  _applyPlansMode();
   const baseLayers = [
     { id: 'satellite', name: 'Satellite', color: '#3d8bfd' },
     { id: 'topo', name: 'Topographic', color: '#22c55e' },
@@ -7410,11 +7782,12 @@ function buildLayerControl() {
 
   // Radar overlay
   if (S.radarAnim && S.radarAnim.layers && S.radarAnim.layers.length > 0) {
-    html += `<h4 style="margin-top:10px">Radar</h4>`;
+    html += _sectionOpen('radar', 'Radar');
     const radarOn = S.radarAnim.layers.some(l => S.map.hasLayer(l) && l.options.opacity > 0);
     html += `<div class="layer-item${radarOn ? ' active' : ''}" data-layer="radar" onclick="toggleLayer('radar',this)">
       <div class="layer-check"></div><div class="layer-color" style="background:#22c55e"></div><span>Weather Radar</span>
     </div>`;
+    html += _sectionClose();
   }
 
   // Weather Imagery (optional near-real-time global rasters): GOES-East GeoColor clouds
@@ -7422,7 +7795,7 @@ function buildLayerControl() {
   {
     ensureGoesLayer(); ensureGlmLayer();
     if (S.mapLayers.goes_clouds || S.mapLayers.glm_lightning) {
-      html += `<h4 style="margin-top:10px">Weather Imagery</h4>`;
+      html += _sectionOpen('wximagery', 'Weather Imagery');
       if (S.mapLayers.goes_clouds) {
         const on = S.map.hasLayer(S.mapLayers.goes_clouds);
         html += `<div class="layer-item${on ? ' active' : ''}" data-layer="goes_clouds" onclick="toggleLayer('goes_clouds',this)">
@@ -7435,6 +7808,7 @@ function buildLayerControl() {
           <div class="layer-check"></div><div class="layer-color" style="background:#fde047"></div><span>Lightning strike density (NOAA)</span>
         </div>`;
       }
+      html += _sectionClose();
     }
   }
 
@@ -7443,7 +7817,7 @@ function buildLayerControl() {
   const hasTowers = S.mapLayers.cell_towers && S.mapLayers.cell_towers.getLayers().length > 0;
   const hasLZs = S.mapLayers.emergency_lz && S.mapLayers.emergency_lz.getLayers().length > 0;
   if (hasAirports || hasTowers || hasLZs || _layerHasFeatures('hospitals')) {
-    html += `<h4 style="margin-top:10px">Facilities</h4>`;
+    html += _sectionOpen('facilities', 'Facilities');
     if (hasAirports) {
       const airportCount = S.mapLayers.airports.getLayers().length;
       const on = S.map.hasLayer(S.mapLayers.airports);
@@ -7462,13 +7836,14 @@ function buildLayerControl() {
     if (_layerHasFeatures('buildings')) html += _layerRow('buildings', '#9ca3af', 'Buildings (OSM, 3D)');
     // LZ markers removed — elevation grid too coarse for reliable LZ placement.
     // Terrain tab shows suitability assessment instead.
+    html += _sectionClose();
   }
 
   // ADS-B Traffic
   const hasAdsbAc = S.mapLayers.adsb_aircraft && S.mapLayers.adsb_aircraft.getLayers().length > 0;
   const hasAdsbTrails = S.mapLayers.adsb_trails && S.mapLayers.adsb_trails.getLayers().length > 0;
   if (hasAdsbAc || hasAdsbTrails) {
-    html += `<h4 style="margin-top:10px">Traffic</h4>`;
+    html += _sectionOpen('traffic', 'Traffic');
     if (hasAdsbAc) {
       const acCount = S.mapLayers.adsb_aircraft.getLayers().length;
       const on = S.map.hasLayer(S.mapLayers.adsb_aircraft);
@@ -7482,41 +7857,46 @@ function buildLayerControl() {
         <div class="layer-check"></div><div class="layer-color" style="background:#3d8bfd"></div><span>Position Trails</span>
       </div>`;
     }
+    html += _sectionClose();
   }
 
   // Ops overlays: swap radius
   const hasSwap = S.mapLayers.swap_radius && S.mapLayers.swap_radius.getLayers().length > 0;
   if (hasSwap) {
-    html += `<h4 style="margin-top:10px">Operations</h4>`;
+    html += _sectionOpen('operations', 'Operations');
     const on = S.map.hasLayer(S.mapLayers.swap_radius);
     html += `<div class="layer-item${on ? ' active' : ''}" data-layer="swap_radius" onclick="toggleLayer('swap_radius',this)">
       <div class="layer-check"></div><div class="layer-color" style="background:#f59e0b"></div><span>Swap Radius</span>
     </div>`;
+    html += _sectionClose();
   }
 
   // NWS Alerts section
   if (S.nwsAlerts.length > 0 && S.mapLayers.nws_alerts) {
-    html += `<h4 style="margin-top:10px">Alerts</h4>`;
+    html += _sectionOpen('alerts', 'Alerts');
     const on = S.map.hasLayer(S.mapLayers.nws_alerts);
     html += `<div class="layer-item${on ? ' active' : ''}" data-layer="nws_alerts" onclick="toggleLayer('nws_alerts',this)">
       <div class="layer-check"></div><div class="layer-color" style="background:#ef4444"></div><span>NWS Alerts (${S.nwsAlerts.length})</span>
     </div>`;
+    html += _sectionClose();
   }
 
   // Active Fires section
   const hasFirePerimeters = S.mapLayers.fire_perimeters && S.mapLayers.fire_perimeters.getLayers && S.mapLayers.fire_perimeters.getLayers().length > 0;
   if (hasFirePerimeters) {
-    html += `<h4 style="margin-top:10px">Fire</h4>`;
+    html += _sectionOpen('fire', 'Fire');
     const on = S.map.hasLayer(S.mapLayers.fire_perimeters);
     html += `<div class="layer-item${on ? ' active' : ''}" data-layer="fire_perimeters" onclick="toggleLayer('fire_perimeters',this)">
       <div class="layer-check"></div><div class="layer-color" style="background:#f97316"></div><span>Fire Perimeters (${S.mapLayers.fire_perimeters.getLayers().length})</span>
     </div>`;
+    html += _sectionClose();
   }
 
   // Smoke (NOAA HMS) section
   if (_layerHasFeatures('hms_smoke')) {
-    html += `<h4 style="margin-top:10px">Smoke</h4>`;
+    html += _sectionOpen('smoke', 'Smoke');
     html += _layerRow('hms_smoke', '#ea580c', 'HMS Smoke Plumes');
+    html += _sectionClose();
   }
 
   // FAA Airspace section
@@ -7527,7 +7907,7 @@ function buildLayerControl() {
   const hasFAAns = S.mapLayers.faa_ns_restrictions && S.mapLayers.faa_ns_restrictions.getLayers && S.mapLayers.faa_ns_restrictions.getLayers().length > 0;
   const hasFAAprohibited = S.mapLayers.faa_prohibited && S.mapLayers.faa_prohibited.getLayers && S.mapLayers.faa_prohibited.getLayers().length > 0;
   if (hasFAAclass || hasFAAsua || hasFAAtfr || hasFAAlaanc || hasFAAns || hasFAAprohibited) {
-    html += `<h4 style="margin-top:10px">FAA Airspace</h4>`;
+    html += _sectionOpen('faa_airspace', 'FAA Airspace');
     if (hasFAAclass) {
       const on = S.map.hasLayer(S.mapLayers.faa_class_airspace);
       html += `<div class="layer-item${on ? ' active' : ''}" data-layer="faa_class_airspace" onclick="toggleLayer('faa_class_airspace',this)">
@@ -7564,13 +7944,14 @@ function buildLayerControl() {
         <div class="layer-check"></div><div class="layer-color" style="background:#991b1b"></div><span>Prohibited Areas</span>
       </div>`;
     }
+    html += _sectionClose();
   }
 
   // Imported TFR / NOTAM section
   const hasImpTfr = S.mapLayers.tfr_imported && S.mapLayers.tfr_imported.getLayers && S.mapLayers.tfr_imported.getLayers().length > 0;
   const hasImpNotam = S.mapLayers.notam_imported && S.mapLayers.notam_imported.getLayers && S.mapLayers.notam_imported.getLayers().length > 0;
   if (hasImpTfr || hasImpNotam) {
-    html += `<h4 style="margin-top:10px">Imported TFR/NOTAM</h4>`;
+    html += _sectionOpen('imported_restrictions', 'Imported TFR/NOTAM');
     if (hasImpTfr) {
       const on = S.map.hasLayer(S.mapLayers.tfr_imported);
       html += `<div class="layer-item${on ? ' active' : ''}" data-layer="tfr_imported" onclick="toggleLayer('tfr_imported',this)">
@@ -7583,6 +7964,7 @@ function buildLayerControl() {
         <div class="layer-check"></div><div class="layer-color" style="background:#f59e0b"></div><span>NOTAMs (${S.mapLayers.notam_imported.getLayers().length})</span>
       </div>`;
     }
+    html += _sectionClose();
   }
 
   // Protected Areas section
@@ -7590,7 +7972,7 @@ function buildLayerControl() {
   const hasWilderness = S.mapLayers.wilderness && S.mapLayers.wilderness.getLayers && S.mapLayers.wilderness.getLayers().length > 0;
   const hasNatlParks = S.mapLayers.national_parks && S.mapLayers.national_parks.getLayers && S.mapLayers.national_parks.getLayers().length > 0;
   if (hasDams || hasWilderness || hasNatlParks) {
-    html += `<h4 style="margin-top:10px">Protected Areas</h4>`;
+    html += _sectionOpen('protected', 'Protected Areas');
     if (hasDams) {
       const count = S.mapLayers.dams.getLayers().length;
       const on = S.map.hasLayer(S.mapLayers.dams);
@@ -7612,6 +7994,7 @@ function buildLayerControl() {
         <div class="layer-check"></div><div class="layer-color" style="background:#78350f"></div><span>National Parks (${count})</span>
       </div>`;
     }
+    html += _sectionClose();
   }
 
   // FAA Obstacles (Digital Obstacle File) section
@@ -7619,16 +8002,17 @@ function buildLayerControl() {
   if (hasObstacles) {
     const count = S.mapLayers.faa_obstacles.getLayers().length;
     const on = S.map.hasLayer(S.mapLayers.faa_obstacles);
-    html += `<h4 style="margin-top:10px">FAA Obstacles (DOF)</h4>`;
+    html += _sectionOpen('obstacles', 'FAA Obstacles (DOF)');
     html += `<div class="layer-item${on ? ' active' : ''}" data-layer="faa_obstacles" onclick="toggleLayer('faa_obstacles',this)">
       <div class="layer-check"></div><div class="layer-color" style="background:#ef4444"></div><span>Obstacles (${count})</span>
     </div>`;
+    html += _sectionClose();
   }
 
   const wireCounts = Object.assign({}, S.wireHazardCounts, S.utilityWireCounts);
   const totalWires = Object.values(wireCounts).reduce((a, b) => a + b, 0);
   if (totalWires > 0) {
-    html += `<h4 style="margin-top:10px">Wire Hazards</h4>`;
+    html += _sectionOpen('wires', 'Wire Hazards');
     Object.entries(WIRE_CATEGORIES).forEach(([k, info]) => {
       const count = wireCounts[k] || 0;
       if (count === 0) return;
@@ -7638,46 +8022,52 @@ function buildLayerControl() {
         <div class="layer-check"></div><div class="layer-color" style="background:${info.color}"></div><span>${info.label} (${count})</span>
       </div>`;
     });
+    html += _sectionClose();
   }
   // Ground Access section: forest roads/trails, MVUM, BLM routes
   if (_layerHasFeatures('usfs_roads') || _layerHasFeatures('usfs_trails') || _layerHasFeatures('mvum_roads') || _layerHasFeatures('mvum_trails') || _layerHasFeatures('blm_gtlf') || _layerHasFeatures('trails')) {
-    html += `<h4 style="margin-top:10px">Ground Access</h4>`;
+    html += _sectionOpen('ground_access', 'Ground Access');
     if (_layerHasFeatures('usfs_roads')) html += _layerRow('usfs_roads', '#c98a3a', 'NFS Roads');
     if (_layerHasFeatures('usfs_trails')) html += _layerRow('usfs_trails', '#8b5a2b', 'NFS Trails');
     if (_layerHasFeatures('mvum_roads')) html += _layerRow('mvum_roads', '#e0a458', 'MVUM Roads');
     if (_layerHasFeatures('mvum_trails')) html += _layerRow('mvum_trails', '#c97f3a', 'MVUM Trails');
     if (_layerHasFeatures('blm_gtlf')) html += _layerRow('blm_gtlf', '#84cc16', 'BLM Routes');
     if (_layerHasFeatures('trails')) html += _layerRow('trails', TRAILS_COLOR, 'Named Trails (OSM)');
+    html += _sectionClose();
   }
 
   // Public Lands (surface management agency) + Water
   if (_layerHasFeatures('public_lands')) {
-    html += `<h4 style="margin-top:10px">Public Lands</h4>`;
+    html += _sectionOpen('public_lands', 'Public Lands');
     html += _layerRow('public_lands', '#2e8b3d', 'Land Ownership');
+    html += _sectionClose();
   }
   if (_layerHasFeatures('nhd_water')) {
-    html += `<h4 style="margin-top:10px">Water</h4>`;
+    html += _sectionOpen('water', 'Water');
     html += _layerRow('nhd_water', '#3b82f6', 'Streams & Lakes');
+    html += _sectionClose();
   }
 
   // Cell Coverage (per-carrier FCC LTE)
   if (_layerHasFeatures('cell_att') || _layerHasFeatures('cell_tmobile') || _layerHasFeatures('cell_verizon')) {
-    html += `<h4 style="margin-top:10px">Cell Coverage (FCC LTE)</h4>`;
+    html += _sectionOpen('cell_coverage', 'Cell Coverage (FCC LTE)');
     if (_layerHasFeatures('cell_att')) html += _layerRow('cell_att', '#2563eb', 'AT&T');
     if (_layerHasFeatures('cell_tmobile')) html += _layerRow('cell_tmobile', '#e6007e', 'T-Mobile');
     if (_layerHasFeatures('cell_verizon')) html += _layerRow('cell_verizon', '#cd040b', 'Verizon');
+    html += _sectionClose();
   }
 
   // Reference overlays (parcels)
   if (S.mapLayers.parcels) {
-    html += `<h4 style="margin-top:10px">Reference</h4>`;
+    html += _sectionOpen('reference', 'Reference');
     html += _layerRow('parcels', '#9ca3af', 'Parcels');
+    html += _sectionClose();
   }
 
   // Imported FAA charts section
   const chartIds = Object.keys(S.faaCharts || {});
   if (chartIds.length > 0) {
-    html += '<h4 style="margin-top:10px">Imported Charts</h4>';
+    html += _sectionOpen('charts', 'Imported Charts');
     for (const cid of chartIds) {
       const c = S.faaCharts[cid];
       const lid = 'chart_' + cid;
@@ -7686,57 +8076,57 @@ function buildLayerControl() {
         <div class="layer-check"></div><div class="layer-color" style="background:#e879f9"></div><span>${c.chartName}</span>
       </div>`;
     }
+    html += _sectionClose();
   }
 
   // Terrain hillshade (always available — a global tile overlay)
   if (S.mapLayers.slope) {
-    html += `<h4 style="margin-top:10px">Terrain</h4>`;
+    html += _sectionOpen('terrain', 'Terrain');
     html += _layerRow('slope', '#9ca3af', 'Hillshade (steepness)');
+    html += _sectionClose();
   }
 
-  // Analysis overlays: vegetation height + viewshed (each with an opacity slider)
-  const hasCanopy = S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy);
-  const hasViewshed = S.mapLayers.viewshed && S.map.hasLayer(S.mapLayers.viewshed);
-  const hasShadow = S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow);
-  const hasObservers = S.mapLayers.observers && S.map.hasLayer(S.mapLayers.observers) && (S.viewsheds || []).length;
-  if (hasCanopy || hasViewshed || hasShadow || hasObservers) {
-    html += `<h4 style="margin-top:10px">Analysis</h4>`;
-    if (hasObservers) {
-      html += `<div class="layer-item active" data-layer="observers" onclick="toggleLayer('observers',this)">
-        <div class="layer-check"></div><div class="layer-color" style="background:#5ec522"></div><span>Observers (${S.viewsheds.length})</span>
-      </div>`;
-    }
-    if (hasCanopy) {
-      const op = S.mapLayers.canopy.options.opacity != null ? S.mapLayers.canopy.options.opacity : CANOPY_OVERLAY_OPACITY;
-      html += `<div class="layer-item active" data-layer="canopy" onclick="toggleLayer('canopy',this)">
-        <div class="layer-check"></div><div class="layer-color" style="background:#0d5e28"></div><span>Vegetation Height</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:6px;margin:2px 0 4px 22px;">
-        <input type="range" min="0" max="1" step="0.05" value="${op}" style="width:90px;" oninput="setCanopyOpacity(this.value)" onclick="event.stopPropagation()">
-        <span style="font-size:9px;color:var(--text-muted);">opacity</span>
-      </div>`;
-    }
-    if (hasViewshed) {
-      const op = S.mapLayers.viewshed.options.opacity != null ? S.mapLayers.viewshed.options.opacity : VIEWSHED_OVERLAY_OPACITY;
-      html += `<div class="layer-item active" data-layer="viewshed" onclick="toggleLayer('viewshed',this)">
-        <div class="layer-check"></div><div class="layer-color" style="background:#22c55e"></div><span>Viewshed</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:6px;margin:2px 0 4px 22px;">
-        <input type="range" min="0" max="1" step="0.05" value="${op}" style="width:90px;" oninput="setViewshedOpacity(this.value)" onclick="event.stopPropagation()">
-        <span style="font-size:9px;color:var(--text-muted);">opacity</span>
-      </div>`;
-    }
-    if (hasShadow) {
-      const op = S.mapLayers.shadow.options.opacity != null ? S.mapLayers.shadow.options.opacity : SHADOW_OVERLAY_OPACITY;
-      html += `<div class="layer-item active" data-layer="shadow" onclick="toggleLayer('shadow',this)">
-        <div class="layer-check"></div><div class="layer-color" style="background:#0b1220;border:1px solid #475569"></div><span>Sun Shadow</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:6px;margin:2px 0 4px 22px;">
-        <input type="range" min="0" max="1" step="0.05" value="${op}" style="width:90px;" oninput="setShadowOpacity(this.value)" onclick="event.stopPropagation()">
-        <span style="font-size:9px;color:var(--text-muted);">opacity</span>
-      </div>`;
-    }
+  // Analysis overlays. Vegetation height + sun shadow are ALWAYS listed (like
+  // Hillshade / Snow Depth): checking a row is what loads them, so the row can
+  // never be gated on the overlay already being displayed. Observers/viewshed
+  // still appear only once they exist.
+  const hasCanopy = !!(S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy));
+  const hasViewshed = !!(S.mapLayers.viewshed && S.map.hasLayer(S.mapLayers.viewshed));
+  const hasShadow = !!(S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow));
+  const hasObservers = !!(S.mapLayers.observers && (S.viewsheds || []).length);
+  // Inline slider under a checked raster row; its twin lives in the Terrain tab
+  // and setCanopyOpacity/setShadowOpacity/setViewshedOpacity keep the two in step.
+  const _overlayOpacity = (id, fallback) => {
+    const o = S.mapLayers[id] && S.mapLayers[id].options.opacity;
+    return o != null ? o : fallback;
+  };
+  const _opacityRow = (id, fn, op) =>
+    `<div style="display:flex;align-items:center;gap:6px;margin:2px 0 4px 22px;">
+      <input type="range" id="lc${id}Opacity" min="0" max="1" step="0.05" value="${op}" style="width:90px;" oninput="${fn}(this.value)" onclick="event.stopPropagation()">
+      <span style="font-size:9px;color:var(--text-muted);">opacity</span>
+    </div>`;
+  html += _sectionOpen('analysis', 'Analysis');
+  if (hasObservers) {
+    const on = S.map.hasLayer(S.mapLayers.observers);
+    html += `<div class="layer-item${on ? ' active' : ''}" data-layer="observers" onclick="toggleLayer('observers',this)">
+      <div class="layer-check"></div><div class="layer-color" style="background:#5ec522"></div><span>Observers (${S.viewsheds.length})</span>
+    </div>`;
   }
+  html += `<div class="layer-item${hasCanopy ? ' active' : ''}" data-layer="canopy" onclick="toggleLayer('canopy',this)">
+    <div class="layer-check"></div><div class="layer-color" style="background:#0d5e28"></div><span>Vegetation Height</span>
+  </div>`;
+  if (hasCanopy) html += _opacityRow('Canopy', 'setCanopyOpacity', _overlayOpacity('canopy', CANOPY_OVERLAY_OPACITY));
+  if (hasViewshed) {
+    html += `<div class="layer-item active" data-layer="viewshed" onclick="toggleLayer('viewshed',this)">
+      <div class="layer-check"></div><div class="layer-color" style="background:#22c55e"></div><span>Viewshed</span>
+    </div>`;
+    html += _opacityRow('Viewshed', 'setViewshedOpacity', _overlayOpacity('viewshed', VIEWSHED_OVERLAY_OPACITY));
+  }
+  html += `<div class="layer-item${hasShadow ? ' active' : ''}" data-layer="shadow" onclick="toggleLayer('shadow',this)">
+    <div class="layer-check"></div><div class="layer-color" style="background:#0b1220;border:1px solid #475569"></div><span>Sun Shadow</span>
+  </div>`;
+  if (hasShadow) html += _opacityRow('Shadow', 'setShadowOpacity', _overlayOpacity('shadow', SHADOW_OVERLAY_OPACITY));
+  html += _sectionClose();
 
   // Winter Ops (optional): avalanche danger zones + SNODAS snow depth. Snow depth is a
   // CONUS-wide WMS overlay (NOHRSC analysis domain, not clipped to the drawn area) built lazily so its toggle is always available; avalanche rows
@@ -7746,7 +8136,7 @@ function buildLayerControl() {
     const hasAval = _layerHasFeatures('avalanche');
     const hasSnow = !!S.mapLayers.snow_depth;
     if (hasAval || hasSnow) {
-      html += `<h4 style="margin-top:10px">Winter Ops</h4>`;
+      html += _sectionOpen('winter', 'Winter Ops');
       if (hasAval) html += _layerRow('avalanche', '#ef4444', 'Avalanche Danger');
       if (hasSnow) {
         const on = S.map.hasLayer(S.mapLayers.snow_depth);
@@ -7754,6 +8144,7 @@ function buildLayerControl() {
           <div class="layer-check"></div><div class="layer-color" style="background:#38bdf8"></div><span>Snow Depth (SNODAS)</span>
         </div>`;
       }
+      html += _sectionClose();
     }
   }
 
@@ -7769,6 +8160,11 @@ function toggleLayer(id, el) {
   if (S._canopyEditing && ['satellite', 'topo', 'sectional', 'canopy'].includes(id)) return;
   el.classList.toggle('active');
   const on = el.classList.contains('active');
+  _notePlansOverride(id, on); // only the click path counts as user intent
+  setLayerVisible(id, on);
+}
+// The layer-visibility logic itself, callable without a DOM row (PLANS mode).
+function setLayerVisible(id, on) {
   const overlayIds = ['satellite', 'topo', 'sectional'];
   if (overlayIds.includes(id)) {
     if (on) {
@@ -7810,6 +8206,12 @@ function toggleLayer(id, el) {
   } else if (id === 'glm_lightning') {
     const layer = ensureGlmLayer();
     if (layer) { if (on) S.map.addLayer(layer); else S.map.removeLayer(layer); }
+  } else if (id === 'canopy' || id === 'shadow') {
+    // These two OWN their fetch: checking the row must load the raster, not just
+    // re-attach a layer that may not exist yet. Both re-run buildLayerControl.
+    if (id === 'canopy') toggleCanopyOverlay(on);
+    else toggleShadowOverlay(on);
+    return; // their own paths handle _overlayWanted + the 3D mirror
   } else if (id === 'parcels') {
     // Live vector parcels: view-driven fetch while on (moveend hook), abort +
     // chip teardown when off. Zoom gate + tiering live in loadParcelsForView.
@@ -7823,20 +8225,23 @@ function toggleLayer(id, el) {
       if (S._parcelAbort) { try { S._parcelAbort.abort(); } catch (_) {} }
       _setParcelChip(null);
     }
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'canopy' || id === 'viewshed' || id === 'shadow' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'slope' || id === 'streets' || id === 'trails' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
-    if (id === 'canopy' || id === 'viewshed' || id === 'shadow') {
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'viewshed' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'slope' || id === 'streets' || id === 'trails' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
+    if (id === 'viewshed') {
       // Keep the zoom-cap's "wanted" flag in sync — otherwise _applyOverlayZoomCap
       // re-adds the overlay on the next zoomend after it was unchecked here.
       if (!S._overlayWanted) S._overlayWanted = {};
       S._overlayWanted[id] = on;
     }
-    if (id === 'canopy') { const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = on; }
-    if (id === 'shadow') { const cb = document.getElementById('shadowToggle'); if (cb) cb.checked = on; }
     if (on) {
       // Raster overlays go through the zoom cap so the mobile display-size budget still applies
-      if (id === 'canopy' || id === 'viewshed' || id === 'shadow') _applyOverlayZoomCap();
+      if (id === 'viewshed') _applyOverlayZoomCap();
       else S.map.addLayer(S.mapLayers[id]);
     } else S.map.removeLayer(S.mapLayers[id]);
+    // Observer markers and their VLOS range rings are one logical layer.
+    if (id === 'observers' && S.mapLayers.observer_rings) {
+      if (on) S.map.addLayer(S.mapLayers.observer_rings);
+      else S.map.removeLayer(S.mapLayers.observer_rings);
+    }
     // Toggling aircraft also toggles trails
     if (id === 'adsb_aircraft' && S.mapLayers.adsb_trails) {
       if (on) S.map.addLayer(S.mapLayers.adsb_trails);
@@ -7850,6 +8255,87 @@ function toggleLayer(id, el) {
 }
 
 // ============================================================
+// PLANS MODE — pre-mission declutter
+// Turns off (and collapses) the live-operational categories so the map shows
+// planning data only. Sticky, because these layers re-add THEMSELVES: fetchRadar
+// drapes a brand-new frame at 0.5 opacity on every auto-refresh, and
+// computeOpsData re-attaches the swap radius whenever it recomputes. So the
+// suppression re-runs at every buildLayerControl rather than once per layer —
+// what makes it not fight the user is _plansUserOverride, the set of layers the
+// user has deliberately switched back on by clicking their row.
+// ============================================================
+const PLANS_OFF_SECTIONS = ['radar', 'traffic', 'operations', 'smoke'];
+const PLANS_OFF_LAYERS = ['radar', 'adsb_aircraft', 'adsb_trails', 'swap_radius', 'hms_smoke'];
+
+// Radar is not an S.mapLayers entry — its frames live on S.radarAnim.
+function _plansLayerExists(id) {
+  if (id === 'radar') return !!(S.radarAnim && S.radarAnim.layers && S.radarAnim.layers.length);
+  return _layerHasFeatures(id);
+}
+
+// Called from toggleLayer (the click path ONLY, never from app-driven renders),
+// so a deliberate re-check is remembered and stops being suppressed.
+function _notePlansOverride(id, on) {
+  if (!S.plansMode || !PLANS_OFF_LAYERS.includes(id)) return;
+  if (!S._plansUserOverride) S._plansUserOverride = new Set();
+  // Aircraft and its trails are one logical toggle (see setLayerVisible).
+  const ids = id === 'adsb_aircraft' ? [id, 'adsb_trails'] : [id];
+  ids.forEach(k => on ? S._plansUserOverride.add(k) : S._plansUserOverride.delete(k));
+}
+
+// True while PLANS owns this layer, i.e. the user has not re-checked it. Render
+// paths that re-attach a layer of their own accord should consult this.
+function _plansSuppressed(id) {
+  return !!(S.plansMode && PLANS_OFF_LAYERS.includes(id)
+    && !(S._plansUserOverride && S._plansUserOverride.has(id)));
+}
+
+function _applyPlansMode() {
+  if (!S.plansMode) return;
+  if (!S._plansUserOverride) S._plansUserOverride = new Set();
+  for (const id of PLANS_OFF_LAYERS) {
+    if (!_plansSuppressed(id)) continue;  // the user asked this one back
+    if (!_plansLayerExists(id)) continue; // not created yet; catch it when it arrives
+    setLayerVisible(id, false);           // idempotent — a no-op once it is already off
+  }
+}
+
+function togglePlansMode() {
+  S.plansMode = !S.plansMode;
+  document.getElementById('btnPlans')?.classList.toggle('active', S.plansMode);
+  document.getElementById('headerActions')?.classList.remove('open'); // close the mobile menu
+  S._plansUserOverride = S.plansMode ? new Set() : null;
+  if (!S.layerSections) S.layerSections = new Set();
+  PLANS_OFF_SECTIONS.forEach(k => S.plansMode ? S.layerSections.add(k) : S.layerSections.delete(k));
+  _persistLayerUiState();
+  buildLayerControl(); // runs _applyPlansMode(), then re-emits with the sections collapsed
+}
+
+// Collapsed sections + PLANS mode survive a reload (same convention as sar_theme).
+function _persistLayerUiState() {
+  try {
+    localStorage.setItem('sar_layer_ui', JSON.stringify({
+      sections: [...(S.layerSections || [])],
+      plans: !!S.plansMode,
+    }));
+  } catch (_) { /* private mode / quota — UI chrome only */ }
+}
+
+function restoreLayerUiState() {
+  try {
+    const raw = localStorage.getItem('sar_layer_ui');
+    if (!raw) return;
+    const st = JSON.parse(raw);
+    if (Array.isArray(st.sections)) S.layerSections = new Set(st.sections);
+    if (st.plans) {
+      S.plansMode = true;
+      S._plansUserOverride = new Set(); // a reloaded PLANS session suppresses again from scratch
+      document.getElementById('btnPlans')?.classList.add('active');
+    }
+  } catch (_) { /* corrupt entry — fall back to defaults */ }
+}
+
+// ============================================================
 // AGGREGATED MULTI-FEATURE POPUP
 // A single click can land on many overlapping features (e.g. Class airspace +
 // LAANC grid + an obstacle + a NOTAM). Leaflet only opens the topmost feature's
@@ -7857,7 +8343,9 @@ function toggleLayer(id, el) {
 // show all matches in one popup with "<- n/N ->" pagination.
 // ============================================================
 const AGG_HIT_PX = 8; // pixel tolerance for line / point hit-testing
-const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'shadow', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning']);
+// observer_rings: a VLOS ring covers a large area, so hit-testing it would add a
+// spurious page to the popup for every click inside the ring.
+const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'shadow', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning', 'observer_rings']);
 // Export-only exclusion set. Extends the popup-skip set (so basemaps /
 // rasters stay out of the vector export) and adds layers CalTopo already provides
 // natively and that would be stale by import time. These layers remain visible and
@@ -10158,12 +10646,21 @@ function renderRasterOverlay(layerId, rgba, grid, opacity) {
   return layer;
 }
 
+// Each overlay has two sliders — one in the Terrain tab, one inline in the layer
+// control — so whichever the user moves, push the value to the other.
+function _syncOpacitySliders(v, ...ids) {
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el && el.value !== String(v)) el.value = v;
+  }
+}
 function setCanopyOpacity(v) {
   const o = parseFloat(v);
   if (S.mapLayers.canopy && S.mapLayers.canopy.setOpacity) S.mapLayers.canopy.setOpacity(o);
   if (S._canopyEditing && S.canopyEdit && S.canopyEdit.canvas) S.canopyEdit.canvas.style.opacity = o;
   const span = document.getElementById('canopyOpacityVal');
   if (span) span.textContent = Math.round(o * 100) + '%';
+  _syncOpacitySliders(v, 'canopyOpacity', 'lcCanopyOpacity');
   // 2D drape only — the 3D canopy surface renders fully opaque by design.
   if (S.is3D && typeof sync3d === 'function') sync3d();
 }
@@ -10172,13 +10669,14 @@ function setViewshedOpacity(v) {
   if (S.mapLayers.viewshed && S.mapLayers.viewshed.setOpacity) S.mapLayers.viewshed.setOpacity(o);
   const span = document.getElementById('viewshedOpacityVal');
   if (span) span.textContent = Math.round(o * 100) + '%';
+  _syncOpacitySliders(v, 'vsOpacity', 'lcViewshedOpacity');
   if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 
-async function toggleCanopyOverlay() {
+// on: explicit target state (the Map Layers row drives this). Omit to flip.
+async function toggleCanopyOverlay(on) {
   if (S._canopyEditing) return; // edit mode owns the canopy display
-  const cb = document.getElementById('canopyToggle');
-  const on = cb ? cb.checked : !(S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy));
+  if (on == null) on = !(S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy));
   if (!on) {
     if (S._overlayWanted) S._overlayWanted.canopy = false;
     if (S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
@@ -10188,7 +10686,7 @@ async function toggleCanopyOverlay() {
   }
   if (!getCanopyProxyBase()) {
     setStatus('canopyStatus', 'error', 'NO PROXY');
-    if (cb) cb.checked = false;
+    buildLayerControl(); // revert the row the user just checked
     if (typeof alert === 'function') alert('Set a Canopy proxy URL in the Config tab first (see tools/canopy-proxy/README.md).');
     return;
   }
@@ -10229,8 +10727,8 @@ async function loadCanopyForView() {
       setStatus('canopyStatus', 'error', 'ZOOM IN');
       markSection('canopy', { status: 'error', error: 'Zoom in to load 1 m canopy for this view' });
       try { Diag.note('canopy.skip', { halfKm: Math.round(halfWidthM / 100) / 10 }); } catch (_) {}
-      const cbz = document.getElementById('canopyToggle'); if (cbz) cbz.checked = false;
       if (S._overlayWanted) S._overlayWanted.canopy = false;
+      buildLayerControl(); // revert the row the user just checked
       return;
     }
     const resM = Math.max(WORK_RES_M, (2 * halfWidthM) / MAX_GRID);
@@ -10241,7 +10739,8 @@ async function loadCanopyForView() {
     if (!canopyFlat) {
       setStatus('canopyStatus', 'error', source === 'no proxy' ? 'NO PROXY' : 'NO DATA');
       markSection('canopy', { status: 'error', error: source === 'no proxy' ? 'No canopy proxy configured' : 'No canopy data for this view' });
-      const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = false;
+      if (S._overlayWanted) S._overlayWanted.canopy = false;
+      buildLayerControl(); // revert the row the user just checked
       return;
     }
     const op = parseFloat((document.getElementById('canopyOpacity') || {}).value) || CANOPY_OVERLAY_OPACITY;
@@ -10258,13 +10757,14 @@ async function loadCanopyForView() {
     }
     // Canopy is view-based; record when this view's overlay was loaded.
     markSection('canopy', { status: 'live', updatedAt: Date.now(), error: null });
-    const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = true;
     buildLayerControl();
   } catch (e) {
     console.error('Canopy overlay error:', e);
     recordDataSourceError('Canopy', e);
     setStatus('canopyStatus', 'error', 'ERROR');
     markSection('canopy', { status: 'error', error: e && e.message ? e.message : String(e) });
+    if (S._overlayWanted) S._overlayWanted.canopy = false;
+    buildLayerControl(); // revert the row the user just checked
   } finally {
     trackFetchEnd('Canopy');
   }
@@ -10352,7 +10852,6 @@ function exitCanopyEdit(force) {
   if (S.canopy && S.canopy.canopyFlat) {
     const op = parseFloat((document.getElementById('canopyOpacity') || {}).value) || CANOPY_OVERLAY_OPACITY;
     renderRasterOverlay('canopy', canopyGridToRGBA(S.canopy.grid, S.canopy.canopyFlat), S.canopy.grid, op);
-    const cb = document.getElementById('canopyToggle'); if (cb) cb.checked = true;
   }
   buildLayerControl();
 }
@@ -10715,12 +11214,13 @@ function setShadowOpacity(v) {
   if (S.mapLayers.shadow && S.mapLayers.shadow.setOpacity) S.mapLayers.shadow.setOpacity(o);
   const span = document.getElementById('shadowOpacityVal');
   if (span) span.textContent = Math.round(o * 100) + '%';
+  _syncOpacitySliders(v, 'shadowOpacity', 'lcShadowOpacity');
   if (S.is3D && typeof sync3d === 'function') sync3d();
 }
 
-async function toggleShadowOverlay() {
-  const cb = document.getElementById('shadowToggle');
-  const on = cb ? cb.checked : !(S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow));
+// on: explicit target state (the Map Layers row drives this). Omit to flip.
+async function toggleShadowOverlay(on) {
+  if (on == null) on = !(S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow));
   if (!on) {
     if (S._overlayWanted) S._overlayWanted.shadow = false;
     if (S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow)) S.map.removeLayer(S.mapLayers.shadow);
@@ -10760,18 +11260,19 @@ async function loadShadowForView() {
     const dem = await fetch3DEPDEM(grid);
     if (!dem.demFlat) {
       setStatus('shadowStatus', 'error', 'NO DEM');
-      const cbn = document.getElementById('shadowToggle'); if (cbn) cbn.checked = false;
       if (S._overlayWanted) S._overlayWanted.shadow = false;
+      buildLayerControl(); // revert the row the user just checked
       return;
     }
     S.shadow = { grid, demFlat: dem.demFlat, source: dem.source };
     _renderShadowForTime();
-    const cb = document.getElementById('shadowToggle'); if (cb) cb.checked = true;
     buildLayerControl();
   } catch (e) {
     console.error('Sun shadow overlay error:', e);
     recordDataSourceError('Sun shadow', e);
     setStatus('shadowStatus', 'error', 'ERROR');
+    if (S._overlayWanted) S._overlayWanted.shadow = false;
+    buildLayerControl(); // revert the row the user just checked
   } finally {
     trackFetchEnd('Sun shadow');
   }
@@ -10949,6 +11450,12 @@ function _readVsInputs() {
   return { aglFt, vlosFt };
 }
 
+// Dashed ring showing how far the VLOS range actually reaches at the current map
+// scale — as a cursor ghost while picking, and permanently around every placed
+// observer (touch devices never fire mousemove, so the placed rings are the only
+// guide there).
+const VLOS_RING_STYLE = { color: '#5ec522', weight: 1.5, dashArray: '5,7', fillColor: '#5ec522', fillOpacity: 0.04, interactive: false };
+
 function startViewshedPick() {
   if (S._canopyEditing) return; // observer pick is disabled in canopy edit mode
   if (S.is3D && typeof _exit3D === 'function') _exit3D(); // observer pick is a 2D map tap
@@ -10959,7 +11466,36 @@ function startViewshedPick() {
   document.getElementById('vsPickBtnMap')?.classList.add('active');
   document.getElementById('vsPickBtn')?.classList.add('active');
   if (S.map) S.map.getContainer().style.cursor = 'crosshair';
-  setStatus('viewshedStatus', 'loading', 'TAP MAP');
+  const { vlosFt } = _readVsInputs();
+  setStatus('viewshedStatus', 'loading', `TAP MAP · VLOS ${vlosFt} ft`);
+  // Own mousemove handler rather than folding into the cursor-coordinate one in
+  // initMap — that one runs a debounced elevation fetch we don't want to touch.
+  if (S.map && !S._vlosMove) {
+    S._vlosMove = e => _updateVlosGhost(e.latlng);
+    S.map.on('mousemove', S._vlosMove);
+  }
+}
+
+// Lazily created on the first cursor move, so it never flashes at a stale point.
+function _updateVlosGhost(latlng) {
+  if (!S.map || typeof L === 'undefined' || typeof L.circle !== 'function') return;
+  const radius = ftToM(_readVsInputs().vlosFt);
+  if (!S._vlosGhost) {
+    S._vlosGhost = L.circle(latlng, Object.assign({ radius }, VLOS_RING_STYLE));
+    S._vlosGhost.addTo(S.map); // bare on the map, NOT in S.mapLayers — invisible to popup aggregation, export and the 3D mirror
+    return;
+  }
+  S._vlosGhost.setLatLng(latlng);
+  if (S._vlosGhost.getRadius() !== radius) S._vlosGhost.setRadius(radius);
+}
+
+// Live-resize the ghost while the VLOS field is being edited mid-pick.
+function _onVlosInputChange() {
+  if (!S._viewshedPicking || !S._vlosGhost) return;
+  const radius = ftToM(_readVsInputs().vlosFt);
+  if (S._vlosGhost.getRadius() !== radius) S._vlosGhost.setRadius(radius);
+  const { vlosFt } = _readVsInputs();
+  setStatus('viewshedStatus', 'loading', `TAP MAP · VLOS ${vlosFt} ft`);
 }
 
 function cancelViewshedPick() {
@@ -10967,6 +11503,12 @@ function cancelViewshedPick() {
   document.getElementById('vsPickBtnMap')?.classList.remove('active');
   document.getElementById('vsPickBtn')?.classList.remove('active');
   if (S.map) S.map.getContainer().style.cursor = '';
+  if (S.map && S._vlosMove) { S.map.off('mousemove', S._vlosMove); }
+  S._vlosMove = null;
+  if (S._vlosGhost) {
+    if (S.map && S.map.hasLayer(S._vlosGhost)) S.map.removeLayer(S._vlosGhost);
+    S._vlosGhost = null;
+  }
 }
 
 function genViewshedId() {
@@ -10982,7 +11524,29 @@ function _ensureObserverLayer() {
     S.mapLayers.observers = L.layerGroup();
     if (S.map) S.mapLayers.observers.addTo(S.map);
   }
+  // VLOS rings ride in their OWN group, not alongside the markers: a big circle
+  // inside `observers` would be hit-tested by the aggregated popup and match
+  // every click inside it. Shown/hidden in lockstep via the observers toggle.
+  if (!S.mapLayers.observer_rings) {
+    S.mapLayers.observer_rings = L.layerGroup();
+    if (S.map && S.map.hasLayer(S.mapLayers.observers)) S.mapLayers.observer_rings.addTo(S.map);
+  }
   return S.mapLayers.observers;
+}
+
+// One ring per observer, each at ITS OWN stored vlosFt — editing the #vsVlos
+// field must not move rings for observers already placed.
+function _renderObserverRings() {
+  if (typeof L === 'undefined' || typeof L.circle !== 'function') return;
+  _ensureObserverLayer();
+  const g = S.mapLayers.observer_rings;
+  if (!g || !g.clearLayers) return;
+  g.clearLayers();
+  for (const rec of (S.viewsheds || [])) {
+    if (!rec || !rec.observer) continue;
+    g.addLayer(L.circle([rec.observer.lat, rec.observer.lng],
+      Object.assign({ radius: ftToM(rec.vlosFt) }, VLOS_RING_STYLE)));
+  }
 }
 
 const BACKDROP_SECTOR_MIN_FRAC = 0.5; // sector flagged when most in-VLOS positions sit below the skyline
@@ -11051,6 +11615,7 @@ function _addObserverMarker(rec) {
     const r = S.viewsheds.find(x => x.id === rec.id);
     if (!r) return;
     r.observer = { lat: p.lat, lng: p.lng };
+    _renderObserverRings(); // ring follows the marker immediately, before the recompute
     setActiveViewshed(r.id);
     runViewshed(r.id);
   });
@@ -11092,6 +11657,7 @@ function onViewshedMapClick(latlng) {
   if (typeof saveAppState === 'function') saveAppState('activeViewshedId', rec.id);
   _addObserverMarker(rec);
   renderObserverList();
+  buildLayerControl(); // the Observers row appears with the first observer, even if the compute fails
   runViewshed(rec.id);
 }
 
@@ -11223,6 +11789,8 @@ function clearAllViewsheds() {
 
 // Render the observer list UI (one row per record).
 function renderObserverList() {
+  // Chokepoint for add / remove / rename / visibility — keep the VLOS rings with it.
+  _renderObserverRings();
   const el = document.getElementById('vsObserverList');
   if (!el) return;
   if (!S.viewsheds.length) {
@@ -11251,6 +11819,7 @@ async function restoreViewsheds() {
   if (typeof getAllViewsheds !== 'function') return;
   const ak = _currentAreaKey();
   if (S.mapLayers.observers) S.mapLayers.observers.clearLayers();
+  if (S.mapLayers.observer_rings) S.mapLayers.observer_rings.clearLayers();
   if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
   S.viewsheds = [];
   let recs = [];
@@ -12573,9 +13142,14 @@ if (typeof module !== 'undefined' && module.exports) {
     genViewshedId, _ensureObserverLayer, _addObserverMarker, _observerPopupHtml, _toPersistable,
     _renderVisibleViewsheds, setActiveViewshed, toggleViewshedVisible, recomputeViewshed, renameViewshed, renameViewshedPrompt,
     removeViewshed, renderObserverList, restoreViewsheds,
-    buildLayerControl, toggleLayer, updateWireDisplay,
+    VLOS_RING_STYLE, _updateVlosGhost, _onVlosInputChange, _renderObserverRings,
+    buildLayerControl, toggleLayer, setLayerVisible, updateWireDisplay,
+    _sectionOpen, _sectionClose, toggleLayerSection, _persistLayerUiState, restoreLayerUiState,
+    PLANS_OFF_SECTIONS, PLANS_OFF_LAYERS, togglePlansMode, _applyPlansMode, _plansLayerExists,
+    _notePlansOverride, _plansSuppressed,
     openAggregatePopup, aggPopupStep, renderAggregatePopup, collectFeaturesAt,
     wirePopupAggregation, eachPopupLayer, _aggFeatureClick,
+    AGG_SKIP_LAYERS, EXPORT_SKIP_LAYERS,
     computeAirspace, computeOpsData, computeAssessment,
     snapshotAtIdx, renderWeather, renderWind, refreshPanelForHour, updateTimeContextBanner,
     renderKp, _parseKpForecast,
@@ -12616,6 +13190,12 @@ if (typeof module !== 'undefined' && module.exports) {
     loadCellCoverage, cellCoverageReadout, _pointInRegion, _ringsBBox,
     cacheCurrentView, gridForView, _cacheViewRaster, getSelectedTileProviders,
     initMap, startDraw, clearDrawBtns, clearArea, enterCoords, locateMe,
+    _noteDeviceFix, searchAnchor, DEVICE_FIX_MAX_AGE_MS,
+    closeCoordSearch, submitCoordSearch, onCoordSearchKey,
+    _syncCoordRadiusRow, _coordSearchRadiusM,
+    _memoGeocode, _cachedGeocode, _fetchGeocode, runGeocodeSearch,
+    _setGeocodeBusy, _setGeocodeStatus,
+    _renderGeocodeResults, _highlightGeocodeRow, pickGeocodeResult, _applyCoordTarget,
     getStoredTheme, applyTheme, cycleTheme,
     toggle3D, collect3dState, sync3d, _enter3D, _exit3D, _loadMaplibre,
     collect3dVectorGroups, _vec3dRecords, _open3dPopup, agg3dStep, _agg3dHtml, VEC3D_SKIP,
