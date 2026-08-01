@@ -138,6 +138,15 @@ function routeStrategy(url) {
   // FAA VFR Sectional service metadata (edition check) — network-first
   if (url.includes('/VFR_Sectional/MapServer') && !url.includes('/tile/')) return 'network-first';
 
+  // Imagery pixel-sampling retry (canopy VEG classifier) — network-only.
+  // This marker is only ever appended after a plain tile fetch came back
+  // unreadable, which on a long-lived install means an OPAQUE entry left in
+  // CACHE_TILES by a pre-guard version of this SW. Answering it from cache
+  // would return that same unreadable response forever. Network-only also
+  // keeps the marked URL out of CACHE_TILES so it cannot double tile storage.
+  // Must be tested BEFORE the arcgisonline cache-first rule below.
+  if (url.includes('sarcors=1')) return 'network-only';
+
   // Map tiles — cache-first (opportunistic + pre-downloaded)
   if (url.includes('basemaps.cartocdn.com') ||
       url.includes('arcgisonline.com') ||
@@ -175,10 +184,27 @@ function routeStrategy(url) {
   return 'cache-first';
 }
 
+// Whether a cached entry may answer this request.
+//
+// An OPAQUE cached tile cannot satisfy a CORS request: the browser turns an
+// opaque SW response into a network error, and its pixels are unreadable by
+// canvas (which is what the canopy VEG classifier needs). Opaque entries can
+// only be legacy — this SW has gated on `response.status === 200` (opaque is
+// status 0) since before the classifier shipped, and CACHE_TILES was never
+// renamed, so an install old enough predates the guard. Bypassing lets the
+// cors response overwrite the entry via the normal cache.put below, so the
+// cache heals itself as the user pans. A no-cors <img> request is still served
+// from the opaque entry, so tile display sees no regression and no extra
+// network traffic.
+function useCachedResponse(cached, request) {
+  if (!cached) return false;
+  return !(cached.type === 'opaque' && request && request.mode === 'cors');
+}
+
 // --- Cache-first: serve from cache, fallback to network ---
 async function cacheFirst(request) {
   const cached = await caches.match(request);
-  if (cached) return cached;
+  if (useCachedResponse(cached, request)) return cached;
   try {
     const response = await fetch(request);
     // Only cache full 200 responses — never 206 (partial) or other statuses;
@@ -407,7 +433,7 @@ async function getCacheSize() {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     routeStrategy, latlngToTile, getCacheName,
-    navigationStrategy, stripRedirect,
+    navigationStrategy, stripRedirect, useCachedResponse, cacheFirst,
     CURRENT_CACHES, APP_SHELL, CDN_ASSETS,
     CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_API, CACHE_SECTIONAL,
     SAR_VERSION,

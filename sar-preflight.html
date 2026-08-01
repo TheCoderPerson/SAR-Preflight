@@ -306,6 +306,22 @@ body {
 .ce-btn:disabled { opacity: 0.4; cursor: default; }
 .ce-btn.ce-danger { color: var(--accent-red); }
 .ce-msg { flex-basis: 100%; text-align: center; font-family: var(--font-mono); font-size: 10px; color: var(--accent-amber); display: none; }
+/* VEG panel — wraps to its own full-width rows so it stays usable on a phone */
+.ce-veg-row { flex-basis: 100%; flex-wrap: wrap; justify-content: center; row-gap: 6px; }
+.ce-lbl { font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); }
+.ce-num {
+  min-height: 44px; width: 68px; font-size: 16px; /* <16px triggers iOS focus-zoom */
+  background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text-primary); font-family: var(--font-mono); text-align: center;
+}
+.ce-num:disabled { opacity: 0.4; }
+.ce-range { -webkit-appearance: none; appearance: none; width: 132px; height: 44px; background: transparent; }
+.ce-range::-webkit-slider-runnable-track { height: 4px; background: var(--border); border-radius: 2px; }
+.ce-range::-webkit-slider-thumb { -webkit-appearance: none; width: 26px; height: 26px; margin-top: -11px; border-radius: 13px; background: var(--accent-cyan); }
+.ce-range::-moz-range-track { height: 4px; background: var(--border); border-radius: 2px; }
+.ce-range::-moz-range-thumb { width: 26px; height: 26px; border: 0; border-radius: 13px; background: var(--accent-cyan); }
+.ce-stat { flex-basis: 100%; text-align: center; font-family: var(--font-mono); font-size: 10px; color: var(--accent-cyan); }
+.ce-caveat { flex-basis: 100%; max-width: 460px; text-align: center; font-family: var(--font-mono); font-size: 9px; color: var(--accent-amber); line-height: 1.35; }
 /* Edit mode hides map chrome that would fight the toolbar or the pinned base */
 .map-container.mode-canopy-edit .timebar,
 .map-container.mode-canopy-edit .draw-toolbar,
@@ -848,6 +864,7 @@ select.api-input { cursor: pointer; }
         <button class="ce-btn" id="ceBtnPan" onclick="setCanopyEditSubMode('pan')" title="Pan / zoom the map">PAN</button>
         <button class="ce-btn" id="ceBtnBrush" onclick="setCanopyEditSubMode('brush')" title="Paint trees at the raster's average tree height">BRUSH</button>
         <button class="ce-btn" id="ceBtnPoly" onclick="setCanopyEditSubMode('polygon')" title="Draw a polygon, then delete all trees inside it">POLY</button>
+        <button class="ce-btn" id="ceBtnVeg" onclick="setCanopyEditSubMode('vegPolygon')" title="Draw an area, classify trees from the satellite imagery, then add or remove them in bulk">VEG</button>
       </div>
       <div class="ce-group" id="ceBrushSizes" style="display:none;">
         <button class="ce-btn" id="ceSizeS" onclick="setCanopyBrushSize(5)" title="Small brush (5 m radius)">S</button>
@@ -857,6 +874,24 @@ select.api-input { cursor: pointer; }
       <div class="ce-group" id="cePolyActions" style="display:none;">
         <button class="ce-btn ce-danger" onclick="canopyEditDelete()" title="Remove all canopy inside the polygon">DELETE</button>
         <button class="ce-btn" onclick="canopyEditCancelPoly()" title="Discard the polygon, keep the trees">CANCEL</button>
+      </div>
+      <div class="ce-group ce-veg-row" id="ceVegPanel" style="display:none;">
+        <button class="ce-btn" id="ceVegDirAdd" onclick="setCanopyVegDirection('add')" title="Add trees wherever the imagery is green">ADD</button>
+        <button class="ce-btn ce-danger" id="ceVegDirCut" onclick="setCanopyVegDirection('del')" title="Remove trees wherever the imagery is NOT green">CUT</button>
+        <label class="ce-lbl" for="ceVegHeight">HT</label>
+        <input class="ce-num" id="ceVegHeight" type="number" inputmode="numeric" min="5" max="250" step="5"
+               onchange="setCanopyVegHeight(this.value)" title="Height for detected trees (ft)">
+        <span class="ce-lbl">ft</span>
+        <label class="ce-lbl" for="ceVegSens">SENS</label>
+        <input class="ce-range" id="ceVegSens" type="range" min="0" max="100" step="1" value="50"
+               oninput="setCanopyVegSensitivity(this.value)" title="How readily a pixel counts as green">
+        <span class="ce-lbl" id="ceVegSensVal">50</span>
+        <button class="ce-btn active" id="ceVegSmooth" onclick="toggleCanopyVegSmooth()" title="Reject flat green (pasture, crops) when adding trees. A weak filter — mown turf can still pass.">SMOOTH</button>
+        <button class="ce-btn" id="ceVegApply" onclick="canopyVegApply()" title="Commit the previewed change">APPLY</button>
+        <button class="ce-btn" onclick="canopyVegCancel()" title="Discard the preview, change nothing">CANCEL</button>
+        <span class="ce-stat" id="ceVegStats"></span>
+        <span class="ce-caveat">IMAGERY ONLY — Esri World Imagery is a mosaic of unknown date and may be OLDER than the canopy data.
+          Green &ne; tall: lawns, brush and crops score green. Shadowed cells are skipped, not cleared. Verify before APPLY.</span>
       </div>
       <div class="ce-sep"></div>
       <button class="ce-btn" id="ceBtnUndo" onclick="canopyEditUndo()" title="Undo the last paint or delete (up to 20)">UNDO</button>
@@ -1168,7 +1203,7 @@ select.api-input { cursor: pointer; }
               <input type="range" id="canopyOpacity" min="0" max="1" step="0.05" value="0.6" style="width:110px;" oninput="setCanopyOpacity(this.value)">
               <span id="canopyOpacityVal" style="font-size:10px;color:var(--text-muted);width:32px;">60%</span>
               <a href="#" onclick="loadCanopyForView();return false;" style="font-size:10px;color:var(--accent-cyan);margin-left:auto;">Refresh for view</a>
-              <a href="#" id="canopyEditBtn" onclick="startCanopyEdit();return false;" title="Correct the canopy: delete phantom trees or paint missing ones" style="font-size:10px;color:var(--accent-amber);margin-left:8px;">EDIT</a>
+              <a href="#" id="canopyEditBtn" onclick="startCanopyEdit();return false;" title="Correct the canopy: delete phantom trees, paint missing ones, or bulk-classify trees from the satellite imagery (VEG)" style="font-size:10px;color:var(--accent-amber);margin-left:8px;">EDIT</a>
             </div>
             <div id="canopyProxyHint" style="font-size:10px;color:var(--text-muted);margin-top:4px;"></div>
           </div>

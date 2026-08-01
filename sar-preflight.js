@@ -520,6 +520,12 @@ function setStatus(id, type, text) {
 // cached edition.
 const VFR_SECTIONAL_BASE = 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer';
 
+// Esri World Imagery — the app's only true orthoimagery source. Used both as
+// the satellite base layer and as the pixel source for the canopy VEG
+// classifier, so it lives in ONE literal (sw.js mirrors it in its own
+// pre-download provider table, which is a separate scope).
+const SAT_TILE_TEMPLATE = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+
 function sectionalTileUrl(edition) {
   return VFR_SECTIONAL_BASE + '/tile/{z}/{y}/{x}?ed=' + encodeURIComponent(edition);
 }
@@ -685,7 +691,12 @@ function initMap() {
   S.mapLayers.basemap_dark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
   S.mapLayers.basemap_light = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
   applyTheme(getStoredTheme());
-  S.mapLayers.satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19 });
+  // crossOrigin: the canopy VEG classifier reads these tiles' PIXELS. Requesting
+  // them CORS-mode means the tiles Leaflet has already displayed land in the SW
+  // tile cache as readable (non-opaque) responses, so classification reuses them
+  // — no second download, and it works offline for anything already viewed.
+  // Only this layer needs it; the others are never sampled.
+  S.mapLayers.satellite = L.tileLayer(SAT_TILE_TEMPLATE, { maxZoom: 19, crossOrigin: 'anonymous' });
   S.mapLayers.topo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { maxZoom: 17 });
   S.mapLayers.sectional = L.tileLayer(sectionalTileUrl(getStoredSectionalEdition()), { maxNativeZoom: 12, maxZoom: 18, opacity: 1.0, attribution: 'FAA Aeronautical Information Services' });
   // Terrain hillshade (steepness) — Esri World Hillshade XYZ tiles (free, CORS-OK).
@@ -10778,6 +10789,8 @@ async function loadCanopyForView() {
 // sar-preflight-raster.js) and replayed by fetchCanopyRaster onto any grid.
 // ============================================================
 const CANOPY_EDIT_BRUSH_SIZES = { S: 5, M: 10, L: 20 }; // ground radius, metres
+const CANOPY_EDIT_WARN_BYTES = 4 * 1024 * 1024;   // op log this big: suggest a clear
+const CANOPY_EDIT_MAX_BYTES = 16 * 1024 * 1024;   // refuse to grow it past this
 
 // Show exactly one of the mutually-exclusive base overlays (null → none).
 function _setBaseOverlay(id) {
@@ -10816,6 +10829,7 @@ async function startCanopyEdit() {
     sessionOps: [], undoStack: [],
     polyLayer: null, drawHandler: null, prevBase,
     canvas: null, off: null, _stroke: null, _raf: 0,
+    veg: null, vegCanvas: null, _vegGen: 0, _undoBytes: 0,
   };
   S._canopyEditing = true;
   try { Diag.alloc('canopyEditWork', workFlat.byteLength); Diag.note('canopyEdit.start', { cells: workFlat.length, avgM: Math.round(avg.avgM * 10) / 10 }); } catch (_) {}
@@ -10823,7 +10837,7 @@ async function startCanopyEdit() {
   _canopyEditPointerAttach();
   document.querySelector('.map-container')?.classList.add('mode-canopy-edit');
   setCanopyEditSubMode('pan');
-  _canopyEditFlash('BRUSH paints trees at ' + Math.round(mToFt(S.canopyEdit.avgM)) + ' ft · POLY deletes them');
+  _canopyEditFlash('BRUSH paints trees at ' + Math.round(mToFt(S.canopyEdit.avgM)) + ' ft · POLY deletes them · VEG classifies them from the imagery');
 }
 
 function exitCanopyEdit(force) {
@@ -10833,10 +10847,12 @@ function exitCanopyEdit(force) {
       && !confirm('Discard unsaved canopy edits?')) return;
   _canopyEditPointerDetach();
   if (ce.drawHandler) { try { ce.drawHandler.disable(); } catch (_) {} ce.drawHandler = null; }
+  _canopyVegTeardown();
   _canopyEditDiscardPoly();
   if (ce._raf) { cancelAnimationFrame(ce._raf); ce._raf = 0; }
   if (ce._onMapMove) { S.map.off('move resize', ce._onMapMove); S.map.off('zoomstart', ce._onZoomStart); S.map.off('zoomend', ce._onZoomEnd); }
   if (ce.canvas) ce.canvas.remove();
+  if (ce.vegCanvas) ce.vegCanvas.remove();
   const el = S.map.getContainer();
   S.map.dragging.enable();
   if (S.map.touchZoom) S.map.touchZoom.enable();
@@ -10860,7 +10876,10 @@ function setCanopyEditSubMode(mode) {
   const ce = S.canopyEdit;
   if (!ce) return;
   if (ce.drawHandler) { try { ce.drawHandler.disable(); } catch (_) {} ce.drawHandler = null; }
-  if (mode !== 'polygonEdit') _canopyEditDiscardPoly();
+  // Leaving the VEG preview discards the candidate mask — nothing is committed
+  // until APPLY. Runs before the polygon discard so both clean up exactly once.
+  if (mode !== 'vegPreview' && ce.veg) _canopyVegTeardown();
+  if (mode !== 'polygonEdit' && mode !== 'vegPreview') _canopyEditDiscardPoly();
   ce.subMode = mode;
   ce._stroke = null;
   const el = S.map.getContainer();
@@ -10874,15 +10893,21 @@ function setCanopyEditSubMode(mode) {
     S.map.dragging.enable();
     if (S.map.touchZoom) S.map.touchZoom.enable();
     if (S.map.doubleClickZoom) S.map.doubleClickZoom.enable();
-    el.style.cursor = mode === 'polygon' ? 'crosshair' : '';
+    el.style.cursor = (mode === 'polygon' || mode === 'vegPolygon') ? 'crosshair' : '';
     el.style.touchAction = '';
   }
-  if (mode === 'polygon') {
+  if (mode === 'polygon' || mode === 'vegPolygon') {
+    // Green for VEG, amber for the manual delete polygon — the two do very
+    // different things and must not look alike mid-draw.
+    const c = mode === 'vegPolygon' ? '#22c55e' : '#f59e0b';
     ce.drawHandler = new L.Draw.Polygon(S.map, {
-      shapeOptions: { color: '#f59e0b', weight: 2, fillColor: '#f59e0b', fillOpacity: 0.1, dashArray: '6,4' },
+      shapeOptions: { color: c, weight: 2, fillColor: c, fillOpacity: 0.1, dashArray: '6,4' },
       allowIntersection: false,
     });
     ce.drawHandler.enable();
+    if (mode === 'vegPolygon') {
+      _canopyEditFlash('VEG: draw an area — trees are classified from the satellite imagery, then YOU approve the result');
+    }
   }
   _canopyEditBarSync();
 }
@@ -10900,6 +10925,7 @@ function onCanopyEditPolygon(layer) {
   const ce = S.canopyEdit;
   if (!ce) return;
   ce.drawHandler = null; // L.Draw disables itself after CREATED
+  if (ce.subMode === 'vegPolygon') { onCanopyVegPolygon(layer); return; }
   layer.setStyle({ color: '#f59e0b', weight: 2, fillColor: '#f59e0b', fillOpacity: 0.12, dashArray: '6,4' });
   layer.addTo(S.map);
   if (layer.editing && layer.editing.enable) layer.editing.enable(); // draggable vertex handles
@@ -10942,11 +10968,26 @@ function _canopyEditDiscardPoly() {
   ce.polyLayer = null;
 }
 
+const CANOPY_UNDO_MAX_BYTES = 16 * 1024 * 1024;
+
+function _canopyDiffBytes(d) {
+  if (!d) return 0;
+  if (d.rect) return (d.oldValues ? d.oldValues.byteLength : 0) + 64;
+  return (d.indices ? d.indices.byteLength : 0) + (d.oldValues ? d.oldValues.byteLength : 0) + 64;
+}
+
 function _canopyEditPushOp(op, sparseDiff) {
   const ce = S.canopyEdit;
   ce.sessionOps.push(op);
-  ce.undoStack.push({ op, diff: sparseDiff });
-  if (ce.undoStack.length > 20) ce.undoStack.shift(); // oldest becomes un-undoable; op itself stays
+  const entry = { op, diff: sparseDiff, bytes: _canopyDiffBytes(sparseDiff) };
+  ce.undoStack.push(entry);
+  ce._undoBytes = (ce._undoBytes || 0) + entry.bytes;
+  // Oldest becomes un-undoable; the op itself stays. A VEG mask diff can be
+  // ~1 MB, so depth alone is no longer a sufficient bound.
+  while (ce.undoStack.length > 20
+      || (ce._undoBytes > CANOPY_UNDO_MAX_BYTES && ce.undoStack.length > 1)) {
+    ce._undoBytes -= ce.undoStack.shift().bytes;
+  }
   _canopyEditBarSync();
 }
 
@@ -10954,10 +10995,11 @@ function canopyEditUndo() {
   const ce = S.canopyEdit;
   if (!ce || !ce.undoStack.length) return;
   const entry = ce.undoStack.pop();
-  canopyRevertDiff(ce.workFlat, entry.diff);
+  ce._undoBytes = Math.max(0, (ce._undoBytes || 0) - (entry.bytes || 0));
+  canopyRevertDiff(ce.workFlat, entry.diff, ce.grid.cols);
   const i = ce.sessionOps.indexOf(entry.op);
   if (i >= 0) ce.sessionOps.splice(i, 1);
-  _canopyEditRepaintIndices(entry.diff.indices);
+  _canopyEditRepaintDiff(entry.diff);
   _canopyEditBarSync();
 }
 
@@ -10972,6 +11014,16 @@ async function canopyEditSave() {
       if (rec && rec.data && Array.isArray(rec.data.ops)) ops = rec.data.ops;
     }
     ops = ops.concat(ce.sessionOps);
+    // Byte budget, not just a count: one VEG mask op stores as much as ~1000
+    // brush strokes, and this record is re-read on every canopy fetch. Refusing
+    // KEEPS the session ops so nothing the operator drew is lost.
+    const bytes = typeof canopyOpsBytes === 'function' ? canopyOpsBytes(ops) : 0;
+    if (bytes > CANOPY_EDIT_MAX_BYTES) {
+      _canopyEditFlash('Saved edits would reach ' + Math.round(bytes / 1048576) + ' MB — '
+        + 'use "Clear canopy edits" in Config, then re-apply. Nothing was saved.');
+      _canopyEditBarSync();
+      return;
+    }
     if (typeof cacheRaster === 'function') await cacheRaster('canopyedit', 'global', { ops });
     // Adopt the edited raster into app state. New object identity on purpose —
     // the 3D canopy mesh cache is keyed by it and must invalidate.
@@ -10980,9 +11032,11 @@ async function canopyEditSave() {
     const n = ce.sessionOps.length;
     ce.sessionOps = [];
     ce.undoStack = [];
-    try { Diag.note('canopyEdit.save', { ops: n, total: ops.length }); } catch (_) {}
+    const masks = ops.filter(o => o && o.t === 'mask').length;
+    try { Diag.note('canopyEdit.save', { ops: n, total: ops.length, bytes, masks }); } catch (_) {}
     setStatus('canopyStatus', 'cached', 'EDITED');
-    _canopyEditFlash('Saved ' + n + ' edit' + (n === 1 ? '' : 's') + ' — recompute viewsheds to apply' + (ops.length > 400 ? ' (many edits stored — consider Clear canopy edits in Config)' : ''));
+    const heavy = ops.length > 400 || bytes > CANOPY_EDIT_WARN_BYTES;
+    _canopyEditFlash('Saved ' + n + ' edit' + (n === 1 ? '' : 's') + ' — recompute viewsheds to apply' + (heavy ? ' (many edits stored — consider Clear canopy edits in Config)' : ''));
   } catch (e) {
     console.error('Canopy edit save failed:', e);
     _canopyEditFlash('SAVE FAILED — edits kept in this session');
@@ -11055,6 +11109,19 @@ function _canopyEditRedraw() {
   const se = S.map.latLngToContainerPoint([b.south, b.east]);
   ctx.imageSmoothingEnabled = false; // crisp cells, no blur between tree/no-tree
   ctx.drawImage(ce.off, nw.x, nw.y, se.x - nw.x, se.y - nw.y);
+  _canopyVegRedraw();
+}
+
+// Route a diff to the right repaint path: mask ops carry a dense rect, brush
+// and delete-polygon ops carry a sparse index list.
+function _canopyEditRepaintDiff(diff) {
+  if (!diff) return;
+  if (diff.rect) {
+    const r = diff.rect;
+    _canopyEditRepaintRect(r.r0, r.r0 + r.rows - 1, r.c0, r.c0 + r.cols - 1);
+    return;
+  }
+  _canopyEditRepaintIndices(diff.indices);
 }
 
 // Refresh offscreen pixels for a dirty cell rect from workFlat, then redraw.
@@ -11170,12 +11237,43 @@ function _canopyEditBarSync() {
   document.getElementById('ceBtnPan')?.classList.toggle('active', mode === 'pan');
   document.getElementById('ceBtnBrush')?.classList.toggle('active', mode === 'brush');
   document.getElementById('ceBtnPoly')?.classList.toggle('active', mode === 'polygon' || mode === 'polygonEdit');
+  document.getElementById('ceBtnVeg')?.classList.toggle('active', mode === 'vegPolygon' || mode === 'vegPreview');
   const sizes = document.getElementById('ceBrushSizes');
   if (sizes) sizes.style.display = mode === 'brush' ? 'flex' : 'none';
   Object.entries(CANOPY_EDIT_BRUSH_SIZES).forEach(([k, m]) =>
     document.getElementById('ceSize' + k)?.classList.toggle('active', ce.brushRadiusM === m));
   const polyActions = document.getElementById('cePolyActions');
   if (polyActions) polyActions.style.display = mode === 'polygonEdit' ? 'flex' : 'none';
+  // VEG panel: visible for the whole preview, including while tiles are still
+  // sampling, so the caveat text is on screen before any result appears.
+  const veg = ce.veg;
+  const vegPanel = document.getElementById('ceVegPanel');
+  if (vegPanel) vegPanel.style.display = (mode === 'vegPreview' && veg) ? 'flex' : 'none';
+  if (veg) {
+    document.getElementById('ceVegDirAdd')?.classList.toggle('active', veg.direction !== 'del');
+    document.getElementById('ceVegDirCut')?.classList.toggle('active', veg.direction === 'del');
+    const smooth = document.getElementById('ceVegSmooth');
+    if (smooth) {
+      smooth.classList.toggle('active', veg.smooth);
+      // Only meaningful for ADD — CUT deliberately keeps smooth green (lawns,
+      // crops) classified as vegetation so it is PROTECTED from deletion.
+      smooth.disabled = veg.direction === 'del';
+    }
+    const ht = document.getElementById('ceVegHeight');
+    if (ht) {
+      if (document.activeElement !== ht) ht.value = Math.round(mToFt(veg.hM));
+      ht.disabled = veg.direction === 'del';
+    }
+    const sens = document.getElementById('ceVegSens');
+    if (sens && document.activeElement !== sens) sens.value = veg.sens;
+    const sensVal = document.getElementById('ceVegSensVal');
+    if (sensVal) sensVal.textContent = Math.round(veg.sens);
+    const apply = document.getElementById('ceVegApply');
+    if (apply) {
+      apply.disabled = !veg.result || !veg.result.cells;
+      apply.classList.toggle('ce-danger', veg.direction === 'del');
+    }
+  }
   const undo = document.getElementById('ceBtnUndo');
   if (undo) undo.disabled = !ce.undoStack.length;
   const save = document.getElementById('ceBtnSave');
@@ -11189,6 +11287,397 @@ function _canopyEditFlash(msg) {
   el.style.display = 'block';
   clearTimeout(el._t);
   el._t = setTimeout(() => { el.style.display = 'none'; }, 5000);
+}
+
+// ============================================================
+// VEG — imagery-assisted canopy editing. Draw an area, classify the satellite
+// imagery under it, preview the result, then bulk ADD trees at an entered
+// height or CUT trees where the imagery shows none.
+//
+// The classification is a visible-band proxy (Esri World Imagery has no NIR,
+// so NDVI is impossible) over a mosaic whose capture date is unknown and may
+// be OLDER than the canopy raster. It is therefore NEVER auto-applied: the
+// operator sees the mask, moves a sensitivity slider, and approves.
+// ============================================================
+
+const VEG_MAX_TILES_DESKTOP = 64;   // ~950 m square at z18
+const VEG_MAX_TILES_MOBILE = 24;
+const VEG_MAX_CELLS_DESKTOP = 2097152;
+const VEG_MAX_CELLS_MOBILE = 524288;
+const VEG_TILE_CONCURRENCY = 4;     // matches sw.js downloadTiles BATCH
+const VEG_PREVIEW_OPACITY = 0.85;
+const VEG_SENS_DEFAULT = 50;
+
+function _vegMaxTiles() { return _isConstrained() ? VEG_MAX_TILES_MOBILE : VEG_MAX_TILES_DESKTOP; }
+function _vegMaxCells() { return _isConstrained() ? VEG_MAX_CELLS_MOBILE : VEG_MAX_CELLS_DESKTOP; }
+
+// Decode one imagery tile to a pixel source. Fetched as a BLOB and decoded via
+// createImageBitmap: a canvas drawn from a blob-backed bitmap is never tainted,
+// so getImageData works regardless of the <img> crossOrigin story. Returns null
+// on any failure — including an abort, which the caller detects via its gen
+// guard rather than by exception.
+async function _canopyVegDecodeTile(url, signal) {
+  try {
+    const r = await fetch(url, { mode: 'cors', signal });
+    // A cors-mode request answered from an OPAQUE cache entry usually surfaces
+    // as a rejected promise rather than a readable response, so the catch below
+    // is the real detector; this is the belt to its braces.
+    if (!r.ok || r.type === 'opaque') return null;
+    const blob = await r.blob();
+    if (typeof createImageBitmap === 'function') return await createImageBitmap(blob);
+    return await new Promise((res, rej) => {
+      const img = new Image();
+      const u = URL.createObjectURL(blob);
+      img.onload = () => { URL.revokeObjectURL(u); res(img); };
+      img.onerror = () => { URL.revokeObjectURL(u); rej(new Error('decode')); };
+      img.src = u;
+    });
+  } catch (_) { return null; }
+}
+
+// Plain URL FIRST — that is the one that can hit the SW tile cache and work
+// offline. The ?sarcors=1 retry is the online-only escape hatch for installs
+// still holding legacy opaque tile entries (sw.js routes it network-only).
+async function _canopyVegFetchTile(z, x, y, signal) {
+  const url = SAT_TILE_TEMPLATE.replace('{z}', z).replace('{y}', y).replace('{x}', x);
+  return (await _canopyVegDecodeTile(url, signal))
+      || (await _canopyVegDecodeTile(url + (url.includes('?') ? '&' : '?') + 'sarcors=1', signal));
+}
+
+// Draw a decoded tile into the reused scratch canvas and read its pixels.
+// One 256x256 scratch (256 KB) is reused for every tile — deliberately NOT a
+// stitched mosaic, which would be 16 MB at the desktop tile cap.
+function _canopyVegReadTile(bitmap, scratch) {
+  const w = bitmap.width || VEG_TILE_PX, h = bitmap.height || VEG_TILE_PX;
+  if (scratch.width !== w) scratch.width = w;
+  if (scratch.height !== h) scratch.height = h;
+  const ctx = scratch.getContext('2d', { willReadFrequently: true });
+  ctx.clearRect(0, 0, w, h);
+  ctx.drawImage(bitmap, 0, 0);
+  return { data: ctx.getImageData(0, 0, w, h).data, w, h };
+}
+
+function _canopyVegStatus(txt) {
+  const el = document.getElementById('ceVegStats');
+  if (el) el.textContent = txt || '';
+}
+
+// Yield a frame inside a long chunked run so the map stays interactive.
+// rAF does NOT fire while the tab is hidden, so it is RACED against a timer:
+// backgrounding the tab mid-run (trivial on a phone) would otherwise wedge the
+// whole operation forever, with the progress readout frozen mid-count. In a
+// visible tab rAF wins every time and the timer is a no-op.
+// Shared by VEG imagery sampling and the viewshed LOS kernel.
+function _uiYield() {
+  return new Promise(resolve => {
+    let done = false;
+    const fire = () => { if (!done) { done = true; resolve(); } };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(fire);
+    setTimeout(fire, 32);
+  });
+}
+
+// Completed VEG polygon (routed from onCanopyEditPolygon). Keep it on the map
+// with draggable vertices while the preview is live, then sample.
+function onCanopyVegPolygon(layer) {
+  const ce = S.canopyEdit;
+  if (!ce) return;
+  layer.setStyle({ color: '#22c55e', weight: 2, fillColor: '#22c55e', fillOpacity: 0.08, dashArray: '6,4' });
+  layer.addTo(S.map);
+  if (layer.editing && layer.editing.enable) layer.editing.enable();
+  ce.polyLayer = layer;
+  S.map.getContainer().style.cursor = '';
+  const ring = (layer.getLatLngs()[0] || []).map(p => [p.lat, p.lng]);
+  startCanopyVegSample(ring);
+}
+
+// Completed VEG polygon: sample imagery over it, build the analysis planes,
+// and enter the preview sub-mode. Never mutates workFlat.
+async function startCanopyVegSample(ring) {
+  const ce = S.canopyEdit;
+  if (!ce || !ring || ring.length < 3) return;
+  if (typeof location !== 'undefined' && location.protocol === 'file:'
+      && typeof navigator !== 'undefined' && navigator.onLine === false) {
+    _canopyEditFlash('Imagery sampling needs a connection (the single-file build has no tile cache)');
+    canopyVegCancel();
+    return;
+  }
+  const gb = ce.grid.bounds;
+  let w = Infinity, e = -Infinity, s = Infinity, n = -Infinity;
+  for (const p of ring) {
+    if (p[0] < s) s = p[0]; if (p[0] > n) n = p[0];
+    if (p[1] < w) w = p[1]; if (p[1] > e) e = p[1];
+  }
+  // Clip to the loaded canopy grid — imagery outside it has nothing to edit.
+  const bbox = {
+    west: Math.max(w, gb.west), east: Math.min(e, gb.east),
+    south: Math.max(s, gb.south), north: Math.min(n, gb.north),
+  };
+  if (!(bbox.east > bbox.west) || !(bbox.north > bbox.south)) {
+    _canopyEditFlash('Draw inside the loaded vegetation area');
+    canopyVegCancel();
+    return;
+  }
+  const sel = imageryZoomForBBox(bbox, ce.grid.resM, {
+    maxTiles: _vegMaxTiles(),
+    preferZ: S.map && S.map.getZoom ? S.map.getZoom() : null,
+    maxZ: _isConstrained() ? 18 : VEG_IMAGERY_MAX_Z,
+  });
+  if (!sel) {
+    _canopyEditFlash('AREA TOO LARGE — draw under ~900 m across');
+    canopyVegCancel();
+    return;
+  }
+  const mosaic = tileMosaicBounds(sel.x0, sel.y0, sel.x1, sel.y1, sel.z);
+  const lattice = analysisLatticeFor(mosaic);
+  if (lattice.rows * lattice.cols > _vegMaxCells()) {
+    _canopyEditFlash('AREA TOO LARGE for this device — draw a smaller area');
+    canopyVegCancel();
+    return;
+  }
+
+  const gen = (ce._vegGen = (ce._vegGen || 0) + 1);
+  const abort = (typeof AbortController === 'function') ? new AbortController() : null;
+  const acc = makeVegAccumulator(lattice.rows, lattice.cols);
+  const accBytes = lattice.rows * lattice.cols * 12;
+  try { Diag.alloc('canopyVegAcc', accBytes); } catch (_) {}
+  ce.veg = {
+    stage: 'sampling', ring, bbox, mosaic, lattice, z: sel.z, abort, gen,
+    direction: 'add', sens: VEG_SENS_DEFAULT, smooth: true,
+    hM: ce.avgM, planes: null, result: null, off: null,
+    tiles: sel.tiles, got: 0, failed: 0,
+  };
+  setCanopyEditSubMode('vegPreview');
+  _canopyVegStatus('SAMPLING 0/' + sel.tiles + ' TILES...');
+
+  const jobs = [];
+  for (let ty = sel.y0; ty <= sel.y1; ty++) for (let tx = sel.x0; tx <= sel.x1; tx++) jobs.push([tx, ty]);
+  const scratch = document.createElement('canvas');
+  let next = 0, got = 0, failed = 0;
+  const worker = async () => {
+    while (next < jobs.length) {
+      const j = jobs[next++];
+      if (ce._vegGen !== gen) return;
+      const bm = await _canopyVegFetchTile(sel.z, j[0], j[1], abort ? abort.signal : undefined);
+      if (ce._vegGen !== gen) return;
+      if (!bm) { failed++; } else {
+        try {
+          const px = _canopyVegReadTile(bm, scratch);
+          accumulateVegTile(acc, px.data, px.w, px.h, lattice.pool,
+            (j[1] - sel.y0) * lattice.per, (j[0] - sel.x0) * lattice.per);
+          got++;
+        } catch (err) {
+          failed++;   // tainted canvas / decode failure — never fabricate pixels
+        }
+        if (bm.close) { try { bm.close(); } catch (_) {} }
+      }
+      _canopyVegStatus('SAMPLING ' + (got + failed) + '/' + jobs.length + ' TILES...');
+      await _uiYield();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(VEG_TILE_CONCURRENCY, jobs.length) }, worker));
+  if (ce._vegGen !== gen || !ce.veg) return;
+
+  ce.veg.got = got; ce.veg.failed = failed;
+  if (!got) {
+    const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    _canopyEditFlash(offline
+      ? 'NO IMAGERY (offline — pre-download zoom 17-18 for this area in Config > Offline)'
+      : 'IMAGERY NOT READABLE — reload once to pick up the app update, then retry');
+    try { Diag.note('canopyVeg.noImagery', { z: sel.z, tiles: jobs.length }); } catch (_) {}
+    canopyVegCancel();
+    return;
+  }
+  ce.veg.planes = finalizeVegAccumulator(acc);
+  ce.veg.stage = 'preview';
+  try { Diag.free('canopyVegAcc', accBytes); } catch (_) {}
+  try { Diag.alloc('canopyVegPlanes', lattice.rows * lattice.cols * 4); } catch (_) {}
+  ce.veg.bytes = lattice.rows * lattice.cols * 4;
+  _canopyVegCanvasCreate();
+  _canopyVegRethreshold();
+  _canopyEditBarSync();
+  if (failed) _canopyEditFlash('PARTIAL ' + got + '/' + jobs.length + ' TILES — result covers part of the area only');
+}
+
+// Threshold + morphology parameters for the current slider/direction state.
+// Everything here is cheap enough to re-run on every slider input event.
+function _canopyVegOpts() {
+  const v = S.canopyEdit && S.canopyEdit.veg;
+  const resM = v.lattice.resM;
+  return {
+    direction: v.direction,
+    scoreT: VEG_SCORE_HI - (v.sens / 100) * (VEG_SCORE_HI - VEG_SCORE_LO),
+    bounds: v.lattice.bounds,
+    textureGate: v.smooth,
+    morphR: 1,
+    minBlobCells: Math.max(2, Math.round(VEG_MIN_BLOB_M2 / (resM * resM))),
+    leanCells: Math.max(1, Math.round(VEG_LEAN_MARGIN_M / resM)),
+    poly: v.ring,
+    insideFn: typeof pointInPolygon === 'function' ? pointInPolygon : undefined,
+  };
+}
+
+// Re-classify from the resident planes — O(cells), NO network, and it never
+// touches workFlat. This is what makes the sensitivity slider interactive.
+function _canopyVegRethreshold() {
+  const ce = S.canopyEdit, v = ce && ce.veg;
+  if (!v || !v.planes) return;
+  v.result = vegCandidateMask(v.planes, _canopyVegOpts());
+  _canopyVegPaint();
+  const cells = v.result.cells;
+  const ha = cellsToHectares(cells, v.lattice.resM);
+  _canopyVegStatus((v.direction === 'del' ? 'CUT ' : 'ADD ')
+    + cells.toLocaleString() + ' cells / ' + ha.toFixed(2) + ' ha'
+    + (v.result.unknownCells ? ' / ' + v.result.unknownCells.toLocaleString() + ' skipped (shadow)' : ''));
+}
+
+// Preview canvas: a SECOND screen canvas in the canopy edit pane. It must not
+// inherit the canopy opacity slider, or the preview is illegible whenever the
+// operator has canopy turned down.
+function _canopyVegCanvasCreate() {
+  const ce = S.canopyEdit;
+  if (ce.vegCanvas) return;
+  const pane = (S.map.getPane && S.map.getPane('canopyEditPane')) || S.map.getContainer();
+  const canvas = document.createElement('canvas');
+  canvas.id = 'canopyVegCanvas';
+  canvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;';
+  canvas.style.opacity = VEG_PREVIEW_OPACITY;
+  pane.appendChild(canvas);
+  ce.vegCanvas = canvas;
+}
+
+function _canopyVegPaint() {
+  const ce = S.canopyEdit, v = ce && ce.veg;
+  if (!v || !v.result) return;
+  const { rows, cols } = v.result;
+  if (!v.off) {
+    v.off = document.createElement('canvas');
+    v.off.width = cols; v.off.height = rows;
+  }
+  v.off.getContext('2d').putImageData(
+    new ImageData(vegMaskToRGBA(v.result.mask, v.result.unknown, rows, cols, v.direction), cols, rows), 0, 0);
+  if (!ce._raf) ce._raf = requestAnimationFrame(() => { ce._raf = 0; _canopyEditRedraw(); });
+}
+
+// Drawn from _canopyEditRedraw. The analysis lattice is Mercator-aligned and
+// Leaflet's CRS *is* Web Mercator, so its extent projects to an exact
+// axis-aligned rect — no resampling needed.
+function _canopyVegRedraw() {
+  const ce = S.canopyEdit;
+  if (!ce || !ce.vegCanvas) return;
+  const el = S.map.getContainer();
+  const w = el.clientWidth, h = el.clientHeight;
+  if (ce.vegCanvas.width !== w) ce.vegCanvas.width = w;
+  if (ce.vegCanvas.height !== h) ce.vegCanvas.height = h;
+  if (L.DomUtil && L.DomUtil.setPosition && S.map.containerPointToLayerPoint) {
+    L.DomUtil.setPosition(ce.vegCanvas, S.map.containerPointToLayerPoint([0, 0]));
+  }
+  const ctx = ce.vegCanvas.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  const v = ce.veg;
+  if (!v || !v.off) return;
+  const b = v.lattice.bounds;
+  const nw = S.map.latLngToContainerPoint([b.north, b.west]);
+  const se = S.map.latLngToContainerPoint([b.south, b.east]);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(v.off, nw.x, nw.y, se.x - nw.x, se.y - nw.y);
+}
+
+function setCanopyVegDirection(dir) {
+  const v = S.canopyEdit && S.canopyEdit.veg;
+  if (!v) return;
+  v.direction = dir === 'del' ? 'del' : 'add';
+  _canopyVegRethreshold();
+  _canopyEditBarSync();
+}
+
+function setCanopyVegHeight(ft) {
+  const v = S.canopyEdit && S.canopyEdit.veg;
+  if (!v) return;
+  const f = Math.max(5, Math.min(250, parseFloat(ft) || 0));
+  v.hM = ftToM(f);
+}
+
+function setCanopyVegSensitivity(val) {
+  const v = S.canopyEdit && S.canopyEdit.veg;
+  if (!v) return;
+  v.sens = Math.max(0, Math.min(100, parseFloat(val) || 0));
+  const out = document.getElementById('ceVegSensVal');
+  if (out) out.textContent = Math.round(v.sens);
+  _canopyVegRethreshold();
+}
+
+function toggleCanopyVegSmooth() {
+  const v = S.canopyEdit && S.canopyEdit.veg;
+  if (!v) return;
+  v.smooth = !v.smooth;
+  _canopyVegRethreshold();
+  _canopyEditBarSync();
+}
+
+// Commit the preview: bake the mask into one replayable op, apply it to the
+// working raster, and hand it to the normal undo/save plumbing.
+function canopyVegApply() {
+  const ce = S.canopyEdit, v = ce && ce.veg;
+  if (!v || !v.result) return;
+  const del = v.direction === 'del';
+  if (!v.result.cells) { _canopyEditFlash('Nothing selected — adjust SENS or redraw'); return; }
+  const ha = cellsToHectares(v.result.cells, v.lattice.resM);
+  if (del && typeof confirm === 'function'
+      && !confirm('Delete canopy on ' + v.result.cells.toLocaleString() + ' cells (' + ha.toFixed(2) + ' ha)?\n\n'
+        + 'Removing trees makes the viewshed predict MORE visibility. '
+        + 'Confirm the imagery is current for this area.')) return;
+  const built = makeCanopyMaskOp({
+    mask: v.result.mask, cols: v.result.cols, rows: v.result.rows,
+    bounds: v.lattice.bounds, mode: del ? 'del' : 'add',
+    hM: v.hM, hMode: 'fill', z: v.z, at: Date.now(), poly: v.ring,
+  });
+  if (!built) { _canopyEditFlash('Nothing selected — adjust SENS or redraw'); return; }
+  const diff = canopyApplyMask(ce.grid, ce.workFlat, built.op);
+  const changed = diff ? diff.changed : 0;
+  const ft = Math.round(mToFt(v.hM));
+  const skipped = v.result.unknownCells;
+  _canopyVegTeardown();
+  // Keep the op even when no DISPLAYED cell changed: a finer viewshed grid may
+  // still have trees inside it (same reasoning as canopyEditDelete).
+  _canopyEditPushOp(built.op, diff);
+  if (diff) _canopyEditRepaintDiff(diff);
+  setCanopyEditSubMode('pan');
+  try { Diag.note('canopyVeg.apply', { mode: built.op.mode, cells: built.cells, changed, z: built.op.z }); } catch (_) {}
+  // Lead with what actually CHANGED on the raster, not the detected area. In
+  // dense forest most detected cells already hold trees, so "added 23.5 ha"
+  // when 64 cells moved would badly overstate the effect.
+  const gridHa = cellsToHectares(changed, ce.grid.resM);
+  _canopyEditFlash((del ? 'Cleared ' : 'Filled ') + changed.toLocaleString() + ' cells / '
+    + gridHa.toFixed(2) + ' ha' + (del ? '' : ' at ' + ft + ' ft')
+    + ' — ' + ha.toFixed(2) + ' ha detected'
+    + (skipped ? ' / ' + skipped.toLocaleString() + ' skipped (shadow)' : '')
+    + ' — UNDO if wrong');
+}
+
+function canopyVegCancel() {
+  const ce = S.canopyEdit;
+  if (!ce) return;
+  _canopyVegTeardown();
+  setCanopyEditSubMode('pan');
+}
+
+function _canopyVegTeardown() {
+  const ce = S.canopyEdit;
+  if (!ce) return;
+  const v = ce.veg;
+  if (v) {
+    ce._vegGen = (ce._vegGen || 0) + 1;    // orphan any in-flight tile worker
+    if (v.abort) { try { v.abort.abort(); } catch (_) {} }
+    try { if (v.bytes) Diag.free('canopyVegPlanes', v.bytes); } catch (_) {}
+  }
+  ce.veg = null;
+  if (ce.vegCanvas) {
+    const ctx = ce.vegCanvas.getContext('2d');
+    if (ctx) ctx.clearRect(0, 0, ce.vegCanvas.width, ce.vegCanvas.height);
+  }
+  _canopyVegStatus('');
+  _canopyEditDiscardPoly();
 }
 
 // ============================================================
@@ -11991,7 +12480,7 @@ async function _runViewshedKernel(opts) {
     }
     if ((row - rMin) % 16 === 0) {
       _vsProgress(0.2 + 0.78 * (row - rMin) / Math.max(1, rMax - rMin));
-      await new Promise(requestAnimationFrame);
+      await _uiYield();   // NOT bare rAF — that never fires in a hidden tab
     }
   }
   return out;
@@ -13230,6 +13719,13 @@ if (typeof module !== 'undefined' && module.exports) {
     CANOPY_EDIT_BRUSH_SIZES, _setBaseOverlay, _applyCanopyEdits,
     startCanopyEdit, exitCanopyEdit, setCanopyEditSubMode, setCanopyBrushSize,
     onCanopyEditPolygon, canopyEditDelete, canopyEditCancelPoly, canopyEditUndo, canopyEditSave,
-    clearCanopyEdits, _canopyEditPushOp, _canopyEditBarSync,
+    clearCanopyEdits, _canopyEditPushOp, _canopyEditBarSync, _canopyEditRepaintDiff,
+    CANOPY_EDIT_WARN_BYTES, CANOPY_EDIT_MAX_BYTES, CANOPY_UNDO_MAX_BYTES,
+    // Canopy VEG (imagery classification)
+    SAT_TILE_TEMPLATE, VEG_MAX_TILES_DESKTOP, VEG_MAX_TILES_MOBILE, VEG_TILE_CONCURRENCY,
+    _uiYield, _vegMaxTiles, _vegMaxCells, _canopyVegDecodeTile, _canopyVegFetchTile, _canopyVegReadTile,
+    onCanopyVegPolygon, startCanopyVegSample, _canopyVegOpts, _canopyVegRethreshold,
+    setCanopyVegDirection, setCanopyVegHeight, setCanopyVegSensitivity, toggleCanopyVegSmooth,
+    canopyVegApply, canopyVegCancel, _canopyVegTeardown,
   };
 }
