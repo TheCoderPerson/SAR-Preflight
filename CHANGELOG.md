@@ -4,6 +4,14 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.08.01-a — 2026-08-01
+
+- VEG CUT now actually clears open ground. Field testing over a scattered-conifer meadow showed it clearing well under a tenth of the ground that was obviously treeless; on the same area it now clears about 98% of it. Dense forest still barely cuts at all, which is correct.
+- The cause was a 6 m protective margin drawn around every tree AND every tree shadow. Where trees stand 15-20 m apart those margins merged and covered the whole meadow, throwing away roughly 80% of valid clearing. Shadows are already protected in their own right, so that margin is now off by default.
+- Clearing also required every last sub-cell under a map cell to look bare before it would touch it, so the ground actually cleared was much smaller than the area you reviewed and approved. It now goes by majority, which tracks what you saw in the preview.
+- The SENSITIVITY slider was working backwards when cutting — dragging it to maximum protected more and cut less. Higher now always means "do more of this", and the centre of the slider is the tuned default for both adding and cutting.
+- Edits you already saved keep the behaviour they were saved with; these changes only affect new ones.
+
 ## v2026.07.31-a — 2026-07-31
 
 - Canopy EDIT has a new VEG tool: draw an area and the app reads the satellite imagery underneath it, works out which pixels are trees, and shows you the result before anything is changed. ADD paints canopy at a height you enter wherever the imagery is green; CUT clears canopy wherever it is not. Meant for fixing a stale canopy map — a clearcut, a burn scar, a new subdivision, trees that have grown in — without brushing it by hand.

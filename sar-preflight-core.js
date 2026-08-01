@@ -24,6 +24,17 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.08.01-a',
+    date: '2026-08-01',
+    changes: [
+      'VEG CUT now actually clears open ground. Field testing over a scattered-conifer meadow showed it clearing well under a tenth of the ground that was obviously treeless; on the same area it now clears about 98% of it. Dense forest still barely cuts at all, which is correct.',
+      'The cause was a 6 m protective margin drawn around every tree AND every tree shadow. Where trees stand 15-20 m apart those margins merged and covered the whole meadow, throwing away roughly 80% of valid clearing. Shadows are already protected in their own right, so that margin is now off by default.',
+      'Clearing also required every last sub-cell under a map cell to look bare before it would touch it, so the ground actually cleared was much smaller than the area you reviewed and approved. It now goes by majority, which tracks what you saw in the preview.',
+      'The SENSITIVITY slider was working backwards when cutting — dragging it to maximum protected more and cut less. Higher now always means "do more of this", and the centre of the slider is the tuned default for both adding and cutting.',
+      'Edits you already saved keep the behaviour they were saved with; these changes only affect new ones.',
+    ],
+  },
+  {
     version: '2026.07.31-a',
     date: '2026-07-31',
     changes: [

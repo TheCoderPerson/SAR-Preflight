@@ -11265,7 +11265,12 @@ function _canopyEditBarSync() {
       ht.disabled = veg.direction === 'del';
     }
     const sens = document.getElementById('ceVegSens');
-    if (sens && document.activeElement !== sens) sens.value = veg.sens;
+    if (sens) {
+      if (document.activeElement !== sens) sens.value = veg.sens;
+      sens.title = veg.direction === 'del'
+        ? 'Higher = clear more ground (treats less of the imagery as trees)'
+        : 'Higher = detect more trees';
+    }
     const sensVal = document.getElementById('ceVegSensVal');
     if (sensVal) sensVal.textContent = Math.round(veg.sens);
     const apply = document.getElementById('ceVegApply');
@@ -11506,12 +11511,14 @@ function _canopyVegOpts() {
   const resM = v.lattice.resM;
   return {
     direction: v.direction,
-    scoreT: VEG_SCORE_HI - (v.sens / 100) * (VEG_SCORE_HI - VEG_SCORE_LO),
+    // Centre of the slider is the calibrated default; higher always does more
+    // of the current operation (which means inverting for CUT).
+    scoreT: vegScoreThresholdForSens(v.sens, v.direction),
     bounds: v.lattice.bounds,
     textureGate: v.smooth,
     morphR: 1,
     minBlobCells: Math.max(2, Math.round(VEG_MIN_BLOB_M2 / (resM * resM))),
-    leanCells: Math.max(1, Math.round(VEG_LEAN_MARGIN_M / resM)),
+    leanCells: Math.max(0, Math.round(VEG_LEAN_MARGIN_M / resM)),
     poly: v.ring,
     insideFn: typeof pointInPolygon === 'function' ? pointInPolygon : undefined,
   };

@@ -1067,7 +1067,36 @@ const VEG_CELL_LIT_MIN = 0.35;    // cell with < 35% lit pixels => UNKNOWN
 const VEG_TEXTURE_MIN = 0.008;
 const VEG_TEXTURE_RADIUS_CELLS = 2; // 5x5 window ~9 m at the 1.86 m lattice — crown scale
 const VEG_MIN_BLOB_M2 = 100;      // ~one large crown — drop smaller specks
-const VEG_LEAN_MARGIN_M = 6;      // off-nadir crown displacement guard, CUT only
+
+// Off-nadir crown-displacement guard for CUT, in metres, dilating the protect
+// mask. DEFAULT 0 — MEASURED against real scattered-conifer meadow, where the
+// original 6 m (3 cells) was the single biggest source of under-cutting:
+//   stage                      candidates remaining (% of covered area)
+//   genuinely bare ground                        52%
+//   after protect close                          52%
+//   after 6 m lean dilate                        10%   <-- 81% of valid
+//   after open + min-blob                         8%        candidates lost
+// Scattered trees sit ~15-20 m apart, so a 6 m isotropic dilation around every
+// crown AND every shadow cell merges into near-total coverage and the tool
+// cannot cut an obviously empty meadow. Two protections already stand in for
+// it: tree shadow is classified unknown and protected on its own (and shadow
+// abuts the crown), and the maskOpen(cand, 1) step leaves ~1 cell (~1.9 m) of
+// standoff from anything protected. Raise this only for imagery with a known
+// large off-nadir angle.
+const VEG_LEAN_MARGIN_M = 0;
+
+// Fraction of a target cell's source window that must be bare before CUT
+// clears it. MEASURED on the same meadow (19.22 ha genuinely bare, 8.5 m grid):
+//   minFrac 1.00 (unanimity) ->  5.65 ha cleared (29%)
+//   minFrac 0.75             -> 13.60 ha        (71%)
+//   minFrac 0.50             -> 18.92 ha        (98%)
+//   minFrac 0.34             -> 21.28 ha       (111% — eats real trees)
+// Unanimity sounds like the safe choice but a single vegetated sub-pixel
+// anywhere in a ~21-cell window spared the whole grid cell, so CUT cleared far
+// less than the operator had reviewed and approved. A majority rule tracks the
+// reviewed area almost exactly without overshooting it. The value is written
+// into every op at bake time, so ops saved under the old default keep it.
+const VEG_DEL_MIN_FRAC = 0.5;
 const CANOPY_MASK_MAX_CELLS = 4194304; // 512 KB packed; larger masks coarsen instead of failing
 
 // Ground sample distance of an XYZ tile pixel at a latitude.
@@ -1172,6 +1201,24 @@ function vegGreenScore(R, G, B, blueWeight) {
   const r = R / s, g = G / s, b = B / s;
   const w = blueWeight == null ? VEG_BLUE_W : blueWeight;
   return (g - r) + w * (g - b);
+}
+
+// Map the 0-100 sensitivity slider to a greenness threshold.
+//
+// The CENTRE is pinned to the calibrated default (VEG_SCORE_T0) so a freshly
+// opened preview is exactly the tuned behaviour and the slider only ever means
+// "more" or "less" than that. A plain linear ramp between the endpoints put the
+// default off-centre and made the midpoint over-cut.
+//
+// Higher always does MORE of the CURRENT operation, which means inverting for
+// CUT: a lower threshold counts more pixels as vegetation, so it paints more in
+// ADD but PROTECTS more — cuts less — in CUT.
+function vegScoreThresholdForSens(sens, direction) {
+  const s = Math.max(0, Math.min(100, Number(sens) || 0));
+  const f = direction === 'del' ? 100 - s : s;   // 0 = least effect, 100 = most
+  return f <= 50
+    ? VEG_SCORE_HI + (f / 50) * (VEG_SCORE_T0 - VEG_SCORE_HI)
+    : VEG_SCORE_T0 + ((f - 50) / 50) * (VEG_SCORE_LO - VEG_SCORE_T0);
 }
 
 // Per-cell accumulator over the analysis lattice. ~12 B/cell during sampling;
@@ -1563,7 +1610,8 @@ function makeCanopyMaskOp(spec) {
     srcCols: cols, srcRows: rows,
     srcBounds: { west: bounds.west, south: bounds.south, east: bounds.east, north: bounds.north },
     srcIsMercator: true,
-    minFrac: mode === 'del' ? 1 : 0,
+    minFrac: Number.isFinite(spec.minFrac) ? spec.minFrac
+      : (mode === 'del' ? VEG_DEL_MIN_FRAC : 0),
     clsV: 1,
   };
   if (spec.z != null) op.z = spec.z;
@@ -2293,9 +2341,9 @@ if (typeof module !== 'undefined' && module.exports) {
     VEG_ANALYSIS_Z, VEG_TILE_PX, VEG_IMAGERY_MIN_Z, VEG_IMAGERY_MAX_Z, VEG_TARGET_PX_PER_CELL,
     VEG_BLUE_W, VEG_SCORE_T0, VEG_SCORE_HI, VEG_SCORE_LO, VEG_DARK_V, VEG_MIN_SAT,
     VEG_CELL_LIT_MIN, VEG_TEXTURE_MIN, VEG_TEXTURE_RADIUS_CELLS, VEG_MIN_BLOB_M2,
-    VEG_LEAN_MARGIN_M, CANOPY_MASK_MAX_CELLS, vegTexturePlane,
+    VEG_LEAN_MARGIN_M, VEG_DEL_MIN_FRAC, CANOPY_MASK_MAX_CELLS, vegTexturePlane,
     imageryMetresPerPixel, imageryZoomForBBox, tileMosaicBounds, analysisLatticeFor,
-    vegGreenScore, makeVegAccumulator, accumulateVegTile, finalizeVegAccumulator,
+    vegGreenScore, vegScoreThresholdForSens, makeVegAccumulator, accumulateVegTile, finalizeVegAccumulator,
     maskDilate, maskErode, maskOpen, maskClose, filterMaskMinArea, maskClipToPolygon,
     maskDownsample, packBitMask, countMask, cellsToHectares,
     vegCandidateMask, vegMaskToRGBA, makeCanopyMaskOp,

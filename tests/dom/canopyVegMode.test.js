@@ -10,6 +10,7 @@ const core = require('../../sar-preflight-core.js');
 Object.assign(globalThis, core);
 const raster = require('../../sar-preflight-raster.js');
 Object.assign(globalThis, raster);
+const { VEG_DEL_MIN_FRAC } = raster;
 
 // Colour every mocked tile pixel returns. Swapped per test.
 const CONIFER = [60, 80, 45];
@@ -387,8 +388,28 @@ describe('CUT', () => {
     canopyVegApply();
     expect(S.canopyEdit.sessionOps.length).toBe(1);
     expect(S.canopyEdit.sessionOps[0].mode).toBe('del');
-    expect(S.canopyEdit.sessionOps[0].minFrac).toBe(1);
+    expect(S.canopyEdit.sessionOps[0].minFrac).toBe(VEG_DEL_MIN_FRAC);
     expect(S.canopyEdit.workFlat[S.canopy.grid.cols * 5 + 5]).toBe(0);
+  });
+
+  // The slider moves the greenness threshold, so mapping both directions the
+  // same way made dragging to max PROTECT more and cut less — the opposite of
+  // what the control reads as. It must be monotone in "do more of this".
+  it('higher sensitivity cuts MORE, not less', async () => {
+    TILE_RGB = DRY_GRASS;
+    await enterVegPreview();
+    setCanopyVegDirection('del');
+    setCanopyVegSensitivity(0);
+    const low = S.canopyEdit.veg.result.cells;
+    setCanopyVegSensitivity(100);
+    const high = S.canopyEdit.veg.result.cells;
+    expect(high).toBeGreaterThanOrEqual(low);
+    // ...and ADD stays monotone in the same direction.
+    setCanopyVegDirection('add');
+    setCanopyVegSensitivity(0);
+    const addLow = S.canopyEdit.veg.result.cells;
+    setCanopyVegSensitivity(100);
+    expect(S.canopyEdit.veg.result.cells).toBeGreaterThanOrEqual(addLow);
   });
 
   it('never selects a cell it could not judge', async () => {
