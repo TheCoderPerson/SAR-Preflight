@@ -4,6 +4,14 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.08.01-b — 2026-08-01
+
+- VEG ADD now fills dense forest. It was doing the opposite of what it should: painting sunlit grass and road verges while leaving thick canopy — the very places missing canopy data — untouched. On a dense stand it now covers 99% of the area instead of 50%.
+- The reason: a cell had to be bright enough to judge by colour, and dense conifer canopy is mostly deep shadow. Measurement showed 84% of those rejected cells had no lit pixel at all, so no colour rule could ever rescue them. A dark area ringed by treetops is that canopy’s own shadow, and is now treated as trees. Dark ground out in the open, with no canopy around it, is still left alone.
+- Turning the slider to maximum used to paint dry grass, because the bottom of its range sat just below grass’s score. The range now stops above grass, bare dirt and asphalt, so the top of the slider reaches for marginal vegetation rather than bare ground.
+- Added a colour key under the preview. The amber checkerboard means "too dark to judge, left alone" — it is easily misread as "trees found", which is nearly its opposite.
+- Cells reclaimed as canopy shadow no longer count in the "skipped" total, so that number now reflects what the tool genuinely could not judge.
+
 ## v2026.08.01-a — 2026-08-01
 
 - VEG CUT now actually clears open ground. Field testing over a scattered-conifer meadow showed it clearing well under a tenth of the ground that was obviously treeless; on the same area it now clears about 98% of it. Dense forest still barely cuts at all, which is correct.

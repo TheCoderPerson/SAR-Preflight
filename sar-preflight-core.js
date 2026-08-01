@@ -24,6 +24,17 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.08.01-b',
+    date: '2026-08-01',
+    changes: [
+      'VEG ADD now fills dense forest. It was doing the opposite of what it should: painting sunlit grass and road verges while leaving thick canopy — the very places missing canopy data — untouched. On a dense stand it now covers 99% of the area instead of 50%.',
+      'The reason: a cell had to be bright enough to judge by colour, and dense conifer canopy is mostly deep shadow. Measurement showed 84% of those rejected cells had no lit pixel at all, so no colour rule could ever rescue them. A dark area ringed by treetops is that canopy’s own shadow, and is now treated as trees. Dark ground out in the open, with no canopy around it, is still left alone.',
+      'Turning the slider to maximum used to paint dry grass, because the bottom of its range sat just below grass’s score. The range now stops above grass, bare dirt and asphalt, so the top of the slider reaches for marginal vegetation rather than bare ground.',
+      'Added a colour key under the preview. The amber checkerboard means "too dark to judge, left alone" — it is easily misread as "trees found", which is nearly its opposite.',
+      'Cells reclaimed as canopy shadow no longer count in the "skipped" total, so that number now reflects what the tool genuinely could not judge.',
+    ],
+  },
+  {
     version: '2026.08.01-a',
     date: '2026-08-01',
     changes: [

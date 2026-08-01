@@ -16,7 +16,7 @@ const {
   makeCanopyMaskOp, canopyMaskOpValid, canopyApplyMask, canopyRevertDiff,
   canopyOpBBox, canopyApplyOps, canopyOpBytes, canopyOpsBytes,
   VEG_SCORE_T0, VEG_SCORE_HI, VEG_SCORE_LO, VEG_DEL_MIN_FRAC, VEG_LEAN_MARGIN_M,
-  vegScoreThresholdForSens,
+  vegScoreThresholdForSens, reclaimShadowInVeg, VEG_SHADOW_RECLAIM_FRAC,
 } = require('../../sar-preflight-raster.js');
 const { pointInPolygon } = require('../../sar-preflight-core.js');
 
@@ -246,6 +246,41 @@ describe('vegCandidateMask', () => {
   // closing step reclaims it: painting it is physically right and errs toward
   // more canopy. Closing cannot grow a boundary, so open ground stays unpainted
   // (asserted above). Without this, real stands come out moth-eaten.
+  // Measured over real dense conifer: 84% of the cells the darkness gate
+  // rejects have NO lit pixel at all, so no per-cell rule can rescue them and
+  // ADD refused to paint exactly the dense stands it was most needed for —
+  // while happily painting sunlit grass. A dark region bounded by canopy is
+  // that canopy's own shadow.
+  it('reclaims a large dark region bounded by canopy, at any size', () => {
+    const N = 12;
+    const veg = new Uint8Array(N * N).fill(1);
+    const unknown = new Uint8Array(N * N);
+    for (let y = 3; y <= 8; y++) for (let x = 3; x <= 8; x++) {   // 6x6 dark core
+      unknown[y * N + x] = 1; veg[y * N + x] = 0;
+    }
+    const got = reclaimShadowInVeg(veg, unknown, N, N);
+    expect(countMask(got)).toBe(36);          // the whole region, not just its rim
+  });
+
+  it('leaves an isolated dark blob in the open alone', () => {
+    const N = 12;
+    const veg = new Uint8Array(N * N);        // no vegetation anywhere
+    const unknown = new Uint8Array(N * N);
+    for (let y = 4; y <= 7; y++) for (let x = 4; x <= 7; x++) unknown[y * N + x] = 1;
+    expect(countMask(reclaimShadowInVeg(veg, unknown, N, N))).toBe(0);
+  });
+
+  it('leaves a region only half-bounded by canopy alone', () => {
+    const N = 12;
+    const veg = new Uint8Array(N * N);
+    const unknown = new Uint8Array(N * N);
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < 5; x++) veg[y * N + x] = 1;            // canopy to the west only
+      for (let x = 5; x <= 6; x++) unknown[y * N + x] = 1;       // dark strip between
+    }
+    expect(countMask(reclaimShadowInVeg(veg, unknown, N, N))).toBe(0);
+  });
+
   it('reclaims a shadow hole enclosed by vegetation', () => {
     // 5x5 of conifer with one shadow pixel dead centre, at pool 1.
     const TW = 5, TH = 5;
@@ -260,8 +295,11 @@ describe('vegCandidateMask', () => {
     const p = finalizeVegAccumulator(acc);
     const opts = { bounds: BOUNDS, morphR: 1, textureGate: false, insideFn: pointInPolygon };
     const add = vegCandidateMask(p, Object.assign({}, opts, { direction: 'add' }));
-    expect(add.unknown[2 * TW + 2]).toBe(1);   // still reported as unjudged
-    expect(add.mask[2 * TW + 2]).toBe(1);      // ...but filled by the close
+    expect(add.mask[2 * TW + 2]).toBe(1);      // painted as the canopy's own shadow
+    // ...and no longer counted as "skipped": it WAS judged, just by context
+    // rather than by colour, so reporting it as unjudged would understate the
+    // coverage the operator is approving.
+    expect(add.unknown[2 * TW + 2]).toBe(0);
     // And it is never a CUT candidate, enclosed or not.
     const cut = vegCandidateMask(p, Object.assign({}, opts, { direction: 'del' }));
     expect(cut.mask[2 * TW + 2]).toBe(0);
@@ -287,8 +325,19 @@ describe('vegCandidateMask', () => {
   });
 
   it('re-thresholds from the same planes without resampling', () => {
-    const strict = vegCandidateMask(planes, Object.assign({}, baseOpts, { direction: 'add', scoreT: VEG_SCORE_HI, textureGate: false }));
-    const loose = vegCandidateMask(planes, Object.assign({}, baseOpts, { direction: 'add', scoreT: VEG_SCORE_LO, textureGate: false }));
+    // Needs a surface that actually sits BETWEEN the slider endpoints. Dull
+    // olive scores ~0.098: selected at the loose end, rejected at the strict
+    // end. (An earlier version of this test leaned on dry grass passing at the
+    // loose end, which only worked while the bottom of the slider was low
+    // enough to paint bare ground — the bug that made max sensitivity paint
+    // grass while dense canopy went untouched.)
+    const MARGINAL = [100, 120, 90];
+    expect(vegGreenScore(...MARGINAL)).toBeGreaterThan(VEG_SCORE_LO);
+    expect(vegGreenScore(...MARGINAL)).toBeLessThan(VEG_SCORE_HI);
+    const p = synthPlanes({ paint: (x, y) => (y >= 4 ? MARGINAL : null) });
+    const o = Object.assign({}, baseOpts, { direction: 'add', textureGate: false });
+    const strict = vegCandidateMask(p, Object.assign({}, o, { scoreT: VEG_SCORE_HI }));
+    const loose = vegCandidateMask(p, Object.assign({}, o, { scoreT: VEG_SCORE_LO }));
     expect(loose.cells).toBeGreaterThan(strict.cells);
   });
 

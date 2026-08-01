@@ -11273,6 +11273,13 @@ function _canopyEditBarSync() {
     }
     const sensVal = document.getElementById('ceVegSensVal');
     if (sensVal) sensVal.textContent = Math.round(veg.sens);
+    // Only the swatch for the active direction is relevant; showing both
+    // invites the reading that one colour means "found" and the other "not".
+    const del = veg.direction === 'del';
+    const keyAdd = document.getElementById('ceVegKeyAdd');
+    if (keyAdd) keyAdd.style.display = del ? 'none' : '';
+    const keyCut = document.getElementById('ceVegKeyCut');
+    if (keyCut) keyCut.style.display = del ? '' : 'none';
     const apply = document.getElementById('ceVegApply');
     if (apply) {
       apply.disabled = !veg.result || !veg.result.cells;
