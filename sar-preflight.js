@@ -10547,11 +10547,21 @@ async function _cogTileToGrid(tiff, grid) {
   // free it, so peak memory stays ~128 MB regardless of AOI size.
   const winW = px1 - px0;
   const sampleW = Math.min(winW, 1024);                                  // horizontal downsample of each strip
-  // Desktop has no per-tab memory ceiling, so read the whole window in one pass
-  // (one readRasters = far fewer proxy Range requests, less transient-5xx
-  // exposure). Mobile keeps the bounded strip budget to avoid the OOM crash.
-  const budget = _isConstrained() ? CANOPY_DECODE_BUDGET_PX : Infinity;
-  const stripRows = Math.max(1, Math.floor(budget / winW));              // native rows per strip within the budget
+  // Cost per native row is set by the FILE's layout, not by our window. These
+  // COGs are STRIPPED with RowsPerStrip = 1 — 65536 one-row strips, no
+  // overviews at all — so decoding N rows always inflates N x imageWidth
+  // pixels however narrow the AOI is. Budgeting by winW therefore under-counted
+  // badly: at a 1200 px window the mobile guard worked out 26k rows, i.e. no
+  // bound whatsoever, and the iOS protection only ever bit on wide AOIs.
+  const rowCostPx = img.fileDirectory && img.fileDirectory.TileWidth ? winW : w;
+  // Bounded on desktop too. The old Infinity read the whole window in one call
+  // to save proxy Range requests — but measured on the 1.08 GB tile, striping
+  // costs ~1 extra request per strip (10, not thousands: geotiff.js coalesces
+  // contiguous strips into ONE range) and barely moves total time, while the
+  // longest uninterruptible chunk drops from 4.5 s to ~1.2 s. Unbounded, a
+  // full-view AOI over that tile locked the tab for over 90 s.
+  const budget = CANOPY_DECODE_BUDGET_PX;
+  const stripRows = Math.max(1, Math.floor(budget / rowCostPx));         // native rows per strip within the budget
   const nStrips = Math.ceil((py1 - py0) / stripRows);
   const peakBytes = Math.min(py1 - py0, stripRows) * winW * 4;
   try { Diag.note('canopy.read', { winW, winH: py1 - py0, strips: nStrips, peakMb: Math.round(peakBytes / 1048576) }); } catch (_) {}
@@ -10582,6 +10592,12 @@ async function _cogTileToGrid(tiff, grid) {
     for (let i = 0; i < out.length; i++) {
       if (Number.isNaN(out[i]) && Number.isFinite(partial[i])) out[i] = partial[i];
     }
+    // Hand the main thread back between strips. Bounding the strip size caps
+    // how long any ONE decode blocks, but back-to-back strips still pinned the
+    // thread ~82% of the load; without this the map freezes for the duration
+    // even though no single chunk is long. One frame per strip is noise against
+    // a multi-second read.
+    if (nStrips > 1 && typeof _uiYield === 'function') await _uiYield();
   }
   return out;
 }
@@ -10731,10 +10747,19 @@ async function loadCanopyForView() {
       center.distanceTo(L.latLng(center.lat, vb.getWest())),
       center.distanceTo(L.latLng(vb.getNorth(), center.lng))
     );
-    if (_isConstrained() && halfWidthM > MAX_CANOPY_HALF_M) {
-      // Mobile only: 1 m canopy over a very wide view is hundreds of MB–GB to
-      // decode and only blur at that scale — guide the user to zoom in rather
-      // than crash. On desktop there's no memory ceiling, so we always fetch.
+    if (halfWidthM > MAX_CANOPY_HALF_M) {
+      // 1 m canopy over a very wide view is hundreds of MB-GB to decode and
+      // only blur at that scale — guide the user to zoom in rather than hang.
+      //
+      // This used to be mobile-only, on the reasoning that desktop has no
+      // memory ceiling. Memory was never the binding constraint: these COGs
+      // are stripped with RowsPerStrip = 1 and have no overviews, so cost
+      // scales with the AOI's ROW COUNT times the file's full 65536-px width.
+      // Traced on desktop at a 70 km half-width, that is 12 quadkey tiles of
+      // ~59,000 rows each — tens of billions of pixels. Every tile timed out
+      // after its 4 attempts (~24 s per read) and the load never finished,
+      // leaving "Fetching..." on screen indefinitely. Bounding the strip size
+      // caps peak memory (27 MB, confirmed) but cannot make that request sane.
       setStatus('canopyStatus', 'error', 'ZOOM IN');
       markSection('canopy', { status: 'error', error: 'Zoom in to load 1 m canopy for this view' });
       try { Diag.note('canopy.skip', { halfKm: Math.round(halfWidthM / 100) / 10 }); } catch (_) {}
@@ -11381,6 +11406,13 @@ function _canopyVegStatus(txt) {
 // visible tab rAF wins every time and the timer is a no-op.
 // Shared by VEG imagery sampling and the viewshed LOS kernel.
 function _uiYield() {
+  // A hidden tab has no UI to keep responsive, and it is the WORST place to
+  // yield: rAF never fires there and Chrome clamps background timers to ~1 s,
+  // so each call measured 868 ms against the 32 ms it costs when visible. Over
+  // a 64-tile sample that is a minute of pure waiting. Returning immediately
+  // still cannot hang — that was the whole point of the timer — because the
+  // loop simply keeps running.
+  if (typeof document !== 'undefined' && document.hidden) return Promise.resolve();
   return new Promise(resolve => {
     let done = false;
     const fire = () => { if (!done) { done = true; resolve(); } };

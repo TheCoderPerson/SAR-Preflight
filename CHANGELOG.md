@@ -4,6 +4,13 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.08.01-c — 2026-08-01
+
+- Fixed a hang when the vegetation layer was switched on while zoomed well out. The app would sit on "Fetching..." forever and the tab could stop responding. It now says ZOOM IN straight away, the same as it already did on phones — the wide view was asking for tens of billions of pixels across a dozen source tiles.
+- Vegetation data now loads in bounded chunks on desktop as well as on phones, so the map stays usable while it works instead of locking up for seconds at a time. Peak memory during a load is capped at about 27 MB.
+- Long operations no longer waste time waiting when the app is in a background tab, which could add a second per step for no benefit.
+- Fixed a test that quietly depended on the calendar month and had gone red for August; it now covers nesting season, autumn migration and winter explicitly.
+
 ## v2026.08.01-b — 2026-08-01
 
 - VEG ADD now fills dense forest. It was doing the opposite of what it should: painting sunlit grass and road verges while leaving thick canopy — the very places missing canopy data — untouched. On a dense stand it now covers 99% of the area instead of 50%.

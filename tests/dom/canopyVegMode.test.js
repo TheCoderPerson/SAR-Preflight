@@ -190,6 +190,27 @@ describe('_uiYield', () => {
     }
   });
 
+  // Measured in a real background tab: rAF never fires AND Chrome clamps the
+  // fallback timer to ~1 s, so a yield cost 868 ms instead of 32 ms. Over a
+  // 64-tile sample that is a minute of waiting to keep a UI responsive that
+  // nobody is looking at.
+  it('does not wait at all while the tab is hidden', async () => {
+    const hidden = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+    const savedRaf = globalThis.requestAnimationFrame;
+    const savedTimeout = globalThis.setTimeout;
+    globalThis.requestAnimationFrame = () => { throw new Error('must not schedule rAF when hidden'); };
+    globalThis.setTimeout = () => { throw new Error('must not schedule a timer when hidden'); };
+    try {
+      await expect(_uiYield()).resolves.toBeUndefined();
+    } finally {
+      globalThis.requestAnimationFrame = savedRaf;
+      globalThis.setTimeout = savedTimeout;
+      delete document.hidden;
+      if (hidden) Object.defineProperty(Document.prototype, 'hidden', hidden);
+    }
+  });
+
   it('resolves once, not twice, when both rAF and the timer fire', async () => {
     let calls = 0;
     const saved = globalThis.requestAnimationFrame;

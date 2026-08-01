@@ -24,6 +24,16 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.08.01-c',
+    date: '2026-08-01',
+    changes: [
+      'Fixed a hang when the vegetation layer was switched on while zoomed well out. The app would sit on "Fetching..." forever and the tab could stop responding. It now says ZOOM IN straight away, the same as it already did on phones — the wide view was asking for tens of billions of pixels across a dozen source tiles.',
+      'Vegetation data now loads in bounded chunks on desktop as well as on phones, so the map stays usable while it works instead of locking up for seconds at a time. Peak memory during a load is capped at about 27 MB.',
+      'Long operations no longer waste time waiting when the app is in a background tab, which could add a second per step for no benefit.',
+      'Fixed a test that quietly depended on the calendar month and had gone red for August; it now covers nesting season, autumn migration and winter explicitly.',
+    ],
+  },
+  {
     version: '2026.08.01-b',
     date: '2026-08-01',
     changes: [
