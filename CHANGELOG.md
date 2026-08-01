@@ -4,6 +4,16 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.07.31-a — 2026-07-31
+
+- Canopy EDIT has a new VEG tool: draw an area and the app reads the satellite imagery underneath it, works out which pixels are trees, and shows you the result before anything is changed. ADD paints canopy at a height you enter wherever the imagery is green; CUT clears canopy wherever it is not. Meant for fixing a stale canopy map — a clearcut, a burn scar, a new subdivision, trees that have grown in — without brushing it by hand.
+- Nothing is applied until you approve it. The candidate cells are drawn over the map (cyan to add, red to cut) and a SENSITIVITY slider re-classifies instantly, with no further downloads, so you can tune it against what you can see. CUT also asks for confirmation, because removing trees makes the viewshed predict MORE visibility than really exists.
+- Cells the tool could not judge — deep shadow, or a gap in the imagery — are shown as an amber checkerboard and are never painted and never cleared. Tree shadows in particular are dark, not green, so treating them as "no trees" would have eaten the shaded edges of real stands.
+- ADD only fills gaps: a cell that already carries a measured height from the vegetation data keeps it, and no edit ever makes a stand shorter than it was.
+- Read the caveat on the toolbar before trusting a result. The imagery is a mosaic of unknown date and may be OLDER than the canopy data; lawns, brush and crops all score green; and tall trees on slopes lean away from their trunks in the imagery. Treat VEG as a fast first pass, then correct it with BRUSH and POLY.
+- VEG edits save, persist and replay onto viewsheds like every other canopy edit — recompute a viewshed to see the effect.
+- Fixed: switching away from the app while a viewshed was computing could leave it stuck at a frozen percentage forever, needing a reload. Long computations now keep running in the background.
+
 ## v2026.07.30-a — 2026-07-30
 
 - The Enter Coordinates button is now Go To: the same box still takes coordinates (DD / DDM / DMS / UTM), but you can also type a place name ("Jenkinson Lake", "Pyramid Peak", "Desolation Wilderness") or a street address and the map goes there. It opens a proper dialog instead of the old browser prompt.

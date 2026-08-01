@@ -1,4 +1,4 @@
-const { routeStrategy, latlngToTile, getCacheName, navigationStrategy, stripRedirect, CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_SECTIONAL, SAR_VERSION } = require('../../sw.js');
+const { routeStrategy, latlngToTile, getCacheName, navigationStrategy, stripRedirect, useCachedResponse, cacheFirst, CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_SECTIONAL, SAR_VERSION } = require('../../sw.js');
 
 const SECTIONAL_TILE = 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/10/396/164?ed=2026-05-13';
 const SECTIONAL_META = 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer?f=json';
@@ -57,6 +57,86 @@ describe('routeStrategy(url)', () => {
     expect(routeStrategy('http://localhost:3000/sar-preflight.html')).toBe('cache-first');
     expect(routeStrategy('http://localhost:3000/sar-preflight.js')).toBe('cache-first');
     expect(routeStrategy('http://localhost:3000/manifest.json')).toBe('cache-first');
+  });
+});
+
+// The canopy VEG classifier appends this marker only after a plain tile fetch
+// came back UNREADABLE — which on a long-lived install means an opaque entry
+// left in CACHE_TILES by a pre-guard version of this SW. A cached answer here
+// is not merely stale, it is unusable, so this must be network-only and must
+// be tested BEFORE the arcgisonline cache-first rule.
+describe('imagery pixel-sampling retry', () => {
+  const SAMPLE = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/18/1/2?sarcors=1';
+
+  it('routes the cors retry to network-only, never cache-first', () => {
+    expect(routeStrategy(SAMPLE)).toBe('network-only');
+  });
+
+  it('leaves the plain imagery tile URL on cache-first so it still works offline', () => {
+    expect(routeStrategy(SAMPLE.split('?')[0])).toBe('cache-first');
+  });
+});
+
+describe('useCachedResponse(cached, request)', () => {
+  const opaque = { type: 'opaque' };
+  const basic = { type: 'basic' };
+
+  it('refuses an opaque cached entry for a cors request', () => {
+    expect(useCachedResponse(opaque, { mode: 'cors' })).toBe(false);
+  });
+
+  // Tile DISPLAY still uses that entry — bypassing for <img> would mean a
+  // second download of every tile the user has already looked at.
+  it('still serves an opaque cached entry to a no-cors image request', () => {
+    expect(useCachedResponse(opaque, { mode: 'no-cors' })).toBe(true);
+  });
+
+  it('serves readable entries to anyone', () => {
+    expect(useCachedResponse(basic, { mode: 'cors' })).toBe(true);
+    expect(useCachedResponse(basic, { mode: 'no-cors' })).toBe(true);
+  });
+
+  it('treats a cache miss as a miss', () => {
+    expect(useCachedResponse(null, { mode: 'cors' })).toBe(false);
+    expect(useCachedResponse(undefined, { mode: 'cors' })).toBe(false);
+  });
+});
+
+describe('cacheFirst(request) with legacy opaque tiles', () => {
+  const TILE = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/18/1/2';
+  let savedCaches, savedFetch;
+
+  function stub(cached) {
+    const puts = [];
+    globalThis.caches = {
+      match: () => Promise.resolve(cached),
+      open: () => Promise.resolve({ put: (req, resp) => { puts.push([req, resp]); return Promise.resolve(); } }),
+    };
+    return puts;
+  }
+
+  beforeEach(() => { savedCaches = globalThis.caches; savedFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.caches = savedCaches; globalThis.fetch = savedFetch; });
+
+  it('goes to the network for a cors request and overwrites the opaque entry', async () => {
+    const puts = stub({ type: 'opaque', status: 0 });
+    const fresh = new Response('tile', { status: 200 });
+    let fetched = false;
+    globalThis.fetch = () => { fetched = true; return Promise.resolve(fresh); };
+    const out = await cacheFirst({ url: TILE, mode: 'cors' });
+    expect(fetched).toBe(true);
+    expect(out).toBe(fresh);
+    expect(puts.length).toBe(1);   // the cache heals itself
+  });
+
+  it('serves the opaque entry to a no-cors request without hitting the network', async () => {
+    const cached = { type: 'opaque', status: 0 };
+    stub(cached);
+    let fetched = false;
+    globalThis.fetch = () => { fetched = true; return Promise.reject(new Error('offline')); };
+    const out = await cacheFirst({ url: TILE, mode: 'no-cors' });
+    expect(out).toBe(cached);
+    expect(fetched).toBe(false);
   });
 });
 

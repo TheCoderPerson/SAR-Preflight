@@ -710,6 +710,13 @@ function canopyGridToRGBA(grid, canopyFlat) {
 // Op shapes (plain JSON):
 //   { t:'del',   poly: [[lat,lng],...] }               zero cells inside polygon
 //   { t:'paint', pts: [[lat,lng],...], rM, hM }        stamp stroke at height hM
+//   { t:'mask',  mode, data, srcCols, srcRows, srcBounds, minFrac, hM, hMode }
+//                                                      baked imagery-derived raster
+// The 'mask' op is a BAKED raster rather than geometry because its source —
+// satellite imagery classification — is async, network-bound and resolution
+// dependent, while replay must stay pure and synchronous. The mask is stored
+// finer (~1.9 m) than any grid it replays onto (>= WORK_RES_M), so baking
+// loses nothing. See canopyApplyMask and the IMAGERY VEGETATION section below.
 // ============================================================
 const CANOPY_PAINT_DEFAULT_M = 10; // paint height when the raster has no trees to average
 
@@ -816,14 +823,153 @@ function canopyApplyDelete(grid, canopyFlat, poly, insideFn) {
   return canopyDiffToSparse(diff);
 }
 
-// Restore pre-op values recorded in a sparse diff.
-function canopyRevertDiff(canopyFlat, diff) {
-  if (!diff || !diff.indices) return;
+// Structural validity gate for a 'mask' op. A truncated or partially-cloned op
+// must be SKIPPED, never thrown from: canopyApplyOps runs inside the single
+// try/catch in _applyCanopyEdits, so one bad op would otherwise silently
+// disable EVERY saved edit.
+function canopyMaskOpValid(op) {
+  if (!op || op.t !== 'mask') return false;
+  if (op.mode !== 'add' && op.mode !== 'del') return false;
+  const sb = op.srcBounds;
+  if (!sb) return false;
+  if (!(Number.isFinite(sb.west) && Number.isFinite(sb.east)
+     && Number.isFinite(sb.south) && Number.isFinite(sb.north))) return false;
+  if (!(sb.east > sb.west) || !(sb.north > sb.south)) return false;
+  const cols = op.srcCols | 0, rows = op.srcRows | 0;
+  if (cols <= 0 || rows <= 0) return false;
+  if (!op.data || op.data.length < Math.ceil(cols * rows / 8)) return false;
+  if (op.mode === 'add' && !(Number.isFinite(op.hM) && op.hM > 0)) return false;
+  return true;
+}
+
+// Read bit i out of a packed mask (row-major, MSB-first within each byte).
+function bitMaskGet(packed, i) { return (packed[i >> 3] >> (7 - (i & 7))) & 1; }
+
+// Replay a baked imagery-derived mask onto a grid's raster.
+//
+// The mask's pixels are equally spaced in lng and in Web-Mercator Y — the same
+// convention resampleToGrid documents for the Meta COG tiles. For each target
+// cell we POOL the whole source window covering it rather than point-sampling:
+// target cells run 3 m (viewshed) to ~20 m (zoomed-out overlay) over a ~1.9 m
+// mask, and point sampling would arbitrarily drop trees and speckle the result
+// exactly as decimateCanopyMesh notes. A cell is selected when
+//   setSamples >= max(1, ceil(minFrac * samples))
+// so minFrac 0 ('add') means ANY green sub-pixel paints, and minFrac 1 ('del')
+// means EVERY sub-pixel must be non-canopy before anything is deleted. Both
+// directions therefore err toward MORE canopy — more occlusion, smaller
+// viewshed — which is the safe error for a VLOS tool.
+//
+// mode 'add': hMode 'fill' writes hM only where the cell holds no tree, so a
+//             measured Meta height always survives; hMode 'set' raises every
+//             selected cell to at least hM. NEITHER ever lowers a height.
+// mode 'del': zeroes the cell, skipping cells that already hold no tree (same
+//             rule as canopyApplyDelete).
+//
+// Returns a DENSE RECT diff { rect:{r0,c0,rows,cols}, oldValues, changed }. A
+// mask op can touch every cell in the grid, and building a Map of 262k numeric
+// entries (what canopyDiffToSparse consumes) costs ~20 MB of transient heap
+// before it is ever compacted; the rect is 4 B/cell with no spike.
+function canopyApplyMask(grid, canopyFlat, op) {
+  if (!grid || !canopyFlat || !canopyMaskOpValid(op)) return null;
+  const sb = op.srcBounds;
+  const srcCols = op.srcCols | 0, srcRows = op.srcRows | 0;
+  const data = op.data;
+  const merc = op.srcIsMercator !== false;
+  const dLat = (grid.north - grid.south) / grid.rows;
+  const dLng = (grid.east - grid.west) / grid.cols;
+
+  // Target window: grid cells whose EDGES overlap the mask. Edge (not centre)
+  // overlap matters at coarse zoom, where one grid cell can swallow the whole
+  // mask and would otherwise never be tested.
+  const r0 = Math.max(0, Math.floor((grid.north - sb.north) / dLat));
+  const r1 = Math.min(grid.rows - 1, Math.floor((grid.north - sb.south) / dLat));
+  const c0 = Math.max(0, Math.floor((sb.west - grid.west) / dLng));
+  const c1 = Math.min(grid.cols - 1, Math.floor((sb.east - grid.west) / dLng));
+  if (r1 < r0 || c1 < c0) return null;
+
+  const myTop = merc ? mercatorY(sb.north) : sb.north;
+  const myBot = merc ? mercatorY(sb.south) : sb.south;
+  const ySpan = myTop - myBot;
+  const toSrcY = lat => ((myTop - (merc ? mercatorY(lat) : lat)) / ySpan) * srcRows;
+  const toSrcX = lng => ((lng - sb.west) / (sb.east - sb.west)) * srcCols;
+
+  const wCells = c1 - c0 + 1, hCells = r1 - r0 + 1;
+  const oldValues = new Float32Array(wCells * hCells);
+  const mode = op.mode, hM = op.hM, fillOnly = op.hMode !== 'set';
+  const minFrac = Number.isFinite(op.minFrac) ? op.minFrac : (mode === 'del' ? 1 : 0);
+  let changed = 0;
+
+  for (let row = r0; row <= r1; row++) {
+    const latN = grid.north - row * dLat, latS = latN - dLat;
+    let iy0 = Math.floor(toSrcY(latN)), iy1 = Math.ceil(toSrcY(latS)) - 1;
+    if (iy0 < 0) iy0 = 0; if (iy1 > srcRows - 1) iy1 = srcRows - 1;
+    if (iy1 < iy0) iy1 = iy0;
+    const outBase = (row - r0) * wCells;
+    const gridBase = row * grid.cols;
+    const rowOutside = iy0 > srcRows - 1 || iy1 < 0;
+    for (let col = c0; col <= c1; col++) {
+      const idx = gridBase + col;
+      oldValues[outBase + (col - c0)] = canopyFlat[idx];
+      if (rowOutside) continue;
+      const lngW = grid.west + col * dLng, lngE = lngW + dLng;
+      let ix0 = Math.floor(toSrcX(lngW)), ix1 = Math.ceil(toSrcX(lngE)) - 1;
+      if (ix0 < 0) ix0 = 0; if (ix1 > srcCols - 1) ix1 = srcCols - 1;
+      if (ix1 < ix0) ix1 = ix0;
+      if (ix0 > srcCols - 1 || ix1 < 0) continue;
+      let set = 0, tot = 0;
+      for (let sy = iy0; sy <= iy1; sy++) {
+        const base = sy * srcCols;
+        for (let sx = ix0; sx <= ix1; sx++) { set += bitMaskGet(data, base + sx); tot++; }
+      }
+      if (!tot) continue;
+      if (set < Math.max(1, Math.ceil(minFrac * tot))) continue;
+      const v = canopyFlat[idx];
+      const hasTree = Number.isFinite(v) && v > 0;
+      if (mode === 'del') {
+        if (!hasTree) continue;
+        canopyFlat[idx] = 0;
+      } else {
+        if (fillOnly && hasTree) continue;
+        const next = hasTree ? Math.max(v, hM) : hM;   // raise only, never lower
+        if (next === v) continue;
+        canopyFlat[idx] = next;
+      }
+      changed++;
+    }
+  }
+  return { rect: { r0, c0, rows: hCells, cols: wCells }, oldValues, changed };
+}
+
+// Restore pre-op values recorded in a diff. Sparse diffs (brush / delete-poly)
+// carry {indices, oldValues}; mask ops carry a dense {rect, oldValues} and need
+// gridCols to walk it — a trailing arg so the two-arg calls keep working.
+function canopyRevertDiff(canopyFlat, diff, gridCols) {
+  if (!diff) return;
+  if (diff.rect) {
+    const { r0, c0, rows, cols } = diff.rect;
+    const stride = gridCols || cols;
+    for (let r = 0; r < rows; r++) {
+      const dst = (r0 + r) * stride + c0, src = r * cols;
+      for (let c = 0; c < cols; c++) canopyFlat[dst + c] = diff.oldValues[src + c];
+    }
+    return;
+  }
+  if (!diff.indices) return;
   for (let i = 0; i < diff.indices.length; i++) canopyFlat[diff.indices[i]] = diff.oldValues[i];
 }
 
 // Geographic bbox of an op (paint strokes inflated by their brush radius).
+// NOTE the fall-through: an op type this build does not know yields null here
+// whenever it carries no `pts` (a 'mask' op does not), so canopyApplyOps culls
+// it at the bbox test — and even if a future op type did carry `pts`, the
+// dispatch's `else continue` skips it without counting. That two-layer skip is
+// what lets an older build read a newer op log without crashing or corrupting.
 function canopyOpBBox(op) {
+  if (op && op.t === 'mask') {
+    if (!canopyMaskOpValid(op)) return null;
+    const sb = op.srcBounds;
+    return { west: sb.west, south: sb.south, east: sb.east, north: sb.north };
+  }
   const pts = op ? (op.t === 'del' ? op.poly : op.pts) : null;
   if (!pts || !pts.length) return null;
   let w = Infinity, s = Infinity, e = -Infinity, n = -Infinity;
@@ -850,10 +996,584 @@ function canopyApplyOps(grid, canopyFlat, ops, insideFn) {
     if (!bb || bb.west > gb.east || bb.east < gb.west || bb.south > gb.north || bb.north < gb.south) continue;
     if (op.t === 'del') canopyApplyDelete(grid, canopyFlat, op.poly, insideFn);
     else if (op.t === 'paint') canopyApplyStroke(grid, canopyFlat, op.pts, op.rM, op.hM);
+    else if (op.t === 'mask') canopyApplyMask(grid, canopyFlat, op);
     else continue;
     applied++;
   }
   return applied;
+}
+
+// Approximate persisted size of an op / op log. The op log is one IndexedDB
+// record read on EVERY canopy fetch, so its growth needs a byte budget, not
+// just a count: one mask op stores as much as ~1000 brush strokes.
+function canopyOpBytes(op) {
+  if (!op) return 0;
+  if (op.t === 'mask') {
+    return (op.data ? op.data.length : 0) + (op.poly ? op.poly.length * 24 : 0) + 160;
+  }
+  const pts = op.t === 'del' ? op.poly : op.pts;
+  return (pts ? pts.length * 24 : 0) + 80;
+}
+
+function canopyOpsBytes(ops) {
+  let n = 0;
+  if (ops) for (const op of ops) n += canopyOpBytes(op);
+  return n;
+}
+
+// ============================================================
+// IMAGERY VEGETATION CLASSIFICATION — turn RGB satellite imagery into a binary
+// vegetation mask that bakes into a replayable 'mask' op. Pure: the caller
+// supplies RGBA bytes it has already read off a canvas, so this file stays
+// DOM/fetch-free.
+//
+// Esri World Imagery is 3-band 8-bit RGB. There is NO near-infrared band, so
+// NDVI (and every genuinely reliable vegetation index) is IMPOSSIBLE here.
+// Everything below is a visible-band proxy and is inherently less trustworthy
+// than NDVI — which is why the UI previews the mask and makes the operator
+// approve it rather than auto-applying.
+//
+// Output is THREE classes, not two: bare / vegetated / unknown-dark. Deep tree
+// shadow is near-black, not green; classifying it "not vegetation" is exactly
+// what would make the delete direction eat real forest. Unknown is never
+// painted and NEVER deleted.
+// ============================================================
+
+const VEG_ANALYSIS_Z = 16;        // analysis lattice = z16 tile pixels (1.86 m at 38.7N)
+const VEG_TILE_PX = 256;
+const VEG_IMAGERY_MIN_Z = 16;
+const VEG_IMAGERY_MAX_Z = 19;     // Esri World Imagery native max
+const VEG_TARGET_PX_PER_CELL = 4; // imagery px across one canopy cell
+const VEG_BLUE_W = 0.35;          // blue weight in the greenness score (see vegGreenScore)
+const VEG_SCORE_T0 = 0.055;       // default threshold — slider centre
+const VEG_SCORE_HI = 0.16;        // slider 0   (most selective)
+const VEG_SCORE_LO = -0.02;       // slider 100 (most permissive)
+const VEG_DARK_V = 0.18;          // max(R,G,B)/255 below this => shadow, not evidence
+const VEG_MIN_SAT = 0.10;         // HSV S below this => achromatic (rock/asphalt/snow) => score 0
+const VEG_CELL_LIT_MIN = 0.35;    // cell with < 35% lit pixels => UNKNOWN
+// Neighbourhood brightness std-dev floor; ADD direction only. CALIBRATED
+// against Esri World Imagery at z17 over three real surfaces (fraction of
+// candidate cells KEPT):
+//        threshold   conifer forest   irrigated turf   pasture/ag
+//          0.008          85%              70%             33%
+//          0.012          61%              42%             15%
+//          0.016          34%              20%              7%
+//          0.045           0%               0%              0%
+// The distributions overlap heavily — visible-band texture is a WEAK
+// discriminator, not a clean one, and mown turf is not reliably separable from
+// canopy at this resolution. 0.008 is chosen to protect forest retention:
+// dropping real canopy makes the viewshed predict MORE visibility, the unsafe
+// direction, so the gate is tuned to shed smooth pasture/crops and little else.
+const VEG_TEXTURE_MIN = 0.008;
+const VEG_TEXTURE_RADIUS_CELLS = 2; // 5x5 window ~9 m at the 1.86 m lattice — crown scale
+const VEG_MIN_BLOB_M2 = 100;      // ~one large crown — drop smaller specks
+const VEG_LEAN_MARGIN_M = 6;      // off-nadir crown displacement guard, CUT only
+const CANOPY_MASK_MAX_CELLS = 4194304; // 512 KB packed; larger masks coarsen instead of failing
+
+// Ground sample distance of an XYZ tile pixel at a latitude.
+function imageryMetresPerPixel(z, lat) {
+  return (2 * Math.PI * WEBMERC_R * Math.cos(lat * Math.PI / 180)) / (VEG_TILE_PX * Math.pow(2, z));
+}
+
+// Pick the imagery zoom and tile range covering `bbox`, then step down until
+// the tile count fits the budget. Returns null when even the minimum zoom is
+// over budget (the polygon is simply too large) — the caller reports that, it
+// is not an error state.
+//
+// The sampled zoom is floored at VEG_ANALYSIS_Z + 1 so every analysis cell
+// aggregates at least 2x2 imagery pixels. Sampling AT the analysis zoom gives
+// pool 1 — one pixel per cell — which silently degenerates the per-cell
+// fraction logic: darkFrac becomes binary, so a single shaded pixel condemns a
+// whole cell, and measured over real conifer forest that marked ~42% of the
+// area unjudgeable. opts.preferZ (the zoom on screen, whose tiles are already
+// cached) caps the choice but may NOT push it below that floor.
+function imageryZoomForBBox(bbox, cellSizeM, opts) {
+  opts = opts || {};
+  const maxTiles = opts.maxTiles > 0 ? opts.maxTiles : 64;
+  const minZ = opts.minZ != null ? opts.minZ : VEG_IMAGERY_MIN_Z;
+  const maxZ = opts.maxZ != null ? opts.maxZ : VEG_IMAGERY_MAX_Z;
+  if (!bbox || !(bbox.east > bbox.west) || !(bbox.north > bbox.south)) return null;
+  const lat = (bbox.north + bbox.south) / 2;
+  const want = (cellSizeM > 0 ? cellSizeM : WORK_RES_M) / (opts.pxPerCell || VEG_TARGET_PX_PER_CELL);
+  const analysisZ = opts.analysisZ != null ? opts.analysisZ : VEG_ANALYSIS_Z;
+  const poolFloor = Math.min(maxZ, analysisZ + 1);
+  let z = minZ;
+  while (z < maxZ && imageryMetresPerPixel(z, lat) > want) z++;
+  if (z < poolFloor) z = poolFloor;
+  if (opts.preferZ != null) {
+    const p = Math.floor(opts.preferZ);
+    if (p >= minZ) z = Math.max(poolFloor, Math.min(z, Math.min(p, maxZ)));
+  }
+  for (; z >= minZ; z--) {
+    const nw = lngLatToTileXY(bbox.west, bbox.north, z);
+    const se = lngLatToTileXY(bbox.east, bbox.south, z);
+    const x0 = Math.min(nw.x, se.x), x1 = Math.max(nw.x, se.x);
+    const y0 = Math.min(nw.y, se.y), y1 = Math.max(nw.y, se.y);
+    const tiles = (x1 - x0 + 1) * (y1 - y0 + 1);
+    if (tiles <= maxTiles) return { z, x0, y0, x1, y1, tiles, mpp: imageryMetresPerPixel(z, lat) };
+  }
+  return null;
+}
+
+// Exact extent of a rectangular XYZ tile block. Web Mercator metres are the
+// EXACT representation — tile edges are dyadic in merc space — so the WGS84
+// corners are derived from them, never the other way round.
+function tileMosaicBounds(x0, y0, x1, y1, z) {
+  const MERC_MAX = Math.PI * WEBMERC_R;
+  const span = 2 * MERC_MAX / Math.pow(2, z);   // merc metres per tile
+  const mercWest = x0 * span - MERC_MAX;
+  const mercEast = (x1 + 1) * span - MERC_MAX;
+  const mercNorth = MERC_MAX - y0 * span;
+  const mercSouth = MERC_MAX - (y1 + 1) * span;
+  return {
+    z, x0, y0, x1, y1,
+    pxW: (x1 - x0 + 1) * VEG_TILE_PX, pxH: (y1 - y0 + 1) * VEG_TILE_PX,
+    mercPerPx: span / VEG_TILE_PX,
+    mercWest, mercSouth, mercEast, mercNorth,
+    west: mercXToLng(mercWest), east: mercXToLng(mercEast),
+    north: mercYToLat(mercNorth), south: mercYToLat(mercSouth),
+  };
+}
+
+// The analysis lattice for a mosaic: the z16 tile pixel lattice, reached by
+// integer-pooling the sampled pixels (4x4 at z18, 2x2 at z17, 1:1 at z16).
+// Because tile lattices are dyadic in Mercator, this is exactly aligned at
+// every sample zoom and its bounds are the mosaic's own. ~1.86 m at 38.7N and
+// between ~1.6 m and ~2.2 m across CONUS — always finer than WORK_RES_M, the
+// finest grid any op ever replays onto, so baking here loses nothing.
+function analysisLatticeFor(mosaic, analysisZ) {
+  const az = analysisZ == null ? VEG_ANALYSIS_Z : analysisZ;
+  const pool = Math.max(1, Math.pow(2, mosaic.z - az));
+  const per = VEG_TILE_PX / pool;   // analysis cells per tile side
+  return {
+    z: az, pool, per,
+    rows: (mosaic.y1 - mosaic.y0 + 1) * per,
+    cols: (mosaic.x1 - mosaic.x0 + 1) * per,
+    bounds: { west: mosaic.west, south: mosaic.south, east: mosaic.east, north: mosaic.north },
+    srcIsMercator: true,
+    resM: imageryMetresPerPixel(az, (mosaic.north + mosaic.south) / 2),
+  };
+}
+
+// Green-vegetation score on normalized chromaticity (r,g,b = R/(R+G+B), ...):
+//   score = (g - r) + blueWeight * (g - b)
+// blueWeight 1 recovers normalized Excess Green exactly (2g-r-b === 3g-1);
+// blueWeight 0 recovers the green-red contrast (the NGRDI numerator).
+//
+// Sierra summer imagery needs a value well under 1. Dry gold grass has a large
+// BLUE deficit that full-weight ExG misreads as greenness (it scores ~+0.06,
+// indistinguishable from a marginal tree), while its RED excess is
+// unambiguous. At the 0.35 default: conifer +0.174, oak +0.133, dry grass
+// -0.018, tan dirt -0.027, gray asphalt 0.000.
+// Returns ~[-0.5, 0.5]; exactly 0 for any neutral gray or a black pixel.
+function vegGreenScore(R, G, B, blueWeight) {
+  const s = R + G + B;
+  if (!(s > 0)) return 0;
+  const r = R / s, g = G / s, b = B / s;
+  const w = blueWeight == null ? VEG_BLUE_W : blueWeight;
+  return (g - r) + w * (g - b);
+}
+
+// Per-cell accumulator over the analysis lattice. ~12 B/cell during sampling;
+// finalizeVegAccumulator collapses it to 3 B/cell and this can be released.
+function makeVegAccumulator(rows, cols) {
+  const n = rows * cols;
+  return {
+    rows, cols,
+    scoreSum: new Int32Array(n),  // sum of per-pixel scores quantized to +-127
+    lit: new Uint8Array(n),       // pixels bright enough to score
+    total: new Uint8Array(n),     // pixels with imagery coverage
+    vSum: new Uint16Array(n),
+    vSqSum: new Uint32Array(n),
+  };
+}
+
+// Fold one decoded tile into the accumulator. (cellRow0, cellCol0) is the
+// accumulator index of the tile's top-left pixel; `pool` is the lattice pool
+// factor. Dark pixels count toward `total` but are NOT scored — that is what
+// keeps shadow out of the greenness average instead of dragging it down.
+// Fully transparent pixels (imagery gaps) count toward neither.
+// Returns the number of pixels accumulated.
+function accumulateVegTile(acc, rgba, tileW, tileH, pool, cellRow0, cellCol0, opts) {
+  opts = opts || {};
+  const darkV = (opts.darkV != null ? opts.darkV : VEG_DARK_V) * 255;
+  const minSat = opts.minSat != null ? opts.minSat : VEG_MIN_SAT;
+  const bw = opts.blueWeight != null ? opts.blueWeight : VEG_BLUE_W;
+  const p = Math.max(1, pool | 0);
+  const rows = acc.rows, cols = acc.cols;
+  let used = 0;
+  for (let py = 0; py < tileH; py++) {
+    const cr = cellRow0 + ((py / p) | 0);
+    if (cr < 0 || cr >= rows) continue;
+    const rowBase = cr * cols;
+    const lineBase = py * tileW * 4;
+    for (let px = 0; px < tileW; px++) {
+      const cc = cellCol0 + ((px / p) | 0);
+      if (cc < 0 || cc >= cols) continue;
+      const o = lineBase + px * 4;
+      if (rgba[o + 3] < 128) continue;           // imagery gap — not evidence either way
+      const R = rgba[o], G = rgba[o + 1], B = rgba[o + 2];
+      const i = rowBase + cc;
+      if (acc.total[i] < 255) acc.total[i]++;
+      used++;
+      const mx = R > G ? (R > B ? R : B) : (G > B ? G : B);
+      if (mx < darkV) continue;                  // shadow: counted, never scored
+      const mn = R < G ? (R < B ? R : B) : (G < B ? G : B);
+      const sat = mx > 0 ? (mx - mn) / mx : 0;
+      if (acc.lit[i] < 255) acc.lit[i]++;
+      acc.vSum[i] += mx;
+      acc.vSqSum[i] += mx * mx;
+      // Achromatic pixels score 0 rather than their chromaticity: hue on a
+      // gray pixel is numerically meaningless and flips wildly.
+      let q = Math.round((sat < minSat ? 0 : vegGreenScore(R, G, B, bw)) * 254);
+      if (q > 127) q = 127; else if (q < -127) q = -127;
+      acc.scoreSum[i] += q;
+    }
+  }
+  return used;
+}
+
+// Brightness texture at the CROWN scale — the std-dev of per-cell mean V over
+// a square neighbourhood, not within a single cell.
+//
+// Measuring inside one analysis cell (~1.9 m) samples the interior of a single
+// crown, where brightness is smooth: over real Sierra conifer forest that read
+// a mean texture of 7.5 against a threshold of 11 and rejected 77% of genuine
+// canopy. The structure that actually separates a crown from a lawn lives at
+// the crown scale, ~5-10 m. A neighbourhood measure is also independent of the
+// pool factor, so the threshold does not move when the sampled zoom changes.
+// Cells without coverage, and cells with too few neighbours to judge, return
+// 255 so the gate never rejects on missing information.
+function vegTexturePlane(vMean, cover, rows, cols, r) {
+  const n = rows * cols;
+  const out = new Uint8Array(n);
+  if (!(r > 0)) { out.fill(255); return out; }
+  const W = cols + 1;
+  const s1 = new Float64Array((rows + 1) * W);
+  const s2 = new Float64Array((rows + 1) * W);
+  const sc = new Float64Array((rows + 1) * W);
+  for (let y = 0; y < rows; y++) {
+    let r1 = 0, r2 = 0, rc = 0;
+    for (let x = 0; x < cols; x++) {
+      const i = y * cols + x;
+      const c = cover[i] ? 1 : 0, v = c ? vMean[i] : 0;
+      r1 += v; r2 += v * v; rc += c;
+      s1[(y + 1) * W + x + 1] = s1[y * W + x + 1] + r1;
+      s2[(y + 1) * W + x + 1] = s2[y * W + x + 1] + r2;
+      sc[(y + 1) * W + x + 1] = sc[y * W + x + 1] + rc;
+    }
+  }
+  const box = (S, y0, x0, y1, x1) =>
+    S[(y1 + 1) * W + x1 + 1] - S[y0 * W + x1 + 1] - S[(y1 + 1) * W + x0] + S[y0 * W + x0];
+  for (let y = 0; y < rows; y++) {
+    const y0 = y - r < 0 ? 0 : y - r, y1 = y + r > rows - 1 ? rows - 1 : y + r;
+    for (let x = 0; x < cols; x++) {
+      const i = y * cols + x;
+      if (!cover[i]) { out[i] = 255; continue; }
+      const x0 = x - r < 0 ? 0 : x - r, x1 = x + r > cols - 1 ? cols - 1 : x + r;
+      const cnt = box(sc, y0, x0, y1, x1);
+      if (cnt < 4) { out[i] = 255; continue; }
+      const m = box(s1, y0, x0, y1, x1) / cnt;
+      const varr = box(s2, y0, x0, y1, x1) / cnt - m * m;
+      const sd = varr > 0 ? Math.sqrt(varr) / 255 : 0;
+      out[i] = Math.min(255, Math.round(sd * 255));
+    }
+  }
+  return out;
+}
+
+// Collapse an accumulator into three Uint8 planes (3 B/cell) plus a coverage
+// flag. Re-thresholding then costs O(cells) with no imagery refetch, which is
+// what makes the sensitivity slider interactive.
+//   score    128 = 0.0; value v => score (v-128)/254
+//   darkFrac 0-255 fraction of covered pixels too dark to score
+//   texture  neighbourhood brightness std-dev, 0-255 (255 = unmeasurable)
+// opts.textureRadiusCells sizes the texture neighbourhood (default 2 => a 5x5
+// window, ~9 m at the 1.86 m lattice).
+function finalizeVegAccumulator(acc, opts) {
+  opts = opts || {};
+  const n = acc.rows * acc.cols;
+  const score = new Uint8Array(n), darkFrac = new Uint8Array(n);
+  const cover = new Uint8Array(n), vMean = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const tot = acc.total[i], lit = acc.lit[i];
+    score[i] = 128;
+    if (!tot) { darkFrac[i] = 255; continue; }
+    cover[i] = 1;
+    darkFrac[i] = Math.round(255 * (tot - lit) / tot);
+    if (!lit) continue;
+    const v = Math.round(acc.scoreSum[i] / lit) + 128;
+    score[i] = v < 0 ? 0 : (v > 255 ? 255 : v);
+    vMean[i] = Math.min(255, Math.round(acc.vSum[i] / lit));
+  }
+  const r = opts.textureRadiusCells != null ? opts.textureRadiusCells : VEG_TEXTURE_RADIUS_CELLS;
+  const texture = vegTexturePlane(vMean, cover, acc.rows, acc.cols, r);
+  return { rows: acc.rows, cols: acc.cols, score, darkFrac, texture, cover, vMean };
+}
+
+// --- Binary morphology (square structuring element, radius r in cells) ---
+// Separable two-pass; out-of-range neighbours are ignored rather than treated
+// as background, so erosion does not chew a rim off the region border.
+function _maskMorph(mask, rows, cols, r, dilate) {
+  if (!(r > 0)) return mask.slice();
+  const n = rows * cols;
+  const tmp = new Uint8Array(n), out = new Uint8Array(n);
+  for (let y = 0; y < rows; y++) {
+    const b = y * cols;
+    for (let x = 0; x < cols; x++) {
+      const x0 = x - r < 0 ? 0 : x - r, x1 = x + r > cols - 1 ? cols - 1 : x + r;
+      let v = dilate ? 0 : 1;
+      for (let k = x0; k <= x1; k++) {
+        if (dilate) { if (mask[b + k]) { v = 1; break; } }
+        else if (!mask[b + k]) { v = 0; break; }
+      }
+      tmp[b + x] = v;
+    }
+  }
+  for (let y = 0; y < rows; y++) {
+    const y0 = y - r < 0 ? 0 : y - r, y1 = y + r > rows - 1 ? rows - 1 : y + r;
+    for (let x = 0; x < cols; x++) {
+      let v = dilate ? 0 : 1;
+      for (let k = y0; k <= y1; k++) {
+        if (dilate) { if (tmp[k * cols + x]) { v = 1; break; } }
+        else if (!tmp[k * cols + x]) { v = 0; break; }
+      }
+      out[y * cols + x] = v;
+    }
+  }
+  return out;
+}
+function maskDilate(mask, rows, cols, r) { return _maskMorph(mask, rows, cols, r, true); }
+function maskErode(mask, rows, cols, r) { return _maskMorph(mask, rows, cols, r, false); }
+function maskOpen(mask, rows, cols, r) {  // kills salt-and-pepper specks
+  return maskDilate(maskErode(mask, rows, cols, r), rows, cols, r);
+}
+function maskClose(mask, rows, cols, r) { // fills per-crown shadow holes
+  return maskErode(maskDilate(mask, rows, cols, r), rows, cols, r);
+}
+
+// Zero 4-connected components smaller than minCells (reuses labelMaskComponents).
+function filterMaskMinArea(mask, rows, cols, minCells) {
+  const n = rows * cols;
+  if (!(minCells > 1)) return { mask: mask.slice(), removed: 0, kept: 0 };
+  const comp = labelMaskComponents(mask, rows, cols);
+  const out = new Uint8Array(n);
+  const keep = new Uint8Array(comp.count + 1);
+  let removed = 0, kept = 0;
+  for (let L = 1; L <= comp.count; L++) {
+    if (comp.areas[L] >= minCells) { keep[L] = 1; kept++; } else removed++;
+  }
+  for (let i = 0; i < n; i++) if (comp.labels[i] && keep[comp.labels[i]]) out[i] = 1;
+  return { mask: out, removed, kept };
+}
+
+// Zero every cell outside an open [lat,lng] ring, using cell-CENTRE lat/lng on
+// the Mercator-spaced lattice. insideFn is injectable for Node tests; in the
+// browser it defaults to the global pointInPolygon from core.js.
+function maskClipToPolygon(mask, cols, rows, bounds, poly, insideFn) {
+  const inside = insideFn || (typeof pointInPolygon !== 'undefined' ? pointInPolygon : null);
+  const out = new Uint8Array(cols * rows);
+  if (!inside || !poly || poly.length < 3) return out;
+  const myTop = mercatorY(bounds.north), myBot = mercatorY(bounds.south);
+  const lngSpan = bounds.east - bounds.west;
+  for (let y = 0; y < rows; y++) {
+    const lat = mercatorLatFromY(myTop - (y + 0.5) / rows * (myTop - myBot));
+    const b = y * cols;
+    for (let x = 0; x < cols; x++) {
+      if (!mask[b + x]) continue;
+      if (!inside(lat, bounds.west + (x + 0.5) / cols * lngSpan, poly)) continue;
+      out[b + x] = 1;
+    }
+  }
+  return out;
+}
+
+// Integer box downsample. OR-pools for 'add', AND-pools for 'del' — the same
+// conservative bias canopyApplyMask applies at replay, so coarsening for the
+// storage cap can never flip an edit toward LESS canopy. When the dimensions
+// do not divide evenly the bounds are extended to the padded extent (in
+// Mercator Y for rows) so the georeferencing stays exact.
+function maskDownsample(mask, cols, rows, bounds, factor, pool) {
+  const f = Math.max(1, factor | 0);
+  if (f === 1) return { mask: mask.slice(), cols, rows, bounds };
+  const oc = Math.ceil(cols / f), orow = Math.ceil(rows / f);
+  const out = new Uint8Array(oc * orow);
+  const and = pool === 'and';
+  for (let y = 0; y < orow; y++) {
+    for (let x = 0; x < oc; x++) {
+      let v = and ? 1 : 0, any = false;
+      for (let dy = 0; dy < f; dy++) {
+        const sy = y * f + dy;
+        if (sy >= rows) break;
+        const b = sy * cols;
+        for (let dx = 0; dx < f; dx++) {
+          const sx = x * f + dx;
+          if (sx >= cols) break;
+          any = true;
+          if (and) { if (!mask[b + sx]) v = 0; }
+          else if (mask[b + sx]) v = 1;
+        }
+      }
+      out[y * oc + x] = any ? v : 0;
+    }
+  }
+  const myTop = mercatorY(bounds.north), myBot = mercatorY(bounds.south);
+  const nb = {
+    west: bounds.west,
+    east: bounds.west + (oc * f / cols) * (bounds.east - bounds.west),
+    north: bounds.north,
+    south: mercatorLatFromY(myTop - (orow * f / rows) * (myTop - myBot)),
+  };
+  return { mask: out, cols: oc, rows: orow, bounds: nb };
+}
+
+// Pack a 0/1 mask to 1 bit/cell, MSB-first. Structured clone stores the
+// Uint8Array as binary, so this is a straight 8x cut in persisted op-log size
+// (1 km2 at 1.86 m: 289 KB raw -> 36 KB packed).
+function packBitMask(mask, n) {
+  const out = new Uint8Array(Math.ceil(n / 8));
+  for (let i = 0; i < n; i++) if (mask[i]) out[i >> 3] |= 128 >> (i & 7);
+  return out;
+}
+
+function countMask(mask) {
+  let n = 0;
+  if (mask) for (let i = 0; i < mask.length; i++) if (mask[i]) n++;
+  return n;
+}
+
+function cellsToHectares(cells, resM) { return cells * resM * resM / 10000; }
+
+// Build the candidate mask for one direction from finalized planes.
+// O(cells) apart from the morphology passes, so the sensitivity slider can
+// re-run this on every input event without touching the network.
+//
+// ADD: strict veg (texture gate ON — tree crowns at sub-metre GSD carry strong
+//      shadow structure, turf and alfalfa are smooth), opened then closed.
+// CUT: permissive veg (texture gate OFF, so a smooth lawn reads as green and
+//      is PROTECTED rather than cut), unioned with unknown, closed, then
+//      dilated by the crown-lean margin; the candidate is what remains.
+// UNKNOWN cells are never candidates in EITHER direction.
+function vegCandidateMask(planes, opts) {
+  opts = opts || {};
+  const rows = planes.rows, cols = planes.cols, n = rows * cols;
+  const del = opts.direction === 'del';
+  const scoreT = opts.scoreT != null ? opts.scoreT : VEG_SCORE_T0;
+  const litMin = opts.litMin != null ? opts.litMin : VEG_CELL_LIT_MIN;
+  const useTexture = !del && opts.textureGate !== false;
+  const texT = useTexture ? Math.round((opts.textureMin != null ? opts.textureMin : VEG_TEXTURE_MIN) * 255) : 0;
+  const qT = Math.round(scoreT * 254) + 128;
+  const darkMax = Math.round(255 * (1 - litMin));
+  const r = opts.morphR != null ? opts.morphR : 1;
+  const leanCells = del ? (opts.leanCells != null ? opts.leanCells : 0) : 0;
+
+  const veg = new Uint8Array(n), unknown = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    if (!planes.cover[i] || planes.darkFrac[i] > darkMax) { unknown[i] = 1; continue; }
+    if (planes.score[i] < qT) continue;
+    if (texT && planes.texture[i] < texT) continue;   // flat green => pasture/crop, ADD only
+    veg[i] = 1;
+  }
+
+  let mask;
+  if (del) {
+    const protect = new Uint8Array(n);
+    for (let i = 0; i < n; i++) if (veg[i] || unknown[i]) protect[i] = 1;
+    let prot = maskClose(protect, rows, cols, r);
+    if (leanCells > 0) prot = maskDilate(prot, rows, cols, leanCells);
+    const cand = new Uint8Array(n);
+    for (let i = 0; i < n; i++) if (planes.cover[i] && !prot[i]) cand[i] = 1;
+    mask = maskOpen(cand, rows, cols, r);
+  } else {
+    // Open kills specks, then close reclaims shade ENCLOSED by vegetation —
+    // that shadow is cast by the very trees around it, so painting it is both
+    // physically right and the safe direction (more canopy, smaller viewshed).
+    // Closing cannot grow a boundary, only fill holes narrower than the
+    // element, so unknown ground in the OPEN is still never painted. Punching
+    // the unknown cells back out after this step (an earlier version did) just
+    // undid the close and left real stands moth-eaten with shadow holes.
+    mask = maskClose(maskOpen(veg, rows, cols, r), rows, cols, r);
+  }
+
+  if (opts.minBlobCells > 1) mask = filterMaskMinArea(mask, rows, cols, opts.minBlobCells).mask;
+
+  // The analysis lattice spans the whole tile mosaic, which is larger than the
+  // drawn area. Clip the UNKNOWN plane to the polygon too, not just the
+  // candidates: otherwise the preview dithers cells the operator never drew
+  // over, and the "N skipped" count reports the mosaic rather than the job.
+  let unknownOut = unknown, inPoly = null;
+  if (opts.poly) {
+    const b = planes.bounds || opts.bounds;
+    const ones = new Uint8Array(n).fill(1);
+    inPoly = maskClipToPolygon(ones, cols, rows, b, opts.poly, opts.insideFn);
+    mask = maskClipToPolygon(mask, cols, rows, b, opts.poly, opts.insideFn);
+    unknownOut = maskClipToPolygon(unknown, cols, rows, b, opts.poly, opts.insideFn);
+  }
+  let unknownCells = 0, coverCells = 0;
+  for (let i = 0; i < n; i++) {
+    if (inPoly && !inPoly[i]) continue;
+    if (unknownOut[i]) unknownCells++;
+    else if (planes.cover[i]) coverCells++;
+  }
+
+  return { mask, veg, unknown: unknownOut, rows, cols, cells: countMask(mask), unknownCells, coverCells };
+}
+
+// Preview pixels. Colours are deliberately unlike the tan->green canopy ramp:
+// cyan = will be painted, red = will be deleted, dithered amber = UNKNOWN
+// (shadow / no imagery) which the tool refused to judge. Showing the skipped
+// cells matters — silently ignoring them is how a tool earns misplaced trust.
+function vegMaskToRGBA(mask, unknown, rows, cols, direction) {
+  const rgba = new Uint8ClampedArray(rows * cols * 4);
+  const del = direction === 'del';
+  const cr = del ? 239 : 34, cg = del ? 68 : 211, cb = del ? 68 : 238;
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const i = y * cols + x, o = i * 4;
+      if (mask && mask[i]) {
+        rgba[o] = cr; rgba[o + 1] = cg; rgba[o + 2] = cb; rgba[o + 3] = 215;
+      } else if (unknown && unknown[i] && ((x + y) & 1)) {
+        rgba[o] = 245; rgba[o + 1] = 158; rgba[o + 2] = 11; rgba[o + 3] = 120;
+      }
+    }
+  }
+  return rgba;
+}
+
+// Assemble a replayable 'mask' op, coarsening (in the direction's safe pooling
+// sense) until the cell count fits the storage cap so an enormous polygon
+// degrades to a lower-resolution edit rather than failing. Returns null when
+// nothing is selected.
+function makeCanopyMaskOp(spec) {
+  let mask = spec.mask, cols = spec.cols, rows = spec.rows, bounds = spec.bounds;
+  const mode = spec.mode === 'del' ? 'del' : 'add';
+  const pooling = mode === 'del' ? 'and' : 'or';
+  const maxCells = spec.maxCells > 0 ? spec.maxCells : CANOPY_MASK_MAX_CELLS;
+  let coarsened = 0;
+  while (cols * rows > maxCells && cols > 1 && rows > 1) {
+    const d = maskDownsample(mask, cols, rows, bounds, 2, pooling);
+    mask = d.mask; cols = d.cols; rows = d.rows; bounds = d.bounds;
+    coarsened++;
+  }
+  const cells = countMask(mask);
+  if (!cells) return null;
+  const op = {
+    t: 'mask', mode,
+    data: packBitMask(mask, cols * rows),
+    srcCols: cols, srcRows: rows,
+    srcBounds: { west: bounds.west, south: bounds.south, east: bounds.east, north: bounds.north },
+    srcIsMercator: true,
+    minFrac: mode === 'del' ? 1 : 0,
+    clsV: 1,
+  };
+  if (spec.z != null) op.z = spec.z;
+  if (spec.at != null) op.at = spec.at;
+  if (spec.poly) op.poly = spec.poly;           // advisory only — replay never reads it
+  if (mode === 'add') {
+    op.hM = Math.round(spec.hM * 100) / 100;
+    op.hMode = spec.hMode === 'set' ? 'set' : 'fill';
+  }
+  return { op, cells, cols, rows, coarsened };
 }
 
 // ============================================================
@@ -1569,6 +2289,16 @@ if (typeof module !== 'undefined' && module.exports) {
     canopyColorRamp, viewshedColorRamp, canopyGridToRGBA, viewshedMaskToRGBA,
     CANOPY_PAINT_DEFAULT_M, canopyAvgHeight, canopyStampBrush, canopyDiffToSparse,
     canopyApplyStroke, canopyApplyDelete, canopyRevertDiff, canopyOpBBox, canopyApplyOps,
+    canopyMaskOpValid, canopyApplyMask, bitMaskGet, canopyOpBytes, canopyOpsBytes,
+    VEG_ANALYSIS_Z, VEG_TILE_PX, VEG_IMAGERY_MIN_Z, VEG_IMAGERY_MAX_Z, VEG_TARGET_PX_PER_CELL,
+    VEG_BLUE_W, VEG_SCORE_T0, VEG_SCORE_HI, VEG_SCORE_LO, VEG_DARK_V, VEG_MIN_SAT,
+    VEG_CELL_LIT_MIN, VEG_TEXTURE_MIN, VEG_TEXTURE_RADIUS_CELLS, VEG_MIN_BLOB_M2,
+    VEG_LEAN_MARGIN_M, CANOPY_MASK_MAX_CELLS, vegTexturePlane,
+    imageryMetresPerPixel, imageryZoomForBBox, tileMosaicBounds, analysisLatticeFor,
+    vegGreenScore, makeVegAccumulator, accumulateVegTile, finalizeVegAccumulator,
+    maskDilate, maskErode, maskOpen, maskClose, filterMaskMinArea, maskClipToPolygon,
+    maskDownsample, packBitMask, countMask, cellsToHectares,
+    vegCandidateMask, vegMaskToRGBA, makeCanopyMaskOp,
     decimateCanopyMesh, canopyMeshIndexed, normalFromSlopes,
     encodeGeoTiffRGBA, reprojectRgbaTo3857, worldFileForBounds, WGS84_WKT, WEBMERC_WKT, crc32, zipStore,
     makeViewshedRecord, viewshedFilenameSlug, uniqueViewshedName, observerKmlDescription,
