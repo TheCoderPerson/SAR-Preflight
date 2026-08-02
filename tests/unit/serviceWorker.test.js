@@ -1,4 +1,4 @@
-const { routeStrategy, latlngToTile, getCacheName, navigationStrategy, stripRedirect, useCachedResponse, cacheFirst, CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_SECTIONAL, SAR_VERSION } = require('../../sw.js');
+const { routeStrategy, latlngToTile, getCacheName, navigationStrategy, stripRedirect, useCachedResponse, cacheFirst, APP_SHELL, CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_SECTIONAL, SAR_VERSION } = require('../../sw.js');
 
 const SECTIONAL_TILE = 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/10/396/164?ed=2026-05-13';
 const SECTIONAL_META = 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer?f=json';
@@ -57,6 +57,28 @@ describe('routeStrategy(url)', () => {
     expect(routeStrategy('http://localhost:3000/sar-preflight.html')).toBe('cache-first');
     expect(routeStrategy('http://localhost:3000/sar-preflight.js')).toBe('cache-first');
     expect(routeStrategy('http://localhost:3000/manifest.json')).toBe('cache-first');
+  });
+
+  // The ?cb= probes exist to see PAST every cache (they detect newly deployed
+  // versions). The cache-first default would put one unique-query entry per
+  // check into CACHE_STATIC, forever. Plain version.js must stay cache-first
+  // so the shell still loads offline.
+  it('routes deployed-version probes to network-only, plain files stay cache-first', () => {
+    expect(routeStrategy('http://localhost:3000/version.js?cb=1722600000000')).toBe('network-only');
+    expect(routeStrategy('http://localhost:3000/CHANGELOG.md?cb=1722600000000')).toBe('network-only');
+    expect(routeStrategy('http://localhost:3000/version.js')).toBe('cache-first');
+    expect(routeStrategy('http://localhost:3000/CHANGELOG.md')).toBe('cache-first');
+  });
+});
+
+describe('APP_SHELL', () => {
+  // charts.js was missing from the precache list: shell refreshes never
+  // updated it and a fresh install couldn't run offline until the first
+  // opportunistic fetch cached it.
+  it('includes every locally loaded script', () => {
+    expect(APP_SHELL).toContain('./sar-preflight-charts.js');
+    expect(APP_SHELL).toContain('./sar-preflight.js');
+    expect(APP_SHELL).toContain('./version.js');
   });
 });
 

@@ -3,7 +3,7 @@ Object.assign(globalThis, core);
 globalThis.L = { layerGroup: () => ({ addLayer() {}, clearLayers() {}, getLayers: () => [], addTo() { return this; } }) };
 globalThis.SAR_VERSION = '2026.07.17-b';
 
-const { S, showUpdateModal, dismissUpdateModal, acceptDisclaimer, checkDeployedVersion, fetchLatestVersion } = require('../../sar-preflight.js');
+const { S, showUpdateModal, showUpdateModalIfNewer, dismissUpdateModal, acceptDisclaimer, checkDeployedVersion, fetchLatestVersion } = require('../../sar-preflight.js');
 
 const NEW_MD = [
   '# Changelog', '',
@@ -93,6 +93,45 @@ describe('showUpdateModal', () => {
     acceptDisclaimer();
     await new Promise(r => setTimeout(r, 0)); // let the deferred async modal render
     expect(document.getElementById('updateModal').classList.contains('active')).toBe(true);
+  });
+});
+
+// Gate for the SW-install-triggered modal paths: a new SW installing does not
+// prove new APP code (after a REFRESH_SHELL-style update the app can already
+// be current when the browser belatedly installs the matching worker).
+describe('showUpdateModalIfNewer (version-gated SW-install trigger)', () => {
+  beforeEach(() => {
+    setBody(false);
+    S._updateModalShown = false;
+    S._pendingUpdateModal = false;
+    S._updateApplying = false;
+    mockFetch();
+  });
+  afterEach(() => { document.body.innerHTML = ''; delete globalThis.fetch; S._updateApplying = false; });
+
+  it('suppresses the modal AND banner when the deployed version equals the running one (phantom install)', async () => {
+    globalThis.fetch = vi.fn(async () => ({ ok: true, text: async () => "var SAR_VERSION = '2026.07.17-b';" }));
+    await showUpdateModalIfNewer();
+    expect(document.getElementById('updateModal').classList.contains('active')).toBe(false);
+    expect(document.getElementById('swUpdateBanner')).toBeFalsy();
+  });
+
+  it('shows the modal when the deployed version differs', async () => {
+    await showUpdateModalIfNewer();
+    expect(document.getElementById('updateModal').classList.contains('active')).toBe(true);
+  });
+
+  it('shows the modal when the version fetch fails — an installed update is real evidence', async () => {
+    globalThis.fetch = vi.fn(async () => { throw new Error('offline'); });
+    await showUpdateModalIfNewer();
+    expect(document.getElementById('updateModal').classList.contains('active')).toBe(true);
+  });
+
+  it('does nothing while an update is being applied (the install it observes is our own)', async () => {
+    S._updateApplying = true;
+    await showUpdateModalIfNewer();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(document.getElementById('updateModal').classList.contains('active')).toBe(false);
   });
 });
 

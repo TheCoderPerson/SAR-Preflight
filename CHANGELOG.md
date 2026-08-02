@@ -4,6 +4,15 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.08.02-a — 2026-08-02
+
+- The "Reload & Update" button now responds the moment you press it: the buttons lock, and a status line walks through Checking → Downloading → Verifying → Reloading instead of the screen sitting frozen for up to half a minute.
+- Fixed updates on desktop needing several reload-and-update rounds before the new version actually arrived. The update check and the update download went through different caching paths, so the app could detect a new version that the download then couldn't fetch — it re-downloaded the old files and the same update prompt came straight back. Both now bypass every cache the same way.
+- The app now verifies an update actually landed BEFORE reloading. If the server is still handing out the old version (a deploy still propagating), it says so and lets you retry, instead of reloading into the same version and re-prompting.
+- When a new service worker is being installed, the reload now waits for it to take over completely instead of racing it — another way a reload could land back on the old version.
+- The update prompt no longer appears when you are already on the newest version (it previously could after a service-worker reinstall).
+- Fixed the charts module being left out of the offline bundle: it was not refreshed by updates and a fresh install could not chart offline until it had been viewed online once.
+
 ## v2026.08.01-d — 2026-08-01
 
 - Fixed vegetation data failing with "NO DATA" over some areas even though the data was there. Reproduced over a Contra Costa search area: the tile existed, the server was healthy, every byte of it downloaded correctly — but the reader we use was configured with a block size too small for how these files are laid out, and it gave up part-way through. That area now loads normally.

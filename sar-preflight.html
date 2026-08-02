@@ -1738,9 +1738,10 @@ select.api-input { cursor: pointer; }
     <h3 style="color:var(--accent-cyan);">Update Available</h3>
     <div id="updateModalSub" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:2px;"></div>
     <div id="updateModalBody" style="overflow-y:auto;max-height:50vh;margin-top:10px;"></div>
+    <div id="updateModalStatus" style="display:none;font-family:var(--font-mono);font-size:11px;color:var(--accent-cyan);margin-top:10px;"></div>
     <div class="modal-actions" style="margin-top:16px;">
-      <button class="btn btn-ghost" onclick="dismissUpdateModal()">Later</button>
-      <button class="btn btn-primary" onclick="applyUpdate()">Reload &amp; Update</button>
+      <button id="updateModalLater" class="btn btn-ghost" onclick="dismissUpdateModal()">Later</button>
+      <button id="updateModalApply" class="btn btn-primary" onclick="applyUpdate()">Reload &amp; Update</button>
     </div>
   </div>
 </div>

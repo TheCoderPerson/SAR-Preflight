@@ -8686,7 +8686,7 @@ function startApp() {
         // On an update, navigator.serviceWorker.controller is already set by
         // the old SW, so this distinguishes "update" from "first install".
         if (sw.state === 'installed' && navigator.serviceWorker.controller) {
-          showUpdateModal();
+          showUpdateModalIfNewer();
         }
       });
     };
@@ -8697,7 +8697,7 @@ function startApp() {
       // Cover three cases missed by a naked updatefound listener:
       // 1. An update is already waiting from a previous session
       if (reg.waiting && navigator.serviceWorker.controller) {
-        showUpdateModal();
+        showUpdateModalIfNewer();
       }
       // 2. An update is currently installing (race: install may start before listener attaches)
       if (reg.installing) {
@@ -8782,6 +8782,10 @@ function startApp() {
   // so the display survives any earlier failure in startApp.
 }
 
+function _updateBannerHtml() {
+  return 'Update available <button class="btn btn-primary" style="padding:3px 10px;font-size:10px;" onclick="applyUpdate()">Reload</button>';
+}
+
 function showUpdateBanner() {
   if (document.getElementById('swUpdateBanner')) return;
   const banner = document.getElementById('assessmentBanner');
@@ -8789,8 +8793,37 @@ function showUpdateBanner() {
   const div = document.createElement('div');
   div.id = 'swUpdateBanner';
   div.style.cssText = 'padding:8px 16px;background:var(--bg-tertiary);border-bottom:1px solid var(--accent-cyan);font-family:var(--font-mono);font-size:11px;color:var(--accent-cyan);display:flex;align-items:center;gap:8px;';
-  div.innerHTML = 'Update available <button class="btn btn-primary" style="padding:3px 10px;font-size:10px;" onclick="applyUpdate()">Reload</button>';
+  div.innerHTML = _updateBannerHtml();
   banner.parentElement.insertBefore(div, banner);
+}
+
+// Immediate on-screen acknowledgement for the update-apply flow. Mirrors the
+// current stage into every surface the user might have clicked from: the
+// update modal (status line + disabled buttons), the thin header banner, and
+// the Config-tab check status. `failed: true` re-enables the buttons and
+// restores the banner so the user can retry.
+function _updateApplyStatus(msg, opts) {
+  const failed = !!(opts && opts.failed);
+  const status = document.getElementById('updateModalStatus');
+  if (status) {
+    status.style.display = 'block';
+    status.style.color = failed ? 'var(--accent-amber)' : 'var(--accent-cyan)';
+    status.textContent = msg;
+  }
+  const later = document.getElementById('updateModalLater');
+  if (later) later.disabled = !failed;
+  const apply = document.getElementById('updateModalApply');
+  if (apply) {
+    apply.disabled = !failed;
+    apply.textContent = failed ? 'Try Again' : 'Updating…';
+  }
+  const bannerEl = document.getElementById('swUpdateBanner');
+  if (bannerEl) bannerEl.innerHTML = failed ? _updateBannerHtml() : ('Updating… ' + msg);
+  const cfg = document.getElementById('updateCheckStatus');
+  if (cfg) {
+    cfg.textContent = msg;
+    cfg.style.color = failed ? 'var(--accent-amber)' : 'var(--accent-cyan)';
+  }
 }
 
 // Fetch the server's current version.js, bypassing the SW cache. The cache-busting
@@ -8894,6 +8927,14 @@ async function showUpdateModal(force) {
   const body = document.getElementById('updateModalBody');
   if (!modal || !body) return;
   S._updateModalShown = true;
+  // Reset any prior apply-attempt state (status line, disabled buttons) so a
+  // reopened modal doesn't show a stale "Updating…" or failure message.
+  const status = document.getElementById('updateModalStatus');
+  if (status) { status.style.display = 'none'; status.textContent = ''; }
+  const later = document.getElementById('updateModalLater');
+  if (later) later.disabled = false;
+  const apply = document.getElementById('updateModalApply');
+  if (apply) { apply.disabled = false; apply.textContent = 'Reload & Update'; }
   const cur = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : null;
   const latest = await fetchLatestVersion();
   let entries = [];
@@ -8916,6 +8957,23 @@ function dismissUpdateModal() {
   document.getElementById('updateModal')?.classList.remove('active');
 }
 
+// Version-gated wrapper for the SW-install-triggered modal paths. A new SW
+// installing does NOT prove new app code: after a REFRESH_SHELL-style update
+// the app can already be current when the browser belatedly installs the
+// matching worker — popping the modal then sends the user through a pointless
+// reload ("update available" → reload → nothing changed). Suppress it only
+// when the deployed version PROVABLY equals the running one; on fetch failure
+// show the modal as before (an installed update is real evidence).
+async function showUpdateModalIfNewer() {
+  try {
+    if (S._updateApplying) return; // install was triggered by applyUpdate itself
+    const cur = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : null;
+    const latest = await fetchLatestVersion();
+    if (cur && latest && latest === cur) return;
+    await showUpdateModal();
+  } catch (_) {}
+}
+
 // Active deployed-version check. The browser's SW update byte-compare does NOT
 // notice deploys that only change version.js (an imported script) — verified in
 // Chrome even with updateViaCache:'none' — so releases that don't touch sw.js
@@ -8936,12 +8994,14 @@ async function checkDeployedVersion() {
 
 // Ask the active SW to re-fetch the app shell from the network into its cache
 // (REFRESH_SHELL). Resolves false on timeout — e.g. an older deployed SW
-// without the handler — so the caller can fall back.
+// without the handler — so the caller can fall back. Default 30 s: the shell
+// is ~1.2 MB fetched from the origin, and slow field connections need the
+// headroom now that the user sees progress instead of a frozen button.
 function _swRefreshShell(sw, timeoutMs) {
   return new Promise((resolve) => {
     let done = false;
     const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
-    setTimeout(() => finish(false), timeoutMs || 12000);
+    setTimeout(() => finish(false), timeoutMs || 30000);
     try {
       const ch = new MessageChannel();
       ch.port1.onmessage = (e) => finish(!!(e.data && e.data.ok));
@@ -8950,53 +9010,153 @@ function _swRefreshShell(sw, timeoutMs) {
   });
 }
 
-// Wait for an in-flight SW install to settle (installed/activated) so a reload
-// lands on the new worker's cache rather than racing the install.
-function _swAwaitInstalled(reg, timeoutMs) {
+// Wait for an in-flight SW update to ACTIVATE — not just install — before the
+// caller reloads. Reloading at 'installed' races activation: the OLD worker
+// still controls the page and both static caches coexist, so the navigation
+// is served from the OLD cache and the "update" reload lands on the old
+// version (one full wasted update cycle). Reaching 'activated' also
+// guarantees the activate handler's old-cache cleanup has finished (it runs
+// inside its waitUntil). Resolves 'activated' | 'redundant' | 'timeout'.
+function _swAwaitActivated(reg, timeoutMs) {
   return new Promise((resolve) => {
-    const sw = reg && reg.installing;
-    if (!sw) return resolve(true);
+    const sw = reg && (reg.installing || reg.waiting);
+    if (!sw) return resolve('activated');
+    if (sw.state === 'activated') return resolve('activated');
     let done = false;
-    const finish = (v) => { if (!done) { done = true; resolve(v); } };
-    setTimeout(() => finish(true), timeoutMs || 8000);
+    const container = (typeof navigator !== 'undefined') ? navigator.serviceWorker : null;
+    const onControllerChange = () => finish('activated');
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      try { container?.removeEventListener('controllerchange', onControllerChange); } catch (_) {}
+      resolve(v);
+    };
+    setTimeout(() => finish('timeout'), timeoutMs || 30000);
     sw.addEventListener('statechange', () => {
-      if (sw.state === 'installed' || sw.state === 'activated') finish(true);
-      if (sw.state === 'redundant') finish(false);
+      if (sw.state === 'activated') finish('activated');
+      if (sw.state === 'redundant') finish('redundant');
     });
+    // Secondary signal: clients.claim() switching this page's controller.
+    try { container?.addEventListener('controllerchange', onControllerChange); } catch (_) {}
+    // Belt-and-braces: sw.js always skipWaiting()s during install, but a
+    // worker stuck in `waiting` across a browser restart can lose that flag.
+    if (reg.waiting) { try { reg.waiting.postMessage({ type: 'SKIP_WAITING' }); } catch (_) {} }
   });
 }
 
-// Apply a discovered update.
-// 1) sw.js itself changed → normal SW update: nudge it, wait for the install
-//    to settle (skipWaiting + clients.claim), reload.
+// Read the version.js the cache would serve on the next reload. Global exact
+// match (never ignoreSearch — legacy '?cb=' probe entries must not answer),
+// and deliberately NOT 'sar-static-' + SAR_VERSION: after a REFRESH_SHELL-only
+// update the running SW's cache name lags the page's version, so a named read
+// would miss. At both call sites exactly one sar-static-* cache exists.
+async function _cachedShellVersion() {
+  try {
+    if (typeof caches === 'undefined') return null; // file:// dist build
+    const resp = await caches.match('version.js');
+    if (!resp) return null;
+    const m = (await resp.text()).match(/SAR_VERSION\s*=\s*'([^']+)'/);
+    return m ? m[1] : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Did the shell refresh actually land a NEW version in the cache? 'stale'
+// only when a version was positively read AND still equals the running one —
+// that is the reload-into-the-same-version loop this exists to break.
+// 'fresh' means it differs from the running version (not "equals latest":
+// an intermediate deploy still makes progress and the next check self-heals).
+// 'unknown' (no latest, no running version, nothing cached) keeps today's
+// behavior: reload and hope — never strand a user who could have updated.
+async function _verifyShellFresh(latest) {
+  const cur = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : null;
+  if (!latest || !cur || latest === cur) return 'unknown';
+  const cached = await _cachedShellVersion();
+  if (!cached) return 'unknown';
+  return (cached === cur) ? 'stale' : 'fresh';
+}
+
+// Apply a discovered update. Returns an outcome string (testable — jsdom's
+// location.reload can't be spied on): 'busy' | 'reloaded' | 'stale' |
+// 'timeout' | 'unregistered'.
+// 1) sw.js itself changed → normal SW update: nudge it, wait for ACTIVATION
+//    (skipWaiting + clients.claim), verify the cache holds a new version
+//    (the old SW's install precache can race a stale CDN edge — repair via
+//    the new SW's cache-busted REFRESH_SHELL), then reload.
 // 2) Only app files / version.js changed (sw.js byte-identical → the browser
 //    installs nothing) → REFRESH_SHELL: the ACTIVE SW re-pulls the shell from
-//    the network into its cache, then a plain reload serves the new version
-//    cache-first. NEVER unregister here: an unregistered reload falls back to
-//    the browser HTTP cache, which can hold the OLD shell for its full
-//    max-age (10 min on GitHub Pages) — that caused an "Update Available" →
-//    reload → same old version modal loop.
+//    the network into its cache (cache-busted past the CDN edge), verify,
+//    then a plain reload serves the new version cache-first. NEVER unregister
+//    here: an unregistered reload falls back to the browser HTTP cache, which
+//    can hold the OLD shell for its full max-age (10 min on GitHub Pages).
 // 3) Old deployed SW without REFRESH_SHELL (timeout) → legacy fallback:
 //    unregister so the reload fetches from the network.
+// When verification says the server is still serving the running version, do
+// NOT reload (that's the "update → reload → same version" loop the user
+// reported) — say so honestly and re-enable the buttons.
 async function applyUpdate() {
+  if (S._updateApplying) return 'busy';
+  S._updateApplying = true;
+  const fail = (msg) => { S._updateApplying = false; _updateApplyStatus(msg, { failed: true }); };
+  const reloadNow = () => { _updateApplyStatus('Reloading…'); location.reload(); };
+  const stillServingMsg = () =>
+    'The server is still serving v' + ((typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : '?') +
+    ' — the deploy may still be propagating. Try again in a few minutes.';
   try {
     const reg = S._swReg;
     const online = (typeof isOnline !== 'function') || isOnline();
-    if (reg && online) {
-      if (!reg.waiting && !reg.installing) { try { await reg.update(); } catch (_) {} }
-      if (reg.waiting || reg.installing) {
-        await _swAwaitInstalled(reg);
-        location.reload();
-        return;
+    if (!reg || !online) { reloadNow(); return 'reloaded'; }
+
+    _updateApplyStatus('Checking latest version…');
+    const latest = await fetchLatestVersion(); // null on dist / offline — verification then no-ops
+    if (!reg.waiting && !reg.installing) { try { await reg.update(); } catch (_) {} }
+
+    // Path 1: a new SW is installing/waiting (sw.js bytes changed).
+    if (reg.waiting || reg.installing) {
+      _updateApplyStatus('Downloading update…');
+      const res = await _swAwaitActivated(reg, 30000);
+      if (res === 'activated') {
+        _updateApplyStatus('Verifying…');
+        let v = await _verifyShellFresh(latest);
+        if (v === 'stale' && reg.active) {
+          _updateApplyStatus('Re-downloading update…');
+          if (await _swRefreshShell(reg.active, 30000)) v = await _verifyShellFresh(latest);
+        }
+        if (v === 'stale') { fail(stillServingMsg()); return 'stale'; }
+        reloadNow();
+        return 'reloaded';
       }
-      if (reg.active) {
-        const ok = await _swRefreshShell(reg.active);
-        if (ok) { location.reload(); return; }
+      if (res === 'timeout') {
+        fail('Still downloading — the update will finish in the background. Try again in a moment.');
+        return 'timeout';
       }
-      try { await reg.unregister(); } catch (_) {}
+      // 'redundant' (install failed) → fall through to the active-SW paths.
     }
-  } catch (_) {}
-  location.reload();
+
+    // Path 2: sw.js byte-identical — refresh the shell via the active SW.
+    if (reg.active) {
+      _updateApplyStatus('Downloading update…');
+      if (await _swRefreshShell(reg.active, 30000)) {
+        _updateApplyStatus('Verifying…');
+        let v = await _verifyShellFresh(latest);
+        if (v === 'stale') {
+          _updateApplyStatus('Retrying download…');
+          if (await _swRefreshShell(reg.active, 30000)) v = await _verifyShellFresh(latest);
+        }
+        if (v === 'stale') { fail(stillServingMsg()); return 'stale'; }
+        reloadNow();
+        return 'reloaded';
+      }
+      // Timeout / no handler (old deployed SW) → legacy fallback below.
+    }
+
+    try { await reg.unregister(); } catch (_) {}
+    reloadNow();
+    return 'unregistered';
+  } catch (_) {
+    location.reload();
+    return 'reloaded';
+  }
 }
 
 function closeChangelog() {
@@ -13696,7 +13856,8 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer,
-    checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitInstalled,
+    checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitActivated,
+    showUpdateModalIfNewer, _updateApplyStatus, _updateBannerHtml, _cachedShellVersion, _verifyShellFresh,
     getCanopyProxyBase, getCustomProxy, saveCanopyProxy, DEFAULT_DATA_PROXY, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
     notifyProxyRateLimited, _proxyFetch,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
