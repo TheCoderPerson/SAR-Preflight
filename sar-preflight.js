@@ -10247,6 +10247,11 @@ const COG_MAX_READ_PX = 1024;
 // window — a 22,727×20,756 single read hit ~1.8 GB and crashed the iOS PWA.
 // We read the window in row strips capped to this budget so peak stays bounded.
 const CANOPY_DECODE_BUDGET_PX = 32000000;
+// Block size for geotiff.js's BlockedSource on the canopy COGs. Its 64 KB
+// default is too small for these files (stripped, RowsPerStrip = 1) and makes
+// wide reads throw "reading 'offset'" — see the call site in
+// _fetchCanopyFromProxy for the reproduction.
+const CANOPY_COG_BLOCK_BYTES = 1048576;
 // Skip the canopy overlay when the view half-width exceeds this (~12 km AOI):
 // 1 m canopy over a wider area is hundreds of MB–GB to fetch/decode and is only
 // upscaled blur at that scale, so we tell the user to zoom in instead.
@@ -10468,6 +10473,7 @@ async function fetchCanopyRaster(grid) {
 async function _fetchCanopyFromProxy(base, grid) {
   const b = grid.bounds;
   const qks = metaQuadkeysForBBox(b.west, b.south, b.east, b.north);
+  S._canopyTileError = null; // stale reason must not outlive its load
   try { Diag.note('canopy.tiles', { qk: qks.length }); } catch (_) {}
   const canopy = new Float32Array(grid.rows * grid.cols).fill(NaN);
   let any = false, loaded = 0, failed = 0;
@@ -10477,16 +10483,31 @@ async function _fetchCanopyFromProxy(base, grid) {
     let tileGrid = null;
     // Retry transient proxy/S3 errors: cold Range fetches of these large COGs
     // intermittently 5xx even though the tile is valid. Back off between tries.
+    let lastErr = null;
     for (let attempt = 0; attempt < CANOPY_TILE_ATTEMPTS && tileGrid == null; attempt++) {
       if (attempt > 0) await new Promise(r => setTimeout(r, 300 * attempt)); // 300/600/900ms backoff
       try {
-        const tiff = await GeoTIFF.fromUrl(url);
+        // blockSize: geotiff.js's BlockedSource defaults to 64 KB blocks, which
+        // BREAKS on these tiles. They are stripped with RowsPerStrip = 1, and a
+        // strip runs ~7 KB over dense canopy, so one strip-batch read spans
+        // ~3.8 MB of non-contiguous small strips; the reader then asks for a
+        // block that was never registered and throws
+        // "Cannot read properties of undefined (reading 'offset')".
+        // Reproduced on 023010212 over a real search area: the default fails
+        // every time, cacheSize: 1000 does NOT help (so it is not eviction),
+        // and 1 MB blocks read the full grid successfully.
+        const tiff = await GeoTIFF.fromUrl(url, { blockSize: CANOPY_COG_BLOCK_BYTES });
         tileGrid = await _cogTileToGrid(tiff, grid);
-      } catch (_) { tileGrid = null; } // missing tile / CORS / transient
+      } catch (e) { tileGrid = null; lastErr = e; } // missing tile / CORS / transient
     }
     if (!tileGrid) {
       failed++;
-      try { Diag.note('canopy.tileFail', { qk }); } catch (_) {}
+      // Record WHY. This catch used to swallow the error entirely, so every
+      // cause — missing tile, CORS, rate limit, decoder bug — surfaced as an
+      // identical "NO DATA" with no way to tell them apart.
+      const why = lastErr ? ((lastErr.name || 'Error') + ': ' + (lastErr.message || String(lastErr))) : 'unknown';
+      try { Diag.note('canopy.tileFail', { qk, why }); } catch (_) {}
+      if (!S._canopyTileError) S._canopyTileError = why;
       // GeoTIFF.js fetches internally, so a proxy 429 only surfaces as a thrown
       // error. Probe the tile once: if the proxy is rate-limiting this IP, flag
       // the status bar and stop — more tiles would just burn more of the limit.
@@ -10774,7 +10795,16 @@ async function loadCanopyForView() {
     if (S._canopyEditing) return; // user entered edit mode while this load was in flight — don't fight the edit canvas
     if (!canopyFlat) {
       setStatus('canopyStatus', 'error', source === 'no proxy' ? 'NO PROXY' : 'NO DATA');
-      markSection('canopy', { status: 'error', error: source === 'no proxy' ? 'No canopy proxy configured' : 'No canopy data for this view' });
+      // Carry the underlying tile error through. "No canopy data for this view"
+      // is only honest when the tiles genuinely 404; when they failed for some
+      // other reason, saying so is the difference between a one-glance
+      // diagnosis and an afternoon of bisecting.
+      markSection('canopy', {
+        status: 'error',
+        error: source === 'no proxy' ? 'No canopy proxy configured'
+          : (S._canopyTileError ? 'Canopy tiles failed to load — ' + S._canopyTileError
+                                : 'No canopy data for this view'),
+      });
       if (S._overlayWanted) S._overlayWanted.canopy = false;
       buildLayerControl(); // revert the row the user just checked
       return;

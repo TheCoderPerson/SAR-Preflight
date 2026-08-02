@@ -4,6 +4,11 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.08.01-d — 2026-08-01
+
+- Fixed vegetation data failing with "NO DATA" over some areas even though the data was there. Reproduced over a Contra Costa search area: the tile existed, the server was healthy, every byte of it downloaded correctly — but the reader we use was configured with a block size too small for how these files are laid out, and it gave up part-way through. That area now loads normally.
+- When vegetation tiles do fail, the app now tells you WHY instead of just "no data". The underlying error was being discarded, so a missing tile, a blocked request and a decoder fault all looked identical — which is exactly what made this one hard to pin down.
+
 ## v2026.08.01-c — 2026-08-01
 
 - Fixed a hang when the vegetation layer was switched on while zoomed well out. The app would sit on "Fetching..." forever and the tab could stop responding. It now says ZOOM IN straight away, the same as it already did on phones — the wide view was asking for tens of billions of pixels across a dozen source tiles.
