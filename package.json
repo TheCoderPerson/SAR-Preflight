@@ -1,6 +1,7 @@
 {
   "name": "sar-preflight",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
