@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.08.12-a — 2026-08-12
+
+- The "Building 3D Canopy" progress dialog now appears in the center of the screen instead of tucked along the bottom edge, so it's obvious the 3D vegetation surface is still being built (and where to cancel it).
+
 ## v2026.08.02-a — 2026-08-02
 
 - The "Reload & Update" button now responds the moment you press it: the buttons lock, and a status line walks through Checking → Downloading → Verifying → Reloading instead of the screen sitting frozen for up to half a minute.

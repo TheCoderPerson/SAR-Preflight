@@ -24,6 +24,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.08.12-a',
+    date: '2026-08-12',
+    changes: [
+      'The "Building 3D Canopy" progress dialog now appears in the center of the screen instead of tucked along the bottom edge, so it\'s obvious the 3D vegetation surface is still being built (and where to cancel it).',
+    ],
+  },
+  {
     version: '2026.08.02-a',
     date: '2026-08-02',
     changes: [
