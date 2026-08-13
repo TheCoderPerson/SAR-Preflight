@@ -30,6 +30,7 @@ const APP_SHELL = [
   './sar-preflight-raster.js',
   './sar-preflight.js',
   './sar-preflight-offline.js',
+  './sar-preflight-charts.js',
   './manifest.json',
   './icons/icon-192.svg',
   './icons/icon-512.svg',
@@ -48,14 +49,34 @@ const CDN_ASSETS = [
   'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap',
 ];
 
+// Re-download the app shell from the origin and commit it to CACHE_STATIC.
+// Each fetch carries a unique ?swr= query: a CDN edge (GitHub Pages/Fastly,
+// max-age=600) keys its cache on the full URL, so `cache:'reload'` alone —
+// which only bypasses the BROWSER HTTP cache — can re-download the OLD bytes
+// for up to 10 minutes after a deploy. The version probe (?cb=) always busts
+// the edge, so without this the app detects an update it can't actually
+// download, and the "Update Available → reload → same version" loop follows.
+// Fetch ALL files first, commit under the CLEAN URLs only when every fetch is
+// a 200 — a partial commit would leave a mixed old/new shell, which is worse
+// than either version. (A fetch made from SW context does not re-enter this
+// SW's own fetch handler, so nothing here recurses or pollutes other caches.)
+async function refreshAppShell() {
+  const stamp = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const fetched = await Promise.all(APP_SHELL.map(async (u) => {
+    const bust = u + (u.includes('?') ? '&' : '?') + 'swr=' + stamp;
+    const resp = await fetch(new Request(bust, { cache: 'reload' }));
+    if (resp.status !== 200) throw new Error(u + ' HTTP ' + resp.status);
+    return [u, resp];
+  }));
+  const cache = await caches.open(CACHE_STATIC);
+  await Promise.all(fetched.map(([u, resp]) => cache.put(new Request(u), resp)));
+}
+
 // --- Install: pre-cache app shell + CDN ---
 self.addEventListener('install', event => {
   event.waitUntil(
     Promise.all([
-      // cache:'reload' bypasses the browser HTTP cache for the shell files: a
-      // just-updated SW must never install the stale copies it was updated to
-      // replace (shell files can sit in the HTTP cache for their full max-age).
-      caches.open(CACHE_STATIC).then(cache => cache.addAll(APP_SHELL.map(u => new Request(u, { cache: 'reload' })))),
+      refreshAppShell(),
       // CDN assets are version-pinned URLs — immutable, HTTP cache is fine.
       // Best-effort per asset: one CDN hiccup must not reject the whole install
       // (a rejected install means NOTHING gets cached and offline never works).
@@ -179,6 +200,12 @@ function routeStrategy(url) {
       url.includes('overpass-api.de') ||
       url.includes('api.weather.gov') ||
       url.includes('api.rainviewer.com'))      return 'network-first';
+
+  // Deployed-version probes — network-only. They exist to see PAST every
+  // cache; letting the cache-first default store them would pollute
+  // CACHE_STATIC with one unique-query entry per check that can never be
+  // served again. (Plain version.js stays cache-first — required offline.)
+  if (url.includes('version.js?cb=') || url.includes('CHANGELOG.md?cb=')) return 'network-only';
 
   // App shell and everything else — cache-first
   return 'cache-first';
@@ -317,14 +344,18 @@ self.addEventListener('message', event => {
     // version. (The old approach — unregister + reload — fell back to the
     // browser HTTP cache, which can hold the OLD shell for its full max-age;
     // on GitHub Pages that's 10 min of "Update Available" → reload → same old
-    // version → modal loop.) cache:'reload' bypasses the HTTP cache.
+    // version → modal loop.)
     const port = event.ports && event.ports[0];
     event.waitUntil(
-      caches.open(CACHE_STATIC)
-        .then(cache => cache.addAll(APP_SHELL.map(u => new Request(u, { cache: 'reload' }))))
+      refreshAppShell()
         .then(() => { port?.postMessage({ ok: true }); })
         .catch(() => { port?.postMessage({ ok: false }); })
     );
+  }
+  if (event.data?.type === 'SKIP_WAITING') {
+    // Belt-and-braces: install() already calls skipWaiting(), but a worker
+    // stuck in `waiting` across a browser restart can lose that flag.
+    self.skipWaiting();
   }
   if (event.data?.type === 'CLEAR_TILE_CACHE') {
     Promise.all([caches.delete(CACHE_TILES), caches.delete(CACHE_SECTIONAL)]).then(() => {
@@ -432,7 +463,7 @@ async function getCacheSize() {
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    routeStrategy, latlngToTile, getCacheName,
+    routeStrategy, latlngToTile, getCacheName, refreshAppShell,
     navigationStrategy, stripRedirect, useCachedResponse, cacheFirst,
     CURRENT_CACHES, APP_SHELL, CDN_ASSETS,
     CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_API, CACHE_SECTIONAL,

@@ -105,9 +105,9 @@
 .parcel-chip.warn  { color: var(--accent-amber); border-color: var(--accent-amber); }
 .parcel-chip.error { color: var(--accent-red); border-color: var(--accent-red); }
 .map-container.mode-observer #observerHint { display: block; }
-/* 3D canopy mesh build progress — floats over the map in 3D mode */
+/* 3D canopy mesh build progress — centered over the map in 3D mode */
 #canopy3dProgress {
-  position: absolute; bottom: 52px; left: 50%; transform: translateX(-50%); z-index: 850;
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 850;
   display: none; align-items: center; gap: 10px;
   background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px;
   padding: 8px 12px; font-family: var(--font-mono); font-size: 10px;
@@ -322,6 +322,16 @@ body {
 .ce-range::-moz-range-thumb { width: 26px; height: 26px; border: 0; border-radius: 13px; background: var(--accent-cyan); }
 .ce-stat { flex-basis: 100%; text-align: center; font-family: var(--font-mono); font-size: 10px; color: var(--accent-cyan); }
 .ce-caveat { flex-basis: 100%; max-width: 460px; text-align: center; font-family: var(--font-mono); font-size: 9px; color: var(--accent-amber); line-height: 1.35; }
+/* Legend: the amber dither reads as "trees found" without it — it means the
+   opposite (unjudged), and that misreading sent a tester down a long detour. */
+.ce-legend { flex-basis: 100%; display: flex; justify-content: center; align-items: center; gap: 5px;
+  font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); flex-wrap: wrap; }
+.ce-key { display: inline-flex; align-items: center; gap: 4px; margin: 0 6px; }
+.ce-sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; flex: none; }
+
+.ce-sw-add { background: rgb(34,211,238); }
+.ce-sw-cut { background: rgb(239,68,68); }
+.ce-sw-unk { background: repeating-conic-gradient(rgb(245,158,11) 0% 25%, transparent 0% 50%) 0 0 / 6px 6px; border: 1px solid rgba(245,158,11,0.5); }
 /* Edit mode hides map chrome that would fight the toolbar or the pinned base */
 .map-container.mode-canopy-edit .timebar,
 .map-container.mode-canopy-edit .draw-toolbar,
@@ -890,6 +900,11 @@ select.api-input { cursor: pointer; }
         <button class="ce-btn" id="ceVegApply" onclick="canopyVegApply()" title="Commit the previewed change">APPLY</button>
         <button class="ce-btn" onclick="canopyVegCancel()" title="Discard the preview, change nothing">CANCEL</button>
         <span class="ce-stat" id="ceVegStats"></span>
+        <span class="ce-legend" id="ceVegLegend">
+          <span class="ce-key" id="ceVegKeyAdd"><i class="ce-sw ce-sw-add"></i>will be added</span>
+          <span class="ce-key" id="ceVegKeyCut"><i class="ce-sw ce-sw-cut"></i>will be cleared</span>
+          <span class="ce-key"><i class="ce-sw ce-sw-unk"></i>too dark to judge &mdash; left alone</span>
+        </span>
         <span class="ce-caveat">IMAGERY ONLY — Esri World Imagery is a mosaic of unknown date and may be OLDER than the canopy data.
           Green &ne; tall: lawns, brush and crops score green. Shadowed cells are skipped, not cleared. Verify before APPLY.</span>
       </div>
@@ -1723,9 +1738,10 @@ select.api-input { cursor: pointer; }
     <h3 style="color:var(--accent-cyan);">Update Available</h3>
     <div id="updateModalSub" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:2px;"></div>
     <div id="updateModalBody" style="overflow-y:auto;max-height:50vh;margin-top:10px;"></div>
+    <div id="updateModalStatus" style="display:none;font-family:var(--font-mono);font-size:11px;color:var(--accent-cyan);margin-top:10px;"></div>
     <div class="modal-actions" style="margin-top:16px;">
-      <button class="btn btn-ghost" onclick="dismissUpdateModal()">Later</button>
-      <button class="btn btn-primary" onclick="applyUpdate()">Reload &amp; Update</button>
+      <button id="updateModalLater" class="btn btn-ghost" onclick="dismissUpdateModal()">Later</button>
+      <button id="updateModalApply" class="btn btn-primary" onclick="applyUpdate()">Reload &amp; Update</button>
     </div>
   </div>
 </div>

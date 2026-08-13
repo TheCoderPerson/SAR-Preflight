@@ -15,7 +15,8 @@ const {
   maskDownsample, packBitMask, bitMaskGet, countMask, cellsToHectares,
   makeCanopyMaskOp, canopyMaskOpValid, canopyApplyMask, canopyRevertDiff,
   canopyOpBBox, canopyApplyOps, canopyOpBytes, canopyOpsBytes,
-  VEG_SCORE_T0, VEG_SCORE_HI, VEG_SCORE_LO,
+  VEG_SCORE_T0, VEG_SCORE_HI, VEG_SCORE_LO, VEG_DEL_MIN_FRAC, VEG_LEAN_MARGIN_M,
+  vegScoreThresholdForSens, reclaimShadowInVeg, VEG_SHADOW_RECLAIM_FRAC,
 } = require('../../sar-preflight-raster.js');
 const { pointInPolygon } = require('../../sar-preflight-core.js');
 
@@ -59,6 +60,37 @@ describe('vegGreenScore', () => {
 
   it('returns 0 rather than NaN for a black pixel', () => {
     expect(vegGreenScore(0, 0, 0)).toBe(0);
+  });
+});
+
+describe('vegScoreThresholdForSens', () => {
+  // The centre must BE the calibrated default, so a freshly opened preview is
+  // the tuned behaviour and the slider only means "more"/"less" than it.
+  it('pins the slider centre to the calibrated default in both directions', () => {
+    expect(vegScoreThresholdForSens(50, 'add')).toBeCloseTo(VEG_SCORE_T0, 12);
+    expect(vegScoreThresholdForSens(50, 'del')).toBeCloseTo(VEG_SCORE_T0, 12);
+  });
+
+  // Higher must always do MORE of the current operation. Because the threshold
+  // moves the greenness cut, that requires inverting for CUT — mapping both
+  // directions the same way made dragging to max cut LESS.
+  it('is monotone in "more effect" for ADD', () => {
+    // More painting = lower threshold as the slider rises.
+    expect(vegScoreThresholdForSens(100, 'add')).toBeLessThan(vegScoreThresholdForSens(50, 'add'));
+    expect(vegScoreThresholdForSens(50, 'add')).toBeLessThan(vegScoreThresholdForSens(0, 'add'));
+  });
+
+  it('is monotone in "more effect" for CUT — the opposite threshold direction', () => {
+    // More cutting = HIGHER threshold (less counts as vegetation to protect).
+    expect(vegScoreThresholdForSens(100, 'del')).toBeGreaterThan(vegScoreThresholdForSens(50, 'del'));
+    expect(vegScoreThresholdForSens(50, 'del')).toBeGreaterThan(vegScoreThresholdForSens(0, 'del'));
+  });
+
+  it('spans the full range and clamps out-of-range input', () => {
+    expect(vegScoreThresholdForSens(0, 'add')).toBeCloseTo(VEG_SCORE_HI, 12);
+    expect(vegScoreThresholdForSens(100, 'add')).toBeCloseTo(VEG_SCORE_LO, 12);
+    expect(vegScoreThresholdForSens(-40, 'add')).toBeCloseTo(VEG_SCORE_HI, 12);
+    expect(vegScoreThresholdForSens(999, 'add')).toBeCloseTo(VEG_SCORE_LO, 12);
   });
 });
 
@@ -214,6 +246,41 @@ describe('vegCandidateMask', () => {
   // closing step reclaims it: painting it is physically right and errs toward
   // more canopy. Closing cannot grow a boundary, so open ground stays unpainted
   // (asserted above). Without this, real stands come out moth-eaten.
+  // Measured over real dense conifer: 84% of the cells the darkness gate
+  // rejects have NO lit pixel at all, so no per-cell rule can rescue them and
+  // ADD refused to paint exactly the dense stands it was most needed for —
+  // while happily painting sunlit grass. A dark region bounded by canopy is
+  // that canopy's own shadow.
+  it('reclaims a large dark region bounded by canopy, at any size', () => {
+    const N = 12;
+    const veg = new Uint8Array(N * N).fill(1);
+    const unknown = new Uint8Array(N * N);
+    for (let y = 3; y <= 8; y++) for (let x = 3; x <= 8; x++) {   // 6x6 dark core
+      unknown[y * N + x] = 1; veg[y * N + x] = 0;
+    }
+    const got = reclaimShadowInVeg(veg, unknown, N, N);
+    expect(countMask(got)).toBe(36);          // the whole region, not just its rim
+  });
+
+  it('leaves an isolated dark blob in the open alone', () => {
+    const N = 12;
+    const veg = new Uint8Array(N * N);        // no vegetation anywhere
+    const unknown = new Uint8Array(N * N);
+    for (let y = 4; y <= 7; y++) for (let x = 4; x <= 7; x++) unknown[y * N + x] = 1;
+    expect(countMask(reclaimShadowInVeg(veg, unknown, N, N))).toBe(0);
+  });
+
+  it('leaves a region only half-bounded by canopy alone', () => {
+    const N = 12;
+    const veg = new Uint8Array(N * N);
+    const unknown = new Uint8Array(N * N);
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < 5; x++) veg[y * N + x] = 1;            // canopy to the west only
+      for (let x = 5; x <= 6; x++) unknown[y * N + x] = 1;       // dark strip between
+    }
+    expect(countMask(reclaimShadowInVeg(veg, unknown, N, N))).toBe(0);
+  });
+
   it('reclaims a shadow hole enclosed by vegetation', () => {
     // 5x5 of conifer with one shadow pixel dead centre, at pool 1.
     const TW = 5, TH = 5;
@@ -228,8 +295,11 @@ describe('vegCandidateMask', () => {
     const p = finalizeVegAccumulator(acc);
     const opts = { bounds: BOUNDS, morphR: 1, textureGate: false, insideFn: pointInPolygon };
     const add = vegCandidateMask(p, Object.assign({}, opts, { direction: 'add' }));
-    expect(add.unknown[2 * TW + 2]).toBe(1);   // still reported as unjudged
-    expect(add.mask[2 * TW + 2]).toBe(1);      // ...but filled by the close
+    expect(add.mask[2 * TW + 2]).toBe(1);      // painted as the canopy's own shadow
+    // ...and no longer counted as "skipped": it WAS judged, just by context
+    // rather than by colour, so reporting it as unjudged would understate the
+    // coverage the operator is approving.
+    expect(add.unknown[2 * TW + 2]).toBe(0);
     // And it is never a CUT candidate, enclosed or not.
     const cut = vegCandidateMask(p, Object.assign({}, opts, { direction: 'del' }));
     expect(cut.mask[2 * TW + 2]).toBe(0);
@@ -255,8 +325,19 @@ describe('vegCandidateMask', () => {
   });
 
   it('re-thresholds from the same planes without resampling', () => {
-    const strict = vegCandidateMask(planes, Object.assign({}, baseOpts, { direction: 'add', scoreT: VEG_SCORE_HI, textureGate: false }));
-    const loose = vegCandidateMask(planes, Object.assign({}, baseOpts, { direction: 'add', scoreT: VEG_SCORE_LO, textureGate: false }));
+    // Needs a surface that actually sits BETWEEN the slider endpoints. Dull
+    // olive scores ~0.098: selected at the loose end, rejected at the strict
+    // end. (An earlier version of this test leaned on dry grass passing at the
+    // loose end, which only worked while the bottom of the slider was low
+    // enough to paint bare ground — the bug that made max sensitivity paint
+    // grass while dense canopy went untouched.)
+    const MARGINAL = [100, 120, 90];
+    expect(vegGreenScore(...MARGINAL)).toBeGreaterThan(VEG_SCORE_LO);
+    expect(vegGreenScore(...MARGINAL)).toBeLessThan(VEG_SCORE_HI);
+    const p = synthPlanes({ paint: (x, y) => (y >= 4 ? MARGINAL : null) });
+    const o = Object.assign({}, baseOpts, { direction: 'add', textureGate: false });
+    const strict = vegCandidateMask(p, Object.assign({}, o, { scoreT: VEG_SCORE_HI }));
+    const loose = vegCandidateMask(p, Object.assign({}, o, { scoreT: VEG_SCORE_LO }));
     expect(loose.cells).toBeGreaterThan(strict.cells);
   });
 
@@ -279,10 +360,17 @@ describe('vegCandidateMask', () => {
     expect(cut.cells).toBe(0);
   });
 
-  it('the lean margin protects canopy near a green cell from being cut', () => {
+  it('the lean margin, when enabled, protects ground near a green cell', () => {
     const bare = vegCandidateMask(planes, Object.assign({}, baseOpts, { direction: 'del', leanCells: 0 }));
     const leaned = vegCandidateMask(planes, Object.assign({}, baseOpts, { direction: 'del', leanCells: 2 }));
     expect(leaned.cells).toBeLessThan(bare.cells);
+  });
+
+  // Measured on real scattered-conifer meadow: a 6 m isotropic dilation around
+  // every crown AND every shadow cell merged into near-total coverage and threw
+  // away 81% of genuinely bare ground, so CUT could not clear an empty meadow.
+  it('ships the lean margin OFF by default', () => {
+    expect(VEG_LEAN_MARGIN_M).toBe(0);
   });
 
   it('clips to the drawn polygon', () => {
@@ -423,11 +511,18 @@ describe('makeCanopyMaskOp', () => {
     expect(canopyMaskOpValid(op)).toBe(true);
   });
 
-  it('uses AND pooling for the delete direction', () => {
+  it('uses majority pooling for the delete direction', () => {
     const { op } = makeCanopyMaskOp(spec({ mode: 'del', hM: undefined }));
-    expect(op.minFrac).toBe(1);
+    expect(op.minFrac).toBe(VEG_DEL_MIN_FRAC);
     expect(op.hM).toBeUndefined();
     expect(canopyMaskOpValid(op)).toBe(true);
+  });
+
+  // minFrac is written into every op at bake time, so changing the default
+  // must not retroactively alter the meaning of an already-saved edit.
+  it('honours an explicit minFrac so saved ops keep their own pooling rule', () => {
+    const { op } = makeCanopyMaskOp(spec({ mode: 'del', hM: undefined, minFrac: 1 }));
+    expect(op.minFrac).toBe(1);
   });
 
   it('returns null when nothing is selected', () => {
@@ -549,9 +644,30 @@ describe('canopyApplyMask', () => {
       expect(countMask(f.map(v => (v > 0 ? 1 : 0)))).toBeGreaterThanOrEqual(1);
     });
 
-    it('AND pooling spares a coarse cell holding a single green sub-pixel', () => {
+    // Unanimity (minFrac 1) sounded safe but cleared only 29% of ground the
+    // operator had already reviewed and approved — one vegetated sub-pixel
+    // anywhere in a ~21-cell window spared the whole cell. A majority rule
+    // tracks the reviewed area without overshooting it.
+    it('majority pooling clears a coarse cell that is mostly bare', () => {
       const allButOne = new Uint8Array(64 * 64).fill(1); allButOne[0] = 0;
       const op = makeCanopyMaskOp({ mask: allButOne, cols: 64, rows: 64, bounds: coarse.bounds, mode: 'del' }).op;
+      const f = new Float32Array(coarse.rows * coarse.cols).fill(5);
+      canopyApplyMask(coarse, f, op);
+      expect(f[0]).toBe(0);
+    });
+
+    it('majority pooling spares a coarse cell that is mostly vegetated', () => {
+      const mask = new Uint8Array(64 * 64);
+      mask[0] = 1;                       // a lone bare sub-pixel in a vegetated cell
+      const op = makeCanopyMaskOp({ mask, cols: 64, rows: 64, bounds: coarse.bounds, mode: 'del' }).op;
+      const f = new Float32Array(coarse.rows * coarse.cols).fill(5);
+      canopyApplyMask(coarse, f, op);
+      expect(f[0]).toBe(5);
+    });
+
+    it('an op saved with minFrac 1 still pools unanimously', () => {
+      const allButOne = new Uint8Array(64 * 64).fill(1); allButOne[0] = 0;
+      const op = makeCanopyMaskOp({ mask: allButOne, cols: 64, rows: 64, bounds: coarse.bounds, mode: 'del', minFrac: 1 }).op;
       const f = new Float32Array(coarse.rows * coarse.cols).fill(5);
       canopyApplyMask(coarse, f, op);
       expect(f[0]).toBe(5);

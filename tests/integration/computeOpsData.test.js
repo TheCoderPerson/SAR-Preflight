@@ -16,6 +16,9 @@ describe('computeOpsData()', () => {
       <span id="opsCapacity"></span>
       <div id="opsCapBar" style="width: 0%; background: green;"></div>
       <span id="opsBirds"></span>
+      <span id="opsBirdSeason"></span>
+      <span id="opsBirdTime"></span>
+      <span id="opsBirdRisk"></span>
     `;
     // Reset state
     S.wx = {};
@@ -254,18 +257,72 @@ describe('computeOpsData()', () => {
     });
   });
 
+  // computeOpsData falls back to the real clock when no timeline hour is
+  // selected, so these PIN it. An earlier version did not, and asserted a
+  // season-specific string against the summary line — which only lists factors
+  // scoring >= 2. That silently passed Mar-Jul and Sep-Nov and went red every
+  // August and Dec-Feb; it broke on a month rollover having never been touched.
+  // Noon is used throughout so the dawn/dusk factor stays out of the summary
+  // and each assertion is about the season alone.
   describe('bird risk seasonal display', () => {
-    it('renders a bird risk assessment string', () => {
+    const season = () => document.getElementById('opsBirdSeason').textContent;
+    const summary = () => document.getElementById('opsBirds').textContent;
+    const atNoonOn = iso => {
+      vi.setSystemTime(new Date(iso + 'T12:00:00'));
+      computeOpsData();
+    };
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['Date'] });
       S.wx = { temperature_2m: 70 };
       S.elev = { center: 1000 };
       S.wind = { maxWind: 5 };
+    });
+    afterEach(() => { vi.useRealTimers(); });
 
+    it('flags nesting season in spring', () => {
+      atNoonOn('2026-05-15');
+      expect(season()).toMatch(/nesting/i);
+      expect(summary()).toMatch(/nesting/i);
+    });
+
+    it('flags fall migration in October', () => {
+      atNoonOn('2026-10-15');
+      expect(season()).toMatch(/migration/i);
+      expect(summary()).toMatch(/migration/i);
+    });
+
+    // August scores only 1, below the threshold for the summary list. It still
+    // has to be REPORTED on the season line — this is the month the old test
+    // died in, and the distinction it was blind to.
+    it('reports late summer without promoting it to an elevated factor', () => {
+      atNoonOn('2026-08-15');
+      expect(season()).toMatch(/late summer|fledgling/i);
+      expect(summary()).not.toMatch(/nesting|migration/i);
+    });
+
+    it('reports winter as low activity', () => {
+      atNoonOn('2026-01-15');
+      expect(season()).toMatch(/winter/i);
+      expect(summary()).not.toMatch(/nesting|migration/i);
+    });
+
+    it('always renders a non-empty season line and summary, every month', () => {
+      for (let m = 1; m <= 12; m++) {
+        atNoonOn('2026-' + String(m).padStart(2, '0') + '-15');
+        expect(season().length).toBeGreaterThan(0);
+        expect(summary().length).toBeGreaterThan(0);
+        expect(document.getElementById('opsBirdRisk').textContent).toMatch(/LOW|MODERATE|HIGH/);
+      }
+    });
+
+    it('adds the dawn/dusk factor only at dawn and dusk', () => {
+      vi.setSystemTime(new Date('2026-01-15T07:00:00'));
       computeOpsData();
-
-      const text = document.getElementById('opsBirds').textContent;
-      expect(text.length).toBeGreaterThan(0);
-      // The text should relate to bird activity
-      expect(text).toMatch(/nesting|migration|bird activity/i);
+      expect(summary()).toMatch(/peak bird hours/i);
+      vi.setSystemTime(new Date('2026-01-15T12:00:00'));
+      computeOpsData();
+      expect(summary()).not.toMatch(/peak bird hours/i);
     });
   });
 

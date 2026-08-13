@@ -24,6 +24,65 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.08.12-a',
+    date: '2026-08-12',
+    changes: [
+      'The "Building 3D Canopy" progress dialog now appears in the center of the screen instead of tucked along the bottom edge, so it\'s obvious the 3D vegetation surface is still being built (and where to cancel it).',
+    ],
+  },
+  {
+    version: '2026.08.02-a',
+    date: '2026-08-02',
+    changes: [
+      'The "Reload & Update" button now responds the moment you press it: the buttons lock, and a status line walks through Checking → Downloading → Verifying → Reloading instead of the screen sitting frozen for up to half a minute.',
+      'Fixed updates on desktop needing several reload-and-update rounds before the new version actually arrived. The update check and the update download went through different caching paths, so the app could detect a new version that the download then couldn\'t fetch — it re-downloaded the old files and the same update prompt came straight back. Both now bypass every cache the same way.',
+      'The app now verifies an update actually landed BEFORE reloading. If the server is still handing out the old version (a deploy still propagating), it says so and lets you retry, instead of reloading into the same version and re-prompting.',
+      'When a new service worker is being installed, the reload now waits for it to take over completely instead of racing it — another way a reload could land back on the old version.',
+      'The update prompt no longer appears when you are already on the newest version (it previously could after a service-worker reinstall).',
+      'Fixed the charts module being left out of the offline bundle: it was not refreshed by updates and a fresh install could not chart offline until it had been viewed online once.',
+    ],
+  },
+  {
+    version: '2026.08.01-d',
+    date: '2026-08-01',
+    changes: [
+      'Fixed vegetation data failing with "NO DATA" over some areas even though the data was there. Reproduced over a Contra Costa search area: the tile existed, the server was healthy, every byte of it downloaded correctly — but the reader we use was configured with a block size too small for how these files are laid out, and it gave up part-way through. That area now loads normally.',
+      'When vegetation tiles do fail, the app now tells you WHY instead of just "no data". The underlying error was being discarded, so a missing tile, a blocked request and a decoder fault all looked identical — which is exactly what made this one hard to pin down.',
+    ],
+  },
+  {
+    version: '2026.08.01-c',
+    date: '2026-08-01',
+    changes: [
+      'Fixed a hang when the vegetation layer was switched on while zoomed well out. The app would sit on "Fetching..." forever and the tab could stop responding. It now says ZOOM IN straight away, the same as it already did on phones — the wide view was asking for tens of billions of pixels across a dozen source tiles.',
+      'Vegetation data now loads in bounded chunks on desktop as well as on phones, so the map stays usable while it works instead of locking up for seconds at a time. Peak memory during a load is capped at about 27 MB.',
+      'Long operations no longer waste time waiting when the app is in a background tab, which could add a second per step for no benefit.',
+      'Fixed a test that quietly depended on the calendar month and had gone red for August; it now covers nesting season, autumn migration and winter explicitly.',
+    ],
+  },
+  {
+    version: '2026.08.01-b',
+    date: '2026-08-01',
+    changes: [
+      'VEG ADD now fills dense forest. It was doing the opposite of what it should: painting sunlit grass and road verges while leaving thick canopy — the very places missing canopy data — untouched. On a dense stand it now covers 99% of the area instead of 50%.',
+      'The reason: a cell had to be bright enough to judge by colour, and dense conifer canopy is mostly deep shadow. Measurement showed 84% of those rejected cells had no lit pixel at all, so no colour rule could ever rescue them. A dark area ringed by treetops is that canopy’s own shadow, and is now treated as trees. Dark ground out in the open, with no canopy around it, is still left alone.',
+      'Turning the slider to maximum used to paint dry grass, because the bottom of its range sat just below grass’s score. The range now stops above grass, bare dirt and asphalt, so the top of the slider reaches for marginal vegetation rather than bare ground.',
+      'Added a colour key under the preview. The amber checkerboard means "too dark to judge, left alone" — it is easily misread as "trees found", which is nearly its opposite.',
+      'Cells reclaimed as canopy shadow no longer count in the "skipped" total, so that number now reflects what the tool genuinely could not judge.',
+    ],
+  },
+  {
+    version: '2026.08.01-a',
+    date: '2026-08-01',
+    changes: [
+      'VEG CUT now actually clears open ground. Field testing over a scattered-conifer meadow showed it clearing well under a tenth of the ground that was obviously treeless; on the same area it now clears about 98% of it. Dense forest still barely cuts at all, which is correct.',
+      'The cause was a 6 m protective margin drawn around every tree AND every tree shadow. Where trees stand 15-20 m apart those margins merged and covered the whole meadow, throwing away roughly 80% of valid clearing. Shadows are already protected in their own right, so that margin is now off by default.',
+      'Clearing also required every last sub-cell under a map cell to look bare before it would touch it, so the ground actually cleared was much smaller than the area you reviewed and approved. It now goes by majority, which tracks what you saw in the preview.',
+      'The SENSITIVITY slider was working backwards when cutting — dragging it to maximum protected more and cut less. Higher now always means "do more of this", and the centre of the slider is the tuned default for both adding and cutting.',
+      'Edits you already saved keep the behaviour they were saved with; these changes only affect new ones.',
+    ],
+  },
+  {
     version: '2026.07.31-a',
     date: '2026-07-31',
     changes: [

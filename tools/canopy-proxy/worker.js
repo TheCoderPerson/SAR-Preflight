@@ -113,10 +113,13 @@ export default {
       if (!allow) return new Response(null, { status: 403 });
       return new Response(null, { status: 204, headers: corsHeaders(allow) });
     }
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      return new Response('method not allowed', { status: 405 });
-    }
+    // Origin check FIRST: a disallowed origin learns nothing about the method
+    // policy, and an allowed one gets a 405 it can actually read (a response
+    // without CORS headers surfaces in the browser as a misleading CORS error).
     if (!allow) return new Response('forbidden', { status: 403 });
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      return new Response('method not allowed', { status: 405, headers: corsHeaders(allow) });
+    }
 
     // Per-IP rate limit (guarded: works fine when deployed without the binding).
     if (env && env.RATE_LIMITER) {
@@ -155,8 +158,36 @@ export default {
     // canopy COGs that times out and returns 500 on cold fetches. Range reads are
     // proxied uncached (the app caches the processed raster in IndexedDB anyway);
     // only whole-object GETs (tiles.geojson, TFR/XML) use the edge cache.
-    const cf = range ? { cacheEverything: false } : { cacheEverything: true, cacheTtl: route.cacheTtl };
-    const up = await fetch(route.target, { method: req.method, headers: upHeaders, cf });
+    //
+    // ...and NEVER edge-cache a canopy COG even without a Range header. These
+    // objects run 300 MB - 1 GB (023010300.tif is 1.08 GB / 65536^2 px). Caching
+    // one poisons the edge with the whole object for CANOPY_CACHE_TTL, after
+    // which a later Range request can be answered from that cached full object
+    // as a 200 carrying the ENTIRE file instead of the requested bytes. The
+    // browser then tries to pull a gigabyte through geotiff.js, the tab stalls,
+    // the connection dies, and — because the aborted response has no CORS
+    // headers — Chrome reports it as a bogus "blocked by CORS policy" error.
+    // Observed live on the dev origin. Nothing is lost by skipping the cache
+    // here: the app stores the processed raster in IndexedDB anyway.
+    const isCanopyTif = route.target.startsWith(CANOPY_UPSTREAM) && /\.tif$/i.test(reqUrl.pathname);
+    const cf = (range || isCanopyTif)
+      ? { cacheEverything: false }
+      : { cacheEverything: true, cacheTtl: route.cacheTtl };
+
+    // The upstream fetch MUST be guarded. An unhandled rejection here returns
+    // Cloudflare's own error page, which carries no Access-Control-Allow-Origin,
+    // so every upstream hiccup reaches the operator as a misleading CORS error
+    // that the app cannot detect or report. A CORS-bearing 502 lets
+    // _proxyFetch/_fetchCanopyFromProxy see the real status and retry or degrade.
+    let up;
+    try {
+      up = await fetch(route.target, { method: req.method, headers: upHeaders, cf });
+    } catch (err) {
+      return new Response('upstream fetch failed: ' + (err && err.message ? err.message : 'unknown'), {
+        status: 502,
+        headers: Object.assign({}, corsHeaders(allow), { 'Content-Type': 'text/plain' }),
+      });
+    }
 
     const h = new Headers(up.headers);
     h.set('Access-Control-Allow-Origin', allow);

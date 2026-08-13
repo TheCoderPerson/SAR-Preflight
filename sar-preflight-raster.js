@@ -1047,7 +1047,18 @@ const VEG_TARGET_PX_PER_CELL = 4; // imagery px across one canopy cell
 const VEG_BLUE_W = 0.35;          // blue weight in the greenness score (see vegGreenScore)
 const VEG_SCORE_T0 = 0.055;       // default threshold — slider centre
 const VEG_SCORE_HI = 0.16;        // slider 0   (most selective)
-const VEG_SCORE_LO = -0.02;       // slider 100 (most permissive)
+// Slider 100 (most permissive). Must stay ABOVE the non-vegetation surfaces or
+// the top of the range paints bare ground: dry gold grass scores -0.018, bare
+// dirt -0.026 and neutral asphalt exactly 0.000, so the previous -0.02 meant
+// max sensitivity painted grass and road verges while dense canopy went
+// untouched. 0.02 clears all three with margin and still sits far below oak
+// (0.133) and conifer (0.174).
+const VEG_SCORE_LO = 0.02;
+// Fraction of a dark region's boundary that must be vegetation before ADD
+// treats the region as that vegetation's own shadow. See reclaimShadowInVeg.
+// 0.6 rather than a bare majority so a region bounded half by canopy and half
+// by open ground is left alone instead of tipping on a coin flip.
+const VEG_SHADOW_RECLAIM_FRAC = 0.6;
 const VEG_DARK_V = 0.18;          // max(R,G,B)/255 below this => shadow, not evidence
 const VEG_MIN_SAT = 0.10;         // HSV S below this => achromatic (rock/asphalt/snow) => score 0
 const VEG_CELL_LIT_MIN = 0.35;    // cell with < 35% lit pixels => UNKNOWN
@@ -1067,7 +1078,36 @@ const VEG_CELL_LIT_MIN = 0.35;    // cell with < 35% lit pixels => UNKNOWN
 const VEG_TEXTURE_MIN = 0.008;
 const VEG_TEXTURE_RADIUS_CELLS = 2; // 5x5 window ~9 m at the 1.86 m lattice — crown scale
 const VEG_MIN_BLOB_M2 = 100;      // ~one large crown — drop smaller specks
-const VEG_LEAN_MARGIN_M = 6;      // off-nadir crown displacement guard, CUT only
+
+// Off-nadir crown-displacement guard for CUT, in metres, dilating the protect
+// mask. DEFAULT 0 — MEASURED against real scattered-conifer meadow, where the
+// original 6 m (3 cells) was the single biggest source of under-cutting:
+//   stage                      candidates remaining (% of covered area)
+//   genuinely bare ground                        52%
+//   after protect close                          52%
+//   after 6 m lean dilate                        10%   <-- 81% of valid
+//   after open + min-blob                         8%        candidates lost
+// Scattered trees sit ~15-20 m apart, so a 6 m isotropic dilation around every
+// crown AND every shadow cell merges into near-total coverage and the tool
+// cannot cut an obviously empty meadow. Two protections already stand in for
+// it: tree shadow is classified unknown and protected on its own (and shadow
+// abuts the crown), and the maskOpen(cand, 1) step leaves ~1 cell (~1.9 m) of
+// standoff from anything protected. Raise this only for imagery with a known
+// large off-nadir angle.
+const VEG_LEAN_MARGIN_M = 0;
+
+// Fraction of a target cell's source window that must be bare before CUT
+// clears it. MEASURED on the same meadow (19.22 ha genuinely bare, 8.5 m grid):
+//   minFrac 1.00 (unanimity) ->  5.65 ha cleared (29%)
+//   minFrac 0.75             -> 13.60 ha        (71%)
+//   minFrac 0.50             -> 18.92 ha        (98%)
+//   minFrac 0.34             -> 21.28 ha       (111% — eats real trees)
+// Unanimity sounds like the safe choice but a single vegetated sub-pixel
+// anywhere in a ~21-cell window spared the whole grid cell, so CUT cleared far
+// less than the operator had reviewed and approved. A majority rule tracks the
+// reviewed area almost exactly without overshooting it. The value is written
+// into every op at bake time, so ops saved under the old default keep it.
+const VEG_DEL_MIN_FRAC = 0.5;
 const CANOPY_MASK_MAX_CELLS = 4194304; // 512 KB packed; larger masks coarsen instead of failing
 
 // Ground sample distance of an XYZ tile pixel at a latitude.
@@ -1172,6 +1212,24 @@ function vegGreenScore(R, G, B, blueWeight) {
   const r = R / s, g = G / s, b = B / s;
   const w = blueWeight == null ? VEG_BLUE_W : blueWeight;
   return (g - r) + w * (g - b);
+}
+
+// Map the 0-100 sensitivity slider to a greenness threshold.
+//
+// The CENTRE is pinned to the calibrated default (VEG_SCORE_T0) so a freshly
+// opened preview is exactly the tuned behaviour and the slider only ever means
+// "more" or "less" than that. A plain linear ramp between the endpoints put the
+// default off-centre and made the midpoint over-cut.
+//
+// Higher always does MORE of the CURRENT operation, which means inverting for
+// CUT: a lower threshold counts more pixels as vegetation, so it paints more in
+// ADD but PROTECTS more — cuts less — in CUT.
+function vegScoreThresholdForSens(sens, direction) {
+  const s = Math.max(0, Math.min(100, Number(sens) || 0));
+  const f = direction === 'del' ? 100 - s : s;   // 0 = least effect, 100 = most
+  return f <= 50
+    ? VEG_SCORE_HI + (f / 50) * (VEG_SCORE_T0 - VEG_SCORE_HI)
+    : VEG_SCORE_T0 + ((f - 50) / 50) * (VEG_SCORE_LO - VEG_SCORE_T0);
 }
 
 // Per-cell accumulator over the analysis lattice. ~12 B/cell during sampling;
@@ -1352,6 +1410,52 @@ function maskClose(mask, rows, cols, r) { // fills per-crown shadow holes
   return maskErode(maskDilate(mask, rows, cols, r), rows, cols, r);
 }
 
+// Reclaim shadow that belongs to the canopy casting it.
+//
+// Measured over real dense conifer: 84% of the cells the darkness gate rejects
+// have NO lit pixel at all, so there is simply no colour to score and no
+// per-cell rule can rescue them. But a dark region whose BOUNDARY is mostly
+// canopy is that canopy's own shadow — the strongest evidence of trees there
+// is, not an absence of them. Without this, ADD refused to paint exactly the
+// dense stands it was most needed for while happily painting sunlit grass.
+//
+// ADD ONLY. Painting shadow errs toward more canopy (more occlusion, smaller
+// viewshed) which is the safe direction; CUT must still never delete it, so
+// the delete branch does not call this.
+//
+// Labels the unknown regions and returns a mask of those whose neighbouring
+// cells are at least minVegFrac vegetation. Isolated dark blobs out in the
+// open (a dark roof, water, wet ground) have little or no canopy boundary and
+// are left alone at any size.
+function reclaimShadowInVeg(veg, unknown, rows, cols, opts) {
+  opts = opts || {};
+  const minVegFrac = opts.minVegFrac != null ? opts.minVegFrac : VEG_SHADOW_RECLAIM_FRAC;
+  const n = rows * cols;
+  const out = new Uint8Array(n);
+  const comp = labelMaskComponents(unknown, rows, cols);
+  if (!comp.count) return out;
+  const vegEdge = new Float64Array(comp.count + 1);
+  const otherEdge = new Float64Array(comp.count + 1);
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const i = y * cols + x;
+      const L = comp.labels[i];
+      if (!L) continue;
+      if (y > 0)        { const j = i - cols; if (comp.labels[j] !== L) (veg[j] ? vegEdge : otherEdge)[L]++; }
+      if (y < rows - 1) { const j = i + cols; if (comp.labels[j] !== L) (veg[j] ? vegEdge : otherEdge)[L]++; }
+      if (x > 0)        { const j = i - 1;    if (comp.labels[j] !== L) (veg[j] ? vegEdge : otherEdge)[L]++; }
+      if (x < cols - 1) { const j = i + 1;    if (comp.labels[j] !== L) (veg[j] ? vegEdge : otherEdge)[L]++; }
+    }
+  }
+  const keep = new Uint8Array(comp.count + 1);
+  for (let L = 1; L <= comp.count; L++) {
+    const tot = vegEdge[L] + otherEdge[L];
+    if (tot > 0 && vegEdge[L] / tot >= minVegFrac) keep[L] = 1;
+  }
+  for (let i = 0; i < n; i++) if (comp.labels[i] && keep[comp.labels[i]]) out[i] = 1;
+  return out;
+}
+
 // Zero 4-connected components smaller than minCells (reuses labelMaskComponents).
 function filterMaskMinArea(mask, rows, cols, minCells) {
   const n = rows * cols;
@@ -1475,6 +1579,23 @@ function vegCandidateMask(planes, opts) {
     veg[i] = 1;
   }
 
+  // ADD reclaims canopy shadow before any morphology, so a dense stand seeds
+  // from the whole stand rather than only its sunlit crowns. Reclaimed cells
+  // stop counting as "skipped" — they were judged, just not by colour.
+  let unknownReported = unknown;
+  let seed = veg;
+  if (!del && opts.reclaimShadow !== false) {
+    const reclaimed = reclaimShadowInVeg(veg, unknown, rows, cols, opts);
+    if (countMask(reclaimed)) {
+      seed = new Uint8Array(n);
+      unknownReported = new Uint8Array(n);
+      for (let i = 0; i < n; i++) {
+        if (veg[i] || reclaimed[i]) seed[i] = 1;
+        if (unknown[i] && !reclaimed[i]) unknownReported[i] = 1;
+      }
+    }
+  }
+
   let mask;
   if (del) {
     const protect = new Uint8Array(n);
@@ -1485,14 +1606,11 @@ function vegCandidateMask(planes, opts) {
     for (let i = 0; i < n; i++) if (planes.cover[i] && !prot[i]) cand[i] = 1;
     mask = maskOpen(cand, rows, cols, r);
   } else {
-    // Open kills specks, then close reclaims shade ENCLOSED by vegetation —
-    // that shadow is cast by the very trees around it, so painting it is both
-    // physically right and the safe direction (more canopy, smaller viewshed).
-    // Closing cannot grow a boundary, only fill holes narrower than the
-    // element, so unknown ground in the OPEN is still never painted. Punching
-    // the unknown cells back out after this step (an earlier version did) just
-    // undid the close and left real stands moth-eaten with shadow holes.
-    mask = maskClose(maskOpen(veg, rows, cols, r), rows, cols, r);
+    // `seed` is the vegetation PLUS any shadow reclaimed above. Open kills
+    // specks, close then fills the small gaps morphology alone can reach.
+    // Punching the unknown cells back out after this step (an earlier version
+    // did) just undid the close and left real stands moth-eaten.
+    mask = maskClose(maskOpen(seed, rows, cols, r), rows, cols, r);
   }
 
   if (opts.minBlobCells > 1) mask = filterMaskMinArea(mask, rows, cols, opts.minBlobCells).mask;
@@ -1501,13 +1619,13 @@ function vegCandidateMask(planes, opts) {
   // drawn area. Clip the UNKNOWN plane to the polygon too, not just the
   // candidates: otherwise the preview dithers cells the operator never drew
   // over, and the "N skipped" count reports the mosaic rather than the job.
-  let unknownOut = unknown, inPoly = null;
+  let unknownOut = unknownReported, inPoly = null;
   if (opts.poly) {
     const b = planes.bounds || opts.bounds;
     const ones = new Uint8Array(n).fill(1);
     inPoly = maskClipToPolygon(ones, cols, rows, b, opts.poly, opts.insideFn);
     mask = maskClipToPolygon(mask, cols, rows, b, opts.poly, opts.insideFn);
-    unknownOut = maskClipToPolygon(unknown, cols, rows, b, opts.poly, opts.insideFn);
+    unknownOut = maskClipToPolygon(unknownReported, cols, rows, b, opts.poly, opts.insideFn);
   }
   let unknownCells = 0, coverCells = 0;
   for (let i = 0; i < n; i++) {
@@ -1563,7 +1681,8 @@ function makeCanopyMaskOp(spec) {
     srcCols: cols, srcRows: rows,
     srcBounds: { west: bounds.west, south: bounds.south, east: bounds.east, north: bounds.north },
     srcIsMercator: true,
-    minFrac: mode === 'del' ? 1 : 0,
+    minFrac: Number.isFinite(spec.minFrac) ? spec.minFrac
+      : (mode === 'del' ? VEG_DEL_MIN_FRAC : 0),
     clsV: 1,
   };
   if (spec.z != null) op.z = spec.z;
@@ -2293,10 +2412,11 @@ if (typeof module !== 'undefined' && module.exports) {
     VEG_ANALYSIS_Z, VEG_TILE_PX, VEG_IMAGERY_MIN_Z, VEG_IMAGERY_MAX_Z, VEG_TARGET_PX_PER_CELL,
     VEG_BLUE_W, VEG_SCORE_T0, VEG_SCORE_HI, VEG_SCORE_LO, VEG_DARK_V, VEG_MIN_SAT,
     VEG_CELL_LIT_MIN, VEG_TEXTURE_MIN, VEG_TEXTURE_RADIUS_CELLS, VEG_MIN_BLOB_M2,
-    VEG_LEAN_MARGIN_M, CANOPY_MASK_MAX_CELLS, vegTexturePlane,
+    VEG_LEAN_MARGIN_M, VEG_DEL_MIN_FRAC, CANOPY_MASK_MAX_CELLS, vegTexturePlane,
     imageryMetresPerPixel, imageryZoomForBBox, tileMosaicBounds, analysisLatticeFor,
-    vegGreenScore, makeVegAccumulator, accumulateVegTile, finalizeVegAccumulator,
+    vegGreenScore, vegScoreThresholdForSens, makeVegAccumulator, accumulateVegTile, finalizeVegAccumulator,
     maskDilate, maskErode, maskOpen, maskClose, filterMaskMinArea, maskClipToPolygon,
+    reclaimShadowInVeg, VEG_SHADOW_RECLAIM_FRAC,
     maskDownsample, packBitMask, countMask, cellsToHectares,
     vegCandidateMask, vegMaskToRGBA, makeCanopyMaskOp,
     decimateCanopyMesh, canopyMeshIndexed, normalFromSlopes,

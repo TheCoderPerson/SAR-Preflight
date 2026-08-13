@@ -8686,7 +8686,7 @@ function startApp() {
         // On an update, navigator.serviceWorker.controller is already set by
         // the old SW, so this distinguishes "update" from "first install".
         if (sw.state === 'installed' && navigator.serviceWorker.controller) {
-          showUpdateModal();
+          showUpdateModalIfNewer();
         }
       });
     };
@@ -8697,7 +8697,7 @@ function startApp() {
       // Cover three cases missed by a naked updatefound listener:
       // 1. An update is already waiting from a previous session
       if (reg.waiting && navigator.serviceWorker.controller) {
-        showUpdateModal();
+        showUpdateModalIfNewer();
       }
       // 2. An update is currently installing (race: install may start before listener attaches)
       if (reg.installing) {
@@ -8782,6 +8782,10 @@ function startApp() {
   // so the display survives any earlier failure in startApp.
 }
 
+function _updateBannerHtml() {
+  return 'Update available <button class="btn btn-primary" style="padding:3px 10px;font-size:10px;" onclick="applyUpdate()">Reload</button>';
+}
+
 function showUpdateBanner() {
   if (document.getElementById('swUpdateBanner')) return;
   const banner = document.getElementById('assessmentBanner');
@@ -8789,8 +8793,37 @@ function showUpdateBanner() {
   const div = document.createElement('div');
   div.id = 'swUpdateBanner';
   div.style.cssText = 'padding:8px 16px;background:var(--bg-tertiary);border-bottom:1px solid var(--accent-cyan);font-family:var(--font-mono);font-size:11px;color:var(--accent-cyan);display:flex;align-items:center;gap:8px;';
-  div.innerHTML = 'Update available <button class="btn btn-primary" style="padding:3px 10px;font-size:10px;" onclick="applyUpdate()">Reload</button>';
+  div.innerHTML = _updateBannerHtml();
   banner.parentElement.insertBefore(div, banner);
+}
+
+// Immediate on-screen acknowledgement for the update-apply flow. Mirrors the
+// current stage into every surface the user might have clicked from: the
+// update modal (status line + disabled buttons), the thin header banner, and
+// the Config-tab check status. `failed: true` re-enables the buttons and
+// restores the banner so the user can retry.
+function _updateApplyStatus(msg, opts) {
+  const failed = !!(opts && opts.failed);
+  const status = document.getElementById('updateModalStatus');
+  if (status) {
+    status.style.display = 'block';
+    status.style.color = failed ? 'var(--accent-amber)' : 'var(--accent-cyan)';
+    status.textContent = msg;
+  }
+  const later = document.getElementById('updateModalLater');
+  if (later) later.disabled = !failed;
+  const apply = document.getElementById('updateModalApply');
+  if (apply) {
+    apply.disabled = !failed;
+    apply.textContent = failed ? 'Try Again' : 'Updating…';
+  }
+  const bannerEl = document.getElementById('swUpdateBanner');
+  if (bannerEl) bannerEl.innerHTML = failed ? _updateBannerHtml() : ('Updating… ' + msg);
+  const cfg = document.getElementById('updateCheckStatus');
+  if (cfg) {
+    cfg.textContent = msg;
+    cfg.style.color = failed ? 'var(--accent-amber)' : 'var(--accent-cyan)';
+  }
 }
 
 // Fetch the server's current version.js, bypassing the SW cache. The cache-busting
@@ -8894,6 +8927,14 @@ async function showUpdateModal(force) {
   const body = document.getElementById('updateModalBody');
   if (!modal || !body) return;
   S._updateModalShown = true;
+  // Reset any prior apply-attempt state (status line, disabled buttons) so a
+  // reopened modal doesn't show a stale "Updating…" or failure message.
+  const status = document.getElementById('updateModalStatus');
+  if (status) { status.style.display = 'none'; status.textContent = ''; }
+  const later = document.getElementById('updateModalLater');
+  if (later) later.disabled = false;
+  const apply = document.getElementById('updateModalApply');
+  if (apply) { apply.disabled = false; apply.textContent = 'Reload & Update'; }
   const cur = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : null;
   const latest = await fetchLatestVersion();
   let entries = [];
@@ -8916,6 +8957,23 @@ function dismissUpdateModal() {
   document.getElementById('updateModal')?.classList.remove('active');
 }
 
+// Version-gated wrapper for the SW-install-triggered modal paths. A new SW
+// installing does NOT prove new app code: after a REFRESH_SHELL-style update
+// the app can already be current when the browser belatedly installs the
+// matching worker — popping the modal then sends the user through a pointless
+// reload ("update available" → reload → nothing changed). Suppress it only
+// when the deployed version PROVABLY equals the running one; on fetch failure
+// show the modal as before (an installed update is real evidence).
+async function showUpdateModalIfNewer() {
+  try {
+    if (S._updateApplying) return; // install was triggered by applyUpdate itself
+    const cur = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : null;
+    const latest = await fetchLatestVersion();
+    if (cur && latest && latest === cur) return;
+    await showUpdateModal();
+  } catch (_) {}
+}
+
 // Active deployed-version check. The browser's SW update byte-compare does NOT
 // notice deploys that only change version.js (an imported script) — verified in
 // Chrome even with updateViaCache:'none' — so releases that don't touch sw.js
@@ -8936,12 +8994,14 @@ async function checkDeployedVersion() {
 
 // Ask the active SW to re-fetch the app shell from the network into its cache
 // (REFRESH_SHELL). Resolves false on timeout — e.g. an older deployed SW
-// without the handler — so the caller can fall back.
+// without the handler — so the caller can fall back. Default 30 s: the shell
+// is ~1.2 MB fetched from the origin, and slow field connections need the
+// headroom now that the user sees progress instead of a frozen button.
 function _swRefreshShell(sw, timeoutMs) {
   return new Promise((resolve) => {
     let done = false;
     const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
-    setTimeout(() => finish(false), timeoutMs || 12000);
+    setTimeout(() => finish(false), timeoutMs || 30000);
     try {
       const ch = new MessageChannel();
       ch.port1.onmessage = (e) => finish(!!(e.data && e.data.ok));
@@ -8950,53 +9010,153 @@ function _swRefreshShell(sw, timeoutMs) {
   });
 }
 
-// Wait for an in-flight SW install to settle (installed/activated) so a reload
-// lands on the new worker's cache rather than racing the install.
-function _swAwaitInstalled(reg, timeoutMs) {
+// Wait for an in-flight SW update to ACTIVATE — not just install — before the
+// caller reloads. Reloading at 'installed' races activation: the OLD worker
+// still controls the page and both static caches coexist, so the navigation
+// is served from the OLD cache and the "update" reload lands on the old
+// version (one full wasted update cycle). Reaching 'activated' also
+// guarantees the activate handler's old-cache cleanup has finished (it runs
+// inside its waitUntil). Resolves 'activated' | 'redundant' | 'timeout'.
+function _swAwaitActivated(reg, timeoutMs) {
   return new Promise((resolve) => {
-    const sw = reg && reg.installing;
-    if (!sw) return resolve(true);
+    const sw = reg && (reg.installing || reg.waiting);
+    if (!sw) return resolve('activated');
+    if (sw.state === 'activated') return resolve('activated');
     let done = false;
-    const finish = (v) => { if (!done) { done = true; resolve(v); } };
-    setTimeout(() => finish(true), timeoutMs || 8000);
+    const container = (typeof navigator !== 'undefined') ? navigator.serviceWorker : null;
+    const onControllerChange = () => finish('activated');
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      try { container?.removeEventListener('controllerchange', onControllerChange); } catch (_) {}
+      resolve(v);
+    };
+    setTimeout(() => finish('timeout'), timeoutMs || 30000);
     sw.addEventListener('statechange', () => {
-      if (sw.state === 'installed' || sw.state === 'activated') finish(true);
-      if (sw.state === 'redundant') finish(false);
+      if (sw.state === 'activated') finish('activated');
+      if (sw.state === 'redundant') finish('redundant');
     });
+    // Secondary signal: clients.claim() switching this page's controller.
+    try { container?.addEventListener('controllerchange', onControllerChange); } catch (_) {}
+    // Belt-and-braces: sw.js always skipWaiting()s during install, but a
+    // worker stuck in `waiting` across a browser restart can lose that flag.
+    if (reg.waiting) { try { reg.waiting.postMessage({ type: 'SKIP_WAITING' }); } catch (_) {} }
   });
 }
 
-// Apply a discovered update.
-// 1) sw.js itself changed → normal SW update: nudge it, wait for the install
-//    to settle (skipWaiting + clients.claim), reload.
+// Read the version.js the cache would serve on the next reload. Global exact
+// match (never ignoreSearch — legacy '?cb=' probe entries must not answer),
+// and deliberately NOT 'sar-static-' + SAR_VERSION: after a REFRESH_SHELL-only
+// update the running SW's cache name lags the page's version, so a named read
+// would miss. At both call sites exactly one sar-static-* cache exists.
+async function _cachedShellVersion() {
+  try {
+    if (typeof caches === 'undefined') return null; // file:// dist build
+    const resp = await caches.match('version.js');
+    if (!resp) return null;
+    const m = (await resp.text()).match(/SAR_VERSION\s*=\s*'([^']+)'/);
+    return m ? m[1] : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Did the shell refresh actually land a NEW version in the cache? 'stale'
+// only when a version was positively read AND still equals the running one —
+// that is the reload-into-the-same-version loop this exists to break.
+// 'fresh' means it differs from the running version (not "equals latest":
+// an intermediate deploy still makes progress and the next check self-heals).
+// 'unknown' (no latest, no running version, nothing cached) keeps today's
+// behavior: reload and hope — never strand a user who could have updated.
+async function _verifyShellFresh(latest) {
+  const cur = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : null;
+  if (!latest || !cur || latest === cur) return 'unknown';
+  const cached = await _cachedShellVersion();
+  if (!cached) return 'unknown';
+  return (cached === cur) ? 'stale' : 'fresh';
+}
+
+// Apply a discovered update. Returns an outcome string (testable — jsdom's
+// location.reload can't be spied on): 'busy' | 'reloaded' | 'stale' |
+// 'timeout' | 'unregistered'.
+// 1) sw.js itself changed → normal SW update: nudge it, wait for ACTIVATION
+//    (skipWaiting + clients.claim), verify the cache holds a new version
+//    (the old SW's install precache can race a stale CDN edge — repair via
+//    the new SW's cache-busted REFRESH_SHELL), then reload.
 // 2) Only app files / version.js changed (sw.js byte-identical → the browser
 //    installs nothing) → REFRESH_SHELL: the ACTIVE SW re-pulls the shell from
-//    the network into its cache, then a plain reload serves the new version
-//    cache-first. NEVER unregister here: an unregistered reload falls back to
-//    the browser HTTP cache, which can hold the OLD shell for its full
-//    max-age (10 min on GitHub Pages) — that caused an "Update Available" →
-//    reload → same old version modal loop.
+//    the network into its cache (cache-busted past the CDN edge), verify,
+//    then a plain reload serves the new version cache-first. NEVER unregister
+//    here: an unregistered reload falls back to the browser HTTP cache, which
+//    can hold the OLD shell for its full max-age (10 min on GitHub Pages).
 // 3) Old deployed SW without REFRESH_SHELL (timeout) → legacy fallback:
 //    unregister so the reload fetches from the network.
+// When verification says the server is still serving the running version, do
+// NOT reload (that's the "update → reload → same version" loop the user
+// reported) — say so honestly and re-enable the buttons.
 async function applyUpdate() {
+  if (S._updateApplying) return 'busy';
+  S._updateApplying = true;
+  const fail = (msg) => { S._updateApplying = false; _updateApplyStatus(msg, { failed: true }); };
+  const reloadNow = () => { _updateApplyStatus('Reloading…'); location.reload(); };
+  const stillServingMsg = () =>
+    'The server is still serving v' + ((typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : '?') +
+    ' — the deploy may still be propagating. Try again in a few minutes.';
   try {
     const reg = S._swReg;
     const online = (typeof isOnline !== 'function') || isOnline();
-    if (reg && online) {
-      if (!reg.waiting && !reg.installing) { try { await reg.update(); } catch (_) {} }
-      if (reg.waiting || reg.installing) {
-        await _swAwaitInstalled(reg);
-        location.reload();
-        return;
+    if (!reg || !online) { reloadNow(); return 'reloaded'; }
+
+    _updateApplyStatus('Checking latest version…');
+    const latest = await fetchLatestVersion(); // null on dist / offline — verification then no-ops
+    if (!reg.waiting && !reg.installing) { try { await reg.update(); } catch (_) {} }
+
+    // Path 1: a new SW is installing/waiting (sw.js bytes changed).
+    if (reg.waiting || reg.installing) {
+      _updateApplyStatus('Downloading update…');
+      const res = await _swAwaitActivated(reg, 30000);
+      if (res === 'activated') {
+        _updateApplyStatus('Verifying…');
+        let v = await _verifyShellFresh(latest);
+        if (v === 'stale' && reg.active) {
+          _updateApplyStatus('Re-downloading update…');
+          if (await _swRefreshShell(reg.active, 30000)) v = await _verifyShellFresh(latest);
+        }
+        if (v === 'stale') { fail(stillServingMsg()); return 'stale'; }
+        reloadNow();
+        return 'reloaded';
       }
-      if (reg.active) {
-        const ok = await _swRefreshShell(reg.active);
-        if (ok) { location.reload(); return; }
+      if (res === 'timeout') {
+        fail('Still downloading — the update will finish in the background. Try again in a moment.');
+        return 'timeout';
       }
-      try { await reg.unregister(); } catch (_) {}
+      // 'redundant' (install failed) → fall through to the active-SW paths.
     }
-  } catch (_) {}
-  location.reload();
+
+    // Path 2: sw.js byte-identical — refresh the shell via the active SW.
+    if (reg.active) {
+      _updateApplyStatus('Downloading update…');
+      if (await _swRefreshShell(reg.active, 30000)) {
+        _updateApplyStatus('Verifying…');
+        let v = await _verifyShellFresh(latest);
+        if (v === 'stale') {
+          _updateApplyStatus('Retrying download…');
+          if (await _swRefreshShell(reg.active, 30000)) v = await _verifyShellFresh(latest);
+        }
+        if (v === 'stale') { fail(stillServingMsg()); return 'stale'; }
+        reloadNow();
+        return 'reloaded';
+      }
+      // Timeout / no handler (old deployed SW) → legacy fallback below.
+    }
+
+    try { await reg.unregister(); } catch (_) {}
+    reloadNow();
+    return 'unregistered';
+  } catch (_) {
+    location.reload();
+    return 'reloaded';
+  }
 }
 
 function closeChangelog() {
@@ -10247,6 +10407,11 @@ const COG_MAX_READ_PX = 1024;
 // window — a 22,727×20,756 single read hit ~1.8 GB and crashed the iOS PWA.
 // We read the window in row strips capped to this budget so peak stays bounded.
 const CANOPY_DECODE_BUDGET_PX = 32000000;
+// Block size for geotiff.js's BlockedSource on the canopy COGs. Its 64 KB
+// default is too small for these files (stripped, RowsPerStrip = 1) and makes
+// wide reads throw "reading 'offset'" — see the call site in
+// _fetchCanopyFromProxy for the reproduction.
+const CANOPY_COG_BLOCK_BYTES = 1048576;
 // Skip the canopy overlay when the view half-width exceeds this (~12 km AOI):
 // 1 m canopy over a wider area is hundreds of MB–GB to fetch/decode and is only
 // upscaled blur at that scale, so we tell the user to zoom in instead.
@@ -10468,6 +10633,7 @@ async function fetchCanopyRaster(grid) {
 async function _fetchCanopyFromProxy(base, grid) {
   const b = grid.bounds;
   const qks = metaQuadkeysForBBox(b.west, b.south, b.east, b.north);
+  S._canopyTileError = null; // stale reason must not outlive its load
   try { Diag.note('canopy.tiles', { qk: qks.length }); } catch (_) {}
   const canopy = new Float32Array(grid.rows * grid.cols).fill(NaN);
   let any = false, loaded = 0, failed = 0;
@@ -10477,16 +10643,31 @@ async function _fetchCanopyFromProxy(base, grid) {
     let tileGrid = null;
     // Retry transient proxy/S3 errors: cold Range fetches of these large COGs
     // intermittently 5xx even though the tile is valid. Back off between tries.
+    let lastErr = null;
     for (let attempt = 0; attempt < CANOPY_TILE_ATTEMPTS && tileGrid == null; attempt++) {
       if (attempt > 0) await new Promise(r => setTimeout(r, 300 * attempt)); // 300/600/900ms backoff
       try {
-        const tiff = await GeoTIFF.fromUrl(url);
+        // blockSize: geotiff.js's BlockedSource defaults to 64 KB blocks, which
+        // BREAKS on these tiles. They are stripped with RowsPerStrip = 1, and a
+        // strip runs ~7 KB over dense canopy, so one strip-batch read spans
+        // ~3.8 MB of non-contiguous small strips; the reader then asks for a
+        // block that was never registered and throws
+        // "Cannot read properties of undefined (reading 'offset')".
+        // Reproduced on 023010212 over a real search area: the default fails
+        // every time, cacheSize: 1000 does NOT help (so it is not eviction),
+        // and 1 MB blocks read the full grid successfully.
+        const tiff = await GeoTIFF.fromUrl(url, { blockSize: CANOPY_COG_BLOCK_BYTES });
         tileGrid = await _cogTileToGrid(tiff, grid);
-      } catch (_) { tileGrid = null; } // missing tile / CORS / transient
+      } catch (e) { tileGrid = null; lastErr = e; } // missing tile / CORS / transient
     }
     if (!tileGrid) {
       failed++;
-      try { Diag.note('canopy.tileFail', { qk }); } catch (_) {}
+      // Record WHY. This catch used to swallow the error entirely, so every
+      // cause — missing tile, CORS, rate limit, decoder bug — surfaced as an
+      // identical "NO DATA" with no way to tell them apart.
+      const why = lastErr ? ((lastErr.name || 'Error') + ': ' + (lastErr.message || String(lastErr))) : 'unknown';
+      try { Diag.note('canopy.tileFail', { qk, why }); } catch (_) {}
+      if (!S._canopyTileError) S._canopyTileError = why;
       // GeoTIFF.js fetches internally, so a proxy 429 only surfaces as a thrown
       // error. Probe the tile once: if the proxy is rate-limiting this IP, flag
       // the status bar and stop — more tiles would just burn more of the limit.
@@ -10547,11 +10728,21 @@ async function _cogTileToGrid(tiff, grid) {
   // free it, so peak memory stays ~128 MB regardless of AOI size.
   const winW = px1 - px0;
   const sampleW = Math.min(winW, 1024);                                  // horizontal downsample of each strip
-  // Desktop has no per-tab memory ceiling, so read the whole window in one pass
-  // (one readRasters = far fewer proxy Range requests, less transient-5xx
-  // exposure). Mobile keeps the bounded strip budget to avoid the OOM crash.
-  const budget = _isConstrained() ? CANOPY_DECODE_BUDGET_PX : Infinity;
-  const stripRows = Math.max(1, Math.floor(budget / winW));              // native rows per strip within the budget
+  // Cost per native row is set by the FILE's layout, not by our window. These
+  // COGs are STRIPPED with RowsPerStrip = 1 — 65536 one-row strips, no
+  // overviews at all — so decoding N rows always inflates N x imageWidth
+  // pixels however narrow the AOI is. Budgeting by winW therefore under-counted
+  // badly: at a 1200 px window the mobile guard worked out 26k rows, i.e. no
+  // bound whatsoever, and the iOS protection only ever bit on wide AOIs.
+  const rowCostPx = img.fileDirectory && img.fileDirectory.TileWidth ? winW : w;
+  // Bounded on desktop too. The old Infinity read the whole window in one call
+  // to save proxy Range requests — but measured on the 1.08 GB tile, striping
+  // costs ~1 extra request per strip (10, not thousands: geotiff.js coalesces
+  // contiguous strips into ONE range) and barely moves total time, while the
+  // longest uninterruptible chunk drops from 4.5 s to ~1.2 s. Unbounded, a
+  // full-view AOI over that tile locked the tab for over 90 s.
+  const budget = CANOPY_DECODE_BUDGET_PX;
+  const stripRows = Math.max(1, Math.floor(budget / rowCostPx));         // native rows per strip within the budget
   const nStrips = Math.ceil((py1 - py0) / stripRows);
   const peakBytes = Math.min(py1 - py0, stripRows) * winW * 4;
   try { Diag.note('canopy.read', { winW, winH: py1 - py0, strips: nStrips, peakMb: Math.round(peakBytes / 1048576) }); } catch (_) {}
@@ -10582,6 +10773,12 @@ async function _cogTileToGrid(tiff, grid) {
     for (let i = 0; i < out.length; i++) {
       if (Number.isNaN(out[i]) && Number.isFinite(partial[i])) out[i] = partial[i];
     }
+    // Hand the main thread back between strips. Bounding the strip size caps
+    // how long any ONE decode blocks, but back-to-back strips still pinned the
+    // thread ~82% of the load; without this the map freezes for the duration
+    // even though no single chunk is long. One frame per strip is noise against
+    // a multi-second read.
+    if (nStrips > 1 && typeof _uiYield === 'function') await _uiYield();
   }
   return out;
 }
@@ -10731,10 +10928,19 @@ async function loadCanopyForView() {
       center.distanceTo(L.latLng(center.lat, vb.getWest())),
       center.distanceTo(L.latLng(vb.getNorth(), center.lng))
     );
-    if (_isConstrained() && halfWidthM > MAX_CANOPY_HALF_M) {
-      // Mobile only: 1 m canopy over a very wide view is hundreds of MB–GB to
-      // decode and only blur at that scale — guide the user to zoom in rather
-      // than crash. On desktop there's no memory ceiling, so we always fetch.
+    if (halfWidthM > MAX_CANOPY_HALF_M) {
+      // 1 m canopy over a very wide view is hundreds of MB-GB to decode and
+      // only blur at that scale — guide the user to zoom in rather than hang.
+      //
+      // This used to be mobile-only, on the reasoning that desktop has no
+      // memory ceiling. Memory was never the binding constraint: these COGs
+      // are stripped with RowsPerStrip = 1 and have no overviews, so cost
+      // scales with the AOI's ROW COUNT times the file's full 65536-px width.
+      // Traced on desktop at a 70 km half-width, that is 12 quadkey tiles of
+      // ~59,000 rows each — tens of billions of pixels. Every tile timed out
+      // after its 4 attempts (~24 s per read) and the load never finished,
+      // leaving "Fetching..." on screen indefinitely. Bounding the strip size
+      // caps peak memory (27 MB, confirmed) but cannot make that request sane.
       setStatus('canopyStatus', 'error', 'ZOOM IN');
       markSection('canopy', { status: 'error', error: 'Zoom in to load 1 m canopy for this view' });
       try { Diag.note('canopy.skip', { halfKm: Math.round(halfWidthM / 100) / 10 }); } catch (_) {}
@@ -10749,7 +10955,16 @@ async function loadCanopyForView() {
     if (S._canopyEditing) return; // user entered edit mode while this load was in flight — don't fight the edit canvas
     if (!canopyFlat) {
       setStatus('canopyStatus', 'error', source === 'no proxy' ? 'NO PROXY' : 'NO DATA');
-      markSection('canopy', { status: 'error', error: source === 'no proxy' ? 'No canopy proxy configured' : 'No canopy data for this view' });
+      // Carry the underlying tile error through. "No canopy data for this view"
+      // is only honest when the tiles genuinely 404; when they failed for some
+      // other reason, saying so is the difference between a one-glance
+      // diagnosis and an afternoon of bisecting.
+      markSection('canopy', {
+        status: 'error',
+        error: source === 'no proxy' ? 'No canopy proxy configured'
+          : (S._canopyTileError ? 'Canopy tiles failed to load — ' + S._canopyTileError
+                                : 'No canopy data for this view'),
+      });
       if (S._overlayWanted) S._overlayWanted.canopy = false;
       buildLayerControl(); // revert the row the user just checked
       return;
@@ -11265,9 +11480,21 @@ function _canopyEditBarSync() {
       ht.disabled = veg.direction === 'del';
     }
     const sens = document.getElementById('ceVegSens');
-    if (sens && document.activeElement !== sens) sens.value = veg.sens;
+    if (sens) {
+      if (document.activeElement !== sens) sens.value = veg.sens;
+      sens.title = veg.direction === 'del'
+        ? 'Higher = clear more ground (treats less of the imagery as trees)'
+        : 'Higher = detect more trees';
+    }
     const sensVal = document.getElementById('ceVegSensVal');
     if (sensVal) sensVal.textContent = Math.round(veg.sens);
+    // Only the swatch for the active direction is relevant; showing both
+    // invites the reading that one colour means "found" and the other "not".
+    const del = veg.direction === 'del';
+    const keyAdd = document.getElementById('ceVegKeyAdd');
+    if (keyAdd) keyAdd.style.display = del ? 'none' : '';
+    const keyCut = document.getElementById('ceVegKeyCut');
+    if (keyCut) keyCut.style.display = del ? '' : 'none';
     const apply = document.getElementById('ceVegApply');
     if (apply) {
       apply.disabled = !veg.result || !veg.result.cells;
@@ -11369,6 +11596,13 @@ function _canopyVegStatus(txt) {
 // visible tab rAF wins every time and the timer is a no-op.
 // Shared by VEG imagery sampling and the viewshed LOS kernel.
 function _uiYield() {
+  // A hidden tab has no UI to keep responsive, and it is the WORST place to
+  // yield: rAF never fires there and Chrome clamps background timers to ~1 s,
+  // so each call measured 868 ms against the 32 ms it costs when visible. Over
+  // a 64-tile sample that is a minute of pure waiting. Returning immediately
+  // still cannot hang — that was the whole point of the timer — because the
+  // loop simply keeps running.
+  if (typeof document !== 'undefined' && document.hidden) return Promise.resolve();
   return new Promise(resolve => {
     let done = false;
     const fire = () => { if (!done) { done = true; resolve(); } };
@@ -11506,12 +11740,14 @@ function _canopyVegOpts() {
   const resM = v.lattice.resM;
   return {
     direction: v.direction,
-    scoreT: VEG_SCORE_HI - (v.sens / 100) * (VEG_SCORE_HI - VEG_SCORE_LO),
+    // Centre of the slider is the calibrated default; higher always does more
+    // of the current operation (which means inverting for CUT).
+    scoreT: vegScoreThresholdForSens(v.sens, v.direction),
     bounds: v.lattice.bounds,
     textureGate: v.smooth,
     morphR: 1,
     minBlobCells: Math.max(2, Math.round(VEG_MIN_BLOB_M2 / (resM * resM))),
-    leanCells: Math.max(1, Math.round(VEG_LEAN_MARGIN_M / resM)),
+    leanCells: Math.max(0, Math.round(VEG_LEAN_MARGIN_M / resM)),
     poly: v.ring,
     insideFn: typeof pointInPolygon === 'function' ? pointInPolygon : undefined,
   };
@@ -13620,7 +13856,8 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer,
-    checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitInstalled,
+    checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitActivated,
+    showUpdateModalIfNewer, _updateApplyStatus, _updateBannerHtml, _cachedShellVersion, _verifyShellFresh,
     getCanopyProxyBase, getCustomProxy, saveCanopyProxy, DEFAULT_DATA_PROXY, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
     notifyProxyRateLimited, _proxyFetch,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,

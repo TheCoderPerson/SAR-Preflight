@@ -165,6 +165,10 @@ The Worker is locked down so it can't be misused or cost you money:
 
 Full details and a route-by-route breakdown are in **[`tools/canopy-proxy/README.md`](tools/canopy-proxy/README.md)**.
 
+## License
+
+Licensed under [PolyForm Noncommercial 1.0.0](LICENSE). You may use, modify, and redistribute this code for any **noncommercial purpose** — personal, research, educational, and public-safety/nonprofit use are explicitly covered, which includes volunteer SAR teams and government agencies — provided the license text and required-notice line travel with any copy you distribute. Commercial use requires permission from the copyright holder.
+
 ## Offline Use
 
 The app uses a service worker to cache resources for offline use. You can pre-download map tiles for your area of operations via the Settings tab. Previously fetched API data is cached in IndexedDB with configurable TTLs.
