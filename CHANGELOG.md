@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.08.21-a — 2026-08-21
+
+- New FEEDBACK button in the header (and in the Config tab): send bug reports or feature ideas to the developer from inside the app. No email involved — nothing identifies you unless you choose to fill in the optional contact field.
+
 ## v2026.08.12-a — 2026-08-12
 
 - The "Building 3D Canopy" progress dialog now appears in the center of the screen instead of tucked along the bottom edge, so it's obvious the 3D vegetation surface is still being built (and where to cancel it).

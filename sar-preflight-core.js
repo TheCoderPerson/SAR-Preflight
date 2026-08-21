@@ -24,6 +24,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.08.21-a',
+    date: '2026-08-21',
+    changes: [
+      'New FEEDBACK button in the header (and in the Config tab): send bug reports or feature ideas to the developer from inside the app. No email involved — nothing identifies you unless you choose to fill in the optional contact field.',
+    ],
+  },
+  {
     version: '2026.08.12-a',
     date: '2026-08-12',
     changes: [

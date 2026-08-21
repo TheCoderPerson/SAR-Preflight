@@ -22,6 +22,9 @@ A small CORS+Range proxy so the browser-only app can read CORS-blocked sources:
 6. **BLM transport + public-land ownership** — the BLM ArcGIS server (`gis.blm.gov`),
    also CORS-restricted, for BLM GTLF roads/trails and the National Surface Management
    Agency (public vs private land) layer. Served at the `/blm/...` route (cached a day).
+7. **User feedback** — `POST /feedback` forwards in-app feedback (Config tab →
+   Feedback) to a **Discord webhook**, so users can reach the maintainer without any
+   email address appearing anywhere. See [Feedback → Discord](#feedback--discord).
 
 It only ever forwards those upstreams (it is not a general open proxy; `..` is
 rejected), and it enforces an Origin allowlist (below).
@@ -50,6 +53,31 @@ https://sar-canopy-proxy.<your-subdomain>.workers.dev
 
 Paste that URL into the app: **Config tab → "Data proxy URL"**. The app stores it
 in `localStorage` and appends `/chm/{quadkey}.tif` to fetch tiles.
+
+## Feedback → Discord
+
+The `/feedback` route accepts `POST` JSON (`{ message, contact?, version?, ua? }`)
+from the app's Config tab → Feedback panel and posts it as an embed to a Discord
+webhook. Setup (one-time):
+
+1. In your Discord server: channel → ⚙ Edit Channel → **Integrations → Webhooks →
+   New Webhook** → Copy Webhook URL.
+2. Store it as a Worker **secret** (never commit it — this repo is public):
+
+   ```bash
+   cd tools/canopy-proxy
+   wrangler secret put DISCORD_WEBHOOK_URL     # paste the URL when prompted
+   ```
+
+   Or in the dashboard: Worker → Settings → Variables & Secrets → Add → type
+   **Secret**, name `DISCORD_WEBHOOK_URL`.
+
+Until the secret is set, the route answers **503** and the app shows "feedback
+unavailable" — nothing else is affected. Spam protection: the Origin allowlist and
+global rate limit above apply, plus a tighter `FEEDBACK_LIMITER` (3 messages/min
+per IP, `wrangler.toml`), a 4,000-char message cap, and `allowed_mentions: none`
+so a message can never ping `@everyone`. Feedback is delivered fire-and-forget;
+nothing is stored in the Worker.
 
 ## Offline
 
@@ -84,7 +112,11 @@ stops browsers, the per-IP rate limit stops scripts, the free-plan cap stops bil
    and the app surfaces this in its status bar. Note: dashboard **WAF rate-limiting
    rules do not apply to `*.workers.dev`** (they need a custom domain in your zone),
    which is why the limit lives in the Worker. The code guards on the binding, so
-   removing the `[[unsafe.bindings]]` block just disables it.
+   removing the `[[ratelimits]]` block just disables it. **Rate-limit bindings are
+   wrangler-only** — the dashboard has no UI for them, so a Worker that has only
+   ever been paste-deployed in the dashboard editor runs without them (everything
+   still works; the limits are simply inactive). A single `wrangler deploy` from
+   this folder activates them, and they persist across later dashboard edits.
 
 If you host the shared/default proxy, also consider a Cloudflare **Notification**
 (dashboard → Notifications) on Workers usage so a traffic spike emails you before
