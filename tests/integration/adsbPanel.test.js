@@ -48,6 +48,8 @@ beforeEach(() => {
   S.adsbAircraft = [AC];
   S._adsbSel = { hex: null, popup: null, lostAt: null, lastAc: null };
   S._adsbPollTimer = null;
+  S._adsbPolling = false;
+  S._adsbLastFetch = Date.now(); // age footer = ac.seen + elapsed since last successful poll
 });
 
 describe('_adsbPanelHtml', () => {
@@ -122,6 +124,19 @@ describe('open / refresh / close lifecycle', () => {
     refreshAdsbPanel();
     expect(S._adsbSel.lostAt).toBeNull();
     expect(S._adsbSel.popup._content).not.toContain('SIGNAL LOST');
+    now.mockRestore();
+  });
+
+  it('data age keeps growing between successful polls (stale card is visible)', () => {
+    const now = vi.spyOn(Date, 'now');
+    now.mockReturnValue(200000);
+    S._adsbLastFetch = 200000;
+    S.adsbAircraft = [{ ...AC, seen: 1 }];
+    openAdsbPanel(S.adsbAircraft[0]);
+    expect(S._adsbSel.popup._content).toContain('data age: 1s');
+    now.mockReturnValue(200000 + 45000); // backed-off outage window, no fresh fetch
+    refreshAdsbPanel();                  // the failure path calls this each poll
+    expect(S._adsbSel.popup._content).toContain('data age: 46s');
     now.mockRestore();
   });
 

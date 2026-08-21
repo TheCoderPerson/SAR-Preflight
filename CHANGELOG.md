@@ -4,6 +4,12 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.08.21-c — 2026-08-21
+
+- When every live-traffic source is refusing service (the public ADS-B providers have been tightening access), the app now backs off politely — retrying every 5 s, then 30 s, then once a minute — instead of hammering them every 5 seconds, and logs one clear summary instead of a wall of errors. The Traffic status line shows the retry cadence, and everything snaps back to normal 5 s polling on the first successful poll.
+- Fixed live traffic potentially showing zero aircraft even on a successful fetch: one provider serves its aircraft list under a different field name than the others, and only one name was being read.
+- The aircraft info card's "data age" line now shows the true age of the position report (provider delay plus time since the last successful poll) and keeps counting up during an outage, so a stale card is obvious at a glance.
+
 ## v2026.08.21-b — 2026-08-21
 
 - Tapping an aircraft now opens an info panel that stays open and keeps updating, instead of vanishing a few seconds later. It follows the plane as it moves, shows how fresh the data is, and warns SIGNAL LOST if the plane drops off the feed (auto-closing after 30 seconds). Close it with the X or by tapping anywhere else on the map. Tapping a row in the Traffic tab opens it too.

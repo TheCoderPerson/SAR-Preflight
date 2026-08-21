@@ -53,15 +53,25 @@ describe('2D observer marker tap-to-toggle', () => {
     expect(m.options.featId).toBe('vs1');
   });
 
-  it('tapping a shown observer hides its viewshed without stealing the selection', () => {
+  it('tapping a shown non-selected observer selects it (viewshed turns red) without hiding anything', () => {
     const a = makeRec('vs_a'), b = makeRec('vs_b');
     S.viewsheds = [a, b];
     S.activeViewshedId = 'vs_a';
     const m = _addObserverMarker(b);
-    m._handlers.click[0]({}); // b starts visible (default) → hide it
-    expect(b.visible).toBe(false);
+    m._handlers.click[0]({}); // b is visible but not selected → select, don't hide
+    expect(S.activeViewshedId).toBe('vs_b');
+    expect(b.visible).not.toBe(false);
     expect(a.visible).not.toBe(false); // untouched — multiple can stay on
-    expect(S.activeViewshedId).toBe('vs_a');
+  });
+
+  it('tapping the already-selected shown observer hides its viewshed', () => {
+    const a = makeRec('vs_a'), b = makeRec('vs_b');
+    S.viewsheds = [a, b];
+    S.activeViewshedId = 'vs_b';
+    const m = _addObserverMarker(b);
+    m._handlers.click[0]({}); // b is visible AND selected → toggle off as before
+    expect(b.visible).toBe(false);
+    expect(a.visible).not.toBe(false);
   });
 
   it('tapping a hidden observer shows its viewshed again and selects it', () => {

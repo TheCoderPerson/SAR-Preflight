@@ -46,6 +46,8 @@ const S = {
   adsbTrails: {},
   adsbSearchRadiusNm: null,
   _adsbPollTimer: null,
+  _adsbPolling: false,      // true while the poll loop is active (timer id alone goes stale between polls)
+  _adsbFailStreak: 0,       // consecutive polls where EVERY source failed — drives adsbPollDelay backoff
   _adsbLastFetch: 0,
   _adsbApiIndex: 0,
   _adsbEnabled: true,
@@ -5958,6 +5960,7 @@ async function fetchAdsb() {
   if (!S.areaCenter || !S.adsbSearchRadiusNm) return;
   trackFetchStart('ADS-B');
   setStatus('adsbStatus', 'loading', 'Polling...');
+  const fails = []; // per-source reasons, folded into ONE summary line on total failure
   try {
     const lat = S.areaCenter.lat.toFixed(4);
     const lon = S.areaCenter.lng.toFixed(4);
@@ -5975,13 +5978,15 @@ async function fetchAdsb() {
         break;
       } catch (e) {
         lastErr = e;
-        console.warn(`ADS-B ${a.name} failed:`, e.message);
+        fails.push(`${a.name}: ${e.message}`);
       }
     }
     if (!json) throw lastErr || new Error('All ADS-B APIs failed');
+    if (S._adsbFailStreak > 0) console.info(`ADS-B recovered via ${usedApi} after ${S._adsbFailStreak} failed poll${S._adsbFailStreak > 1 ? 's' : ''}`);
+    S._adsbFailStreak = 0;
     ensureAdsbDem(); // load/refresh terrain DEM for per-aircraft AGL (non-blocking, self-guarded)
     const groundFn = adsbGroundElevFnFt();
-    const aircraft = parseAdsbAircraft(json.ac || [], S.areaCenter.lat, S.areaCenter.lng, groundFn);
+    const aircraft = parseAdsbAircraft(adsbAircraftList(json), S.areaCenter.lat, S.areaCenter.lng, groundFn);
     S.adsbAircraft = aircraft;
     S._adsbLastFetch = Date.now();
     updateAdsbTrails(aircraft);
@@ -5999,8 +6004,17 @@ async function fetchAdsb() {
     recordDataSourceError('ADS-B', err);
     markSection('adsb', { status: 'error', error: err && err.message ? err.message : String(err) });
     // Both the proxy /adsb route and the direct providers are unreachable
-    // (CORS / upstream 5xx). Polling continues, so it will retry automatically.
-    setStatus('adsbStatus', 'error', 'UNAVAILABLE — RETRYING');
+    // (CORS / upstream 5xx). Back off instead of hammering refusing providers,
+    // and log ONE summary per escalation tier instead of a wall per poll.
+    S._adsbFailStreak++;
+    const delayS = Math.round(adsbPollDelay(S._adsbFailStreak, ADSB_POLL_MS) / 1000);
+    if (S._adsbFailStreak <= 3) {
+      console.warn(`ADS-B unavailable (${fails.join('; ') || (err && err.message) || err}) — retrying every ${delayS}s`);
+    }
+    setStatus('adsbStatus', 'error', 'UNAVAILABLE — RETRY ' + delayS + 's');
+    const pollEl = document.getElementById('adsbPollStatus');
+    if (pollEl) pollEl.textContent = 'Unavailable — retrying every ' + delayS + 's';
+    refreshAdsbPanel(); // keep an open aircraft card's data-age ticking through the outage
   } finally {
     trackFetchEnd('ADS-B');
   }
@@ -6148,11 +6162,17 @@ function _adsbPopupHtml(ac) {
 const ADSB_PANEL_LOST_MS = 30000;
 
 // Popup body + live footer: data age while tracking, red SIGNAL LOST banner
-// (with last data frozen) once the hex drops out of the feed.
+// (with last data frozen) once the hex drops out of the feed. Age = the
+// provider's own delay (ac.seen) PLUS time since our last successful poll, so
+// during a total outage (backed-off polls, no fresh feed) an open card
+// visibly goes stale instead of pretending the data is a few seconds old.
 function _adsbPanelHtml(ac, lostSecs) {
+  const ageS = ac.seen != null
+    ? Math.max(0, Math.round(ac.seen + (S._adsbLastFetch ? (Date.now() - S._adsbLastFetch) / 1000 : 0)))
+    : null;
   const foot = lostSecs != null
     ? `<span style="color:#ef4444;font-weight:bold;">SIGNAL LOST — last seen ${lostSecs}s ago</span>`
-    : (ac.seen != null ? `<span style="opacity:0.5;">data age: ${Math.round(ac.seen)}s</span>` : '');
+    : (ageS != null ? `<span style="opacity:0.5;">data age: ${ageS}s</span>` : '');
   return _adsbPopupHtml(ac) +
     (foot ? `<div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;padding-top:3px;border-top:1px solid rgba(128,128,128,0.3);">${foot}</div>` : '');
 }
@@ -6296,20 +6316,40 @@ function renderAdsbTab(usedApi) {
   }
 }
 
+// Base poll cadence; consecutive total failures stretch it via adsbPollDelay.
+const ADSB_POLL_MS = 5000;
+
 function startAdsbPolling() {
-  if (S._adsbPollTimer || !S._adsbEnabled || !S.areaCenter || !S.areaBounds) return;
+  if (S._adsbPolling || !S._adsbEnabled || !S.areaCenter || !S.areaBounds) return;
   const ne = S.areaBounds.getNorthEast();
   const sw = S.areaBounds.getSouthWest();
   S.adsbSearchRadiusNm = computeAdsbSearchRadius(S.areaCenter.lat, S.areaCenter.lng, ne, sw);
   setText('adsbRadius', S.adsbSearchRadiusNm + ' nm');
   const statusEl = document.getElementById('adsbPollStatus');
   if (statusEl) statusEl.textContent = 'Polling';
-  fetchAdsb();
-  S._adsbPollTimer = setInterval(fetchAdsb, 5000);
+  S._adsbPolling = true;
+  S._adsbFailStreak = 0;
+  fetchAdsb().then(() => _scheduleAdsbPoll());
+}
+
+// Chain the next poll AFTER the current one completes, at a delay that backs
+// off (adsbPollDelay) while every source is refusing service. setTimeout, not
+// setInterval, so a slow fetch can't overlap the next and the delay can change
+// per cycle; S._adsbPolling gates the chain so a stop during an in-flight
+// fetch doesn't resurrect it.
+function _scheduleAdsbPoll() {
+  if (!S._adsbPolling) return;
+  if (S._adsbPollTimer) clearTimeout(S._adsbPollTimer);
+  S._adsbPollTimer = setTimeout(async () => {
+    await fetchAdsb();
+    _scheduleAdsbPoll();
+  }, adsbPollDelay(S._adsbFailStreak, ADSB_POLL_MS));
 }
 
 function stopAdsbPolling() {
-  if (S._adsbPollTimer) { clearInterval(S._adsbPollTimer); S._adsbPollTimer = null; }
+  S._adsbPolling = false;
+  if (S._adsbPollTimer) { clearTimeout(S._adsbPollTimer); S._adsbPollTimer = null; }
+  S._adsbFailStreak = 0;
   closeAdsbPanel();
   S.adsbAircraft = [];
   S.adsbTrails = {};

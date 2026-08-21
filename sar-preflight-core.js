@@ -24,6 +24,15 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.08.21-c',
+    date: '2026-08-21',
+    changes: [
+      'When every live-traffic source is refusing service (the public ADS-B providers have been tightening access), the app now backs off politely — retrying every 5 s, then 30 s, then once a minute — instead of hammering them every 5 seconds, and logs one clear summary instead of a wall of errors. The Traffic status line shows the retry cadence, and everything snaps back to normal 5 s polling on the first successful poll.',
+      'Fixed live traffic potentially showing zero aircraft even on a successful fetch: one provider serves its aircraft list under a different field name than the others, and only one name was being read.',
+      'The aircraft info card\'s "data age" line now shows the true age of the position report (provider delay plus time since the last successful poll) and keeps counting up during an outage, so a stale card is obvious at a glance.',
+    ],
+  },
+  {
     version: '2026.08.21-b',
     date: '2026-08-21',
     changes: [
@@ -1603,6 +1612,34 @@ function parseAdsbAircraft(acArray, centerLat, centerLng, groundElev) {
       };
     })
     .sort((a, b) => a.distNm - b.distNm);
+}
+
+/**
+ * Extract the aircraft array from an ADS-B API response. Providers disagree
+ * on the field name: readsb-style APIs (airplanes.live, adsb.lol) use `ac`,
+ * adsb.fi has been observed serving `aircraft` — and the data proxy passes
+ * whichever body through untouched, so both must be accepted or a successful
+ * fetch can silently render zero traffic.
+ */
+function adsbAircraftList(json) {
+  if (!json) return [];
+  if (Array.isArray(json.ac)) return json.ac;
+  if (Array.isArray(json.aircraft)) return json.aircraft;
+  return [];
+}
+
+/**
+ * Poll delay with backoff after consecutive total ADS-B failures (every
+ * source refused, including the proxy). One blip retries at the normal
+ * cadence; sustained outages step 30 s → 60 s so the app stops hammering
+ * providers that are already refusing service (aggressive polling is how
+ * IPs end up on their blocklists).
+ */
+function adsbPollDelay(failStreak, baseMs) {
+  const base = baseMs || 5000;
+  if (!failStreak || failStreak <= 1) return base;
+  if (failStreak === 2) return 30000;
+  return 60000;
 }
 
 /**
@@ -4530,6 +4567,7 @@ if (typeof module !== 'undefined' && module.exports) {
     assessTerrainTurbulence, analyzeGPSMasking,
     calcSwapRecommendation,
     computeAdsbSearchRadius, parseAdsbAircraft, formatAltitudeAgl, resolveAdsbSelection,
+    adsbAircraftList, adsbPollDelay,
     pointInPolygon, pointInRings, distPointToSegment, polygonBBox, bboxesOverlap, segmentsIntersect, polygonsIntersect,
     circleToPolygon, parseFaaCoord, normalizeFaaDate, geoJsonOuterRings,
     utmToLatLng, parseAngleFlexible, parseCoordinateInput,
