@@ -223,6 +223,35 @@ describe('compositeViewsheds', () => {
     const inA = latLngToCell(out.grid, 38.5, -120.9);
     expect(out.mask[inA.row * out.grid.cols + inA.col]).toBe(1);
   });
+
+  it('flags the active observer\'s cells with bit 128, counts in the low 7 bits', () => {
+    const a = { ...fullRec(38.70, -120.90, 500, 10), id: 'a' };
+    const b = { ...fullRec(38.70, -120.90, 500, 10), id: 'b' };   // fully overlaps a
+    const c = { ...fullRec(38.703, -120.90, 500, 10), id: 'c' };  // offset north — partial overlap
+    const out = compositeViewsheds([a, b, c], undefined, { activeId: 'c' });
+    const northEdge = latLngToCell(out.grid, 38.707, -120.90);  // inside c only
+    expect(out.mask[northEdge.row * out.grid.cols + northEdge.col]).toBe(128 | 1); // active only
+    const center = latLngToCell(out.grid, 38.70, -120.90);      // inside a, b, AND c
+    expect(out.mask[center.row * out.grid.cols + center.col]).toBe(128 | 3);       // active + 2 others
+    const southEdge = latLngToCell(out.grid, 38.6962, -120.90); // inside a+b only, south of c
+    expect(out.mask[southEdge.row * out.grid.cols + southEdge.col]).toBe(2);       // no bit 128
+  });
+
+  it('single record + activeId still passes through by reference (stays green)', () => {
+    const rec = { ...fullRec(38.7, -120.9, 500, 10), id: 'only' };
+    const out = compositeViewsheds([rec], undefined, { activeId: 'only' });
+    expect(out.grid).toBe(rec.grid);
+    expect(out.mask).toBe(rec.mask);
+    expect(out.mask[0]).toBe(1); // no bit 128 written into the persisted record mask
+  });
+
+  it('activeId not among the records → plain counts everywhere', () => {
+    const a = { ...fullRec(38.70, -120.90, 500, 10), id: 'a' };
+    const b = { ...fullRec(38.70, -120.90, 500, 10), id: 'b' };
+    const out = compositeViewsheds([a, b], undefined, { activeId: 'ghost' });
+    const c = latLngToCell(out.grid, 38.70, -120.90);
+    expect(out.mask[c.row * out.grid.cols + c.col]).toBe(2);
+  });
 });
 
 // ============================================================

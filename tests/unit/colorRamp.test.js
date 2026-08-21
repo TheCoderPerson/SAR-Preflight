@@ -36,6 +36,13 @@ describe('viewshedColorRamp', () => {
     expect(three[1]).toBeLessThan(two[1]); // darker still
     expect(viewshedColorRamp(7)).toEqual(three); // clamps at the 3+ tier
   });
+  it('bit 128 (selected observer sees the cell) → red tiers', () => {
+    expect(viewshedColorRamp(128 | 1)).toEqual([239, 68, 68, 255]); // selected only (red-500)
+    expect(viewshedColorRamp(128 | 2)).toEqual([220, 38, 38, 255]); // + 1 other (red-600)
+    expect(viewshedColorRamp(128 | 3)).toEqual([185, 28, 28, 255]); // + 2 others (red-700)
+    expect(viewshedColorRamp(128 | 7)).toEqual([185, 28, 28, 255]); // clamps at the 2+-others tier
+    expect(viewshedColorRamp(128)).toEqual([239, 68, 68, 255]);     // defensive: flag with count 0
+  });
 });
 
 describe('grid → RGBA buffers', () => {
@@ -50,5 +57,10 @@ describe('grid → RGBA buffers', () => {
     const rgba = viewshedMaskToRGBA(grid, new Uint8Array([1, 0, 0, 1]));
     expect(rgba[3]).toBe(255);   // visible
     expect(rgba[7]).toBe(0);     // hidden
+  });
+  it('viewshedMaskToRGBA renders selected-observer cells red', () => {
+    const rgba = viewshedMaskToRGBA(grid, new Uint8Array([128 | 1, 1, 0, 0]));
+    expect([rgba[0], rgba[1], rgba[2], rgba[3]]).toEqual([239, 68, 68, 255]); // red-500
+    expect([rgba[4], rgba[5], rgba[6], rgba[7]]).toEqual([34, 197, 94, 255]); // green-500
   });
 });

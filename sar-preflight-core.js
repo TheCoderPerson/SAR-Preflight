@@ -24,6 +24,15 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.08.21-b',
+    date: '2026-08-21',
+    changes: [
+      'Tapping an aircraft now opens an info panel that stays open and keeps updating, instead of vanishing a few seconds later. It follows the plane as it moves, shows how fresh the data is, and warns SIGNAL LOST if the plane drops off the feed (auto-closing after 30 seconds). Close it with the X or by tapping anywhere else on the map. Tapping a row in the Traffic tab opens it too.',
+      'With several observer viewsheds shown, the selected observer\'s viewshed now draws in RED (darker red where it overlaps others), so you can tell at a glance which coverage belongs to the observer you\'re working with. Tapping a visible observer\'s pin now selects it; tapping the already-selected pin hides its viewshed as before. Exported viewshed files are unchanged (still green).',
+      'On phones, the OPS toolbar and the Map Layers panel now start collapsed so more of the map is visible — tap their headers to expand them.',
+    ],
+  },
+  {
     version: '2026.08.21-a',
     date: '2026-08-21',
     changes: [
@@ -1594,6 +1603,28 @@ function parseAdsbAircraft(acArray, centerLat, centerLng, groundElev) {
       };
     })
     .sort((a, b) => a.distNm - b.distNm);
+}
+
+/**
+ * Decide what the selected-aircraft panel should do this render pass.
+ * Time-based (not miss-count) because the map re-renders more than once per
+ * poll cycle. lostAtMs is when the hex first went missing (null = seen on the
+ * previous pass); maxLostMs is how long to keep showing stale data before
+ * closing.
+ * Returns one of:
+ *   { action: 'none' }                 — nothing selected
+ *   { action: 'update', ac }           — hex present: refresh position + data
+ *   { action: 'lost', lostSecs }       — hex absent, under threshold (0 on first miss)
+ *   { action: 'close' }                — hex absent for >= maxLostMs
+ */
+function resolveAdsbSelection(selHex, aircraft, lostAtMs, nowMs, maxLostMs) {
+  if (!selHex) return { action: 'none' };
+  const ac = (aircraft || []).find(a => a && a.hex === selHex);
+  if (ac) return { action: 'update', ac };
+  if (lostAtMs == null) return { action: 'lost', lostSecs: 0 };
+  const lostMs = nowMs - lostAtMs;
+  if (lostMs >= maxLostMs) return { action: 'close' };
+  return { action: 'lost', lostSecs: Math.round(lostMs / 1000) };
 }
 
 /**
@@ -4498,7 +4529,7 @@ if (typeof module !== 'undefined' && module.exports) {
     detectTerrainFeatures, scoreLZFitness, findEmergencyLZs,
     assessTerrainTurbulence, analyzeGPSMasking,
     calcSwapRecommendation,
-    computeAdsbSearchRadius, parseAdsbAircraft, formatAltitudeAgl,
+    computeAdsbSearchRadius, parseAdsbAircraft, formatAltitudeAgl, resolveAdsbSelection,
     pointInPolygon, pointInRings, distPointToSegment, polygonBBox, bboxesOverlap, segmentsIntersect, polygonsIntersect,
     circleToPolygon, parseFaaCoord, normalizeFaaDate, geoJsonOuterRings,
     utmToLatLng, parseAngleFlexible, parseCoordinateInput,

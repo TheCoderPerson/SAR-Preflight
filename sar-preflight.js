@@ -57,6 +57,9 @@ const S = {
   // deconfliction-relevant subset of traffic, keyed by rounded lat,lng
   _adsbHiresCache: null,
   _adsbHiresFetching: false,
+  // Selected-aircraft panel: one map-anchored popup that follows the plane
+  // across marker rebuilds and refreshes its data each poll
+  _adsbSel: { hex: null, popup: null, lostAt: null, lastAc: null },
   // Vegetation overlay + viewshed
   canopy: {},
   viewsheds: [],            // saved observer viewshed records (see makeViewshedRecord)
@@ -787,10 +790,12 @@ function initMap() {
     );
   }
 
-  // Start with panel collapsed on mobile
+  // Start with panels collapsed on mobile
   if (window.innerWidth <= 900) {
     S.panelOpen = false;
     document.getElementById('sidePanel')?.classList.add('collapsed');
+    document.getElementById('drawToolbar')?.classList.add('collapsed');
+    document.getElementById('layerControl')?.classList.add('collapsed');
   }
 
   // Middle-mouse button panning (allows map drag while drawing tools are active)
@@ -6087,12 +6092,20 @@ function renderAdsbMap() {
     const icon = L.divIcon({ html, className: '', iconSize: [80, 56], iconAnchor: [40, 14] });
     const marker = L.marker([ac.lat, ac.lon], { icon, zIndexOffset: 800 });
 
-    marker.bindPopup(_adsbPopupHtml(ac));
+    // Dedicated click → live panel (not bindPopup: a bound popup dies with the
+    // marker on the next rebuild; aggregation skips this layer for the same
+    // reason). Pick-mode routing matches _aggFeatureClick.
+    marker.on('click', e => {
+      if (S._viewshedPicking) { onViewshedMapClick(e.latlng); return; }
+      openAdsbPanel(ac);
+    });
 
     S.mapLayers.adsb_aircraft.addLayer(marker);
   }
 
   if (needsLayerControlRebuild) buildLayerControl();
+  // Keep the selected-aircraft panel following its plane with fresh data.
+  refreshAdsbPanel();
   // Mirror the fresh positions into the 3D view (fast setData path).
   if (S.is3D && typeof _refresh3dAircraft === 'function') _refresh3dAircraft();
 }
@@ -6124,6 +6137,91 @@ function _adsbPopupHtml(ac) {
     `Dist: ${ac.distNm} nm<br>` +
     `<span style="opacity:0.5;">ICAO: ${ac.hex.toUpperCase()}</span>` +
   `</div>`;
+}
+
+// ── Selected-aircraft panel ─────────────────────────────────────────────
+// One map-anchored popup (NOT marker-bound — renderAdsbMap's clearLayers()
+// would close a bound one every poll) keyed by aircraft hex. It follows the
+// plane and refreshes its data each render, and closes on X, click-away
+// (Leaflet's closePopupOnClick), the layer toggling off, or 30 s of signal
+// loss after the hex leaves the feed.
+const ADSB_PANEL_LOST_MS = 30000;
+
+// Popup body + live footer: data age while tracking, red SIGNAL LOST banner
+// (with last data frozen) once the hex drops out of the feed.
+function _adsbPanelHtml(ac, lostSecs) {
+  const foot = lostSecs != null
+    ? `<span style="color:#ef4444;font-weight:bold;">SIGNAL LOST — last seen ${lostSecs}s ago</span>`
+    : (ac.seen != null ? `<span style="opacity:0.5;">data age: ${Math.round(ac.seen)}s</span>` : '');
+  return _adsbPopupHtml(ac) +
+    (foot ? `<div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;padding-top:3px;border-top:1px solid rgba(128,128,128,0.3);">${foot}</div>` : '');
+}
+
+function openAdsbPanel(ac) {
+  if (!S.map || !ac || !ac.hex) return;
+  // Don't hijack clicks while a draw tool is placing points (mirrors openAggregatePopup).
+  if (typeof document !== 'undefined' && document.querySelector('.draw-btn.active')) return;
+  const st = S._adsbSel;
+  if (!st.popup) {
+    st.popup = L.popup({ maxWidth: 300, autoPan: true, closeButton: true, offset: L.point(0, -18), className: 'adsb-popup' });
+    // 'remove' fires on X-close, click-away, and displacement by another
+    // popup's openOn — all mean "deselect".
+    st.popup.on('remove', () => { st.hex = null; st.lostAt = null; });
+  }
+  st.popup.options.autoPan = true; // pan into view on open only
+  st.popup.setLatLng([ac.lat, ac.lon]);
+  st.popup.setContent(_adsbPanelHtml(ac));
+  st.popup.openOn(S.map);
+  st.popup.options.autoPan = false; // live re-anchoring must never pan the map
+  // Select AFTER openOn: reopening an already-open popup can fire a transient
+  // 'remove' that would clear the selection just made.
+  st.hex = ac.hex;
+  st.lastAc = ac;
+  st.lostAt = null;
+  // Clicks inside the panel must not count as click-away (re-applied each
+  // open — Leaflet recreates the container when the popup is re-added).
+  const el = st.popup.getElement && st.popup.getElement();
+  if (el && !el._adsbStop && typeof L !== 'undefined' && L.DomEvent) {
+    el._adsbStop = true;
+    L.DomEvent.disableClickPropagation(el);
+  }
+}
+
+function closeAdsbPanel() {
+  const st = S._adsbSel;
+  if (st.popup && S.map && S.map.hasLayer(st.popup)) S.map.closePopup(st.popup);
+  st.hex = null; // defensive — the remove handler normally clears these
+  st.lostAt = null;
+}
+
+// Called at the end of every renderAdsbMap pass (which can run more than once
+// per poll — hence time-based, not miss-count, signal-loss tracking).
+function refreshAdsbPanel() {
+  const st = S._adsbSel;
+  if (!st.hex || !st.popup || !S.map) return;
+  // Layer toggled off / PLANS-suppressed / removed directly → panel goes too.
+  if (!S.mapLayers.adsb_aircraft || !S.map.hasLayer(S.mapLayers.adsb_aircraft)) { closeAdsbPanel(); return; }
+  const res = resolveAdsbSelection(st.hex, S.adsbAircraft, st.lostAt, Date.now(), ADSB_PANEL_LOST_MS);
+  if (res.action === 'update') {
+    st.lastAc = res.ac;
+    st.lostAt = null;
+    st.popup.setLatLng([res.ac.lat, res.ac.lon]);
+    st.popup.setContent(_adsbPanelHtml(res.ac));
+  } else if (res.action === 'lost') {
+    if (st.lostAt == null) st.lostAt = Date.now();
+    if (st.lastAc) st.popup.setContent(_adsbPanelHtml(st.lastAc, res.lostSecs));
+  } else if (res.action === 'close') {
+    closeAdsbPanel();
+  }
+}
+
+// ADS-B tab row tap: pan to the plane AND open its live panel.
+function focusAdsbAircraft(hex) {
+  if (!S.map) return;
+  const ac = (S.adsbAircraft || []).find(a => a && a.hex === hex);
+  if (!ac) return;
+  S.map.panTo([ac.lat, ac.lon]);
+  openAdsbPanel(ac);
 }
 
 function renderAdsbTab(usedApi) {
@@ -6184,7 +6282,7 @@ function renderAdsbTab(usedApi) {
         const sqk = ac.squawk || '--';
         const isEmergency = ac.squawk === '7500' || ac.squawk === '7600' || ac.squawk === '7700';
         const sqkStyle = isEmergency ? 'color:#ef4444;font-weight:bold;' : '';
-        html += `<tr class="adsb-row" onclick="if(S.map)S.map.panTo([${ac.lat},${ac.lon}])">` +
+        html += `<tr class="adsb-row" onclick="focusAdsbAircraft('${ac.hex}')">` +
           `<td style="color:var(--accent-cyan);">${label}</td>` +
           `<td style="color:${color};font-weight:600;">${aglStr}</td>` +
           `<td>${ac.distNm} nm</td>` +
@@ -6212,6 +6310,7 @@ function startAdsbPolling() {
 
 function stopAdsbPolling() {
   if (S._adsbPollTimer) { clearInterval(S._adsbPollTimer); S._adsbPollTimer = null; }
+  closeAdsbPanel();
   S.adsbAircraft = [];
   S.adsbTrails = {};
   S.adsbSearchRadiusNm = null;
@@ -8253,12 +8352,13 @@ function setLayerVisible(id, on) {
       if (on) S.map.addLayer(S.mapLayers.observer_rings);
       else S.map.removeLayer(S.mapLayers.observer_rings);
     }
-    // Toggling aircraft also toggles trails
+    // Toggling aircraft also toggles trails (and closes the selected-plane panel)
     if (id === 'adsb_aircraft' && S.mapLayers.adsb_trails) {
       if (on) S.map.addLayer(S.mapLayers.adsb_trails);
       else S.map.removeLayer(S.mapLayers.adsb_trails);
       const trailEl = document.querySelector('[data-layer="adsb_trails"]');
       if (trailEl) { if (on) trailEl.classList.add('active'); else trailEl.classList.remove('active'); }
+      if (!on) closeAdsbPanel();
     }
   }
   // Mirror raster layer changes into the 3D view while it is active.
@@ -8356,7 +8456,11 @@ function restoreLayerUiState() {
 const AGG_HIT_PX = 8; // pixel tolerance for line / point hit-testing
 // observer_rings: a VLOS ring covers a large area, so hit-testing it would add a
 // spurious page to the popup for every click inside the ring.
-const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'shadow', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning', 'observer_rings']);
+// adsb_aircraft: plane clicks open the live selected-aircraft panel instead
+// (openAdsbPanel) — an aggregated page would be a frozen snapshot of a moving
+// target, and skipping here keeps wirePopupAggregation off the markers'
+// dedicated click handler.
+const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_aircraft', 'adsb_trails', 'canopy', 'viewshed', 'shadow', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning', 'observer_rings']);
 // Export-only exclusion set. Extends the popup-skip set (so basemaps /
 // rasters stay out of the vector export) and adds layers CalTopo already provides
 // natively and that would be stale by import time. These layers remain visible and
@@ -8381,7 +8485,7 @@ const AGG_LAYER_META = {
   faa_ns_restrictions: { label: 'Nat. Security', pri: 0 }, tfr_imported: { label: 'TFR (imported)', pri: 0 },
   notam_imported: { label: 'NOTAM', pri: 1 }, faa_sua: { label: 'Special Use', pri: 1 },
   nws_alerts: { label: 'NWS Alert', pri: 1 }, fire_perimeters: { label: 'Fire Perimeter', pri: 1 },
-  faa_class_airspace: { label: 'Class Airspace', pri: 2 }, adsb_aircraft: { label: 'Aircraft', pri: 2 },
+  faa_class_airspace: { label: 'Class Airspace', pri: 2 },
   faa_laanc: { label: 'LAANC Grid', pri: 3 }, airports: { label: 'Airport', pri: 3 },
   faa_obstacles: { label: 'Obstacle', pri: 4 }, dams: { label: 'Dam', pri: 4 },
   cell_towers: { label: 'Tower', pri: 5 }, buildings: { label: 'Building', pri: 7 },
@@ -12408,7 +12512,11 @@ function _addObserverMarker(rec) {
   });
   if (m.on) m.on('click', () => {
     if (S._viewshedPicking) return; // pick-mode click places a NEW observer
-    toggleViewshedVisible(rec.id);
+    // Visible but not selected → select it (its viewshed turns red).
+    // Selected (or hidden) → toggle visibility as before.
+    const r = S.viewsheds.find(x => x.id === rec.id);
+    if (r && r.visible !== false && S.activeViewshedId !== rec.id) setActiveViewshed(rec.id);
+    else toggleViewshedVisible(rec.id);
   });
   rec._marker = m;
   S.mapLayers.observers.addLayer(m);
@@ -12471,15 +12579,16 @@ function _renderVisibleViewsheds() {
     buildLayerControl();
     return;
   }
-  const comp = compositeViewsheds(computed);
+  const comp = compositeViewsheds(computed, undefined, { activeId: S.activeViewshedId });
   const op = parseFloat((document.getElementById('vsOpacity') || {}).value) || VIEWSHED_OVERLAY_OPACITY;
   renderRasterOverlay('viewshed', viewshedMaskToRGBA(comp.grid, comp.mask), comp.grid, op);
   if (r) {
     const rec = computed.find(x => x.id === S.activeViewshedId) || computed[computed.length - 1];
     const canLabel = rec.canopySource ? ('canopy ' + rec.canopySource) : 'bare earth (no canopy)';
     const bldLabel = rec.buildingCount != null ? ` · ${rec.buildingCount} OSM bldgs` : '';
+    const activeShown = computed.length > 1 && computed.some(x => x.id === S.activeViewshedId);
     r.textContent = `${rec.name}: ${Math.round((rec.coverage || 0) * 100)}% of ${rec.vlosFt} ft VLOS visible @ ${rec.aglFt} ft AGL · DEM ${rec.demSource} · ${canLabel}${bldLabel}`
-      + (computed.length > 1 ? ` · ${computed.length} viewsheds shown (darker green = overlap)` : '');
+      + (computed.length > 1 ? ` · ${computed.length} viewsheds shown (${activeShown ? 'red = selected, ' : ''}darker green = overlap)` : '');
   }
   buildLayerControl();
 }
@@ -13937,7 +14046,7 @@ if (typeof module !== 'undefined' && module.exports) {
     _notePlansOverride, _plansSuppressed,
     openAggregatePopup, aggPopupStep, renderAggregatePopup, collectFeaturesAt,
     wirePopupAggregation, eachPopupLayer, _aggFeatureClick,
-    AGG_SKIP_LAYERS, EXPORT_SKIP_LAYERS,
+    AGG_SKIP_LAYERS, AGG_LAYER_META, EXPORT_SKIP_LAYERS,
     computeAirspace, computeOpsData, computeAssessment,
     snapshotAtIdx, renderWeather, renderWind, refreshPanelForHour, updateTimeContextBanner,
     renderKp, _parseKpForecast,
@@ -13989,6 +14098,7 @@ if (typeof module !== 'undefined' && module.exports) {
     collect3dVectorGroups, _vec3dRecords, _open3dPopup, agg3dStep, _agg3dHtml, VEC3D_SKIP,
     enterObserverView, exitObserverView, _on3dClick, _observer3dFeatureAt, _lockObserverCamera, _applyObserverLook,
     _aircraft3dGroup, _refresh3dAircraft, _adsbPopupHtml,
+    _adsbPanelHtml, openAdsbPanel, closeAdsbPanel, refreshAdsbPanel, focusAdsbAircraft, ADSB_PANEL_LOST_MS,
     _overpassFetch, fetchBuildings, renderBuildingsLayer, _buildingsCap,
     getBuildings3dSetting, setBuildings3dMode, _buildings3dMode,
     _buildBuildingTriVerts, _vert3dMakeLayer, _updateVert3dVerts,

@@ -4,6 +4,12 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.08.21-b — 2026-08-21
+
+- Tapping an aircraft now opens an info panel that stays open and keeps updating, instead of vanishing a few seconds later. It follows the plane as it moves, shows how fresh the data is, and warns SIGNAL LOST if the plane drops off the feed (auto-closing after 30 seconds). Close it with the X or by tapping anywhere else on the map. Tapping a row in the Traffic tab opens it too.
+- With several observer viewsheds shown, the selected observer's viewshed now draws in RED (darker red where it overlaps others), so you can tell at a glance which coverage belongs to the observer you're working with. Tapping a visible observer's pin now selects it; tapping the already-selected pin hides its viewshed as before. Exported viewshed files are unchanged (still green).
+- On phones, the OPS toolbar and the Map Layers panel now start collapsed so more of the map is visible — tap their headers to expand them.
+
 ## v2026.08.21-a — 2026-08-21
 
 - New FEEDBACK button in the header (and in the Config tab): send bug reports or feature ideas to the developer from inside the app. No email involved — nothing identifies you unless you choose to fill in the optional contact field.
