@@ -10540,6 +10540,68 @@ function saveCanopyProxy(url) {
   if (hint) hint.textContent = getCustomProxy() ? 'Custom data proxy configured ✓' : 'Using built-in default data proxy';
 }
 
+// --- Feedback (header FEEDBACK button → modal): POST to the data proxy's
+// /feedback route, which forwards to a Discord webhook server-side. No email
+// address is involved anywhere. App version + user agent ride along (disclosed
+// in the UI caption) because "it broke" without a version/browser is
+// undebuggable. The Config tab keeps a button that opens the same modal.
+function openFeedback() {
+  const m = document.getElementById('feedbackModal');
+  if (!m) return;
+  m.classList.add('active');
+  const st = document.getElementById('fbStatus');
+  if (st) st.textContent = ''; // stale "Sent" from a previous open
+  const msg = document.getElementById('fbMessage');
+  if (msg) setTimeout(() => { try { msg.focus(); } catch (_) {} }, 50);
+}
+function closeFeedback() {
+  const m = document.getElementById('feedbackModal');
+  if (m) m.classList.remove('active');
+}
+async function sendFeedback() {
+  const msgEl = document.getElementById('fbMessage');
+  const contactEl = document.getElementById('fbContact');
+  const btn = document.getElementById('btnSendFeedback');
+  const setSt = (color, text) => {
+    const el = document.getElementById('fbStatus');
+    if (el) { el.style.color = color; el.textContent = text; }
+  };
+  const message = msgEl ? msgEl.value.trim() : '';
+  if (!message) { setSt('var(--accent-amber)', 'Type a message first.'); return; }
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    setSt('var(--accent-amber)', 'Offline — feedback needs an internet connection.');
+    return;
+  }
+  if (btn) btn.disabled = true;
+  setSt('var(--text-muted)', 'Sending…');
+  try {
+    const res = await _proxyFetch(getCanopyProxyBase() + '/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message,
+        contact: contactEl ? contactEl.value.trim() : '',
+        version: (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : '',
+        ua: (typeof navigator !== 'undefined') ? navigator.userAgent : '',
+      }),
+    });
+    if (res.ok) {
+      if (msgEl) msgEl.value = ''; // keep the contact field for a follow-up
+      setSt('var(--accent-green)', 'Sent — thank you!');
+    } else if (res.status === 429) {
+      setSt('var(--accent-amber)', 'Rate limited — wait a minute and try again.');
+    } else if (res.status === 503) {
+      setSt('var(--accent-amber)', 'Feedback is not set up on this data proxy.');
+    } else {
+      setSt('var(--accent-red)', 'Send failed (' + res.status + ') — try again later.');
+    }
+  } catch (_) {
+    setSt('var(--accent-red)', 'Send failed — check your connection and try again.');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 // Quantized AOI key for the processed-raster cache (~100 m).
 function _aoiKey(b) {
   return [b.west, b.south, b.east, b.north].map(v => v.toFixed(3)).join('_');
@@ -13859,7 +13921,7 @@ if (typeof module !== 'undefined' && module.exports) {
     checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitActivated,
     showUpdateModalIfNewer, _updateApplyStatus, _updateBannerHtml, _cachedShellVersion, _verifyShellFresh,
     getCanopyProxyBase, getCustomProxy, saveCanopyProxy, DEFAULT_DATA_PROXY, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
-    notifyProxyRateLimited, _proxyFetch,
+    notifyProxyRateLimited, _proxyFetch, sendFeedback, openFeedback, closeFeedback,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
     renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, _isConstrained, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,

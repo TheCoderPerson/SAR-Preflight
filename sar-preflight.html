@@ -797,6 +797,7 @@ select.api-input { cursor: pointer; }
     <button class="header-btn" id="btnSARTopo" onclick="openInSARTopo()">SARTOPO</button>
     <button class="header-btn" id="btnRefresh" onclick="refreshData()">REFRESH</button>
     <button class="header-btn" id="btnClearArea" onclick="clearArea()">CLEAR</button>
+    <button class="header-btn" id="btnFeedback" onclick="openFeedback()" title="Send feedback to the developer">FEEDBACK</button>
   </div>
   <div class="header-status">
     <span id="proxyWarn" style="font-size:10px;color:var(--accent-amber);display:none;cursor:help;"></span>
@@ -1514,6 +1515,14 @@ select.api-input { cursor: pointer; }
           </div>
         </div>
         <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-cyan)"></div>Feedback</div>
+          <div class="api-config">
+            <div class="data-label">Bug reports, feature ideas, anything</div>
+            <button class="btn btn-primary" onclick="openFeedback()" style="padding:5px 14px;font-size:11px;margin-top:6px;">Open Feedback Form</button>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">Also available from the FEEDBACK button in the header.</div>
+          </div>
+        </div>
+        <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-purple)"></div>Offline &amp; Map Tiles</div>
           <div id="sectionalEditionStatus" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-bottom:8px;">FAA Sectional — checking edition…</div>
           <div class="api-config">
@@ -1688,6 +1697,21 @@ select.api-input { cursor: pointer; }
     <div class="modal-actions">
       <button class="btn btn-primary" onclick="exportMissionLogsAsCSV()">Export CSV</button>
       <button class="btn btn-ghost" onclick="closeMissionLogModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="feedbackModal">
+  <div class="modal" style="width:460px;max-height:85vh;">
+    <h3>Feedback</h3>
+    <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;">Bug reports, feature ideas, anything — straight to the developer.</div>
+    <textarea class="api-input" id="fbMessage" rows="5" maxlength="4000" placeholder="What happened, or what would help?" style="display:block;width:100%;box-sizing:border-box;resize:vertical;min-height:90px;font-family:var(--font-sans);"></textarea>
+    <input class="api-input" id="fbContact" type="text" maxlength="200" placeholder="Optional — contact info if you'd like a reply" style="display:block;width:100%;box-sizing:border-box;margin-top:8px;" />
+    <div style="font-size:10px;color:var(--text-muted);margin-top:6px;line-height:1.4;">Delivered through the data proxy — no email involved, and nothing identifies you unless you fill in the contact field. The app version and browser type are sent along to help with bug reports. Requires an internet connection.</div>
+    <div class="modal-actions" style="align-items:center;">
+      <span id="fbStatus" style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-right:auto;"></span>
+      <button class="btn btn-ghost" onclick="closeFeedback()">Close</button>
+      <button class="btn btn-primary" id="btnSendFeedback" onclick="sendFeedback()">Send</button>
     </div>
   </div>
 </div>

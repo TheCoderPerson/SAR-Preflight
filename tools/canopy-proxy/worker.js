@@ -8,6 +8,8 @@
 //   • /tfr/...                              → FAA TFR GeoServer (live TFR polygons)
 //   • /usfs/...                             → USFS EDW ArcGIS (roads/trails/MVUM)
 //   • /blm/...                              → BLM ArcGIS (GTLF transport, surface mgmt agency)
+//   • POST /feedback                        → in-app user feedback → Discord webhook
+//       (requires the DISCORD_WEBHOOK_URL secret; without it the route answers 503)
 //
 // Abuse protection (see README):
 //   • Only the two upstreams above are reachable (never an open proxy; `..` rejected).
@@ -117,7 +119,9 @@ export default {
     // policy, and an allowed one gets a 405 it can actually read (a response
     // without CORS headers surfaces in the browser as a misleading CORS error).
     if (!allow) return new Response('forbidden', { status: 403 });
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
+    const reqUrl = new URL(req.url);
+    const isFeedback = reqUrl.pathname === '/feedback' || reqUrl.pathname === '/feedback/';
+    if (req.method !== 'GET' && req.method !== 'HEAD' && !(req.method === 'POST' && isFeedback)) {
       return new Response('method not allowed', { status: 405, headers: corsHeaders(allow) });
     }
 
@@ -137,7 +141,12 @@ export default {
       } catch (_) { /* limiter unavailable → fail open */ }
     }
 
-    const reqUrl = new URL(req.url);
+    if (isFeedback) {
+      if (req.method !== 'POST') {
+        return new Response('POST required', { status: 405, headers: corsHeaders(allow) });
+      }
+      return handleFeedback(req, env, allow);
+    }
     if (reqUrl.pathname === '/notam' || reqUrl.pathname === '/notam/') {
       return handleNotam(reqUrl, allow);
     }
@@ -202,7 +211,7 @@ function corsHeaders(origin) {
   return {
     'Access-Control-Allow-Origin': origin,
     'Vary': 'Origin',
-    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Range, Content-Type',
     'Access-Control-Max-Age': '86400',
   };
@@ -327,4 +336,81 @@ async function handleAdsb(url, allow) {
     } catch (_) { /* try next provider */ }
   }
   return jsonResponse({ error: 'all ADS-B providers failed', ac: [] }, 502, allow);
+}
+
+// ---- Feedback: forward in-app feedback to a Discord webhook ----
+// The webhook URL is a Worker SECRET (never in this file — the repo is public):
+//   wrangler secret put DISCORD_WEBHOOK_URL
+// or dashboard → Worker → Settings → Variables & Secrets → Add → Secret.
+// Without it the route answers 503 and the app tells the user feedback is
+// unavailable. On top of the global RATE_LIMITER, a tighter FEEDBACK_LIMITER
+// binding (3/min per IP, wrangler.toml) keeps a script from flooding the
+// Discord channel; like every binding here, absent just means disabled.
+async function handleFeedback(req, env, allow) {
+  const hook = env && env.DISCORD_WEBHOOK_URL;
+  if (!hook) return jsonResponse({ ok: false, error: 'feedback not configured' }, 503, allow);
+
+  if (env && env.FEEDBACK_LIMITER) {
+    try {
+      const { success } = await env.FEEDBACK_LIMITER.limit({ key: req.headers.get('CF-Connecting-IP') || '' });
+      if (!success) {
+        return new Response(JSON.stringify({ ok: false, error: 'rate limited' }), {
+          status: 429,
+          headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders(allow), {
+            'Retry-After': '60',
+            'Access-Control-Expose-Headers': 'Retry-After',
+          }),
+        });
+      }
+    } catch (_) { /* limiter unavailable → fail open */ }
+  }
+
+  let body;
+  try {
+    const raw = await req.text();
+    if (raw.length > 16384) return jsonResponse({ ok: false, error: 'message too large' }, 413, allow);
+    body = JSON.parse(raw);
+  } catch (_) {
+    return jsonResponse({ ok: false, error: 'invalid JSON body' }, 400, allow);
+  }
+
+  // Clip every field defensively — Discord hard-limits embed descriptions to
+  // 4096 chars and field values to 1024, and rejects the whole message on
+  // violation, which would surface to the user as an inexplicable failure.
+  const clip = (v, n) => (typeof v === 'string' ? v.trim().slice(0, n) : '');
+  const message = clip(body && body.message, 4000);
+  if (!message) return jsonResponse({ ok: false, error: 'message required' }, 400, allow);
+  const contact = clip(body && body.contact, 200);
+  const version = clip(body && body.version, 40);
+  const ua = clip(body && body.ua, 300);
+
+  const fields = [{ name: 'Origin', value: allow, inline: true }];
+  if (version) fields.push({ name: 'App version', value: version, inline: true });
+  if (contact) fields.push({ name: 'Contact', value: contact, inline: true });
+  if (ua) fields.push({ name: 'Browser', value: ua, inline: false });
+
+  const payload = {
+    embeds: [{
+      title: 'App feedback',
+      description: message,
+      color: 0x00c8ff,
+      fields,
+      timestamp: new Date().toISOString(),
+    }],
+    // User-supplied text must never be able to ping @everyone/roles in the server.
+    allowed_mentions: { parse: [] },
+  };
+
+  let r;
+  try {
+    r = await fetch(hook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (_) {
+    return jsonResponse({ ok: false, error: 'delivery failed' }, 502, allow);
+  }
+  if (!r.ok) return jsonResponse({ ok: false, error: 'delivery failed (' + r.status + ')' }, 502, allow);
+  return jsonResponse({ ok: true }, 200, allow);
 }
