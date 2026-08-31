@@ -24,6 +24,19 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.08.30-a',
+    date: '2026-08-30',
+    changes: [
+      'TFR and NOTAM checks are now fail-safe. The app can no longer silently reuse an old offline-cache answer for the live FAA check — "Re-check now" truly re-fetches every time.',
+      'Every FAA-derived item now shows exactly when it was fetched ("TFRs fetched Aug 30, 02:15 PM (2m ago)"), and the age keeps counting up while the tab is open.',
+      'If the TFR/NOTAM check fails, the app now shows a loud red notice directing you to an official briefing (1800wxbrief.com) instead of a green CHECKED badge — and the GO assessment drops to CAUTION because airspace is unverified. Empty lists after a failed check now say "status UNKNOWN, not none".',
+      'Cached TFR/NOTAM data older than 4 hours is no longer shown at all (a red CACHE EXPIRED notice appears instead), and anything cached is clearly labeled with its age.',
+      'The TFR and NOTAM RETRY buttons in the data-source error banner now actually re-run the check.',
+      'Live air traffic can no longer be served from a stale cache either.',
+      'The license changed from PolyForm Noncommercial to Apache 2.0 — free for any use, including commercial, with the same "no warranty" terms. A persistent "Advisory only" footer was added, the first-run disclaimer was rewritten (it will show once after this update), and PDF/email/clipboard briefings now carry the advisory note.',
+    ],
+  },
+  {
     version: '2026.08.21-c',
     date: '2026-08-21',
     changes: [
@@ -3128,6 +3141,117 @@ function metaToneClass(tone) {
 }
 
 // ============================================================
+// TFR/NOTAM AUTO-CHECK DISPLAY — pure resolvers for the combined
+// freshness/failure state of the live FAA restriction check.
+// Fail-safe invariants (unit-tested):
+//   - CHECKED/green appears ONLY when state === 'ok' (both legs succeeded
+//     in THIS pass) — stale survivors or cached data never earn it.
+//   - Every error-state detail names 1800wxbrief.com.
+//   - A failed check never produces reassuring "no active …" text.
+// ============================================================
+
+// One source's freshness fragment for the FAILED detail line.
+// label: 'TFR' | 'NOTAM'; m: sectionMeta-shaped { status, updatedAt, cachedAt }.
+function _restrictionSourceFrag(label, m, nowMs, tz) {
+  m = m || {};
+  const prior = m.updatedAt != null ? m.updatedAt : m.cachedAt;
+  if (m.status === 'live' && m.updatedAt != null) {
+    return label + 's fetched ' + formatStamp(m.updatedAt, nowMs, tz) + ' (' + (relAge(m.updatedAt, nowMs) || '<1m') + ' ago)';
+  }
+  if (m.status === 'cached' && m.cachedAt != null) {
+    return label + 's cached ' + formatStamp(m.cachedAt, nowMs, tz) + ' (' + (relAge(m.cachedAt, nowMs) || '<1m') + ' ago)';
+  }
+  if (prior != null) {
+    return label + ' check FAILED — showing ' + formatStamp(prior, nowMs, tz) + ' data (' + (relAge(prior, nowMs) || '<1m') + ' old), treat as STALE';
+  }
+  return label + ' check FAILED — no data';
+}
+
+// Combined auto-check panel state.
+// inp: { proxySet, hasArea, online, state:'idle'|'checking'|'ok'|'error',
+//        tfr:   null|{status,updatedAt,cachedAt},   // S.sectionMeta.tfr shape
+//        notam: null|{status,updatedAt,cachedAt},
+//        tfrCount, notamCount,
+//        manualImport: null|{fileName,importedAtMs} }
+// -> { badge, badgeCls, colorToken:'muted'|'cyan'|'amber'|'green'|'red', detail, showBtn }
+function buildAutoCheckDisplay(inp, nowMs, tz) {
+  inp = inp || {};
+  if (!inp.proxySet) {
+    return {
+      badge: 'OFF', badgeCls: 'fetch-status', colorToken: 'muted', showBtn: false,
+      detail: 'Automatic FAA check is off. Add a Data proxy URL in Config to auto-fetch live TFRs & NOTAMs per area. Until then, use the manual import below. Always verify against an official briefing (1800wxbrief.com).',
+    };
+  }
+  if (!inp.hasArea) {
+    return {
+      badge: 'READY', badgeCls: 'fetch-status', colorToken: 'cyan', showBtn: false,
+      detail: 'Draw an operational area — TFRs and NOTAMs are then checked automatically for it.',
+    };
+  }
+  if (inp.state === 'checking') {
+    return {
+      badge: 'CHECKING…', badgeCls: 'fetch-status loading', colorToken: 'amber', showBtn: false,
+      detail: 'Fetching live TFRs and NOTAMs for this area…',
+    };
+  }
+  if (inp.state === 'ok') {
+    const tUpd = inp.tfr && inp.tfr.updatedAt, nUpd = inp.notam && inp.notam.updatedAt;
+    const stamps = [];
+    if (tUpd != null) stamps.push('TFRs fetched ' + formatStamp(tUpd, nowMs, tz) + ' (' + (relAge(tUpd, nowMs) || '<1m') + ' ago)');
+    if (nUpd != null) stamps.push('NOTAMs fetched ' + formatStamp(nUpd, nowMs, tz) + ' (' + (relAge(nUpd, nowMs) || '<1m') + ' ago)');
+    const parts = [];
+    if (inp.tfrCount) parts.push(inp.tfrCount + ' TFR' + (inp.tfrCount > 1 ? 's' : ''));
+    if (inp.notamCount) parts.push(inp.notamCount + ' NOTAM' + (inp.notamCount > 1 ? 's' : ''));
+    const counts = parts.length ? parts.join(' • ') + ' in/near this area.' : 'no active TFRs or NOTAMs in this area.';
+    const lead = stamps.length ? stamps.join(' • ') + ' — ' : '';
+    return {
+      badge: 'CHECKED', badgeCls: 'fetch-status live', colorToken: 'green', showBtn: true,
+      detail: lead + counts + ' Advisory — verify against an official briefing before flight.',
+    };
+  }
+  if (inp.state === 'error') {
+    const t = inp.tfr || {}, n = inp.notam || {};
+    const anyData = (inp.tfrCount || 0) > 0 || (inp.notamCount || 0) > 0 || inp.manualImport != null ||
+      t.updatedAt != null || t.cachedAt != null || n.updatedAt != null || n.cachedAt != null;
+    let detail;
+    if (!anyData) {
+      detail = 'TFR/NOTAM data UNAVAILABLE — airspace restrictions cannot be verified. Obtain an official briefing at 1800wxbrief.com (1-800-WX-BRIEF) before flight, or import data manually below.';
+    } else {
+      detail = _restrictionSourceFrag('TFR', t, nowMs, tz) + ' • ' + _restrictionSourceFrag('NOTAM', n, nowMs, tz) +
+        ' Do not treat missing items as "none" — obtain an official briefing at 1800wxbrief.com before flight.';
+    }
+    if (inp.online === false) detail = 'Offline. ' + detail + ' Re-check when back online.';
+    return { badge: 'FAILED', badgeCls: 'fetch-status error', colorToken: 'red', showBtn: true, detail };
+  }
+  return {
+    badge: 'READY', badgeCls: 'fetch-status', colorToken: 'cyan', showBtn: true,
+    detail: 'Ready — redraw or re-check to fetch live TFRs and NOTAMs for this area.',
+  };
+}
+
+// Empty-state line for the TFR/NOTAM card lists — must never read as
+// reassuring clearance when the check that would have found items did not
+// succeed. inp: { kind:'TFRs'|'NOTAMs', proxySet, hasArea, state,
+//                 srcStatus:'never'|'live'|'cached'|'error', atMs }
+function buildRestrictionEmptyMsg(inp, nowMs, tz) {
+  inp = inp || {};
+  const kind = inp.kind || 'TFRs';
+  const manualMsg = kind === 'TFRs'
+    ? 'No TFR file imported. Download via the links above, then import.'
+    : 'No NOTAMs parsed yet.';
+  if (!inp.proxySet || !inp.hasArea || inp.state === 'idle' || !inp.state) return manualMsg;
+  if (inp.state === 'checking') return 'Checking for ' + kind + '…';
+  if (inp.srcStatus === 'live' && inp.atMs != null) {
+    return 'Auto-checked ' + formatStamp(inp.atMs, nowMs, tz) + ' (' + (relAge(inp.atMs, nowMs) || '<1m') + ' ago) — no active ' + kind + ' in this area.';
+  }
+  if (inp.srcStatus === 'cached' && inp.atMs != null) {
+    return 'Cached data from ' + formatStamp(inp.atMs, nowMs, tz) + ' shows no ' + kind + ' — re-check before flight.';
+  }
+  const singular = kind === 'TFRs' ? 'TFR' : 'NOTAM';
+  return singular + ' check FAILED — status UNKNOWN, not "none". Obtain an official briefing at 1800wxbrief.com, or import below.';
+}
+
+// ============================================================
 // 3D TERRAIN VIEW — pure style + camera helpers (MapLibre)
 // The 3D toggle drapes the raster layers the 2D map is showing over real
 // terrain. These builders are pure (no DOM/MapLibre) so they are testable
@@ -4593,6 +4717,7 @@ if (typeof module !== 'undefined' && module.exports) {
     KML_ICON_BASE, kmlColorToRgba, caltopoStyleProps, geojsonFolderFeature, geojsonMarkerFeature,
     geojsonShapeFeature, geojsonLineGeometry, geojsonPolygonGeometry, geojsonFeatureCollection,
     formatStamp, relAge, buildSectionMetaLine, rollupSources, metaToneClass,
+    buildAutoCheckDisplay, buildRestrictionEmptyMsg, _restrictionSourceFrag,
     TERRAIN_DEM_URL, leafletToMaplibreCamera, maplibreToLeafletCamera, build3dStyle,
     OBSERVER_PITCH_MIN, OBSERVER_PITCH_MAX, OBSERVER_MAX_PITCH, OBSERVER_START_PITCH,
     wrapBearing, clampObserverPitch, applyLookDrag, wheelLook, observerEyeAltitudeM,

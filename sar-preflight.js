@@ -25,6 +25,8 @@ const S = {
   _aggPopup: { items: [], index: 0, popup: null },
   // Imported FAA TFR/NOTAM data (no-server file import)
   tfrs: [], importedNotams: [], tfrImportMeta: null,
+  notamFetchMeta: null,          // { fetchedAtMs, source:'live', cached? } — NOTAM leg's own stamp
+  restrictionCacheExpired: null, // { atMs } — a >4h-old cached TFR/NOTAM record was refused
   // Track data source errors for retry/display
   dataSourceErrors: {},
   // Track active fetches for header status
@@ -173,7 +175,7 @@ const Diag = {
       }
       // 4) Heartbeat so idle/panning sessions still get timestamped heap + DOM samples.
       if (typeof setInterval !== 'undefined') setInterval(() => this.note('heartbeat', this._domSnapshot()), 20000);
-      const ver = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : ((typeof APP_VERSION !== 'undefined') ? APP_VERSION : '?');
+      const ver = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : '?';
       this.note('app.start', { v: ver, mode: this._uaTag() });
     } catch (_) { /* never throw */ }
   },
@@ -1421,6 +1423,10 @@ async function retryFailedSource(source) {
     'Avalanche': () => fetchAvalanche(bounds),
     'Airports': () => fetchNearbyAirports(S.areaCenter, bounds),
     'ADS-B': () => fetchAdsb(),
+    // The combined check is the unit of truth — retrying one leg alone would
+    // leave S.autoCheck lying about the other, so both keys re-run the pair.
+    'TFR': () => fetchLiveRestrictions(S.areaCenter, S.areaBounds),
+    'NOTAM': () => fetchLiveRestrictions(S.areaCenter, S.areaBounds),
   };
   const fn = retryMap[source];
   if (fn) {
@@ -1572,6 +1578,19 @@ const SECTION_DEFS = {
     label: 'Named Trails', computes: null,
     fetch: (c, b) => fetchTrails(b),
     lines: [{ id: 'meta_trails', button: true }],
+  },
+  // The combined live check is the unit of truth for both: refreshing one
+  // source alone would leave S.autoCheck lying about the other, so both
+  // UPDATE buttons re-run the pair.
+  tfr: {
+    label: 'TFRs (live check)', computes: 'assessment',
+    fetch: (c, b) => fetchLiveRestrictions(c, b),
+    lines: [{ id: 'meta_tfr', button: true }],
+  },
+  notam: {
+    label: 'NOTAMs (live check)', computes: 'assessment',
+    fetch: (c, b) => fetchLiveRestrictions(c, b),
+    lines: [{ id: 'meta_notam', button: true }],
   },
 };
 
@@ -2640,7 +2659,10 @@ async function fetchLiveTFRs(bounds) {
   trackFetchStart('TFR');
   setStatus('notamStatus', 'loading', 'TFR…');
   try {
-    const res = await _proxyFetch(base + '/tfr/geoserver/TFR/ows' + _tfrWfsQuery(bounds));
+    // no-store: the SW routes /tfr/ network-only, so keep the browser HTTP
+    // cache from answering in its place — a cached body here would be
+    // reported to the user as a LIVE check.
+    const res = await _proxyFetch(base + '/tfr/geoserver/TFR/ows' + _tfrWfsQuery(bounds), { cache: 'no-store' });
     if (!res.ok) throw new Error('TFR HTTP ' + res.status);
     const gj = await res.json();
     const parsed = (typeof parseTfrGeoJson === 'function') ? parseTfrGeoJson(gj) : { tfrs: [] };
@@ -2653,11 +2675,15 @@ async function fetchLiveTFRs(bounds) {
     // detail XML (the GeoServer WFS feed carries geometry + id + title only).
     await enrichLiveTfrDetails(base, tfrs);
     afterFaaImport();
+    markSection('tfr', { status: 'live', updatedAt: S.tfrImportMeta.importedAtMs, error: null });
+    if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
     setStatus('notamStatus', 'live', tfrs.length ? `${tfrs.length} TFR${tfrs.length > 1 ? 'S' : ''} LIVE` : 'NO TFR (LIVE)');
     clearDataSourceError('TFR');
   } catch (e) {
     console.warn('Live TFR fetch failed:', e);
     recordDataSourceError('TFR', e);
+    markSection('tfr', { status: 'error', error: (e && e.message) ? e.message : String(e) });
+    setStatus('notamStatus', 'error', 'TFR FAILED'); // never leave the loading pill up
     // leave the manual import flow / any cached TFRs in place
   } finally {
     trackFetchEnd('TFR');
@@ -2678,7 +2704,7 @@ async function enrichLiveTfrDetails(base, tfrs) {
 
 async function _fetchTfrDetail(base, id) {
   const fileId = String(id).replace(/\//g, '_'); // '4/3635' -> 'detail_4_3635.xml'
-  const res = await _proxyFetch(base + '/tfr/download/detail_' + fileId + '.xml');
+  const res = await _proxyFetch(base + '/tfr/download/detail_' + fileId + '.xml', { cache: 'no-store' });
   if (!res.ok) return null;
   const xml = await res.text();
   const d = (parseTfrDetailXml(xml).tfrs || [])[0];
@@ -2715,7 +2741,7 @@ async function fetchNotams(lat, lng, radiusNm) {
   trackFetchStart('NOTAM');
   try {
     const r = Math.max(5, Math.min(100, Math.round(radiusNm || 20)));
-    const res = await _proxyFetch(base + '/notam?lat=' + lat.toFixed(5) + '&lng=' + lng.toFixed(5) + '&radius=' + r);
+    const res = await _proxyFetch(base + '/notam?lat=' + lat.toFixed(5) + '&lng=' + lng.toFixed(5) + '&radius=' + r, { cache: 'no-store' });
     if (!res.ok) throw new Error('NOTAM HTTP ' + res.status);
     const data = await res.json();
     const parsed = (typeof parseNotamSearchResponse === 'function') ? parseNotamSearchResponse(data) : [];
@@ -2730,27 +2756,25 @@ async function fetchNotams(lat, lng, radiusNm) {
     renderImportedNotamLayer();
     renderNotamCards();
     if (S.currentArea) computeAssessment();
+    S.notamFetchMeta = { fetchedAtMs: Date.now(), source: 'live' };
+    markSection('notam', { status: 'live', updatedAt: S.notamFetchMeta.fetchedAtMs, error: null });
+    if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+    // NOTAMs persist on their own success: afterFaaImport runs inside
+    // fetchLiveTFRs BEFORE this fetch, so a failed TFR leg used to mean a
+    // successful NOTAM result was never written to IndexedDB at all.
+    _persistRestrictionCache();
     clearDataSourceError('NOTAM');
   } catch (e) {
     console.warn('Live NOTAM fetch failed:', e);
     recordDataSourceError('NOTAM', e);
+    markSection('notam', { status: 'error', error: (e && e.message) ? e.message : String(e) });
   } finally {
     trackFetchEnd('NOTAM');
   }
 }
 
-// Orchestrate live TFR + NOTAM for an area and set a single combined status.
-async function fetchLiveRestrictions(center, bounds) {
-  if (!center) return;
-  const proxySet = typeof getCanopyProxyBase === 'function' && !!getCanopyProxyBase();
-  if (!proxySet) { S.autoCheck = { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 }; renderAutoCheckStatus(); return; }
-  if (typeof isOnline === 'function' && !isOnline()) { S.autoCheck = { state: 'error', ms: Date.now(), tfrCount: 0, notamCount: 0 }; renderAutoCheckStatus(); return; }
-
-  clearDataSourceError('TFR'); clearDataSourceError('NOTAM');
-  S.autoCheck = { state: 'checking', ms: 0, tfrCount: 0, notamCount: 0 };
-  renderAutoCheckStatus();
-
-  await fetchLiveTFRs(bounds);
+// NOTAM search radius sized to the drawn area (10–50 NM).
+function _notamSearchRadiusNm(center, bounds) {
   let radiusNm = 20;
   try {
     if (bounds && typeof haversine === 'function') {
@@ -2759,14 +2783,39 @@ async function fetchLiveRestrictions(center, bounds) {
       radiusNm = Math.max(10, Math.min(50, Math.round(km / 1.852) + 10));
     }
   } catch (_) { /* default radius */ }
-  await fetchNotams(center.lat, center.lng, radiusNm);
+  return radiusNm;
+}
+
+// Orchestrate live TFR + NOTAM for an area and set a single combined status.
+async function fetchLiveRestrictions(center, bounds) {
+  if (!center) return;
+  const proxySet = typeof getCanopyProxyBase === 'function' && !!getCanopyProxyBase();
+  if (!proxySet) { S.autoCheck = { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 }; renderAutoCheckStatus(); return; }
+  if (typeof isOnline === 'function' && !isOnline()) {
+    S.autoCheck = { state: 'error', ms: Date.now(), tfrCount: 0, notamCount: 0, tfrOk: false, notamOk: false };
+    renderAutoCheckStatus();
+    return;
+  }
+
+  clearDataSourceError('TFR'); clearDataSourceError('NOTAM');
+  S.autoCheck = { state: 'checking', ms: 0, tfrCount: 0, notamCount: 0 };
+  renderAutoCheckStatus();
+
+  await fetchLiveTFRs(bounds);
+  await fetchNotams(center.lat, center.lng, _notamSearchRadiusNm(center, bounds));
 
   const nt = (S.tfrs || []).filter(t => t._live).length;
   const nn = (S.importedNotams || []).filter(n => n._live).length;
-  const bothFailed = S.dataSourceErrors && S.dataSourceErrors.TFR && S.dataSourceErrors.NOTAM;
-  const state = (bothFailed && nt === 0 && nn === 0) ? 'error' : 'ok';
-  S.autoCheck = { state, ms: Date.now(), tfrCount: nt, notamCount: nn };
+  const tfrOk = !(S.dataSourceErrors && S.dataSourceErrors.TFR);
+  const notamOk = !(S.dataSourceErrors && S.dataSourceErrors.NOTAM);
+  // EITHER failure is an error: stale _live survivors from a previous pass
+  // must never let a failed check report CHECKED (the silent-stale bug).
+  const state = (tfrOk && notamOk) ? 'ok' : 'error';
+  S.autoCheck = { state, ms: Date.now(), tfrCount: nt, notamCount: nn, tfrOk, notamOk };
   renderAutoCheckStatus();
+  renderTfrCards();       // empty-state lines depend on the per-source outcome
+  renderNotamCards();
+  showDataSourceStatus(); // top-level red DATA SOURCE ERRORS banner incl. TFR/NOTAM
 
   // Combined compact badge on the import section (kept for continuity).
   const parts = [];
@@ -2781,18 +2830,18 @@ function reCheckRestrictionsNow() {
   fetchLiveRestrictions(S.areaCenter, S.areaBounds);
 }
 
-// Context-aware empty-state for the TFR/NOTAM card lists, so "auto-checked, none
-// found" reads differently from "nothing loaded yet". kind = 'TFRs' | 'NOTAMs'.
+// Context-aware empty-state for the TFR/NOTAM card lists — per-source, so a
+// split outcome renders honestly (a live TFR leg still says "no active TFRs"
+// while a failed NOTAM leg says UNKNOWN). Pure logic in core.js.
 function _restrictionEmptyMsg(kind) {
-  const proxySet = typeof getCanopyProxyBase === 'function' && getCanopyProxyBase();
-  if (proxySet && S.currentArea && S.autoCheck) {
-    if (S.autoCheck.state === 'checking') return `Checking for ${kind}…`;
-    if (S.autoCheck.state === 'ok') return `Auto-checked — no active ${kind} in this area.`;
-    if (S.autoCheck.state === 'error') return `Auto-check failed — import ${kind} manually below, or Re-check.`;
-  }
-  return kind === 'TFRs'
-    ? 'No TFR file imported. Download via the links above, then import.'
-    : 'No NOTAMs parsed yet.';
+  const proxySet = typeof getCanopyProxyBase === 'function' && !!getCanopyProxyBase();
+  const sm = (S.sectionMeta && S.sectionMeta[kind === 'TFRs' ? 'tfr' : 'notam']) || {};
+  return buildRestrictionEmptyMsg({
+    kind, proxySet, hasArea: !!S.currentArea,
+    state: (S.autoCheck || {}).state || 'idle',
+    srcStatus: sm.status || 'never',
+    atMs: sm.updatedAt != null ? sm.updatedAt : sm.cachedAt,
+  }, Date.now(), (typeof _localTZ === 'function') ? _localTZ() : undefined);
 }
 
 // Prominent "was this auto-checked?" panel at the top of the NOTAMs tab.
@@ -2807,42 +2856,27 @@ function renderAutoCheckStatus() {
   const proxySet = typeof getCanopyProxyBase === 'function' && !!getCanopyProxyBase();
   const hasArea = !!S.currentArea;
   const ac = S.autoCheck || {};
-  let color = 'var(--text-muted)', badge = '', badgeCls = 'fetch-status', detail = '', showBtn = false;
 
-  if (!proxySet) {
-    badge = 'OFF';
-    detail = 'Automatic FAA check is off. Add a Data proxy URL in Config to auto-fetch live TFRs & NOTAMs per area. Until then, use the manual import below.';
-  } else if (!hasArea) {
-    color = 'var(--accent-cyan)'; badge = 'READY';
-    detail = 'Draw an operational area — TFRs and NOTAMs are then checked automatically for it.';
-  } else if (ac.state === 'checking') {
-    color = 'var(--accent-amber)'; badge = 'CHECKING…'; badgeCls = 'fetch-status loading';
-    detail = 'Fetching live TFRs and NOTAMs for this area…';
-  } else if (ac.state === 'ok') {
-    color = 'var(--accent-green)'; badge = 'CHECKED'; badgeCls = 'fetch-status live';
-    const age = ac.ms && typeof formatAge === 'function' ? formatAge(Date.now() - ac.ms) : '';
-    const parts = [];
-    if (ac.tfrCount) parts.push(`${ac.tfrCount} TFR${ac.tfrCount > 1 ? 's' : ''}`);
-    if (ac.notamCount) parts.push(`${ac.notamCount} NOTAM${ac.notamCount > 1 ? 's' : ''}`);
-    detail = (parts.length ? `Auto-checked ${age} ago • ${parts.join(' • ')} in/near this area.`
-                           : `Auto-checked ${age} ago • no active TFRs or NOTAMs in this area.`)
-           + ' Advisory — verify against an official briefing before flight.';
-    showBtn = true;
-  } else if (ac.state === 'error') {
-    color = 'var(--accent-red)'; badge = 'FAILED'; badgeCls = 'fetch-status error';
-    detail = (typeof isOnline === 'function' && !isOnline())
-      ? 'Offline — could not auto-check; using any cached/manual data. Re-check when back online.'
-      : 'Auto-check failed to reach the FAA sources. Use the manual import below, or Re-check now.';
-    showBtn = true;
-  } else {
-    color = 'var(--accent-cyan)'; badge = 'READY';
-    detail = 'Ready — redraw or re-check to fetch live TFRs and NOTAMs for this area.';
-    showBtn = true;
-  }
+  // All wording/fail-safe logic lives in the pure resolver (core.js).
+  const d = buildAutoCheckDisplay({
+    proxySet, hasArea,
+    online: (typeof isOnline !== 'function') || isOnline(),
+    state: ac.state || 'idle',
+    tfr: (S.sectionMeta && S.sectionMeta.tfr) || null,
+    notam: (S.sectionMeta && S.sectionMeta.notam) || null,
+    tfrCount: ac.tfrCount || 0,
+    notamCount: ac.notamCount || 0,
+    manualImport: (S.tfrImportMeta && S.tfrImportMeta.fileName !== 'live') ? S.tfrImportMeta : null,
+  }, Date.now(), (typeof _localTZ === 'function') ? _localTZ() : undefined);
+
+  const color = {
+    muted: 'var(--text-muted)', cyan: 'var(--accent-cyan)', amber: 'var(--accent-amber)',
+    green: 'var(--accent-green)', red: 'var(--accent-red)',
+  }[d.colorToken] || 'var(--text-muted)';
 
   if (ind) ind.style.background = color;
-  if (sta) { sta.className = badgeCls; sta.textContent = badge; }
-  if (det) det.textContent = detail;
+  if (sta) { sta.className = d.badgeCls; sta.textContent = d.badge; }
+  if (det) det.textContent = d.detail;
   if (btn) btn.style.display = (proxySet && hasArea) ? '' : 'none';
   sec.style.borderLeftColor = color;
   sec.style.display = '';
@@ -2902,13 +2936,27 @@ async function renderNotamsTab(lat, lng) {
       typeof getCachedApiResponse === 'function' && S.areaCenter) {
     try {
       const rec = await getCachedApiResponse('tfr_import', areaKey(S.areaCenter.lat, S.areaCenter.lng));
-      if (rec && rec.data) {
-        S.tfrs = rec.data.tfrs || [];
-        S.importedNotams = rec.data.notams || [];
-        S.tfrImportMeta = rec.data.meta || null;
-        if (S.tfrImportMeta) S.tfrImportMeta.cached = true;
-        renderImportedTfrLayer();
-        renderImportedNotamLayer();
+      // Re-check emptiness AFTER the await — fetchLiveRestrictions runs
+      // concurrently from processArea, and a late IDB read must never
+      // clobber a live result that landed in the meantime.
+      const stillEmpty = (!S.tfrs || !S.tfrs.length) && (!S.importedNotams || !S.importedNotams.length);
+      if (rec && rec.data && stillEmpty) {
+        if (rec.status === 'expired') {
+          // >4x the 1 h TTL — refuse to show it. Restrictions this old are
+          // more dangerous rendered than absent.
+          S.restrictionCacheExpired = { atMs: (rec.data.meta && rec.data.meta.importedAtMs) || rec.timestamp };
+          setStatus('notamStatus', 'expired', 'CACHE EXPIRED');
+        } else { // 'fresh' or 'stale' — show, loudly labeled as cached
+          S.tfrs = rec.data.tfrs || [];
+          S.importedNotams = rec.data.notams || [];
+          S.tfrImportMeta = rec.data.meta || null;
+          if (S.tfrImportMeta) S.tfrImportMeta.cached = true;
+          S.notamFetchMeta = rec.data.notamMeta ? Object.assign({}, rec.data.notamMeta, { cached: true }) : null;
+          if (S.tfrs.length) markSection('tfr', { status: 'cached', cachedAt: rec.timestamp });
+          if (S.importedNotams.length) markSection('notam', { status: 'cached', cachedAt: rec.timestamp });
+          renderImportedTfrLayer();
+          renderImportedNotamLayer();
+        }
       }
     } catch (_) { /* ignore cache errors */ }
   }
@@ -3044,15 +3092,30 @@ function renderImportStatus() {
   const el = document.getElementById('tfrStaleBanner');
   if (!el) return;
   const meta = S.tfrImportMeta;
-  if (!meta) { el.style.display = 'none'; el.textContent = ''; return; }
+  if (!meta) {
+    // No data at all — but a refused expired cache still deserves a loud line.
+    if (S.restrictionCacheExpired) {
+      const tz = (typeof _localTZ === 'function') ? _localTZ() : undefined;
+      el.style.display = '';
+      el.style.color = 'var(--accent-red)';
+      el.style.borderColor = 'var(--accent-red)';
+      el.textContent = `Cached TFR/NOTAM data from ${formatStamp(S.restrictionCacheExpired.atMs, Date.now(), tz)} has EXPIRED and is not shown. Re-check now, or obtain an official briefing at 1800wxbrief.com.`;
+      return;
+    }
+    el.style.display = 'none'; el.textContent = ''; return;
+  }
   const age = Date.now() - (meta.importedAtMs || Date.now());
   const ageStr = typeof formatAge === 'function' ? formatAge(age) : Math.round(age / 60000) + 'm';
   const stale = age > 60 * 60 * 1000;
   el.style.display = '';
   el.style.color = stale ? 'var(--accent-red)' : 'var(--text-muted)';
   el.style.borderColor = stale ? 'var(--accent-red)' : 'var(--border)';
-  el.textContent = `Imported ${meta.fileName || 'data'} • ${ageStr} ago${meta.cached ? ' (cached)' : ''}` +
-    (stale ? ' — re-verify ≤ 1 hr before launch' : '');
+  // Live fetches say when the data was FETCHED; manual imports keep the
+  // exact legacy string (semantics unchanged for the no-proxy workflow).
+  const label = meta.fileName === 'live'
+    ? `Live FAA data fetched ${formatStamp(meta.importedAtMs, Date.now(), (typeof _localTZ === 'function') ? _localTZ() : undefined)} • ${ageStr} ago${meta.cached ? ' (cached)' : ''}`
+    : `Imported ${meta.fileName || 'data'} • ${ageStr} ago${meta.cached ? ' (cached)' : ''}`;
+  el.textContent = label + (stale ? ' — STALE: re-verify ≤ 1 hr before launch' : '');
 }
 
 function renderImportedTfrLayer() {
@@ -3214,6 +3277,17 @@ function mergeNotams(incoming) {
   S.importedNotams = Object.values(byId);
 }
 
+// Single writer of the per-area "tfr_import" IndexedDB record (TTL 1 h).
+function _persistRestrictionCache() {
+  if (typeof cacheApiResponse === 'function' && S.areaCenter) {
+    cacheApiResponse('tfr_import', areaKey(S.areaCenter.lat, S.areaCenter.lng), {
+      tfrs: S.tfrs, notams: S.importedNotams, meta: S.tfrImportMeta,
+      notamMeta: S.notamFetchMeta || null,
+    });
+  }
+  S.restrictionCacheExpired = null; // any successful write supersedes the expired-cache warning
+}
+
 function afterFaaImport() {
   renderImportedTfrLayer();
   renderImportedNotamLayer();
@@ -3222,10 +3296,13 @@ function afterFaaImport() {
   renderImportStatus();
   setStatus('notamStatus', (S.tfrs && S.tfrs.length) ? 'live' : 'manual',
     (S.tfrs && S.tfrs.length) ? `${S.tfrs.length} TFR${S.tfrs.length > 1 ? 'S' : ''}` : 'IMPORT');
-  if (typeof cacheApiResponse === 'function' && S.areaCenter) {
-    cacheApiResponse('tfr_import', areaKey(S.areaCenter.lat, S.areaCenter.lng), {
-      tfrs: S.tfrs, notams: S.importedNotams, meta: S.tfrImportMeta,
-    });
+  _persistRestrictionCache();
+  // Stamp manual imports too, so a later failed live check can say
+  // "showing <import time> data" instead of pretending there is nothing.
+  const meta = S.tfrImportMeta;
+  if (meta && meta.fileName !== 'live') {
+    const isNotamImport = meta.source === 'notam-text' || meta.source === 'notam-paste';
+    markSection(isNotamImport ? 'notam' : 'tfr', { status: 'live', updatedAt: meta.importedAtMs, error: null });
   }
   if (S.currentArea) computeAssessment();
 }
@@ -6925,6 +7002,16 @@ function computeAssessment(snap) {
     }
   }
 
+  // A failed auto-check means TFR/NOTAM ABSENCE is unverified — never a clean
+  // GO. (Active-TFR NO-GO from stale data above stays: presence is conservative.)
+  if (S.autoCheck && S.autoCheck.state === 'error' && S.currentArea &&
+      typeof getCanopyProxyBase === 'function' && getCanopyProxyBase()) {
+    if (result.level === 'GO') result.level = 'CAUTION';
+    result.cautions = result.cautions || [];
+    result.cautions.push('TFR/NOTAM check FAILED — airspace unverified (1800wxbrief.com)');
+    if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
+  }
+
   // Integrate FAA airspace data into assessment
   if (S.faaAirspace) {
     // NO-GO: active TFR
@@ -8768,7 +8855,13 @@ function updateClock() {
   const utc = now.toISOString().substr(11, 8);
   document.getElementById('clockDisplay').textContent = `${local} L / ${utc} Z`;
   // Refresh the per-section "(Xm ago)" ages every ~30s (cheap; text only).
-  if ((++_metaTick % 30) === 0 && typeof renderAllSectionMeta === 'function') renderAllSectionMeta();
+  // The TFR/NOTAM banner + auto-check detail carry ages too — tick them all,
+  // or a tab left open shows a frozen "2m ago" forever.
+  if ((++_metaTick % 30) === 0) {
+    if (typeof renderAllSectionMeta === 'function') renderAllSectionMeta();
+    if (typeof renderImportStatus === 'function') renderImportStatus();
+    if (typeof renderAutoCheckStatus === 'function') renderAutoCheckStatus();
+  }
 }
 
 // ============================================================
@@ -8781,17 +8874,27 @@ window.addEventListener('load', () => {
   }
   startApp();
 });
-const APP_VERSION = '2026.03.27';
+// Bump ONLY when the disclaimer text materially changes — every device then
+// re-prompts exactly once. Deliberately NOT tied to SAR_VERSION: routine
+// releases must not re-interrupt, but a reworded disclaimer must reach
+// everyone, including devices that accepted years ago.
+const DISCLAIMER_VERSION = '2026.08.30';
 
 function checkDisclaimer() {
   const accepted = localStorage.getItem('sar_disclaimer_version');
-  if (accepted !== APP_VERSION) {
+  if (accepted !== DISCLAIMER_VERSION) {
     document.getElementById('disclaimerModal')?.classList.add('active');
   }
 }
 
+// Re-read on demand (footer line, Config → View Disclaimer). Acceptance is
+// already stored; the I Understand button simply closes it again.
+function showDisclaimer() {
+  document.getElementById('disclaimerModal')?.classList.add('active');
+}
+
 function acceptDisclaimer() {
-  localStorage.setItem('sar_disclaimer_version', APP_VERSION);
+  localStorage.setItem('sar_disclaimer_version', DISCLAIMER_VERSION);
   document.getElementById('disclaimerModal')?.classList.remove('active');
   // A pending update supersedes What's New: the update modal shows the NEWER
   // version's notes, so showing last update's notes too would just stack modals.
@@ -9708,8 +9811,17 @@ function buildBriefingText() {
     lines.push('');
   }
 
+  lines.push('--- DISCLAIMER ---');
+  lines.push(BRIEFING_DISCLAIMER);
+
   return lines.join('\n');
 }
+
+// Rides on every briefing artifact that leaves the app (clipboard, email, PDF).
+const BRIEFING_DISCLAIMER =
+  'Advisory planning aid only - NOT an official FAA briefing. Data may be ' +
+  'incomplete or outdated; verify airspace, TFRs, NOTAMs and weather via ' +
+  'official sources (1800wxbrief.com) before flight.';
 
 function copyBriefing() {
   if (!S.currentArea) return;
@@ -9915,6 +10027,7 @@ function _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic
       return `<div style="margin-bottom:10px;"><div style="font-size:13px;font-weight:bold;border-bottom:1px solid #ccc;padding-bottom:2px;margin-bottom:4px;">${title}</div><div style="font-size:11px;color:#333;">${body}</div></div>`;
     }).join('')}
     <div style="margin-top:20px;border-top:2px solid #111;padding-top:10px;">
+      <div style="font-size:10px;color:#7a5d00;background:#fff8e1;border-left:4px solid #f59e0b;padding:6px 8px;margin-bottom:10px;"><b>Advisory planning aid only — NOT an official FAA briefing.</b> Verify airspace, TFRs, NOTAMs and weather via official sources (1800wxbrief.com) before flight.</div>
       <div style="font-size:11px;color:#555;margin-bottom:15px;">I have reviewed this pre-flight briefing and accept responsibility for the safe conduct of this UAS operation.</div>
       <table style="width:100%;font-size:11px;">
         <tr>
@@ -10020,6 +10133,7 @@ function _openEmailBriefingWindow(mapDataUrl) {
     ${mapHtml}
     ${sections.map(s => { const lines = s.split('\n'); return `<div class="section"><div class="section-title">${lines[0]}</div><div>${lines.slice(1).join('<br>')}</div></div>`; }).join('')}
     <div style="margin-top:20px;border-top:2px solid #111;padding-top:10px;">
+      <div style="font-size:10px;color:#7a5d00;background:#fff8e1;border-left:4px solid #f59e0b;padding:6px 8px;margin-bottom:10px;"><b>Advisory planning aid only — NOT an official FAA briefing.</b> Verify airspace, TFRs, NOTAMs and weather via official sources (1800wxbrief.com) before flight.</div>
       <div style="font-size:11px;color:#555;margin-bottom:15px;">I have reviewed this pre-flight briefing and accept responsibility for the safe conduct of this UAS operation.</div>
       <span class="sig-line">RPIC Signature</span><span class="sig-line">Date / Time</span>
     </div>
@@ -14067,6 +14181,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer,
+    checkDisclaimer, showDisclaimer, DISCLAIMER_VERSION, BRIEFING_DISCLAIMER,
     checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitActivated,
     showUpdateModalIfNewer, _updateApplyStatus, _updateBannerHtml, _cachedShellVersion, _verifyShellFresh,
     getCanopyProxyBase, getCustomProxy, saveCanopyProxy, DEFAULT_DATA_PROXY, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
@@ -14097,6 +14212,7 @@ if (typeof module !== 'undefined' && module.exports) {
     fetchUtilityWires, _renderUtilityWires, _utilityWirePopup,
     tfrGeoJsonUrlForBounds, fetchLiveTFRs, fetchNotams, fetchLiveRestrictions,
     renderAutoCheckStatus, reCheckRestrictionsNow, _restrictionEmptyMsg,
+    _notamSearchRadiusNm, _persistRestrictionCache,
     toDMS, fmtTfrTime, currentAreaPolygon,
     renderDeepLinks, renderTfrCards, renderNotamCards, renderImportStatus,
     renderImportedTfrLayer, renderImportedNotamLayer,

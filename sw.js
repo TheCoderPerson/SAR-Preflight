@@ -191,6 +191,20 @@ function routeStrategy(url) {
   // cache-first default below and pin the first response forever.)
   if (url.includes('nominatim.openstreetmap.org')) return 'network-only';
 
+  // FAA-derived live safety data (+ live traffic) via the data proxy —
+  // network-only. The proxy base is user-configurable (localStorage, which SW
+  // scope cannot read synchronously), but every proxy — built-in or custom —
+  // serves these routes at the SAME pathnames, so match on pathname. Same
+  // hazard class as nominatim above: the app keeps its own IndexedDB cache for
+  // TFR/NOTAM with an explicit stale/expired UI; a cache-first hit here pins
+  // the FIRST response for the life of the deployed version and lets
+  // "Re-check now" report week-old airspace as LIVE. /adsb is included because
+  // a pinned response freezes live traffic. /chm/ canopy tiles are unaffected
+  // (range requests are skipped before routing) and /feedback is POST (never
+  // routed here).
+  const path = urlPathname(url);
+  if (path.startsWith('/tfr/') || path === '/notam' || path === '/adsb') return 'network-only';
+
   // API endpoints — network-first with cache fallback
   if (url.includes('api.open-meteo.com') ||
       url.includes('air-quality-api.open-meteo.com') ||
@@ -209,6 +223,10 @@ function routeStrategy(url) {
 
   // App shell and everything else — cache-first
   return 'cache-first';
+}
+
+function urlPathname(url) {
+  try { return new URL(url).pathname; } catch (_) { return ''; }
 }
 
 // Whether a cached entry may answer this request.

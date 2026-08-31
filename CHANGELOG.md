@@ -4,6 +4,16 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.08.30-a — 2026-08-30
+
+- TFR and NOTAM checks are now fail-safe. The app can no longer silently reuse an old offline-cache answer for the live FAA check — "Re-check now" truly re-fetches every time.
+- Every FAA-derived item now shows exactly when it was fetched ("TFRs fetched Aug 30, 02:15 PM (2m ago)"), and the age keeps counting up while the tab is open.
+- If the TFR/NOTAM check fails, the app now shows a loud red notice directing you to an official briefing (1800wxbrief.com) instead of a green CHECKED badge — and the GO assessment drops to CAUTION because airspace is unverified. Empty lists after a failed check now say "status UNKNOWN, not none".
+- Cached TFR/NOTAM data older than 4 hours is no longer shown at all (a red CACHE EXPIRED notice appears instead), and anything cached is clearly labeled with its age.
+- The TFR and NOTAM RETRY buttons in the data-source error banner now actually re-run the check.
+- Live air traffic can no longer be served from a stale cache either.
+- The license changed from PolyForm Noncommercial to Apache 2.0 — free for any use, including commercial, with the same "no warranty" terms. A persistent "Advisory only" footer was added, the first-run disclaimer was rewritten (it will show once after this update), and PDF/email/clipboard briefings now carry the advisory note.
+
 ## v2026.08.21-c — 2026-08-21
 
 - When every live-traffic source is refusing service (the public ADS-B providers have been tightening access), the app now backs off politely — retrying every 5 s, then 30 s, then once a minute — instead of hammering them every 5 seconds, and logs one clear summary instead of a wall of errors. The Traffic status line shows the retry cadence, and everything snaps back to normal 5 s polling on the first successful poll.
