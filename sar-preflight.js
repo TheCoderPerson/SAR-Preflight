@@ -594,9 +594,9 @@ function updateSectionalEditionUI(edition, opts) {
 
 // --- Map theme (dark / light-map / full-light) ---
 // Three modes, cycled by a manual button and persisted to localStorage:
-//   dark      — CARTO dark basemap + dark HUD palette (default)
-//   light-map — CARTO light basemap, dark HUD palette (bright-day map, HUD intact)
-//   light     — CARTO light basemap + full light UI palette
+//   dark      — dark canvas basemap + dark HUD palette (default)
+//   light-map — light canvas basemap, dark HUD palette (bright-day map, HUD intact)
+//   light     — light canvas basemap + full light UI palette
 // The data-theme attribute drives the CSS palette ([data-theme="light"] only);
 // the basemap swap is done here in JS.
 const THEME_MODES = ['dark', 'light-map', 'light'];
@@ -625,6 +625,12 @@ function applyTheme(theme) {
     // repeated theme switches and can leave the basemap ABOVE the base overlays —
     // hiding them when toggled on. A fixed negative z-index is deterministic.
     if (typeof want.setZIndex === 'function') want.setZIndex(-1);
+    // Esri canvas basemaps are a group (base + reference labels): base at -2,
+    // labels at -1 — both beneath toggled base overlays, labels above their base.
+    else if (typeof want.eachLayer === 'function') {
+      let z = -2;
+      want.eachLayer(l => { if (typeof l.setZIndex === 'function') l.setZIndex(z++); });
+    }
   }
   try { localStorage.setItem('sar_theme', theme); } catch (e) { /* private mode */ }
   const btn = (typeof document !== 'undefined') ? document.getElementById('themeToggle') : null;
@@ -695,8 +701,17 @@ function initMap() {
   // Parcels are view-driven: refetch (debounced) after every pan/zoom while on.
   try { S.map.on('moveend', _parcelsOnMoveEnd); } catch (_) {}
   // Tracked basemaps so the theme toggle can swap between them (dark default).
-  S.mapLayers.basemap_dark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
-  S.mapLayers.basemap_light = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
+  // Esri Canvas replaced CARTO in Aug 2026: CARTO began watermarking keyless
+  // basemap tiles "API KEY REQUIRED" (served as normal HTTP 200 PNGs, so no
+  // error path fires). Esri splits place labels into a separate Reference
+  // service, so each basemap is a base+labels pair in one layer group; native
+  // z16 in North America, upscaled past that (like the sectional).
+  const esriCanvasPair = kind => L.layerGroup([
+    L.tileLayer(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${kind}_Gray_Base/MapServer/tile/{z}/{y}/{x}`, { maxNativeZoom: 16, maxZoom: 19, attribution: 'Esri, HERE, Garmin, OpenStreetMap contributors' }),
+    L.tileLayer(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${kind}_Gray_Reference/MapServer/tile/{z}/{y}/{x}`, { maxNativeZoom: 16, maxZoom: 19 }),
+  ]);
+  S.mapLayers.basemap_dark = esriCanvasPair('Dark');
+  S.mapLayers.basemap_light = esriCanvasPair('Light');
   applyTheme(getStoredTheme());
   // crossOrigin: the canopy VEG classifier reads these tiles' PIXELS. Requesting
   // them CORS-mode means the tiles Leaflet has already displayed land in the SW
@@ -9453,7 +9468,7 @@ function downloadTilesForView() {
 }
 
 function getSelectedTileProviders() {
-  const providers = ['carto']; // always include base map
+  const providers = ['basemap', 'basemap_labels']; // always include base map (Esri canvas base + labels)
   if (document.getElementById('cfgTileSat')?.checked) providers.push('satellite');
   if (document.getElementById('cfgTileTopo')?.checked) providers.push('topo');
   if (document.getElementById('cfgTileSectional')?.checked) providers.push('sectional');

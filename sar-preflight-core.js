@@ -24,6 +24,14 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.08.30-b',
+    date: '2026-08-30',
+    changes: [
+      'Replaced the base map: CARTO began stamping "API KEY REQUIRED" across its free basemap tiles, so the dark and light base maps now use Esri\'s keyless Dark/Light Gray Canvas (base + place-label layers) instead. Same aviation-HUD look; place names now come from a separate label layer that stays beneath your data overlays. Offline tile downloads and the 3D view use the new tiles too.',
+      'Old CARTO tiles (including any pre-downloaded offline areas) are cleaned out of the tile cache automatically. If you had downloaded base-map tiles for offline areas, re-download them once to restore the offline base map.',
+    ],
+  },
+  {
     version: '2026.08.30-a',
     date: '2026-08-30',
     changes: [
@@ -3332,18 +3340,21 @@ function _raster3dSource(urls, maxzoom) {
 function build3dStyle(opts) {
   const o = opts || {};
   const theme = o.theme === 'light' ? 'light' : 'dark';
-  const cartoSubs = ['a', 'b', 'c', 'd'];
+  // Esri Canvas (see initMap — CARTO watermarks keyless tiles). Base and place
+  // labels are separate services; native z16, MapLibre overzooms past it.
+  const canvasKind = theme === 'light' ? 'Light' : 'Dark';
   const sources = {
     dem: {
       type: 'raster-dem', tiles: [TERRAIN_DEM_URL], encoding: 'terrarium',
       tileSize: 256, maxzoom: 15, attribution: 'Terrain: Mapzen/AWS, USGS 3DEP',
     },
-    basemap: _raster3dSource(
-      cartoSubs.map(s => `https://${s}.basemaps.cartocdn.com/${theme === 'light' ? 'light_all' : 'dark_all'}/{z}/{x}/{y}.png`), 19),
+    basemap: _raster3dSource(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${canvasKind}_Gray_Base/MapServer/tile/{z}/{y}/{x}`, 16),
+    basemap_ref: _raster3dSource(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${canvasKind}_Gray_Reference/MapServer/tile/{z}/{y}/{x}`, 16),
   };
   const layers = [
     { id: 'bg', type: 'background', paint: { 'background-color': theme === 'light' ? '#dfe8f0' : '#0a0e14' } },
     { id: 'basemap', type: 'raster', source: 'basemap' },
+    { id: 'basemap_ref', type: 'raster', source: 'basemap_ref' },
   ];
   // Mutually exclusive base overlay (same trio as the 2D layer control).
   if (o.base === 'satellite') {

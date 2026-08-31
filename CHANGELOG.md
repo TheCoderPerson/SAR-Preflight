@@ -4,6 +4,11 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.08.30-b — 2026-08-30
+
+- Replaced the base map: CARTO began stamping "API KEY REQUIRED" across its free basemap tiles, so the dark and light base maps now use Esri's keyless Dark/Light Gray Canvas (base + place-label layers) instead. Same aviation-HUD look; place names now come from a separate label layer that stays beneath your data overlays. Offline tile downloads and the 3D view use the new tiles too.
+- Old CARTO tiles (including any pre-downloaded offline areas) are cleaned out of the tile cache automatically. If you had downloaded base-map tiles for offline areas, re-download them once to restore the offline base map.
+
 ## v2026.08.30-a — 2026-08-30
 
 - TFR and NOTAM checks are now fail-safe. The app can no longer silently reuse an old offline-cache answer for the live FAA check — "Re-check now" truly re-fetches every time.
