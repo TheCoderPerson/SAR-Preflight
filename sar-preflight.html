@@ -38,6 +38,7 @@
   --font-sans: 'IBM Plex Sans', -apple-system, sans-serif;
   --panel-width: 480px;
   --header-height: 48px;
+  --footer-height: 22px;
 }
 /* Full light theme (mode "light"). Mode "light-map" keeps this dark palette and
    only swaps the basemap, so it does NOT match this selector. */
@@ -196,9 +197,20 @@ body {
 }
 
 /* Main Layout */
-.main { display: flex; height: calc(100vh - var(--header-height)); }
+.main { display: flex; height: calc(100vh - var(--header-height) - var(--footer-height)); }
 .map-container { flex: 1; position: relative; }
 #map { width: 100%; height: 100%; }
+
+/* Persistent advisory footer — must stay visible on every screen (see LICENSE/disclaimer) */
+.app-footer {
+  height: var(--footer-height);
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg-secondary); border-top: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: 10px; color: var(--accent-amber);
+  letter-spacing: 0.5px; white-space: nowrap; overflow: hidden;
+  padding: 0 8px; cursor: pointer; z-index: 1000; position: relative;
+}
+.app-footer:hover { text-decoration: underline; }
 
 /* Drawing Toolbar */
 .draw-toolbar {
@@ -758,8 +770,9 @@ select.api-input { cursor: pointer; }
   .header-status { font-size: 9px; }
   .side-panel {
     position: absolute; right: 0; top: var(--header-height);
-    width: 100vw; height: calc(100vh - var(--header-height)); z-index: 900;
+    width: 100vw; height: calc(100vh - var(--header-height) - var(--footer-height)); z-index: 900;
   }
+  .app-footer .footer-verify { display: none; }
   .side-panel .tab-bar { overflow-x: auto; flex-wrap: nowrap; }
   .side-panel .tab-btn { flex-shrink: 0; }
   .mobile-panel-close { display: block; }
@@ -1370,6 +1383,7 @@ select.api-input { cursor: pointer; }
             <div class="indicator" style="background:var(--accent-red)"></div>TFRs
             <span class="fetch-status" id="tfrCount"></span>
           </div>
+          <div class="section-meta" id="meta_tfr"></div>
           <div id="tfrList"><div class="notam-body" style="color:var(--text-muted);font-style:italic;">No TFR file imported.</div></div>
         </div>
 
@@ -1378,6 +1392,7 @@ select.api-input { cursor: pointer; }
           <div class="data-section-title">
             <div class="indicator" style="background:var(--accent-amber)"></div>NOTAMs
           </div>
+          <div class="section-meta" id="meta_notam"></div>
           <div class="notam-meta" style="margin-bottom:6px;">FAA NOTAM Search only downloads PDF/Excel. Copy the results (or text from the opened PDF/Excel) and paste below.</div>
           <textarea id="notamPasteBox" class="notam-paste" placeholder="Paste NOTAM text here (ICAO or plain text)…"></textarea>
           <div style="display:flex;gap:6px;margin:6px 0;">
@@ -1441,6 +1456,8 @@ select.api-input { cursor: pointer; }
             <div class="data-label">Installed Version</div>
             <div id="appVersionDisplay" style="font-family:var(--font-mono);font-size:13px;color:var(--accent-cyan);margin-top:4px;">—</div>
             <button class="btn btn-ghost" onclick="showChangelog(false)" style="padding:4px 10px;font-size:10px;margin-top:6px;">What's New / Changelog</button>
+            <button class="btn btn-ghost" onclick="showDisclaimer()" style="padding:4px 10px;font-size:10px;margin-top:6px;">View Disclaimer</button>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:6px;">Advisory planning aid only &mdash; not an official FAA briefing. Licensed under <a href="https://github.com/TheCoderPerson/SAR-Preflight/blob/master/LICENSE" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Apache-2.0</a>; provided &ldquo;AS IS&rdquo;, without warranty of any kind.</div>
           </div>
           <div class="api-config">
             <button class="btn btn-primary" id="btnCheckUpdates" onclick="checkForUpdates()" style="padding:5px 12px;font-size:11px;">Check for Updates</button>
@@ -1655,6 +1672,8 @@ select.api-input { cursor: pointer; }
   </div>
 </div>
 
+<div class="app-footer" onclick="showDisclaimer()" title="Tap to read the full disclaimer">&#9888; Advisory only &mdash; not an official FAA briefing<span class="footer-verify"> &mdash; verify via official sources</span></div>
+
 <!-- Export Modal -->
 <div class="modal-overlay" id="exportModal">
   <div class="modal" style="max-height:85vh;overflow-y:auto;">
@@ -1720,13 +1739,12 @@ select.api-input { cursor: pointer; }
   <div class="modal" style="width:500px;max-height:85vh;">
     <h3 style="color:var(--accent-amber);">Disclaimer</h3>
     <div style="overflow-y:auto;max-height:55vh;font-size:12px;line-height:1.6;color:var(--text-secondary);">
-      <p><b>This tool is provided for informational and planning purposes only.</b></p>
-      <p style="margin-top:10px;">The data displayed in this application may be incomplete, inaccurate, outdated, or incorrect. Data is sourced from third-party APIs and open data services that may experience outages, delays, or errors. Calculated values (density altitude, airspace classification, risk assessments, etc.) are approximations and may not reflect actual conditions.</p>
-      <p style="margin-top:10px;"><b>Users must independently verify all data before flight operations.</b> Always cross-check critical information (airspace, TFRs, NOTAMs, weather) against official FAA sources, certified weather briefings, and current aeronautical publications. The GO/CAUTION/NO-GO assessment is advisory only and does not replace the Remote Pilot In Command's responsibility to evaluate flight safety.</p>
-      <p style="margin-top:10px;">This software is not certified by the FAA or any aviation authority. Use at your own risk. The developers assume no liability for decisions made based on information provided by this tool.</p>
+      <p><b>SAR-Preflight is an advisory planning aid only.</b></p>
+      <p style="margin-top:10px;">It is not certified, endorsed, or approved by the FAA and is not a substitute for an official preflight briefing. Weather, NOTAM, and TFR information shown here may be delayed, incomplete, or unavailable &mdash; always verify through official sources (e.g., <b>1800wxbrief.com</b>, the FAA TFR list) before flight. Terrain and coverage estimates are approximations.</p>
+      <p style="margin-top:10px;">This software is provided free of charge, &ldquo;AS IS,&rdquo; without warranty of any kind, under the Apache License 2.0. The authors and contributors accept no liability for any decision made or action taken in reliance on it. <b>Final responsibility for flight safety and search decisions rests with the remote pilot in command and the incident commander.</b></p>
     </div>
     <div class="modal-actions" style="margin-top:16px;">
-      <button class="btn btn-primary" onclick="acceptDisclaimer()">I Understand</button>
+      <button class="btn btn-primary" onclick="acceptDisclaimer()">I Understand &mdash; Continue</button>
     </div>
   </div>
 </div>

@@ -4,6 +4,33 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.08.30-b — 2026-08-30
+
+- Replaced the base map: CARTO began stamping "API KEY REQUIRED" across its free basemap tiles, so the dark and light base maps now use Esri's keyless Dark/Light Gray Canvas (base + place-label layers) instead. Same aviation-HUD look; place names now come from a separate label layer that stays beneath your data overlays. Offline tile downloads and the 3D view use the new tiles too.
+- Old CARTO tiles (including any pre-downloaded offline areas) are cleaned out of the tile cache automatically. If you had downloaded base-map tiles for offline areas, re-download them once to restore the offline base map.
+
+## v2026.08.30-a — 2026-08-30
+
+- TFR and NOTAM checks are now fail-safe. The app can no longer silently reuse an old offline-cache answer for the live FAA check — "Re-check now" truly re-fetches every time.
+- Every FAA-derived item now shows exactly when it was fetched ("TFRs fetched Aug 30, 02:15 PM (2m ago)"), and the age keeps counting up while the tab is open.
+- If the TFR/NOTAM check fails, the app now shows a loud red notice directing you to an official briefing (1800wxbrief.com) instead of a green CHECKED badge — and the GO assessment drops to CAUTION because airspace is unverified. Empty lists after a failed check now say "status UNKNOWN, not none".
+- Cached TFR/NOTAM data older than 4 hours is no longer shown at all (a red CACHE EXPIRED notice appears instead), and anything cached is clearly labeled with its age.
+- The TFR and NOTAM RETRY buttons in the data-source error banner now actually re-run the check.
+- Live air traffic can no longer be served from a stale cache either.
+- The license changed from PolyForm Noncommercial to Apache 2.0 — free for any use, including commercial, with the same "no warranty" terms. A persistent "Advisory only" footer was added, the first-run disclaimer was rewritten (it will show once after this update), and PDF/email/clipboard briefings now carry the advisory note.
+
+## v2026.08.21-c — 2026-08-21
+
+- When every live-traffic source is refusing service (the public ADS-B providers have been tightening access), the app now backs off politely — retrying every 5 s, then 30 s, then once a minute — instead of hammering them every 5 seconds, and logs one clear summary instead of a wall of errors. The Traffic status line shows the retry cadence, and everything snaps back to normal 5 s polling on the first successful poll.
+- Fixed live traffic potentially showing zero aircraft even on a successful fetch: one provider serves its aircraft list under a different field name than the others, and only one name was being read.
+- The aircraft info card's "data age" line now shows the true age of the position report (provider delay plus time since the last successful poll) and keeps counting up during an outage, so a stale card is obvious at a glance.
+
+## v2026.08.21-b — 2026-08-21
+
+- Tapping an aircraft now opens an info panel that stays open and keeps updating, instead of vanishing a few seconds later. It follows the plane as it moves, shows how fresh the data is, and warns SIGNAL LOST if the plane drops off the feed (auto-closing after 30 seconds). Close it with the X or by tapping anywhere else on the map. Tapping a row in the Traffic tab opens it too.
+- With several observer viewsheds shown, the selected observer's viewshed now draws in RED (darker red where it overlaps others), so you can tell at a glance which coverage belongs to the observer you're working with. Tapping a visible observer's pin now selects it; tapping the already-selected pin hides its viewshed as before. Exported viewshed files are unchanged (still green).
+- On phones, the OPS toolbar and the Map Layers panel now start collapsed so more of the map is visible — tap their headers to expand them.
+
 ## v2026.08.21-a — 2026-08-21
 
 - New FEEDBACK button in the header (and in the Config tab): send bug reports or feature ideas to the developer from inside the app. No email involved — nothing identifies you unless you choose to fill in the optional contact field.

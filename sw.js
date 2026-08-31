@@ -95,9 +95,26 @@ self.addEventListener('activate', event => {
           .filter(name => !CURRENT_CACHES.includes(name))
           .map(name => caches.delete(name))
       )
-    ).then(() => self.clients.claim())
+    ).then(() => purgeCartoTiles())
+      .then(() => self.clients.claim())
   );
 });
+
+// One-time storage reclaim: the app stopped requesting CARTO basemap tiles
+// (CARTO watermarks keyless requests "API KEY REQUIRED", Aug 2026), so any
+// cartocdn entries in the tile cache — including large pre-downloaded offline
+// regions — are dead weight that CACHE_TILES (not version-keyed) would keep
+// forever. Best-effort; never blocks activation.
+async function purgeCartoTiles() {
+  try {
+    const cache = await caches.open(CACHE_TILES);
+    const keys = await cache.keys();
+    await Promise.allSettled(
+      keys.filter(req => req.url.includes('basemaps.cartocdn.com'))
+        .map(req => cache.delete(req))
+    );
+  } catch (_) { /* reclaim only */ }
+}
 
 // --- Fetch: route by URL pattern ---
 self.addEventListener('fetch', event => {
@@ -191,6 +208,20 @@ function routeStrategy(url) {
   // cache-first default below and pin the first response forever.)
   if (url.includes('nominatim.openstreetmap.org')) return 'network-only';
 
+  // FAA-derived live safety data (+ live traffic) via the data proxy —
+  // network-only. The proxy base is user-configurable (localStorage, which SW
+  // scope cannot read synchronously), but every proxy — built-in or custom —
+  // serves these routes at the SAME pathnames, so match on pathname. Same
+  // hazard class as nominatim above: the app keeps its own IndexedDB cache for
+  // TFR/NOTAM with an explicit stale/expired UI; a cache-first hit here pins
+  // the FIRST response for the life of the deployed version and lets
+  // "Re-check now" report week-old airspace as LIVE. /adsb is included because
+  // a pinned response freezes live traffic. /chm/ canopy tiles are unaffected
+  // (range requests are skipped before routing) and /feedback is POST (never
+  // routed here).
+  const path = urlPathname(url);
+  if (path.startsWith('/tfr/') || path === '/notam' || path === '/adsb') return 'network-only';
+
   // API endpoints — network-first with cache fallback
   if (url.includes('api.open-meteo.com') ||
       url.includes('air-quality-api.open-meteo.com') ||
@@ -209,6 +240,10 @@ function routeStrategy(url) {
 
   // App shell and everything else — cache-first
   return 'cache-first';
+}
+
+function urlPathname(url) {
+  try { return new URL(url).pathname; } catch (_) { return ''; }
 }
 
 // Whether a cached entry may answer this request.
@@ -375,7 +410,11 @@ async function downloadTiles(config, client) {
   const { bounds, zooms, providers } = config;
 
   const providerUrls = {
-    carto: 'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+    // Esri Canvas dark base + labels (CARTO watermarks keyless tiles — Aug 2026).
+    basemap: 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+    basemap_labels: 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
+    // Legacy alias: an old cached shell can still send 'carto' to this newer SW.
+    carto: 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
     satellite: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     topo: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
     sectional: 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}',
@@ -386,12 +425,14 @@ async function downloadTiles(config, client) {
   // Native zoom limits per provider — out-of-range tiles don't exist (skip them).
   // Streets capped at 15: past that the service draws labels only (no road
   // lines), so the app upscales z15 tiles and never requests deeper ones.
+  // Esri canvas capped at 16 (its native max in North America).
   const providerZoom = {
     sectional: { min: 8, max: 12 },
     streets_roads: { min: 0, max: 15 }, streets_labels: { min: 0, max: 15 },
+    basemap: { min: 0, max: 16 }, basemap_labels: { min: 0, max: 16 }, carto: { min: 0, max: 16 },
   };
 
-  const selectedProviders = providers || ['carto'];
+  const selectedProviders = providers || ['basemap', 'basemap_labels'];
   const tiles = [];
 
   for (const z of zooms) {

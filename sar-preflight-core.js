@@ -24,6 +24,45 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.08.30-b',
+    date: '2026-08-30',
+    changes: [
+      'Replaced the base map: CARTO began stamping "API KEY REQUIRED" across its free basemap tiles, so the dark and light base maps now use Esri\'s keyless Dark/Light Gray Canvas (base + place-label layers) instead. Same aviation-HUD look; place names now come from a separate label layer that stays beneath your data overlays. Offline tile downloads and the 3D view use the new tiles too.',
+      'Old CARTO tiles (including any pre-downloaded offline areas) are cleaned out of the tile cache automatically. If you had downloaded base-map tiles for offline areas, re-download them once to restore the offline base map.',
+    ],
+  },
+  {
+    version: '2026.08.30-a',
+    date: '2026-08-30',
+    changes: [
+      'TFR and NOTAM checks are now fail-safe. The app can no longer silently reuse an old offline-cache answer for the live FAA check — "Re-check now" truly re-fetches every time.',
+      'Every FAA-derived item now shows exactly when it was fetched ("TFRs fetched Aug 30, 02:15 PM (2m ago)"), and the age keeps counting up while the tab is open.',
+      'If the TFR/NOTAM check fails, the app now shows a loud red notice directing you to an official briefing (1800wxbrief.com) instead of a green CHECKED badge — and the GO assessment drops to CAUTION because airspace is unverified. Empty lists after a failed check now say "status UNKNOWN, not none".',
+      'Cached TFR/NOTAM data older than 4 hours is no longer shown at all (a red CACHE EXPIRED notice appears instead), and anything cached is clearly labeled with its age.',
+      'The TFR and NOTAM RETRY buttons in the data-source error banner now actually re-run the check.',
+      'Live air traffic can no longer be served from a stale cache either.',
+      'The license changed from PolyForm Noncommercial to Apache 2.0 — free for any use, including commercial, with the same "no warranty" terms. A persistent "Advisory only" footer was added, the first-run disclaimer was rewritten (it will show once after this update), and PDF/email/clipboard briefings now carry the advisory note.',
+    ],
+  },
+  {
+    version: '2026.08.21-c',
+    date: '2026-08-21',
+    changes: [
+      'When every live-traffic source is refusing service (the public ADS-B providers have been tightening access), the app now backs off politely — retrying every 5 s, then 30 s, then once a minute — instead of hammering them every 5 seconds, and logs one clear summary instead of a wall of errors. The Traffic status line shows the retry cadence, and everything snaps back to normal 5 s polling on the first successful poll.',
+      'Fixed live traffic potentially showing zero aircraft even on a successful fetch: one provider serves its aircraft list under a different field name than the others, and only one name was being read.',
+      'The aircraft info card\'s "data age" line now shows the true age of the position report (provider delay plus time since the last successful poll) and keeps counting up during an outage, so a stale card is obvious at a glance.',
+    ],
+  },
+  {
+    version: '2026.08.21-b',
+    date: '2026-08-21',
+    changes: [
+      'Tapping an aircraft now opens an info panel that stays open and keeps updating, instead of vanishing a few seconds later. It follows the plane as it moves, shows how fresh the data is, and warns SIGNAL LOST if the plane drops off the feed (auto-closing after 30 seconds). Close it with the X or by tapping anywhere else on the map. Tapping a row in the Traffic tab opens it too.',
+      'With several observer viewsheds shown, the selected observer\'s viewshed now draws in RED (darker red where it overlaps others), so you can tell at a glance which coverage belongs to the observer you\'re working with. Tapping a visible observer\'s pin now selects it; tapping the already-selected pin hides its viewshed as before. Exported viewshed files are unchanged (still green).',
+      'On phones, the OPS toolbar and the Map Layers panel now start collapsed so more of the map is visible — tap their headers to expand them.',
+    ],
+  },
+  {
     version: '2026.08.21-a',
     date: '2026-08-21',
     changes: [
@@ -1597,6 +1636,56 @@ function parseAdsbAircraft(acArray, centerLat, centerLng, groundElev) {
 }
 
 /**
+ * Extract the aircraft array from an ADS-B API response. Providers disagree
+ * on the field name: readsb-style APIs (airplanes.live, adsb.lol) use `ac`,
+ * adsb.fi has been observed serving `aircraft` — and the data proxy passes
+ * whichever body through untouched, so both must be accepted or a successful
+ * fetch can silently render zero traffic.
+ */
+function adsbAircraftList(json) {
+  if (!json) return [];
+  if (Array.isArray(json.ac)) return json.ac;
+  if (Array.isArray(json.aircraft)) return json.aircraft;
+  return [];
+}
+
+/**
+ * Poll delay with backoff after consecutive total ADS-B failures (every
+ * source refused, including the proxy). One blip retries at the normal
+ * cadence; sustained outages step 30 s → 60 s so the app stops hammering
+ * providers that are already refusing service (aggressive polling is how
+ * IPs end up on their blocklists).
+ */
+function adsbPollDelay(failStreak, baseMs) {
+  const base = baseMs || 5000;
+  if (!failStreak || failStreak <= 1) return base;
+  if (failStreak === 2) return 30000;
+  return 60000;
+}
+
+/**
+ * Decide what the selected-aircraft panel should do this render pass.
+ * Time-based (not miss-count) because the map re-renders more than once per
+ * poll cycle. lostAtMs is when the hex first went missing (null = seen on the
+ * previous pass); maxLostMs is how long to keep showing stale data before
+ * closing.
+ * Returns one of:
+ *   { action: 'none' }                 — nothing selected
+ *   { action: 'update', ac }           — hex present: refresh position + data
+ *   { action: 'lost', lostSecs }       — hex absent, under threshold (0 on first miss)
+ *   { action: 'close' }                — hex absent for >= maxLostMs
+ */
+function resolveAdsbSelection(selHex, aircraft, lostAtMs, nowMs, maxLostMs) {
+  if (!selHex) return { action: 'none' };
+  const ac = (aircraft || []).find(a => a && a.hex === selHex);
+  if (ac) return { action: 'update', ac };
+  if (lostAtMs == null) return { action: 'lost', lostSecs: 0 };
+  const lostMs = nowMs - lostAtMs;
+  if (lostMs >= maxLostMs) return { action: 'close' };
+  return { action: 'lost', lostSecs: Math.round(lostMs / 1000) };
+}
+
+/**
  * Format AGL altitude for compact icon labels.
  */
 function formatAltitudeAgl(aglFt) {
@@ -3060,6 +3149,117 @@ function metaToneClass(tone) {
 }
 
 // ============================================================
+// TFR/NOTAM AUTO-CHECK DISPLAY — pure resolvers for the combined
+// freshness/failure state of the live FAA restriction check.
+// Fail-safe invariants (unit-tested):
+//   - CHECKED/green appears ONLY when state === 'ok' (both legs succeeded
+//     in THIS pass) — stale survivors or cached data never earn it.
+//   - Every error-state detail names 1800wxbrief.com.
+//   - A failed check never produces reassuring "no active …" text.
+// ============================================================
+
+// One source's freshness fragment for the FAILED detail line.
+// label: 'TFR' | 'NOTAM'; m: sectionMeta-shaped { status, updatedAt, cachedAt }.
+function _restrictionSourceFrag(label, m, nowMs, tz) {
+  m = m || {};
+  const prior = m.updatedAt != null ? m.updatedAt : m.cachedAt;
+  if (m.status === 'live' && m.updatedAt != null) {
+    return label + 's fetched ' + formatStamp(m.updatedAt, nowMs, tz) + ' (' + (relAge(m.updatedAt, nowMs) || '<1m') + ' ago)';
+  }
+  if (m.status === 'cached' && m.cachedAt != null) {
+    return label + 's cached ' + formatStamp(m.cachedAt, nowMs, tz) + ' (' + (relAge(m.cachedAt, nowMs) || '<1m') + ' ago)';
+  }
+  if (prior != null) {
+    return label + ' check FAILED — showing ' + formatStamp(prior, nowMs, tz) + ' data (' + (relAge(prior, nowMs) || '<1m') + ' old), treat as STALE';
+  }
+  return label + ' check FAILED — no data';
+}
+
+// Combined auto-check panel state.
+// inp: { proxySet, hasArea, online, state:'idle'|'checking'|'ok'|'error',
+//        tfr:   null|{status,updatedAt,cachedAt},   // S.sectionMeta.tfr shape
+//        notam: null|{status,updatedAt,cachedAt},
+//        tfrCount, notamCount,
+//        manualImport: null|{fileName,importedAtMs} }
+// -> { badge, badgeCls, colorToken:'muted'|'cyan'|'amber'|'green'|'red', detail, showBtn }
+function buildAutoCheckDisplay(inp, nowMs, tz) {
+  inp = inp || {};
+  if (!inp.proxySet) {
+    return {
+      badge: 'OFF', badgeCls: 'fetch-status', colorToken: 'muted', showBtn: false,
+      detail: 'Automatic FAA check is off. Add a Data proxy URL in Config to auto-fetch live TFRs & NOTAMs per area. Until then, use the manual import below. Always verify against an official briefing (1800wxbrief.com).',
+    };
+  }
+  if (!inp.hasArea) {
+    return {
+      badge: 'READY', badgeCls: 'fetch-status', colorToken: 'cyan', showBtn: false,
+      detail: 'Draw an operational area — TFRs and NOTAMs are then checked automatically for it.',
+    };
+  }
+  if (inp.state === 'checking') {
+    return {
+      badge: 'CHECKING…', badgeCls: 'fetch-status loading', colorToken: 'amber', showBtn: false,
+      detail: 'Fetching live TFRs and NOTAMs for this area…',
+    };
+  }
+  if (inp.state === 'ok') {
+    const tUpd = inp.tfr && inp.tfr.updatedAt, nUpd = inp.notam && inp.notam.updatedAt;
+    const stamps = [];
+    if (tUpd != null) stamps.push('TFRs fetched ' + formatStamp(tUpd, nowMs, tz) + ' (' + (relAge(tUpd, nowMs) || '<1m') + ' ago)');
+    if (nUpd != null) stamps.push('NOTAMs fetched ' + formatStamp(nUpd, nowMs, tz) + ' (' + (relAge(nUpd, nowMs) || '<1m') + ' ago)');
+    const parts = [];
+    if (inp.tfrCount) parts.push(inp.tfrCount + ' TFR' + (inp.tfrCount > 1 ? 's' : ''));
+    if (inp.notamCount) parts.push(inp.notamCount + ' NOTAM' + (inp.notamCount > 1 ? 's' : ''));
+    const counts = parts.length ? parts.join(' • ') + ' in/near this area.' : 'no active TFRs or NOTAMs in this area.';
+    const lead = stamps.length ? stamps.join(' • ') + ' — ' : '';
+    return {
+      badge: 'CHECKED', badgeCls: 'fetch-status live', colorToken: 'green', showBtn: true,
+      detail: lead + counts + ' Advisory — verify against an official briefing before flight.',
+    };
+  }
+  if (inp.state === 'error') {
+    const t = inp.tfr || {}, n = inp.notam || {};
+    const anyData = (inp.tfrCount || 0) > 0 || (inp.notamCount || 0) > 0 || inp.manualImport != null ||
+      t.updatedAt != null || t.cachedAt != null || n.updatedAt != null || n.cachedAt != null;
+    let detail;
+    if (!anyData) {
+      detail = 'TFR/NOTAM data UNAVAILABLE — airspace restrictions cannot be verified. Obtain an official briefing at 1800wxbrief.com (1-800-WX-BRIEF) before flight, or import data manually below.';
+    } else {
+      detail = _restrictionSourceFrag('TFR', t, nowMs, tz) + ' • ' + _restrictionSourceFrag('NOTAM', n, nowMs, tz) +
+        ' Do not treat missing items as "none" — obtain an official briefing at 1800wxbrief.com before flight.';
+    }
+    if (inp.online === false) detail = 'Offline. ' + detail + ' Re-check when back online.';
+    return { badge: 'FAILED', badgeCls: 'fetch-status error', colorToken: 'red', showBtn: true, detail };
+  }
+  return {
+    badge: 'READY', badgeCls: 'fetch-status', colorToken: 'cyan', showBtn: true,
+    detail: 'Ready — redraw or re-check to fetch live TFRs and NOTAMs for this area.',
+  };
+}
+
+// Empty-state line for the TFR/NOTAM card lists — must never read as
+// reassuring clearance when the check that would have found items did not
+// succeed. inp: { kind:'TFRs'|'NOTAMs', proxySet, hasArea, state,
+//                 srcStatus:'never'|'live'|'cached'|'error', atMs }
+function buildRestrictionEmptyMsg(inp, nowMs, tz) {
+  inp = inp || {};
+  const kind = inp.kind || 'TFRs';
+  const manualMsg = kind === 'TFRs'
+    ? 'No TFR file imported. Download via the links above, then import.'
+    : 'No NOTAMs parsed yet.';
+  if (!inp.proxySet || !inp.hasArea || inp.state === 'idle' || !inp.state) return manualMsg;
+  if (inp.state === 'checking') return 'Checking for ' + kind + '…';
+  if (inp.srcStatus === 'live' && inp.atMs != null) {
+    return 'Auto-checked ' + formatStamp(inp.atMs, nowMs, tz) + ' (' + (relAge(inp.atMs, nowMs) || '<1m') + ' ago) — no active ' + kind + ' in this area.';
+  }
+  if (inp.srcStatus === 'cached' && inp.atMs != null) {
+    return 'Cached data from ' + formatStamp(inp.atMs, nowMs, tz) + ' shows no ' + kind + ' — re-check before flight.';
+  }
+  const singular = kind === 'TFRs' ? 'TFR' : 'NOTAM';
+  return singular + ' check FAILED — status UNKNOWN, not "none". Obtain an official briefing at 1800wxbrief.com, or import below.';
+}
+
+// ============================================================
 // 3D TERRAIN VIEW — pure style + camera helpers (MapLibre)
 // The 3D toggle drapes the raster layers the 2D map is showing over real
 // terrain. These builders are pure (no DOM/MapLibre) so they are testable
@@ -3140,18 +3340,21 @@ function _raster3dSource(urls, maxzoom) {
 function build3dStyle(opts) {
   const o = opts || {};
   const theme = o.theme === 'light' ? 'light' : 'dark';
-  const cartoSubs = ['a', 'b', 'c', 'd'];
+  // Esri Canvas (see initMap — CARTO watermarks keyless tiles). Base and place
+  // labels are separate services; native z16, MapLibre overzooms past it.
+  const canvasKind = theme === 'light' ? 'Light' : 'Dark';
   const sources = {
     dem: {
       type: 'raster-dem', tiles: [TERRAIN_DEM_URL], encoding: 'terrarium',
       tileSize: 256, maxzoom: 15, attribution: 'Terrain: Mapzen/AWS, USGS 3DEP',
     },
-    basemap: _raster3dSource(
-      cartoSubs.map(s => `https://${s}.basemaps.cartocdn.com/${theme === 'light' ? 'light_all' : 'dark_all'}/{z}/{x}/{y}.png`), 19),
+    basemap: _raster3dSource(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${canvasKind}_Gray_Base/MapServer/tile/{z}/{y}/{x}`, 16),
+    basemap_ref: _raster3dSource(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${canvasKind}_Gray_Reference/MapServer/tile/{z}/{y}/{x}`, 16),
   };
   const layers = [
     { id: 'bg', type: 'background', paint: { 'background-color': theme === 'light' ? '#dfe8f0' : '#0a0e14' } },
     { id: 'basemap', type: 'raster', source: 'basemap' },
+    { id: 'basemap_ref', type: 'raster', source: 'basemap_ref' },
   ];
   // Mutually exclusive base overlay (same trio as the 2D layer control).
   if (o.base === 'satellite') {
@@ -4498,7 +4701,8 @@ if (typeof module !== 'undefined' && module.exports) {
     detectTerrainFeatures, scoreLZFitness, findEmergencyLZs,
     assessTerrainTurbulence, analyzeGPSMasking,
     calcSwapRecommendation,
-    computeAdsbSearchRadius, parseAdsbAircraft, formatAltitudeAgl,
+    computeAdsbSearchRadius, parseAdsbAircraft, formatAltitudeAgl, resolveAdsbSelection,
+    adsbAircraftList, adsbPollDelay,
     pointInPolygon, pointInRings, distPointToSegment, polygonBBox, bboxesOverlap, segmentsIntersect, polygonsIntersect,
     circleToPolygon, parseFaaCoord, normalizeFaaDate, geoJsonOuterRings,
     utmToLatLng, parseAngleFlexible, parseCoordinateInput,
@@ -4524,6 +4728,7 @@ if (typeof module !== 'undefined' && module.exports) {
     KML_ICON_BASE, kmlColorToRgba, caltopoStyleProps, geojsonFolderFeature, geojsonMarkerFeature,
     geojsonShapeFeature, geojsonLineGeometry, geojsonPolygonGeometry, geojsonFeatureCollection,
     formatStamp, relAge, buildSectionMetaLine, rollupSources, metaToneClass,
+    buildAutoCheckDisplay, buildRestrictionEmptyMsg, _restrictionSourceFrag,
     TERRAIN_DEM_URL, leafletToMaplibreCamera, maplibreToLeafletCamera, build3dStyle,
     OBSERVER_PITCH_MIN, OBSERVER_PITCH_MAX, OBSERVER_MAX_PITCH, OBSERVER_START_PITCH,
     wrapBearing, clampObserverPitch, applyLookDrag, wheelLook, observerEyeAltitudeM,

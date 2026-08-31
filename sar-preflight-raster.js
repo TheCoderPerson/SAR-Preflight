@@ -610,13 +610,18 @@ function computeBackdropSectors(opts) {
 // ============================================================
 // Composite N computed viewsheds into ONE union grid + mask so several
 // observers can drape through the app's single viewshed overlay (2D + 3D).
-// The output mask holds the COUNT of observers that see each cell (0 = none),
-// so the color ramp can shade overlap zones darker. Render-only: each record
-// keeps its own full-resolution 0/1 grid/mask (exports are unaffected). Union
-// resolution follows the finest member grid, capped at maxDim per axis so
-// far-apart observers can't explode the canvas.
+// The output mask holds the COUNT of observers that see each cell in its low
+// 7 bits (0 = none, capped at 127); bit 128 flags cells seen by the observer
+// named by opts.activeId, so the color ramp can paint the selected observer's
+// coverage red while overlap zones shade darker green. Render-only: each
+// record keeps its own full-resolution 0/1 grid/mask (exports are
+// unaffected). The single-record case passes grid/mask through BY REFERENCE
+// and ignores activeId — a lone viewshed stays plain green, and flagging it
+// would mutate the persisted record mask. Union resolution follows the
+// finest member grid, capped at maxDim per axis so far-apart observers can't
+// explode the canvas.
 // ============================================================
-function compositeViewsheds(records, maxDim) {
+function compositeViewsheds(records, maxDim, opts) {
   const recs = (records || []).filter(r => r && r.grid && r.mask);
   if (!recs.length) return null;
   if (recs.length === 1) return { grid: recs[0].grid, mask: recs[0].mask };
@@ -649,6 +654,7 @@ function compositeViewsheds(records, maxDim) {
   const mask = new Uint8Array(rows * cols);
   recs.forEach(r => {
     const g = r.grid, m = r.mask;
+    const activeBit = (opts && opts.activeId != null && r.id === opts.activeId) ? 128 : 0;
     const r0 = gridLatToRow(grid, g.bounds.north);
     const r1 = gridLatToRow(grid, g.bounds.south);
     const c0 = gridLngToCol(grid, g.bounds.west);
@@ -663,7 +669,8 @@ function compositeViewsheds(records, maxDim) {
         if (sx < 0 || sx >= g.cols) continue;
         if (m[sy * g.cols + sx]) {
           const idx = row * cols + col;
-          if (mask[idx] < 255) mask[idx]++; // count of observers seeing this cell
+          const cnt = mask[idx] & 127; // low 7 bits = observer count, bit 128 = active observer
+          mask[idx] = (mask[idx] & 128) | (cnt < 127 ? cnt + 1 : 127) | activeBit;
         }
       }
     }
@@ -683,10 +690,19 @@ function canopyColorRamp(heightM) {
   return [_lerp(237, 13, t), _lerp(201, 94, t), _lerp(135, 40, t), 255];
 }
 
-// v = number of observers that see the cell (composite masks carry counts;
-// single-viewshed masks are 0/1). Overlap zones step to darker greens.
+// v = number of observers that see the cell in the low 7 bits (composite
+// masks carry counts; single-viewshed masks are 0/1 — the export path only
+// ever feeds those, so it can never hit the red tiers). Bit 128 = the cell is
+// seen by the SELECTED observer (compositeViewsheds activeId) → red family;
+// overlap zones step darker in both families.
 function viewshedColorRamp(v) {
   if (!v) return [0, 0, 0, 0];
+  if (v & 128) {
+    const others = (v & 127) - 1;             // total count minus the active observer
+    if (others <= 0) return [239, 68, 68, 255]; // selected observer only (red-500)
+    if (others === 1) return [220, 38, 38, 255]; // + 1 other (red-600)
+    return [185, 28, 28, 255];                  // + 2+ others (red-700)
+  }
   if (v === 1) return [34, 197, 94, 255]; // --accent-green (green-500)
   if (v === 2) return [21, 128, 61, 255]; // 2 observers overlap (green-700)
   return [20, 83, 45, 255];               // 3+ observers overlap (green-900)

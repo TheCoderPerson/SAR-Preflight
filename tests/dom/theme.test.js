@@ -64,4 +64,16 @@ describe('map theme toggle', () => {
     // Fixed negative z-index keeps the basemap beneath toggled base overlays.
     expect(zCalls.light).toContain(-1);
   });
+
+  it('pins a base+labels layer-group basemap at -2/-1 (Esri canvas pair)', () => {
+    // The Esri canvas basemap is an L.layerGroup (no setZIndex of its own):
+    // applyTheme must walk its members — base first at -2, labels at -1.
+    const zCalls = [];
+    const member = () => ({ setZIndex(z) { zCalls.push(z); } });
+    S.mapLayers.basemap_dark = { eachLayer(fn) { [member(), member()].forEach(fn); } };
+    S.mapLayers.basemap_light = { eachLayer() {} };
+    S.map = { hasLayer: () => false, addLayer() {}, removeLayer() {} };
+    applyTheme('dark');
+    expect(zCalls).toEqual([-2, -1]);
+  });
 });

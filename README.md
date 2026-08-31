@@ -1,6 +1,8 @@
 # SAR UAS Pre-Flight Intelligence Tool
 
-A browser-based pre-flight intelligence tool for UAS (drone) operators conducting Search and Rescue missions. Consolidates weather, airspace, terrain, fire danger, and operational data into a single map-based interface for Part 107 compliance.
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
+A browser-based pre-flight intelligence tool that assists UAS (drone) operators conducting Search and Rescue missions. Consolidates weather, airspace, terrain, fire danger, and operational data into a single map-based interface to support Part 107 compliance. Advisory only — not an official FAA briefing.
 
 ## Disclaimer
 
@@ -10,13 +12,29 @@ The data displayed in this application may be incomplete, inaccurate, outdated, 
 
 **Users must independently verify all data before flight operations.** Always cross-check critical information (airspace, TFRs, NOTAMs, weather) against official FAA sources, certified weather briefings, and current aeronautical publications. The GO/CAUTION/NO-GO assessment is advisory only and does not replace the Remote Pilot In Command's responsibility to evaluate flight safety.
 
+## Known Limitations
+
+Beyond the per-source caveats in [Data Sources](#data-sources), these limits apply to the tool as a whole:
+
+- **Not an official briefing.** Nothing here substitutes for an official preflight briefing (e.g. [1800wxbrief.com](https://www.1800wxbrief.com/)), the FAA TFR list, or LAANC/B4UFLY. Data shown may be delayed, incomplete, or unavailable.
+- **NOTAMs come from an unofficial endpoint.** The live NOTAM feed drives the public FAA NOTAM Search backend, which is undocumented and may change or break without notice.
+- **Proxy dependence.** Live TFRs, NOTAMs, canopy tiles, and several other layers require the Cloudflare Worker data proxy. If it is down or rate-limited, those features degrade to manual import or become unavailable — the app labels this loudly rather than showing stale data as live.
+- **No offline TFR/NOTAM updates.** Offline, the app can only show previously fetched restriction data, clearly marked with its age; restrictions issued since then will be missing.
+- **Terrain and viewshed are approximations.** The DEM is best-available USGS 3DEP (~3 m effective at best, much coarser in places); viewsheds are modeled line-of-sight and are not a substitute for legal VLOS or on-scene judgment.
+- **Canopy data has gaps and unknown vintage.** The Meta/WRI 1 m canopy height layer is a global model product of unspecified date — trees grow, burn, and get cut. The imagery-assisted canopy editor uses Esri World Imagery, an RGB mosaic of unknown (possibly older) date.
+- **Obstacle and wire data are incomplete by design.** The FAA DOF is not a complete low-altitude inventory, and utility/OSM wire layers miss lines routinely — absence of a plotted hazard is never proof of absence.
+- **Parcels are not survey-accurate.** Assessor compilations can be tens of meters off; never used for legal boundary decisions.
+- **ADS-B traffic is advisory.** Coverage is incomplete (no coverage of non-transponder aircraft), altitudes are raw barometric, and AGL is only as precise as the terrain cell — not deconfliction-grade.
+- **Calculated values are approximations.** Density altitude, battery derating, bird-strike risk, solar/lunar figures, and the GO/CAUTION/NO-GO assessment are computed estimates that may not reflect actual conditions.
+- **Updates are not guaranteed.** This is a volunteer-maintained project provided as-is, with no uptime, update-cadence, or support commitments.
+
 ## Website
 
 https://thecoderperson.github.io/SAR-Preflight/sar-preflight.html
 
 ## Changelog
 
-Version history is in [CHANGELOG.md](CHANGELOG.md). In the app, a **What's New** dialog appears after each update, and a **What's New / Changelog** button lives in Config → App Version.
+Version history is in [CHANGELOG.md](CHANGELOG.md). In the app, a **What's New** dialog appears after each update, and a **What's New / Changelog** button lives in Config → App Version. Each release is tagged `v<version>` in git, so the exact code, disclaimer text, and behavior that shipped at any point are datable from the tag history.
 
 ## How to Use
 
@@ -59,8 +77,8 @@ All data is fetched from free, public APIs. No API keys are required.
 | Terrain DEM — viewshed (best-available, ~3 m effective) **and** ADS-B traffic AGL (cached area raster + per-aircraft `getSamples` point sampling) | [USGS 3DEP](https://www.usgs.gov/3d-elevation-program) Elevation ImageServer (CORS-enabled) | Static |
 | Vegetation (canopy) height — 1 m, for the overlay & viewshed | [Meta/WRI Global Canopy Height](https://registry.opendata.aws/dataforgood-fb-forests/) via a self-hosted Cloudflare Worker proxy (see [`tools/canopy-proxy`](tools/canopy-proxy)) | Static |
 | Sunrise, sunset, civil/nautical twilight | [Sunrise-Sunset.org](https://sunrise-sunset.org/) | Daily |
-| Sun azimuth and elevation | Calculated (solar position algorithm) | Real-time |
-| Moon phase and illumination | Calculated (lunar phase algorithm) | Real-time |
+| Sun azimuth and elevation | Calculated (solar position algorithm) | Computed on demand |
+| Moon phase and illumination | Calculated (lunar phase algorithm) | Computed on demand |
 | Geomagnetic Kp index (GNSS accuracy) | [NOAA SWPC](https://www.swpc.noaa.gov/) | ~1 hr |
 | NWS severe weather alerts | [NWS Weather API](https://www.weather.gov/documentation/services-web-api) | ~15 min |
 | Weather radar animation | [RainViewer](https://www.rainviewer.com/) | ~10 min |
@@ -100,9 +118,9 @@ All data is fetched from free, public APIs. No API keys are required.
 | 3D-view terrain elevation tiles | [AWS Open Data terrain tiles](https://registry.opendata.aws/terrain-tiles/) (Mapzen/Terrarium encoding) | Static |
 | Live ADS-B aircraft traffic (with 15-min trails; AGL computed against the terrain beneath each aircraft via USGS 3DEP, MSL shown as raw barometric) | [adsb.fi](https://adsb.fi/), [airplanes.live](https://airplanes.live/), [adsb.lol](https://www.adsb.lol/) (fallback chain; routed through the data proxy's `/adsb` route when configured, since these providers increasingly block browser CORS) | 5 sec polling |
 | Magnetic declination | Approximate WMM 2025 model | Static |
-| Density altitude | Calculated from station pressure and temperature | Real-time |
-| Battery derating | Calculated from temperature, altitude, wind | Real-time |
-| Bird strike risk | Calculated from season, time of day, terrain, altitude | Real-time |
+| Density altitude | Calculated from station pressure and temperature | Computed on demand |
+| Battery derating | Calculated from temperature, altitude, wind | Computed on demand |
+| Bird strike risk | Calculated from season, time of day, terrain, altitude | Computed on demand |
 
 **Notes:**
 - **FAA TFR:** the FAA TFR GeoServer is CORS-restricted, so direct browser polling is blocked. The app fetches live TFR polygons for your area through the data proxy's `/tfr/` route ([`tools/canopy-proxy`](tools/canopy-proxy); a built-in default proxy ships with the app — proxied server-side with a near-zero cache so they stay current). If the proxy is unreachable, it falls back to area-scoped deep-links + an in-app file/paste importer.
@@ -167,7 +185,7 @@ Full details and a route-by-route breakdown are in **[`tools/canopy-proxy/README
 
 ## License
 
-Licensed under [PolyForm Noncommercial 1.0.0](LICENSE). You may use, modify, and redistribute this code for any **noncommercial purpose** — personal, research, educational, and public-safety/nonprofit use are explicitly covered, which includes volunteer SAR teams and government agencies — provided the license text and required-notice line travel with any copy you distribute. Commercial use requires permission from the copyright holder.
+License: Apache-2.0. Licensed under the [Apache License, Version 2.0](LICENSE). You may use, modify, and redistribute this code, provided the [LICENSE](LICENSE) and [NOTICE](NOTICE) files travel with any copy you distribute. The software is provided **"AS IS"**, without warranty of any kind — see sections 7 and 8 of the license.
 
 ## Offline Use
 

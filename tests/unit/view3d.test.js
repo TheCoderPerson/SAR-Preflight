@@ -64,11 +64,14 @@ describe('build3dStyle', () => {
     expect(def.paint['hillshade-exaggeration']).toBe(0.4);
   });
 
-  it('uses the dark CARTO basemap by default and light when themed', () => {
+  it('uses the dark Esri canvas basemap (base + labels) by default and light when themed', () => {
     const dark = build3dStyle({});
-    expect(dark.sources.basemap.tiles[0]).toContain('dark_all');
+    expect(dark.sources.basemap.tiles[0]).toContain('World_Dark_Gray_Base');
+    expect(dark.sources.basemap_ref.tiles[0]).toContain('World_Dark_Gray_Reference');
+    expect(dark.layers.some(l => l.id === 'basemap_ref')).toBe(true);
     const light = build3dStyle({ theme: 'light' });
-    expect(light.sources.basemap.tiles[0]).toContain('light_all');
+    expect(light.sources.basemap.tiles[0]).toContain('World_Light_Gray_Base');
+    expect(light.sources.basemap_ref.tiles[0]).toContain('World_Light_Gray_Reference');
   });
 
   it('includes only the active base overlay', () => {

@@ -1,7 +1,7 @@
 {
   "name": "sar-preflight",
   "private": true,
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "Apache-2.0",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",

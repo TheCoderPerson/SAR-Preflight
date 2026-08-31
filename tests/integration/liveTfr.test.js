@@ -158,6 +158,25 @@ describe('fetchLiveTFRs (live TFR via proxy)', () => {
     expect(S.tfrs.map(t => t.id)).toContain('MANUAL-1');
   });
 
+  it('on fetch error marks the tfr section and turns the pill red (no stuck loading pill)', async () => {
+    S.sectionMeta.tfr = null;
+    installFetch({ wfsOk: false });
+    await fetchLiveTFRs(bounds);
+    expect(S.sectionMeta.tfr.status).toBe('error');
+    const pill = document.getElementById('notamStatus');
+    expect(pill.className).toContain('error');
+    expect(pill.textContent).toBe('TFR FAILED');
+  });
+
+  it('on success stamps the tfr section with the fetch time', async () => {
+    S.sectionMeta.tfr = null;
+    installFetch();
+    const before = Date.now();
+    await fetchLiveTFRs(bounds);
+    expect(S.sectionMeta.tfr.status).toBe('live');
+    expect(S.sectionMeta.tfr.updatedAt).toBeGreaterThanOrEqual(before);
+  });
+
   it('tfrGeoJsonUrlForBounds still builds the direct GeoServer URL', () => {
     const url = tfrGeoJsonUrlForBounds(bounds);
     expect(url).toContain('tfr.faa.gov/geoserver/TFR/ows');

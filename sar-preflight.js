@@ -25,6 +25,8 @@ const S = {
   _aggPopup: { items: [], index: 0, popup: null },
   // Imported FAA TFR/NOTAM data (no-server file import)
   tfrs: [], importedNotams: [], tfrImportMeta: null,
+  notamFetchMeta: null,          // { fetchedAtMs, source:'live', cached? } — NOTAM leg's own stamp
+  restrictionCacheExpired: null, // { atMs } — a >4h-old cached TFR/NOTAM record was refused
   // Track data source errors for retry/display
   dataSourceErrors: {},
   // Track active fetches for header status
@@ -46,6 +48,8 @@ const S = {
   adsbTrails: {},
   adsbSearchRadiusNm: null,
   _adsbPollTimer: null,
+  _adsbPolling: false,      // true while the poll loop is active (timer id alone goes stale between polls)
+  _adsbFailStreak: 0,       // consecutive polls where EVERY source failed — drives adsbPollDelay backoff
   _adsbLastFetch: 0,
   _adsbApiIndex: 0,
   _adsbEnabled: true,
@@ -57,6 +61,9 @@ const S = {
   // deconfliction-relevant subset of traffic, keyed by rounded lat,lng
   _adsbHiresCache: null,
   _adsbHiresFetching: false,
+  // Selected-aircraft panel: one map-anchored popup that follows the plane
+  // across marker rebuilds and refreshes its data each poll
+  _adsbSel: { hex: null, popup: null, lostAt: null, lastAc: null },
   // Vegetation overlay + viewshed
   canopy: {},
   viewsheds: [],            // saved observer viewshed records (see makeViewshedRecord)
@@ -168,7 +175,7 @@ const Diag = {
       }
       // 4) Heartbeat so idle/panning sessions still get timestamped heap + DOM samples.
       if (typeof setInterval !== 'undefined') setInterval(() => this.note('heartbeat', this._domSnapshot()), 20000);
-      const ver = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : ((typeof APP_VERSION !== 'undefined') ? APP_VERSION : '?');
+      const ver = (typeof SAR_VERSION !== 'undefined') ? SAR_VERSION : '?';
       this.note('app.start', { v: ver, mode: this._uaTag() });
     } catch (_) { /* never throw */ }
   },
@@ -587,9 +594,9 @@ function updateSectionalEditionUI(edition, opts) {
 
 // --- Map theme (dark / light-map / full-light) ---
 // Three modes, cycled by a manual button and persisted to localStorage:
-//   dark      — CARTO dark basemap + dark HUD palette (default)
-//   light-map — CARTO light basemap, dark HUD palette (bright-day map, HUD intact)
-//   light     — CARTO light basemap + full light UI palette
+//   dark      — dark canvas basemap + dark HUD palette (default)
+//   light-map — light canvas basemap, dark HUD palette (bright-day map, HUD intact)
+//   light     — light canvas basemap + full light UI palette
 // The data-theme attribute drives the CSS palette ([data-theme="light"] only);
 // the basemap swap is done here in JS.
 const THEME_MODES = ['dark', 'light-map', 'light'];
@@ -618,6 +625,12 @@ function applyTheme(theme) {
     // repeated theme switches and can leave the basemap ABOVE the base overlays —
     // hiding them when toggled on. A fixed negative z-index is deterministic.
     if (typeof want.setZIndex === 'function') want.setZIndex(-1);
+    // Esri canvas basemaps are a group (base + reference labels): base at -2,
+    // labels at -1 — both beneath toggled base overlays, labels above their base.
+    else if (typeof want.eachLayer === 'function') {
+      let z = -2;
+      want.eachLayer(l => { if (typeof l.setZIndex === 'function') l.setZIndex(z++); });
+    }
   }
   try { localStorage.setItem('sar_theme', theme); } catch (e) { /* private mode */ }
   const btn = (typeof document !== 'undefined') ? document.getElementById('themeToggle') : null;
@@ -688,8 +701,17 @@ function initMap() {
   // Parcels are view-driven: refetch (debounced) after every pan/zoom while on.
   try { S.map.on('moveend', _parcelsOnMoveEnd); } catch (_) {}
   // Tracked basemaps so the theme toggle can swap between them (dark default).
-  S.mapLayers.basemap_dark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
-  S.mapLayers.basemap_light = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; CARTO' });
+  // Esri Canvas replaced CARTO in Aug 2026: CARTO began watermarking keyless
+  // basemap tiles "API KEY REQUIRED" (served as normal HTTP 200 PNGs, so no
+  // error path fires). Esri splits place labels into a separate Reference
+  // service, so each basemap is a base+labels pair in one layer group; native
+  // z16 in North America, upscaled past that (like the sectional).
+  const esriCanvasPair = kind => L.layerGroup([
+    L.tileLayer(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${kind}_Gray_Base/MapServer/tile/{z}/{y}/{x}`, { maxNativeZoom: 16, maxZoom: 19, attribution: 'Esri, HERE, Garmin, OpenStreetMap contributors' }),
+    L.tileLayer(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${kind}_Gray_Reference/MapServer/tile/{z}/{y}/{x}`, { maxNativeZoom: 16, maxZoom: 19 }),
+  ]);
+  S.mapLayers.basemap_dark = esriCanvasPair('Dark');
+  S.mapLayers.basemap_light = esriCanvasPair('Light');
   applyTheme(getStoredTheme());
   // crossOrigin: the canopy VEG classifier reads these tiles' PIXELS. Requesting
   // them CORS-mode means the tiles Leaflet has already displayed land in the SW
@@ -787,10 +809,12 @@ function initMap() {
     );
   }
 
-  // Start with panel collapsed on mobile
+  // Start with panels collapsed on mobile
   if (window.innerWidth <= 900) {
     S.panelOpen = false;
     document.getElementById('sidePanel')?.classList.add('collapsed');
+    document.getElementById('drawToolbar')?.classList.add('collapsed');
+    document.getElementById('layerControl')?.classList.add('collapsed');
   }
 
   // Middle-mouse button panning (allows map drag while drawing tools are active)
@@ -1414,6 +1438,10 @@ async function retryFailedSource(source) {
     'Avalanche': () => fetchAvalanche(bounds),
     'Airports': () => fetchNearbyAirports(S.areaCenter, bounds),
     'ADS-B': () => fetchAdsb(),
+    // The combined check is the unit of truth — retrying one leg alone would
+    // leave S.autoCheck lying about the other, so both keys re-run the pair.
+    'TFR': () => fetchLiveRestrictions(S.areaCenter, S.areaBounds),
+    'NOTAM': () => fetchLiveRestrictions(S.areaCenter, S.areaBounds),
   };
   const fn = retryMap[source];
   if (fn) {
@@ -1565,6 +1593,19 @@ const SECTION_DEFS = {
     label: 'Named Trails', computes: null,
     fetch: (c, b) => fetchTrails(b),
     lines: [{ id: 'meta_trails', button: true }],
+  },
+  // The combined live check is the unit of truth for both: refreshing one
+  // source alone would leave S.autoCheck lying about the other, so both
+  // UPDATE buttons re-run the pair.
+  tfr: {
+    label: 'TFRs (live check)', computes: 'assessment',
+    fetch: (c, b) => fetchLiveRestrictions(c, b),
+    lines: [{ id: 'meta_tfr', button: true }],
+  },
+  notam: {
+    label: 'NOTAMs (live check)', computes: 'assessment',
+    fetch: (c, b) => fetchLiveRestrictions(c, b),
+    lines: [{ id: 'meta_notam', button: true }],
   },
 };
 
@@ -2633,7 +2674,10 @@ async function fetchLiveTFRs(bounds) {
   trackFetchStart('TFR');
   setStatus('notamStatus', 'loading', 'TFR…');
   try {
-    const res = await _proxyFetch(base + '/tfr/geoserver/TFR/ows' + _tfrWfsQuery(bounds));
+    // no-store: the SW routes /tfr/ network-only, so keep the browser HTTP
+    // cache from answering in its place — a cached body here would be
+    // reported to the user as a LIVE check.
+    const res = await _proxyFetch(base + '/tfr/geoserver/TFR/ows' + _tfrWfsQuery(bounds), { cache: 'no-store' });
     if (!res.ok) throw new Error('TFR HTTP ' + res.status);
     const gj = await res.json();
     const parsed = (typeof parseTfrGeoJson === 'function') ? parseTfrGeoJson(gj) : { tfrs: [] };
@@ -2646,11 +2690,15 @@ async function fetchLiveTFRs(bounds) {
     // detail XML (the GeoServer WFS feed carries geometry + id + title only).
     await enrichLiveTfrDetails(base, tfrs);
     afterFaaImport();
+    markSection('tfr', { status: 'live', updatedAt: S.tfrImportMeta.importedAtMs, error: null });
+    if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
     setStatus('notamStatus', 'live', tfrs.length ? `${tfrs.length} TFR${tfrs.length > 1 ? 'S' : ''} LIVE` : 'NO TFR (LIVE)');
     clearDataSourceError('TFR');
   } catch (e) {
     console.warn('Live TFR fetch failed:', e);
     recordDataSourceError('TFR', e);
+    markSection('tfr', { status: 'error', error: (e && e.message) ? e.message : String(e) });
+    setStatus('notamStatus', 'error', 'TFR FAILED'); // never leave the loading pill up
     // leave the manual import flow / any cached TFRs in place
   } finally {
     trackFetchEnd('TFR');
@@ -2671,7 +2719,7 @@ async function enrichLiveTfrDetails(base, tfrs) {
 
 async function _fetchTfrDetail(base, id) {
   const fileId = String(id).replace(/\//g, '_'); // '4/3635' -> 'detail_4_3635.xml'
-  const res = await _proxyFetch(base + '/tfr/download/detail_' + fileId + '.xml');
+  const res = await _proxyFetch(base + '/tfr/download/detail_' + fileId + '.xml', { cache: 'no-store' });
   if (!res.ok) return null;
   const xml = await res.text();
   const d = (parseTfrDetailXml(xml).tfrs || [])[0];
@@ -2708,7 +2756,7 @@ async function fetchNotams(lat, lng, radiusNm) {
   trackFetchStart('NOTAM');
   try {
     const r = Math.max(5, Math.min(100, Math.round(radiusNm || 20)));
-    const res = await _proxyFetch(base + '/notam?lat=' + lat.toFixed(5) + '&lng=' + lng.toFixed(5) + '&radius=' + r);
+    const res = await _proxyFetch(base + '/notam?lat=' + lat.toFixed(5) + '&lng=' + lng.toFixed(5) + '&radius=' + r, { cache: 'no-store' });
     if (!res.ok) throw new Error('NOTAM HTTP ' + res.status);
     const data = await res.json();
     const parsed = (typeof parseNotamSearchResponse === 'function') ? parseNotamSearchResponse(data) : [];
@@ -2723,27 +2771,25 @@ async function fetchNotams(lat, lng, radiusNm) {
     renderImportedNotamLayer();
     renderNotamCards();
     if (S.currentArea) computeAssessment();
+    S.notamFetchMeta = { fetchedAtMs: Date.now(), source: 'live' };
+    markSection('notam', { status: 'live', updatedAt: S.notamFetchMeta.fetchedAtMs, error: null });
+    if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+    // NOTAMs persist on their own success: afterFaaImport runs inside
+    // fetchLiveTFRs BEFORE this fetch, so a failed TFR leg used to mean a
+    // successful NOTAM result was never written to IndexedDB at all.
+    _persistRestrictionCache();
     clearDataSourceError('NOTAM');
   } catch (e) {
     console.warn('Live NOTAM fetch failed:', e);
     recordDataSourceError('NOTAM', e);
+    markSection('notam', { status: 'error', error: (e && e.message) ? e.message : String(e) });
   } finally {
     trackFetchEnd('NOTAM');
   }
 }
 
-// Orchestrate live TFR + NOTAM for an area and set a single combined status.
-async function fetchLiveRestrictions(center, bounds) {
-  if (!center) return;
-  const proxySet = typeof getCanopyProxyBase === 'function' && !!getCanopyProxyBase();
-  if (!proxySet) { S.autoCheck = { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 }; renderAutoCheckStatus(); return; }
-  if (typeof isOnline === 'function' && !isOnline()) { S.autoCheck = { state: 'error', ms: Date.now(), tfrCount: 0, notamCount: 0 }; renderAutoCheckStatus(); return; }
-
-  clearDataSourceError('TFR'); clearDataSourceError('NOTAM');
-  S.autoCheck = { state: 'checking', ms: 0, tfrCount: 0, notamCount: 0 };
-  renderAutoCheckStatus();
-
-  await fetchLiveTFRs(bounds);
+// NOTAM search radius sized to the drawn area (10–50 NM).
+function _notamSearchRadiusNm(center, bounds) {
   let radiusNm = 20;
   try {
     if (bounds && typeof haversine === 'function') {
@@ -2752,14 +2798,39 @@ async function fetchLiveRestrictions(center, bounds) {
       radiusNm = Math.max(10, Math.min(50, Math.round(km / 1.852) + 10));
     }
   } catch (_) { /* default radius */ }
-  await fetchNotams(center.lat, center.lng, radiusNm);
+  return radiusNm;
+}
+
+// Orchestrate live TFR + NOTAM for an area and set a single combined status.
+async function fetchLiveRestrictions(center, bounds) {
+  if (!center) return;
+  const proxySet = typeof getCanopyProxyBase === 'function' && !!getCanopyProxyBase();
+  if (!proxySet) { S.autoCheck = { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 }; renderAutoCheckStatus(); return; }
+  if (typeof isOnline === 'function' && !isOnline()) {
+    S.autoCheck = { state: 'error', ms: Date.now(), tfrCount: 0, notamCount: 0, tfrOk: false, notamOk: false };
+    renderAutoCheckStatus();
+    return;
+  }
+
+  clearDataSourceError('TFR'); clearDataSourceError('NOTAM');
+  S.autoCheck = { state: 'checking', ms: 0, tfrCount: 0, notamCount: 0 };
+  renderAutoCheckStatus();
+
+  await fetchLiveTFRs(bounds);
+  await fetchNotams(center.lat, center.lng, _notamSearchRadiusNm(center, bounds));
 
   const nt = (S.tfrs || []).filter(t => t._live).length;
   const nn = (S.importedNotams || []).filter(n => n._live).length;
-  const bothFailed = S.dataSourceErrors && S.dataSourceErrors.TFR && S.dataSourceErrors.NOTAM;
-  const state = (bothFailed && nt === 0 && nn === 0) ? 'error' : 'ok';
-  S.autoCheck = { state, ms: Date.now(), tfrCount: nt, notamCount: nn };
+  const tfrOk = !(S.dataSourceErrors && S.dataSourceErrors.TFR);
+  const notamOk = !(S.dataSourceErrors && S.dataSourceErrors.NOTAM);
+  // EITHER failure is an error: stale _live survivors from a previous pass
+  // must never let a failed check report CHECKED (the silent-stale bug).
+  const state = (tfrOk && notamOk) ? 'ok' : 'error';
+  S.autoCheck = { state, ms: Date.now(), tfrCount: nt, notamCount: nn, tfrOk, notamOk };
   renderAutoCheckStatus();
+  renderTfrCards();       // empty-state lines depend on the per-source outcome
+  renderNotamCards();
+  showDataSourceStatus(); // top-level red DATA SOURCE ERRORS banner incl. TFR/NOTAM
 
   // Combined compact badge on the import section (kept for continuity).
   const parts = [];
@@ -2774,18 +2845,18 @@ function reCheckRestrictionsNow() {
   fetchLiveRestrictions(S.areaCenter, S.areaBounds);
 }
 
-// Context-aware empty-state for the TFR/NOTAM card lists, so "auto-checked, none
-// found" reads differently from "nothing loaded yet". kind = 'TFRs' | 'NOTAMs'.
+// Context-aware empty-state for the TFR/NOTAM card lists — per-source, so a
+// split outcome renders honestly (a live TFR leg still says "no active TFRs"
+// while a failed NOTAM leg says UNKNOWN). Pure logic in core.js.
 function _restrictionEmptyMsg(kind) {
-  const proxySet = typeof getCanopyProxyBase === 'function' && getCanopyProxyBase();
-  if (proxySet && S.currentArea && S.autoCheck) {
-    if (S.autoCheck.state === 'checking') return `Checking for ${kind}…`;
-    if (S.autoCheck.state === 'ok') return `Auto-checked — no active ${kind} in this area.`;
-    if (S.autoCheck.state === 'error') return `Auto-check failed — import ${kind} manually below, or Re-check.`;
-  }
-  return kind === 'TFRs'
-    ? 'No TFR file imported. Download via the links above, then import.'
-    : 'No NOTAMs parsed yet.';
+  const proxySet = typeof getCanopyProxyBase === 'function' && !!getCanopyProxyBase();
+  const sm = (S.sectionMeta && S.sectionMeta[kind === 'TFRs' ? 'tfr' : 'notam']) || {};
+  return buildRestrictionEmptyMsg({
+    kind, proxySet, hasArea: !!S.currentArea,
+    state: (S.autoCheck || {}).state || 'idle',
+    srcStatus: sm.status || 'never',
+    atMs: sm.updatedAt != null ? sm.updatedAt : sm.cachedAt,
+  }, Date.now(), (typeof _localTZ === 'function') ? _localTZ() : undefined);
 }
 
 // Prominent "was this auto-checked?" panel at the top of the NOTAMs tab.
@@ -2800,42 +2871,27 @@ function renderAutoCheckStatus() {
   const proxySet = typeof getCanopyProxyBase === 'function' && !!getCanopyProxyBase();
   const hasArea = !!S.currentArea;
   const ac = S.autoCheck || {};
-  let color = 'var(--text-muted)', badge = '', badgeCls = 'fetch-status', detail = '', showBtn = false;
 
-  if (!proxySet) {
-    badge = 'OFF';
-    detail = 'Automatic FAA check is off. Add a Data proxy URL in Config to auto-fetch live TFRs & NOTAMs per area. Until then, use the manual import below.';
-  } else if (!hasArea) {
-    color = 'var(--accent-cyan)'; badge = 'READY';
-    detail = 'Draw an operational area — TFRs and NOTAMs are then checked automatically for it.';
-  } else if (ac.state === 'checking') {
-    color = 'var(--accent-amber)'; badge = 'CHECKING…'; badgeCls = 'fetch-status loading';
-    detail = 'Fetching live TFRs and NOTAMs for this area…';
-  } else if (ac.state === 'ok') {
-    color = 'var(--accent-green)'; badge = 'CHECKED'; badgeCls = 'fetch-status live';
-    const age = ac.ms && typeof formatAge === 'function' ? formatAge(Date.now() - ac.ms) : '';
-    const parts = [];
-    if (ac.tfrCount) parts.push(`${ac.tfrCount} TFR${ac.tfrCount > 1 ? 's' : ''}`);
-    if (ac.notamCount) parts.push(`${ac.notamCount} NOTAM${ac.notamCount > 1 ? 's' : ''}`);
-    detail = (parts.length ? `Auto-checked ${age} ago • ${parts.join(' • ')} in/near this area.`
-                           : `Auto-checked ${age} ago • no active TFRs or NOTAMs in this area.`)
-           + ' Advisory — verify against an official briefing before flight.';
-    showBtn = true;
-  } else if (ac.state === 'error') {
-    color = 'var(--accent-red)'; badge = 'FAILED'; badgeCls = 'fetch-status error';
-    detail = (typeof isOnline === 'function' && !isOnline())
-      ? 'Offline — could not auto-check; using any cached/manual data. Re-check when back online.'
-      : 'Auto-check failed to reach the FAA sources. Use the manual import below, or Re-check now.';
-    showBtn = true;
-  } else {
-    color = 'var(--accent-cyan)'; badge = 'READY';
-    detail = 'Ready — redraw or re-check to fetch live TFRs and NOTAMs for this area.';
-    showBtn = true;
-  }
+  // All wording/fail-safe logic lives in the pure resolver (core.js).
+  const d = buildAutoCheckDisplay({
+    proxySet, hasArea,
+    online: (typeof isOnline !== 'function') || isOnline(),
+    state: ac.state || 'idle',
+    tfr: (S.sectionMeta && S.sectionMeta.tfr) || null,
+    notam: (S.sectionMeta && S.sectionMeta.notam) || null,
+    tfrCount: ac.tfrCount || 0,
+    notamCount: ac.notamCount || 0,
+    manualImport: (S.tfrImportMeta && S.tfrImportMeta.fileName !== 'live') ? S.tfrImportMeta : null,
+  }, Date.now(), (typeof _localTZ === 'function') ? _localTZ() : undefined);
+
+  const color = {
+    muted: 'var(--text-muted)', cyan: 'var(--accent-cyan)', amber: 'var(--accent-amber)',
+    green: 'var(--accent-green)', red: 'var(--accent-red)',
+  }[d.colorToken] || 'var(--text-muted)';
 
   if (ind) ind.style.background = color;
-  if (sta) { sta.className = badgeCls; sta.textContent = badge; }
-  if (det) det.textContent = detail;
+  if (sta) { sta.className = d.badgeCls; sta.textContent = d.badge; }
+  if (det) det.textContent = d.detail;
   if (btn) btn.style.display = (proxySet && hasArea) ? '' : 'none';
   sec.style.borderLeftColor = color;
   sec.style.display = '';
@@ -2895,13 +2951,27 @@ async function renderNotamsTab(lat, lng) {
       typeof getCachedApiResponse === 'function' && S.areaCenter) {
     try {
       const rec = await getCachedApiResponse('tfr_import', areaKey(S.areaCenter.lat, S.areaCenter.lng));
-      if (rec && rec.data) {
-        S.tfrs = rec.data.tfrs || [];
-        S.importedNotams = rec.data.notams || [];
-        S.tfrImportMeta = rec.data.meta || null;
-        if (S.tfrImportMeta) S.tfrImportMeta.cached = true;
-        renderImportedTfrLayer();
-        renderImportedNotamLayer();
+      // Re-check emptiness AFTER the await — fetchLiveRestrictions runs
+      // concurrently from processArea, and a late IDB read must never
+      // clobber a live result that landed in the meantime.
+      const stillEmpty = (!S.tfrs || !S.tfrs.length) && (!S.importedNotams || !S.importedNotams.length);
+      if (rec && rec.data && stillEmpty) {
+        if (rec.status === 'expired') {
+          // >4x the 1 h TTL — refuse to show it. Restrictions this old are
+          // more dangerous rendered than absent.
+          S.restrictionCacheExpired = { atMs: (rec.data.meta && rec.data.meta.importedAtMs) || rec.timestamp };
+          setStatus('notamStatus', 'expired', 'CACHE EXPIRED');
+        } else { // 'fresh' or 'stale' — show, loudly labeled as cached
+          S.tfrs = rec.data.tfrs || [];
+          S.importedNotams = rec.data.notams || [];
+          S.tfrImportMeta = rec.data.meta || null;
+          if (S.tfrImportMeta) S.tfrImportMeta.cached = true;
+          S.notamFetchMeta = rec.data.notamMeta ? Object.assign({}, rec.data.notamMeta, { cached: true }) : null;
+          if (S.tfrs.length) markSection('tfr', { status: 'cached', cachedAt: rec.timestamp });
+          if (S.importedNotams.length) markSection('notam', { status: 'cached', cachedAt: rec.timestamp });
+          renderImportedTfrLayer();
+          renderImportedNotamLayer();
+        }
       }
     } catch (_) { /* ignore cache errors */ }
   }
@@ -3037,15 +3107,30 @@ function renderImportStatus() {
   const el = document.getElementById('tfrStaleBanner');
   if (!el) return;
   const meta = S.tfrImportMeta;
-  if (!meta) { el.style.display = 'none'; el.textContent = ''; return; }
+  if (!meta) {
+    // No data at all — but a refused expired cache still deserves a loud line.
+    if (S.restrictionCacheExpired) {
+      const tz = (typeof _localTZ === 'function') ? _localTZ() : undefined;
+      el.style.display = '';
+      el.style.color = 'var(--accent-red)';
+      el.style.borderColor = 'var(--accent-red)';
+      el.textContent = `Cached TFR/NOTAM data from ${formatStamp(S.restrictionCacheExpired.atMs, Date.now(), tz)} has EXPIRED and is not shown. Re-check now, or obtain an official briefing at 1800wxbrief.com.`;
+      return;
+    }
+    el.style.display = 'none'; el.textContent = ''; return;
+  }
   const age = Date.now() - (meta.importedAtMs || Date.now());
   const ageStr = typeof formatAge === 'function' ? formatAge(age) : Math.round(age / 60000) + 'm';
   const stale = age > 60 * 60 * 1000;
   el.style.display = '';
   el.style.color = stale ? 'var(--accent-red)' : 'var(--text-muted)';
   el.style.borderColor = stale ? 'var(--accent-red)' : 'var(--border)';
-  el.textContent = `Imported ${meta.fileName || 'data'} • ${ageStr} ago${meta.cached ? ' (cached)' : ''}` +
-    (stale ? ' — re-verify ≤ 1 hr before launch' : '');
+  // Live fetches say when the data was FETCHED; manual imports keep the
+  // exact legacy string (semantics unchanged for the no-proxy workflow).
+  const label = meta.fileName === 'live'
+    ? `Live FAA data fetched ${formatStamp(meta.importedAtMs, Date.now(), (typeof _localTZ === 'function') ? _localTZ() : undefined)} • ${ageStr} ago${meta.cached ? ' (cached)' : ''}`
+    : `Imported ${meta.fileName || 'data'} • ${ageStr} ago${meta.cached ? ' (cached)' : ''}`;
+  el.textContent = label + (stale ? ' — STALE: re-verify ≤ 1 hr before launch' : '');
 }
 
 function renderImportedTfrLayer() {
@@ -3207,6 +3292,17 @@ function mergeNotams(incoming) {
   S.importedNotams = Object.values(byId);
 }
 
+// Single writer of the per-area "tfr_import" IndexedDB record (TTL 1 h).
+function _persistRestrictionCache() {
+  if (typeof cacheApiResponse === 'function' && S.areaCenter) {
+    cacheApiResponse('tfr_import', areaKey(S.areaCenter.lat, S.areaCenter.lng), {
+      tfrs: S.tfrs, notams: S.importedNotams, meta: S.tfrImportMeta,
+      notamMeta: S.notamFetchMeta || null,
+    });
+  }
+  S.restrictionCacheExpired = null; // any successful write supersedes the expired-cache warning
+}
+
 function afterFaaImport() {
   renderImportedTfrLayer();
   renderImportedNotamLayer();
@@ -3215,10 +3311,13 @@ function afterFaaImport() {
   renderImportStatus();
   setStatus('notamStatus', (S.tfrs && S.tfrs.length) ? 'live' : 'manual',
     (S.tfrs && S.tfrs.length) ? `${S.tfrs.length} TFR${S.tfrs.length > 1 ? 'S' : ''}` : 'IMPORT');
-  if (typeof cacheApiResponse === 'function' && S.areaCenter) {
-    cacheApiResponse('tfr_import', areaKey(S.areaCenter.lat, S.areaCenter.lng), {
-      tfrs: S.tfrs, notams: S.importedNotams, meta: S.tfrImportMeta,
-    });
+  _persistRestrictionCache();
+  // Stamp manual imports too, so a later failed live check can say
+  // "showing <import time> data" instead of pretending there is nothing.
+  const meta = S.tfrImportMeta;
+  if (meta && meta.fileName !== 'live') {
+    const isNotamImport = meta.source === 'notam-text' || meta.source === 'notam-paste';
+    markSection(isNotamImport ? 'notam' : 'tfr', { status: 'live', updatedAt: meta.importedAtMs, error: null });
   }
   if (S.currentArea) computeAssessment();
 }
@@ -5953,6 +6052,7 @@ async function fetchAdsb() {
   if (!S.areaCenter || !S.adsbSearchRadiusNm) return;
   trackFetchStart('ADS-B');
   setStatus('adsbStatus', 'loading', 'Polling...');
+  const fails = []; // per-source reasons, folded into ONE summary line on total failure
   try {
     const lat = S.areaCenter.lat.toFixed(4);
     const lon = S.areaCenter.lng.toFixed(4);
@@ -5970,13 +6070,15 @@ async function fetchAdsb() {
         break;
       } catch (e) {
         lastErr = e;
-        console.warn(`ADS-B ${a.name} failed:`, e.message);
+        fails.push(`${a.name}: ${e.message}`);
       }
     }
     if (!json) throw lastErr || new Error('All ADS-B APIs failed');
+    if (S._adsbFailStreak > 0) console.info(`ADS-B recovered via ${usedApi} after ${S._adsbFailStreak} failed poll${S._adsbFailStreak > 1 ? 's' : ''}`);
+    S._adsbFailStreak = 0;
     ensureAdsbDem(); // load/refresh terrain DEM for per-aircraft AGL (non-blocking, self-guarded)
     const groundFn = adsbGroundElevFnFt();
-    const aircraft = parseAdsbAircraft(json.ac || [], S.areaCenter.lat, S.areaCenter.lng, groundFn);
+    const aircraft = parseAdsbAircraft(adsbAircraftList(json), S.areaCenter.lat, S.areaCenter.lng, groundFn);
     S.adsbAircraft = aircraft;
     S._adsbLastFetch = Date.now();
     updateAdsbTrails(aircraft);
@@ -5994,8 +6096,17 @@ async function fetchAdsb() {
     recordDataSourceError('ADS-B', err);
     markSection('adsb', { status: 'error', error: err && err.message ? err.message : String(err) });
     // Both the proxy /adsb route and the direct providers are unreachable
-    // (CORS / upstream 5xx). Polling continues, so it will retry automatically.
-    setStatus('adsbStatus', 'error', 'UNAVAILABLE — RETRYING');
+    // (CORS / upstream 5xx). Back off instead of hammering refusing providers,
+    // and log ONE summary per escalation tier instead of a wall per poll.
+    S._adsbFailStreak++;
+    const delayS = Math.round(adsbPollDelay(S._adsbFailStreak, ADSB_POLL_MS) / 1000);
+    if (S._adsbFailStreak <= 3) {
+      console.warn(`ADS-B unavailable (${fails.join('; ') || (err && err.message) || err}) — retrying every ${delayS}s`);
+    }
+    setStatus('adsbStatus', 'error', 'UNAVAILABLE — RETRY ' + delayS + 's');
+    const pollEl = document.getElementById('adsbPollStatus');
+    if (pollEl) pollEl.textContent = 'Unavailable — retrying every ' + delayS + 's';
+    refreshAdsbPanel(); // keep an open aircraft card's data-age ticking through the outage
   } finally {
     trackFetchEnd('ADS-B');
   }
@@ -6087,12 +6198,20 @@ function renderAdsbMap() {
     const icon = L.divIcon({ html, className: '', iconSize: [80, 56], iconAnchor: [40, 14] });
     const marker = L.marker([ac.lat, ac.lon], { icon, zIndexOffset: 800 });
 
-    marker.bindPopup(_adsbPopupHtml(ac));
+    // Dedicated click → live panel (not bindPopup: a bound popup dies with the
+    // marker on the next rebuild; aggregation skips this layer for the same
+    // reason). Pick-mode routing matches _aggFeatureClick.
+    marker.on('click', e => {
+      if (S._viewshedPicking) { onViewshedMapClick(e.latlng); return; }
+      openAdsbPanel(ac);
+    });
 
     S.mapLayers.adsb_aircraft.addLayer(marker);
   }
 
   if (needsLayerControlRebuild) buildLayerControl();
+  // Keep the selected-aircraft panel following its plane with fresh data.
+  refreshAdsbPanel();
   // Mirror the fresh positions into the 3D view (fast setData path).
   if (S.is3D && typeof _refresh3dAircraft === 'function') _refresh3dAircraft();
 }
@@ -6124,6 +6243,97 @@ function _adsbPopupHtml(ac) {
     `Dist: ${ac.distNm} nm<br>` +
     `<span style="opacity:0.5;">ICAO: ${ac.hex.toUpperCase()}</span>` +
   `</div>`;
+}
+
+// ── Selected-aircraft panel ─────────────────────────────────────────────
+// One map-anchored popup (NOT marker-bound — renderAdsbMap's clearLayers()
+// would close a bound one every poll) keyed by aircraft hex. It follows the
+// plane and refreshes its data each render, and closes on X, click-away
+// (Leaflet's closePopupOnClick), the layer toggling off, or 30 s of signal
+// loss after the hex leaves the feed.
+const ADSB_PANEL_LOST_MS = 30000;
+
+// Popup body + live footer: data age while tracking, red SIGNAL LOST banner
+// (with last data frozen) once the hex drops out of the feed. Age = the
+// provider's own delay (ac.seen) PLUS time since our last successful poll, so
+// during a total outage (backed-off polls, no fresh feed) an open card
+// visibly goes stale instead of pretending the data is a few seconds old.
+function _adsbPanelHtml(ac, lostSecs) {
+  const ageS = ac.seen != null
+    ? Math.max(0, Math.round(ac.seen + (S._adsbLastFetch ? (Date.now() - S._adsbLastFetch) / 1000 : 0)))
+    : null;
+  const foot = lostSecs != null
+    ? `<span style="color:#ef4444;font-weight:bold;">SIGNAL LOST — last seen ${lostSecs}s ago</span>`
+    : (ageS != null ? `<span style="opacity:0.5;">data age: ${ageS}s</span>` : '');
+  return _adsbPopupHtml(ac) +
+    (foot ? `<div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;padding-top:3px;border-top:1px solid rgba(128,128,128,0.3);">${foot}</div>` : '');
+}
+
+function openAdsbPanel(ac) {
+  if (!S.map || !ac || !ac.hex) return;
+  // Don't hijack clicks while a draw tool is placing points (mirrors openAggregatePopup).
+  if (typeof document !== 'undefined' && document.querySelector('.draw-btn.active')) return;
+  const st = S._adsbSel;
+  if (!st.popup) {
+    st.popup = L.popup({ maxWidth: 300, autoPan: true, closeButton: true, offset: L.point(0, -18), className: 'adsb-popup' });
+    // 'remove' fires on X-close, click-away, and displacement by another
+    // popup's openOn — all mean "deselect".
+    st.popup.on('remove', () => { st.hex = null; st.lostAt = null; });
+  }
+  st.popup.options.autoPan = true; // pan into view on open only
+  st.popup.setLatLng([ac.lat, ac.lon]);
+  st.popup.setContent(_adsbPanelHtml(ac));
+  st.popup.openOn(S.map);
+  st.popup.options.autoPan = false; // live re-anchoring must never pan the map
+  // Select AFTER openOn: reopening an already-open popup can fire a transient
+  // 'remove' that would clear the selection just made.
+  st.hex = ac.hex;
+  st.lastAc = ac;
+  st.lostAt = null;
+  // Clicks inside the panel must not count as click-away (re-applied each
+  // open — Leaflet recreates the container when the popup is re-added).
+  const el = st.popup.getElement && st.popup.getElement();
+  if (el && !el._adsbStop && typeof L !== 'undefined' && L.DomEvent) {
+    el._adsbStop = true;
+    L.DomEvent.disableClickPropagation(el);
+  }
+}
+
+function closeAdsbPanel() {
+  const st = S._adsbSel;
+  if (st.popup && S.map && S.map.hasLayer(st.popup)) S.map.closePopup(st.popup);
+  st.hex = null; // defensive — the remove handler normally clears these
+  st.lostAt = null;
+}
+
+// Called at the end of every renderAdsbMap pass (which can run more than once
+// per poll — hence time-based, not miss-count, signal-loss tracking).
+function refreshAdsbPanel() {
+  const st = S._adsbSel;
+  if (!st.hex || !st.popup || !S.map) return;
+  // Layer toggled off / PLANS-suppressed / removed directly → panel goes too.
+  if (!S.mapLayers.adsb_aircraft || !S.map.hasLayer(S.mapLayers.adsb_aircraft)) { closeAdsbPanel(); return; }
+  const res = resolveAdsbSelection(st.hex, S.adsbAircraft, st.lostAt, Date.now(), ADSB_PANEL_LOST_MS);
+  if (res.action === 'update') {
+    st.lastAc = res.ac;
+    st.lostAt = null;
+    st.popup.setLatLng([res.ac.lat, res.ac.lon]);
+    st.popup.setContent(_adsbPanelHtml(res.ac));
+  } else if (res.action === 'lost') {
+    if (st.lostAt == null) st.lostAt = Date.now();
+    if (st.lastAc) st.popup.setContent(_adsbPanelHtml(st.lastAc, res.lostSecs));
+  } else if (res.action === 'close') {
+    closeAdsbPanel();
+  }
+}
+
+// ADS-B tab row tap: pan to the plane AND open its live panel.
+function focusAdsbAircraft(hex) {
+  if (!S.map) return;
+  const ac = (S.adsbAircraft || []).find(a => a && a.hex === hex);
+  if (!ac) return;
+  S.map.panTo([ac.lat, ac.lon]);
+  openAdsbPanel(ac);
 }
 
 function renderAdsbTab(usedApi) {
@@ -6184,7 +6394,7 @@ function renderAdsbTab(usedApi) {
         const sqk = ac.squawk || '--';
         const isEmergency = ac.squawk === '7500' || ac.squawk === '7600' || ac.squawk === '7700';
         const sqkStyle = isEmergency ? 'color:#ef4444;font-weight:bold;' : '';
-        html += `<tr class="adsb-row" onclick="if(S.map)S.map.panTo([${ac.lat},${ac.lon}])">` +
+        html += `<tr class="adsb-row" onclick="focusAdsbAircraft('${ac.hex}')">` +
           `<td style="color:var(--accent-cyan);">${label}</td>` +
           `<td style="color:${color};font-weight:600;">${aglStr}</td>` +
           `<td>${ac.distNm} nm</td>` +
@@ -6198,20 +6408,41 @@ function renderAdsbTab(usedApi) {
   }
 }
 
+// Base poll cadence; consecutive total failures stretch it via adsbPollDelay.
+const ADSB_POLL_MS = 5000;
+
 function startAdsbPolling() {
-  if (S._adsbPollTimer || !S._adsbEnabled || !S.areaCenter || !S.areaBounds) return;
+  if (S._adsbPolling || !S._adsbEnabled || !S.areaCenter || !S.areaBounds) return;
   const ne = S.areaBounds.getNorthEast();
   const sw = S.areaBounds.getSouthWest();
   S.adsbSearchRadiusNm = computeAdsbSearchRadius(S.areaCenter.lat, S.areaCenter.lng, ne, sw);
   setText('adsbRadius', S.adsbSearchRadiusNm + ' nm');
   const statusEl = document.getElementById('adsbPollStatus');
   if (statusEl) statusEl.textContent = 'Polling';
-  fetchAdsb();
-  S._adsbPollTimer = setInterval(fetchAdsb, 5000);
+  S._adsbPolling = true;
+  S._adsbFailStreak = 0;
+  fetchAdsb().then(() => _scheduleAdsbPoll());
+}
+
+// Chain the next poll AFTER the current one completes, at a delay that backs
+// off (adsbPollDelay) while every source is refusing service. setTimeout, not
+// setInterval, so a slow fetch can't overlap the next and the delay can change
+// per cycle; S._adsbPolling gates the chain so a stop during an in-flight
+// fetch doesn't resurrect it.
+function _scheduleAdsbPoll() {
+  if (!S._adsbPolling) return;
+  if (S._adsbPollTimer) clearTimeout(S._adsbPollTimer);
+  S._adsbPollTimer = setTimeout(async () => {
+    await fetchAdsb();
+    _scheduleAdsbPoll();
+  }, adsbPollDelay(S._adsbFailStreak, ADSB_POLL_MS));
 }
 
 function stopAdsbPolling() {
-  if (S._adsbPollTimer) { clearInterval(S._adsbPollTimer); S._adsbPollTimer = null; }
+  S._adsbPolling = false;
+  if (S._adsbPollTimer) { clearTimeout(S._adsbPollTimer); S._adsbPollTimer = null; }
+  S._adsbFailStreak = 0;
+  closeAdsbPanel();
   S.adsbAircraft = [];
   S.adsbTrails = {};
   S.adsbSearchRadiusNm = null;
@@ -6784,6 +7015,16 @@ function computeAssessment(snap) {
         if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
       }
     }
+  }
+
+  // A failed auto-check means TFR/NOTAM ABSENCE is unverified — never a clean
+  // GO. (Active-TFR NO-GO from stale data above stays: presence is conservative.)
+  if (S.autoCheck && S.autoCheck.state === 'error' && S.currentArea &&
+      typeof getCanopyProxyBase === 'function' && getCanopyProxyBase()) {
+    if (result.level === 'GO') result.level = 'CAUTION';
+    result.cautions = result.cautions || [];
+    result.cautions.push('TFR/NOTAM check FAILED — airspace unverified (1800wxbrief.com)');
+    if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
   }
 
   // Integrate FAA airspace data into assessment
@@ -8253,12 +8494,13 @@ function setLayerVisible(id, on) {
       if (on) S.map.addLayer(S.mapLayers.observer_rings);
       else S.map.removeLayer(S.mapLayers.observer_rings);
     }
-    // Toggling aircraft also toggles trails
+    // Toggling aircraft also toggles trails (and closes the selected-plane panel)
     if (id === 'adsb_aircraft' && S.mapLayers.adsb_trails) {
       if (on) S.map.addLayer(S.mapLayers.adsb_trails);
       else S.map.removeLayer(S.mapLayers.adsb_trails);
       const trailEl = document.querySelector('[data-layer="adsb_trails"]');
       if (trailEl) { if (on) trailEl.classList.add('active'); else trailEl.classList.remove('active'); }
+      if (!on) closeAdsbPanel();
     }
   }
   // Mirror raster layer changes into the 3D view while it is active.
@@ -8356,7 +8598,11 @@ function restoreLayerUiState() {
 const AGG_HIT_PX = 8; // pixel tolerance for line / point hit-testing
 // observer_rings: a VLOS ring covers a large area, so hit-testing it would add a
 // spurious page to the popup for every click inside the ring.
-const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_trails', 'canopy', 'viewshed', 'shadow', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning', 'observer_rings']);
+// adsb_aircraft: plane clicks open the live selected-aircraft panel instead
+// (openAdsbPanel) — an aggregated page would be a frozen snapshot of a moving
+// target, and skipping here keeps wirePopupAggregation off the markers'
+// dedicated click handler.
+const AGG_SKIP_LAYERS = new Set(['basemap_dark', 'basemap_light', 'satellite', 'topo', 'sectional', 'adsb_aircraft', 'adsb_trails', 'canopy', 'viewshed', 'shadow', 'slope', 'streets', 'snow_depth', 'goes_clouds', 'glm_lightning', 'observer_rings']);
 // Export-only exclusion set. Extends the popup-skip set (so basemaps /
 // rasters stay out of the vector export) and adds layers CalTopo already provides
 // natively and that would be stale by import time. These layers remain visible and
@@ -8381,7 +8627,7 @@ const AGG_LAYER_META = {
   faa_ns_restrictions: { label: 'Nat. Security', pri: 0 }, tfr_imported: { label: 'TFR (imported)', pri: 0 },
   notam_imported: { label: 'NOTAM', pri: 1 }, faa_sua: { label: 'Special Use', pri: 1 },
   nws_alerts: { label: 'NWS Alert', pri: 1 }, fire_perimeters: { label: 'Fire Perimeter', pri: 1 },
-  faa_class_airspace: { label: 'Class Airspace', pri: 2 }, adsb_aircraft: { label: 'Aircraft', pri: 2 },
+  faa_class_airspace: { label: 'Class Airspace', pri: 2 },
   faa_laanc: { label: 'LAANC Grid', pri: 3 }, airports: { label: 'Airport', pri: 3 },
   faa_obstacles: { label: 'Obstacle', pri: 4 }, dams: { label: 'Dam', pri: 4 },
   cell_towers: { label: 'Tower', pri: 5 }, buildings: { label: 'Building', pri: 7 },
@@ -8624,7 +8870,13 @@ function updateClock() {
   const utc = now.toISOString().substr(11, 8);
   document.getElementById('clockDisplay').textContent = `${local} L / ${utc} Z`;
   // Refresh the per-section "(Xm ago)" ages every ~30s (cheap; text only).
-  if ((++_metaTick % 30) === 0 && typeof renderAllSectionMeta === 'function') renderAllSectionMeta();
+  // The TFR/NOTAM banner + auto-check detail carry ages too — tick them all,
+  // or a tab left open shows a frozen "2m ago" forever.
+  if ((++_metaTick % 30) === 0) {
+    if (typeof renderAllSectionMeta === 'function') renderAllSectionMeta();
+    if (typeof renderImportStatus === 'function') renderImportStatus();
+    if (typeof renderAutoCheckStatus === 'function') renderAutoCheckStatus();
+  }
 }
 
 // ============================================================
@@ -8637,17 +8889,27 @@ window.addEventListener('load', () => {
   }
   startApp();
 });
-const APP_VERSION = '2026.03.27';
+// Bump ONLY when the disclaimer text materially changes — every device then
+// re-prompts exactly once. Deliberately NOT tied to SAR_VERSION: routine
+// releases must not re-interrupt, but a reworded disclaimer must reach
+// everyone, including devices that accepted years ago.
+const DISCLAIMER_VERSION = '2026.08.30';
 
 function checkDisclaimer() {
   const accepted = localStorage.getItem('sar_disclaimer_version');
-  if (accepted !== APP_VERSION) {
+  if (accepted !== DISCLAIMER_VERSION) {
     document.getElementById('disclaimerModal')?.classList.add('active');
   }
 }
 
+// Re-read on demand (footer line, Config → View Disclaimer). Acceptance is
+// already stored; the I Understand button simply closes it again.
+function showDisclaimer() {
+  document.getElementById('disclaimerModal')?.classList.add('active');
+}
+
 function acceptDisclaimer() {
-  localStorage.setItem('sar_disclaimer_version', APP_VERSION);
+  localStorage.setItem('sar_disclaimer_version', DISCLAIMER_VERSION);
   document.getElementById('disclaimerModal')?.classList.remove('active');
   // A pending update supersedes What's New: the update modal shows the NEWER
   // version's notes, so showing last update's notes too would just stack modals.
@@ -9206,7 +9468,7 @@ function downloadTilesForView() {
 }
 
 function getSelectedTileProviders() {
-  const providers = ['carto']; // always include base map
+  const providers = ['basemap', 'basemap_labels']; // always include base map (Esri canvas base + labels)
   if (document.getElementById('cfgTileSat')?.checked) providers.push('satellite');
   if (document.getElementById('cfgTileTopo')?.checked) providers.push('topo');
   if (document.getElementById('cfgTileSectional')?.checked) providers.push('sectional');
@@ -9564,8 +9826,17 @@ function buildBriefingText() {
     lines.push('');
   }
 
+  lines.push('--- DISCLAIMER ---');
+  lines.push(BRIEFING_DISCLAIMER);
+
   return lines.join('\n');
 }
+
+// Rides on every briefing artifact that leaves the app (clipboard, email, PDF).
+const BRIEFING_DISCLAIMER =
+  'Advisory planning aid only - NOT an official FAA briefing. Data may be ' +
+  'incomplete or outdated; verify airspace, TFRs, NOTAMs and weather via ' +
+  'official sources (1800wxbrief.com) before flight.';
 
 function copyBriefing() {
   if (!S.currentArea) return;
@@ -9771,6 +10042,7 @@ function _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic
       return `<div style="margin-bottom:10px;"><div style="font-size:13px;font-weight:bold;border-bottom:1px solid #ccc;padding-bottom:2px;margin-bottom:4px;">${title}</div><div style="font-size:11px;color:#333;">${body}</div></div>`;
     }).join('')}
     <div style="margin-top:20px;border-top:2px solid #111;padding-top:10px;">
+      <div style="font-size:10px;color:#7a5d00;background:#fff8e1;border-left:4px solid #f59e0b;padding:6px 8px;margin-bottom:10px;"><b>Advisory planning aid only — NOT an official FAA briefing.</b> Verify airspace, TFRs, NOTAMs and weather via official sources (1800wxbrief.com) before flight.</div>
       <div style="font-size:11px;color:#555;margin-bottom:15px;">I have reviewed this pre-flight briefing and accept responsibility for the safe conduct of this UAS operation.</div>
       <table style="width:100%;font-size:11px;">
         <tr>
@@ -9876,6 +10148,7 @@ function _openEmailBriefingWindow(mapDataUrl) {
     ${mapHtml}
     ${sections.map(s => { const lines = s.split('\n'); return `<div class="section"><div class="section-title">${lines[0]}</div><div>${lines.slice(1).join('<br>')}</div></div>`; }).join('')}
     <div style="margin-top:20px;border-top:2px solid #111;padding-top:10px;">
+      <div style="font-size:10px;color:#7a5d00;background:#fff8e1;border-left:4px solid #f59e0b;padding:6px 8px;margin-bottom:10px;"><b>Advisory planning aid only — NOT an official FAA briefing.</b> Verify airspace, TFRs, NOTAMs and weather via official sources (1800wxbrief.com) before flight.</div>
       <div style="font-size:11px;color:#555;margin-bottom:15px;">I have reviewed this pre-flight briefing and accept responsibility for the safe conduct of this UAS operation.</div>
       <span class="sig-line">RPIC Signature</span><span class="sig-line">Date / Time</span>
     </div>
@@ -12408,7 +12681,11 @@ function _addObserverMarker(rec) {
   });
   if (m.on) m.on('click', () => {
     if (S._viewshedPicking) return; // pick-mode click places a NEW observer
-    toggleViewshedVisible(rec.id);
+    // Visible but not selected → select it (its viewshed turns red).
+    // Selected (or hidden) → toggle visibility as before.
+    const r = S.viewsheds.find(x => x.id === rec.id);
+    if (r && r.visible !== false && S.activeViewshedId !== rec.id) setActiveViewshed(rec.id);
+    else toggleViewshedVisible(rec.id);
   });
   rec._marker = m;
   S.mapLayers.observers.addLayer(m);
@@ -12471,15 +12748,16 @@ function _renderVisibleViewsheds() {
     buildLayerControl();
     return;
   }
-  const comp = compositeViewsheds(computed);
+  const comp = compositeViewsheds(computed, undefined, { activeId: S.activeViewshedId });
   const op = parseFloat((document.getElementById('vsOpacity') || {}).value) || VIEWSHED_OVERLAY_OPACITY;
   renderRasterOverlay('viewshed', viewshedMaskToRGBA(comp.grid, comp.mask), comp.grid, op);
   if (r) {
     const rec = computed.find(x => x.id === S.activeViewshedId) || computed[computed.length - 1];
     const canLabel = rec.canopySource ? ('canopy ' + rec.canopySource) : 'bare earth (no canopy)';
     const bldLabel = rec.buildingCount != null ? ` · ${rec.buildingCount} OSM bldgs` : '';
+    const activeShown = computed.length > 1 && computed.some(x => x.id === S.activeViewshedId);
     r.textContent = `${rec.name}: ${Math.round((rec.coverage || 0) * 100)}% of ${rec.vlosFt} ft VLOS visible @ ${rec.aglFt} ft AGL · DEM ${rec.demSource} · ${canLabel}${bldLabel}`
-      + (computed.length > 1 ? ` · ${computed.length} viewsheds shown (darker green = overlap)` : '');
+      + (computed.length > 1 ? ` · ${computed.length} viewsheds shown (${activeShown ? 'red = selected, ' : ''}darker green = overlap)` : '');
   }
   buildLayerControl();
 }
@@ -13918,6 +14196,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer,
+    checkDisclaimer, showDisclaimer, DISCLAIMER_VERSION, BRIEFING_DISCLAIMER,
     checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitActivated,
     showUpdateModalIfNewer, _updateApplyStatus, _updateBannerHtml, _cachedShellVersion, _verifyShellFresh,
     getCanopyProxyBase, getCustomProxy, saveCanopyProxy, DEFAULT_DATA_PROXY, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
@@ -13937,7 +14216,7 @@ if (typeof module !== 'undefined' && module.exports) {
     _notePlansOverride, _plansSuppressed,
     openAggregatePopup, aggPopupStep, renderAggregatePopup, collectFeaturesAt,
     wirePopupAggregation, eachPopupLayer, _aggFeatureClick,
-    AGG_SKIP_LAYERS, EXPORT_SKIP_LAYERS,
+    AGG_SKIP_LAYERS, AGG_LAYER_META, EXPORT_SKIP_LAYERS,
     computeAirspace, computeOpsData, computeAssessment,
     snapshotAtIdx, renderWeather, renderWind, refreshPanelForHour, updateTimeContextBanner,
     renderKp, _parseKpForecast,
@@ -13948,6 +14227,7 @@ if (typeof module !== 'undefined' && module.exports) {
     fetchUtilityWires, _renderUtilityWires, _utilityWirePopup,
     tfrGeoJsonUrlForBounds, fetchLiveTFRs, fetchNotams, fetchLiveRestrictions,
     renderAutoCheckStatus, reCheckRestrictionsNow, _restrictionEmptyMsg,
+    _notamSearchRadiusNm, _persistRestrictionCache,
     toDMS, fmtTfrTime, currentAreaPolygon,
     renderDeepLinks, renderTfrCards, renderNotamCards, renderImportStatus,
     renderImportedTfrLayer, renderImportedNotamLayer,
@@ -13989,6 +14269,7 @@ if (typeof module !== 'undefined' && module.exports) {
     collect3dVectorGroups, _vec3dRecords, _open3dPopup, agg3dStep, _agg3dHtml, VEC3D_SKIP,
     enterObserverView, exitObserverView, _on3dClick, _observer3dFeatureAt, _lockObserverCamera, _applyObserverLook,
     _aircraft3dGroup, _refresh3dAircraft, _adsbPopupHtml,
+    _adsbPanelHtml, openAdsbPanel, closeAdsbPanel, refreshAdsbPanel, focusAdsbAircraft, ADSB_PANEL_LOST_MS,
     _overpassFetch, fetchBuildings, renderBuildingsLayer, _buildingsCap,
     getBuildings3dSetting, setBuildings3dMode, _buildings3dMode,
     _buildBuildingTriVerts, _vert3dMakeLayer, _updateVert3dVerts,

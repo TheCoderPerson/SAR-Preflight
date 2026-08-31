@@ -42,6 +42,23 @@ describe('routeStrategy(url)', () => {
     expect(routeStrategy(url)).toBe('network-only');
   });
 
+  // Deliberately network-only, NOT cache-first or network-first: the app keeps
+  // its own IndexedDB cache for TFR/NOTAM with an explicit stale/expired UI. A
+  // cache-first hit pins the FIRST response for the life of the deployed
+  // version and lets "Re-check now" report week-old airspace as LIVE. Matching
+  // is by pathname so user-configured custom proxy bases are covered too.
+  it('routes data-proxy TFR/NOTAM/ADS-B to network-only, never cache-first or network-first', () => {
+    expect(routeStrategy('https://sar-canopy-proxy.joja15.workers.dev/tfr/geoserver/TFR/ows?service=WFS&bbox=1,2,3,4')).toBe('network-only');
+    expect(routeStrategy('https://sar-canopy-proxy.joja15.workers.dev/tfr/download/detail_4_3635.xml')).toBe('network-only');
+    expect(routeStrategy('https://sar-canopy-proxy.joja15.workers.dev/notam?lat=38.68500&lng=-120.99000&radius=25')).toBe('network-only');
+    expect(routeStrategy('https://custom-proxy.example.workers.dev/notam?lat=1&lng=2&radius=20')).toBe('network-only'); // custom base, same route shape
+    expect(routeStrategy('https://sar-canopy-proxy.joja15.workers.dev/adsb?lat=38.6850&lon=-120.9900&dist=25')).toBe('network-only');
+  });
+
+  it('leaves proxy canopy tiles on the cache-first default (range reads skip routing anyway)', () => {
+    expect(routeStrategy('https://sar-canopy-proxy.joja15.workers.dev/chm/023010212.tif')).toBe('cache-first');
+  });
+
   it('routes API endpoints to network-first', () => {
     expect(routeStrategy('https://api.open-meteo.com/v1/forecast?lat=38')).toBe('network-first');
     expect(routeStrategy('https://air-quality-api.open-meteo.com/v1/air-quality?lat=38')).toBe('network-first');
