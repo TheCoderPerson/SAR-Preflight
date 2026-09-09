@@ -24,6 +24,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.09.08-b',
+    date: '2026-09-08',
+    changes: [
+      'A data source that fails now says so in the data itself. Every value that source feeds reads "UNKNOWN: NEEDS UPDATE" in red instead of a reassuring "None", "--" or the previous area\'s numbers — e.g. when the FAA Special Use Airspace query fails, MOA / Restricted / Prohibited show UNKNOWN rather than a green "None"; the same applies to TFR areas, NS restrictions, class airspace, weather, air quality, Kp, elevation, obstacles, sun/moon, traffic, fire danger, ground access, land ownership, water, hospitals and trails. Values filled from a cached copy are marked "(cached)" in amber. Freshness is now tracked per drawn area, so a failure on a new area can no longer be mistaken for "still showing this area\'s earlier data".',
+    ],
+  },
+  {
     version: '2026.09.08-a',
     date: '2026-09-08',
     changes: [

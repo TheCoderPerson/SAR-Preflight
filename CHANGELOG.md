@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.09.08-b — 2026-09-08
+
+- A data source that fails now says so in the data itself. Every value that source feeds reads "UNKNOWN: NEEDS UPDATE" in red instead of a reassuring "None", "--" or the previous area's numbers — e.g. when the FAA Special Use Airspace query fails, MOA / Restricted / Prohibited show UNKNOWN rather than a green "None"; the same applies to TFR areas, NS restrictions, class airspace, weather, air quality, Kp, elevation, obstacles, sun/moon, traffic, fire danger, ground access, land ownership, water, hospitals and trails. Values filled from a cached copy are marked "(cached)" in amber. Freshness is now tracked per drawn area, so a failure on a new area can no longer be mistaken for "still showing this area's earlier data".
+
 ## v2026.09.08-a — 2026-09-08
 
 - NOTAM check: a failed FAA NOTAM Search (outage, rejected session, or a page that never arrived) is now reported as an ERROR with the reason. Previously the data proxy answered with an empty list and the app showed "0 NOTAMs · LIVE".

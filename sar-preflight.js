@@ -1325,6 +1325,10 @@ function locateMe() {
 // ============================================================
 async function processArea(layer, type) {
   try { Diag.note('area.process', { type: type, dom: Diag._domSnapshot() }); } catch (_) {}
+  // Freshness is per area: without this reset a failed fetch on a NEW area
+  // would count the previous area's last update as "prior data" and keep its
+  // values on screen. View-based sections (canopy) are not tied to the area.
+  Object.keys(SECTION_DEFS).forEach(k => { if (!SECTION_DEFS[k].viewBased) delete S.sectionMeta[k]; });
   document.getElementById('noAreaOverlay').style.display = 'none';
   document.getElementById('assessmentBanner').style.display = 'flex';
   document.getElementById('areaInfoBar').style.display = 'flex';
@@ -1529,6 +1533,56 @@ function refreshData() {
 // each). Siblings sharing a fetch read the same S.sectionMeta key
 // so their timestamps always agree.
 // ============================================================
+// A data source that FAILED must not leave a reassuring value on screen. Every
+// data cell a section (or one sub-source of a rollup section) owns is listed
+// here; when that source reports an error with nothing to show, the cells read
+// UNKNOWN: NEEDS UPDATE in red instead of "None", "--" or the previous area's
+// numbers. Cells the fetcher later re-fills (cached fallback, next update)
+// simply overwrite it. Derived cells (ops/battery, assessment) are not listed —
+// they follow their inputs.
+const UNKNOWN_CELL_TEXT = 'UNKNOWN: NEEDS UPDATE';
+const SECTION_CELLS = {
+  weather: ['wxTemp', 'wxFeels', 'wxDew', 'wxHumidity', 'wxPressure', 'wxDensity', 'wxVis', 'wxCloud', 'wxConditions',
+            'wxPrecip', 'wxUV', 'wxIcing', 'wxFreezing',
+            'windMax', 'windGustMax', 'windDir', 'windImpact', 'windGustFactor', 'windShear', 'windTurbulence'],
+  airQuality: ['wxAQI', 'wxPM25', 'wxPM10', 'wxOzone'],
+  spaceWx: ['wxKp', 'satKp', 'satAccuracy', 'satAssessment'],
+  airspace: {
+    faa: ['airClass', 'airLAANC', 'airLAANCAlt', 'airMOA', 'airRestricted', 'airProhibited', 'airTFR', 'airNSRestrict'],
+    airports: ['airNearAirport', 'airNearDist', 'airHeliports'],
+  },
+  elevation: ['terrMin', 'terrMax', 'terrRange', 'terrLaunch', 'terrClass', 'terrSlope', 'terrVeg', 'terrCell', 'terrRID', 'satSkyVis', 'satMasked'],
+  obstacles: { wire: ['terrPower', 'terrTowers'], utility: [], dof: ['terrObstacles'], protected: ['terrHwy'] },
+  solar: ['astSunrise', 'astSunset', 'astTwilightAM', 'astTwilightPM', 'astNauticalAM', 'astNauticalPM', 'astSolarNoon',
+          'astSunAz', 'astSunEl', 'astMoonPhase', 'astMoonIllum', 'astDayWindow', 'astNightOps', 'astShadow', 'astMagDec'],
+  adsb: ['adsbCount', 'adsbRadius', 'adsbNearest', 'adsbNearestAlt', 'adsbLowCount', 'adsbSource'],
+  fireDanger: ['wxFire'],
+  groundAccess: ['terrGroundAccess'],
+  publicLands: ['terrLandOwnership'],
+  water: ['terrWater'],
+  hospitals: ['terrHospitals'],
+  trails: ['terrTrails'],
+};
+
+function sectionCellsFor(key, source) {
+  const c = SECTION_CELLS[key];
+  if (!c) return [];
+  if (Array.isArray(c)) return c;
+  return source ? (c[source] || []) : Object.keys(c).reduce((a, k) => a.concat(c[k]), []);
+}
+
+function markCellsUnknown(ids) {
+  (ids || []).forEach(id => { setText(id, UNKNOWN_CELL_TEXT); setColor(id, 'red'); });
+}
+
+// Has this section / sub-source ever produced data for the CURRENT area?
+// (S.sectionMeta is reset per area in processArea, so a prior updatedAt /
+// cachedAt here means "we are still showing this area's earlier data", which
+// the freshness line reports as "Update failed — showing HH:MM data".)
+function _sectionHasPriorData(meta) {
+  return !!(meta && (meta.updatedAt != null || meta.cachedAt != null));
+}
+
 const SECTION_DEFS = {
   weather: {
     label: 'Weather', computes: 'both',
@@ -1639,20 +1693,33 @@ function _sectionUpdatable(def) {
 //   cached:   markSection(key, { status:'cached', cachedAt: rec.timestamp, error: msg })
 //   error:    markSection(key, { status:'error', error: msg })
 // Pass { source:'wire'|'dof'|... } to record one sub-source of a rollup header.
+// Pass { partial: true } with an error when the fetcher itself decides per
+// item what is unknown (FAA airspace does per layer in computeAirspace) — the
+// section's cells are then left to it instead of being blanked wholesale.
 function markSection(key, patch) {
   patch = patch || {};
   if (patch.status === 'error' && patch.errorAt == null) patch.errorAt = Date.now();
   const cur = S.sectionMeta[key] || { status: 'never', updatedAt: null, cachedAt: null, error: null, errorAt: null };
+  let prior;
   if (patch.source) {
     const src = patch.source;
     const sub = Object.assign({}, patch); delete sub.source;
     cur.sources = cur.sources || {};
+    prior = cur.sources[src];
     cur.sources[src] = Object.assign(cur.sources[src] || {}, sub);
   } else {
+    prior = cur;
     Object.assign(cur, patch);
   }
   S.sectionMeta[key] = cur;
-  if (typeof document !== 'undefined') renderSectionMeta(key);
+  if (typeof document !== 'undefined') {
+    // A failure with nothing to show must not leave "None" / "--" / the last
+    // area's values on screen looking like an answer.
+    if (patch.status === 'error' && !patch.partial && !_sectionHasPriorData(prior)) {
+      markCellsUnknown(sectionCellsFor(key, patch.source));
+    }
+    renderSectionMeta(key);
+  }
 }
 
 // Paint the freshness line(s) + UPDATE button for one section.
@@ -3573,9 +3640,25 @@ async function fetchFireDanger(lat, lng, bounds) {
     console.warn('Fire danger fetch failed:', err);
     recordDataSourceError('Fire Danger', err);
     markSection('fireDanger', { status: 'error', error: err && err.message ? err.message : String(err) });
+    if (!_sectionHasPriorData(S.sectionMeta.fireDanger)) renderFireDangerUnknown(err);
   } finally {
     trackFetchEnd('Fire Danger');
   }
+}
+
+// The fire card must not keep saying "No wildland fire perimeters detected"
+// after the source failed: that reads as an all-clear.
+function renderFireDangerUnknown(err) {
+  const fireDiv = document.getElementById('fireDangerCards');
+  if (!fireDiv) return;
+  const reason = (err && err.message) ? err.message : String(err || 'fetch failed');
+  fireDiv.innerHTML = `<div class="notam-card" style="border-left:3px solid var(--accent-red);">
+      <div class="notam-header">
+        <span class="notam-id" style="color:var(--accent-red);">\ud83d\udd25 WILDFIRE</span>
+        <span class="notam-type" style="background:rgba(239,68,68,0.15);color:var(--accent-red);">${UNKNOWN_CELL_TEXT}</span>
+      </div>
+      <div class="notam-body">Active-fire perimeters and fire danger could not be retrieved (${reason.replace(/</g, '&lt;')}). Status is UNKNOWN, not clear \u2014 press UPDATE or check InciWeb / CAL FIRE before flight.</div>
+    </div>`;
 }
 
 function renderFirePerimeters(fires) {
@@ -3691,8 +3774,36 @@ function computeAirspace(lat, lng) {
     setColor('airHeliports', 'green');
   }
 
+  // One FAA layer's state for the cells it feeds: 'unknown' (fetch failed, no
+  // cached copy), 'cached' (filled from the IndexedDB copy), or null (live).
+  const faaFailed = !S.faaAirspace && !!(S.sectionMeta.airspace && S.sectionMeta.airspace.sources
+    && S.sectionMeta.airspace.sources.faa && S.sectionMeta.airspace.sources.faa.status === 'error');
+  const layerState = k => {
+    if (faaFailed) return 'unknown';
+    const l = S.faaAirspace && S.faaAirspace[k];
+    if (!l) return null;
+    return l._unavailable ? 'unknown' : (l._cachedAt ? 'cached' : null);
+  };
+  // "None" is only an answer when the layer actually loaded. Empty + failed
+  // is UNKNOWN (red); a cached copy keeps its value but says so (amber).
+  const showLayer = (id, k, features, formatFn, presentColor) => {
+    const st = layerState(k);
+    if (st === 'unknown') { setText(id, UNKNOWN_CELL_TEXT); setColor(id, 'red'); return; }
+    if (features.length > 0) {
+      setText(id, formatFn(features) + (st === 'cached' ? ' (cached)' : ''));
+      setColor(id, presentColor);
+    } else {
+      setText(id, st === 'cached' ? 'None (cached)' : 'None');
+      setColor(id, st === 'cached' ? 'amber' : 'green');
+    }
+  };
+
   // Use live FAA data if available, otherwise fall back to hardcoded logic
-  if (S.faaAirspace && S.faaAirspace.classAirspace && S.faaAirspace.classAirspace.features && S.faaAirspace.classAirspace.features.length > 0) {
+  if (layerState('classAirspace') === 'unknown') {
+    // The FAA class-airspace fetch failed with nothing cached: do not guess
+    // from the built-in airport table — the operator must update.
+    markCellsUnknown(['airClass', 'airLAANC', 'airLAANCAlt']);
+  } else if (S.faaAirspace && S.faaAirspace.classAirspace && S.faaAirspace.classAirspace.features && S.faaAirspace.classAirspace.features.length > 0) {
     // Find the most restrictive class airspace intersecting the area
     const classPriority = { B: 1, C: 2, D: 3, E: 4 };
     let mostRestrictive = null;
@@ -3751,54 +3862,28 @@ function computeAirspace(lat, lng) {
   }
 
   // Special Use Airspace from FAA data
-  if (S.faaAirspace && S.faaAirspace.sua && S.faaAirspace.sua.features) {
-    const moas = S.faaAirspace.sua.features.filter(f => (f.properties.TYPE_CODE || '').startsWith('M'));
-    const restricted = S.faaAirspace.sua.features.filter(f => (f.properties.TYPE_CODE || '').startsWith('R'));
-    const prohibited = S.faaAirspace.sua.features.filter(f => (f.properties.TYPE_CODE || '').startsWith('P'));
-
-    if (moas.length > 0) {
-      setText('airMOA', moas.map(f => f.properties.NAME || 'MOA').join(', '));
-      setColor('airMOA', 'amber');
-    } else {
-      setText('airMOA', 'None');
-      setColor('airMOA', 'green');
-    }
-    if (restricted.length > 0) {
-      setText('airRestricted', restricted.map(f => f.properties.NAME || 'Restricted').join(', '));
-      setColor('airRestricted', 'red');
-    } else {
-      setText('airRestricted', 'None');
-      setColor('airRestricted', 'green');
-    }
-    if (prohibited.length > 0) {
-      setText('airProhibited', prohibited.map(f => f.properties.NAME || 'Prohibited').join(', '));
-      setColor('airProhibited', 'red');
-    } else {
-      setText('airProhibited', 'None');
-      setColor('airProhibited', 'green');
-    }
+  if (layerState('sua') === 'unknown') {
+    markCellsUnknown(['airMOA', 'airRestricted', 'airProhibited']);
+  } else if (S.faaAirspace && S.faaAirspace.sua && S.faaAirspace.sua.features) {
+    const sua = S.faaAirspace.sua.features;
+    const names = fallback => fs => fs.map(f => f.properties.NAME || fallback).join(', ');
+    showLayer('airMOA', 'sua', sua.filter(f => (f.properties.TYPE_CODE || '').startsWith('M')), names('MOA'), 'amber');
+    showLayer('airRestricted', 'sua', sua.filter(f => (f.properties.TYPE_CODE || '').startsWith('R')), names('Restricted'), 'red');
+    showLayer('airProhibited', 'sua', sua.filter(f => (f.properties.TYPE_CODE || '').startsWith('P')), names('Prohibited'), 'red');
   }
 
   // TFRs from FAA data
-  if (S.faaAirspace && S.faaAirspace.tfrs && S.faaAirspace.tfrs.features) {
-    if (S.faaAirspace.tfrs.features.length > 0) {
-      setText('airTFR', S.faaAirspace.tfrs.features.map(f => f.properties.NAME || 'TFR').join(', '));
-      setColor('airTFR', 'red');
-    } else {
-      setText('airTFR', 'None');
-      setColor('airTFR', 'green');
-    }
+  if (layerState('tfrs') === 'unknown') {
+    markCellsUnknown(['airTFR']);
+  } else if (S.faaAirspace && S.faaAirspace.tfrs && S.faaAirspace.tfrs.features) {
+    showLayer('airTFR', 'tfrs', S.faaAirspace.tfrs.features, fs => fs.map(f => f.properties.NAME || 'TFR').join(', '), 'red');
   }
 
   // National Security UAS Restrictions
-  if (S.faaAirspace && S.faaAirspace.nsRestrictions && S.faaAirspace.nsRestrictions.features) {
-    if (S.faaAirspace.nsRestrictions.features.length > 0) {
-      setText('airNSRestrict', S.faaAirspace.nsRestrictions.features.map(f => f.properties.NAME || 'NS Restriction').join(', '));
-      setColor('airNSRestrict', 'red');
-    } else {
-      setText('airNSRestrict', 'None');
-      setColor('airNSRestrict', 'green');
-    }
+  if (layerState('nsRestrictions') === 'unknown') {
+    markCellsUnknown(['airNSRestrict']);
+  } else if (S.faaAirspace && S.faaAirspace.nsRestrictions && S.faaAirspace.nsRestrictions.features) {
+    showLayer('airNSRestrict', 'nsRestrictions', S.faaAirspace.nsRestrictions.features, fs => fs.map(f => f.properties.NAME || 'NS Restriction').join(', '), 'red');
   }
 }
 
@@ -4247,7 +4332,7 @@ async function fetchFAAairspace(bounds) {
         + (cachedFilled.length < failed.length ? '; ' + failed.filter(f => cachedFilled.indexOf(f.key) < 0).map(f => label(f.key)).join(', ') + ' UNAVAILABLE' : '');
       recordDataSourceError('FAA Airspace', new Error(msg));
       setStatus('faaAirspaceStatus', 'partial', 'PARTIAL \u00b7 ' + failed.length + '/' + keys.length + ' FAILED');
-      markSection('airspace', { source: 'faa', status: 'error', error: msg, cachedAt: cachedFilled.length ? cached.timestamp : null });
+      markSection('airspace', { source: 'faa', status: 'error', error: msg, partial: true, cachedAt: cachedFilled.length ? cached.timestamp : null });
     } else if (swFallback) {
       // Every layer answered, but from the Service Worker's offline cache.
       clearDataSourceError('FAA Airspace');
@@ -14335,6 +14420,7 @@ if (typeof module !== 'undefined' && module.exports) {
     getCanopyProxyBase, getCustomProxy, saveCanopyProxy, DEFAULT_DATA_PROXY, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
     notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _assessBadgeColor, sendFeedback, openFeedback, closeFeedback,
     fetchFAAairspace, faaAirspaceUnavailableLayers, FAA_AIRSPACE_LAYER_LABELS, fetchFireDanger,
+    UNKNOWN_CELL_TEXT, SECTION_CELLS, sectionCellsFor, markCellsUnknown, renderFireDangerUnknown,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
     renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, _isConstrained, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,
