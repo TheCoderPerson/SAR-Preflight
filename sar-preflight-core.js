@@ -24,6 +24,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.09.08-d',
+    date: '2026-09-08',
+    changes: [
+      'Airspace tab: the Special Use Airspace row "TFRs" is now "National Defense TFR Areas" — it only ever reflected the FAA's standing national-defense areas (a handful of military installations nationwide), not the live TFR list. Live TFRs over your area are in the NOTAMs tab, drawn on the map, and drive the assessment. "NS UAS Restrictions" is now "NS UAS Restrictions (part-time only)": permanent §99.7 security areas such as Bureau of Reclamation dams are published only as FDC NOTAMs and appear in no FAA GIS layer.',
+    ],
+  },
+  {
     version: '2026.09.08-c',
     date: '2026-09-08',
     changes: [

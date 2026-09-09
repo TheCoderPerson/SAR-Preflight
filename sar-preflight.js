@@ -4279,7 +4279,7 @@ function renderNWSAlertPolygons() {
 // Operator-facing names for the six FAA UDDS layers (status line + assessment caution).
 const FAA_AIRSPACE_LAYER_LABELS = {
   classAirspace: 'Class airspace', sua: 'Special-use airspace', tfrs: 'National Defense TFR areas',
-  laanc: 'LAANC grid', nsRestrictions: 'NS UAS restrictions', prohibited: 'Prohibited areas',
+  laanc: 'LAANC grid', nsRestrictions: 'NS UAS restrictions (part-time only)', prohibited: 'Prohibited areas',
 };
 
 // FAA layers whose fetch failed and for which no cached copy exists either —
