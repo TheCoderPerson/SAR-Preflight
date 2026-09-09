@@ -32,7 +32,7 @@ const boundsAround = (lat, lng) => ({
 
 const perimeter = (name) => ({
   type: 'Feature',
-  properties: { poly_IncidentName: name, poly_GISAcres: 1200, poly_PercentContained: 35, poly_CreateDate: 1757000000000 },
+  properties: { poly_IncidentName: name, poly_GISAcres: 1200, attr_PercentContained: 35, poly_CreateDate: 1757000000000 },
   geometry: { type: 'Polygon', coordinates: [[[-105.1, 39.6], [-104.9, 39.6], [-104.9, 39.8], [-105.1, 39.6]]] },
 });
 const ok = (body, headers) => ({
@@ -68,7 +68,7 @@ describe('fetchFireDanger', () => {
 
   it('outside California (Colorado): perimeters reach state and status is LIVE', async () => {
     const calls = mockFetch({
-      Current_WildlandFire_Perimeters: ok({ type: 'FeatureCollection', features: [perimeter('Quarry')] }),
+      WFIGS_Interagency_Perimeters_Current: ok({ type: 'FeatureCollection', features: [perimeter('Quarry')] }),
       // national NFDRS station lookup answers empty → fallback resolves null, harmlessly
       NFDRS_ERC_and_BI_Percentiles_and_Trends: ok({ features: [] }),
     });
@@ -84,7 +84,7 @@ describe('fetchFireDanger', () => {
 
   it('inside California: CA NFDRS rating is applied alongside perimeters', async () => {
     mockFetch({
-      Current_WildlandFire_Perimeters: ok({ type: 'FeatureCollection', features: [] }),
+      WFIGS_Interagency_Perimeters_Current: ok({ type: 'FeatureCollection', features: [] }),
       CA_NFDRS: ok({ features: [{ properties: { PSAName: 'Northern Sierra', Avg_BI: 40, Avg_BI_Pct: 75, Avg_ERC: 60, Avg_ERC_Pct: 80, Avg_FM100Hr: 8, Avg_FM1000Hr: 10 } }] }),
     });
     await fetchFireDanger(38.68, -120.99, boundsAround(38.68, -120.99));
@@ -95,7 +95,7 @@ describe('fetchFireDanger', () => {
 
   it('a failed perimeter request is an ERROR, not "no fires · LIVE"', async () => {
     S.activeFires = [{ name: 'previous' }];
-    mockFetch({ Current_WildlandFire_Perimeters: { ok: false, status: 503 }, CA_NFDRS: ok({ features: [] }) });
+    mockFetch({ WFIGS_Interagency_Perimeters_Current: { ok: false, status: 503 }, CA_NFDRS: ok({ features: [] }) });
     await fetchFireDanger(38.68, -120.99, boundsAround(38.68, -120.99));
     expect(S.sectionMeta.fireDanger.status).toBe('error');
     expect(S.sectionMeta.fireDanger.error).toContain('503');
@@ -104,7 +104,7 @@ describe('fetchFireDanger', () => {
   });
 
   it('a rejected perimeter request (network down) is an ERROR too', async () => {
-    mockFetch({ Current_WildlandFire_Perimeters: { reject: 'Failed to fetch' }, CA_NFDRS: ok({ features: [] }) });
+    mockFetch({ WFIGS_Interagency_Perimeters_Current: { reject: 'Failed to fetch' }, CA_NFDRS: ok({ features: [] }) });
     await fetchFireDanger(38.68, -120.99, boundsAround(38.68, -120.99));
     expect(S.sectionMeta.fireDanger.status).toBe('error');
     expect(S.sectionMeta.fireDanger.error).toContain('Failed to fetch');
@@ -113,7 +113,7 @@ describe('fetchFireDanger', () => {
   it('perimeters served from the Service Worker offline fallback are labeled CACHED by their stored time', async () => {
     const ts = Date.now() - 5 * 3600 * 1000;
     mockFetch({
-      Current_WildlandFire_Perimeters: ok({ type: 'FeatureCollection', features: [perimeter('Old')] }, { 'X-SAR-SW-Cache': String(ts) }),
+      WFIGS_Interagency_Perimeters_Current: ok({ type: 'FeatureCollection', features: [perimeter('Old')] }, { 'X-SAR-SW-Cache': String(ts) }),
       CA_NFDRS: ok({ features: [] }),
     });
     await fetchFireDanger(38.68, -120.99, boundsAround(38.68, -120.99));

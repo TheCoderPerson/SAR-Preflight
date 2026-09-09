@@ -2983,6 +2983,25 @@ function _restrictionEmptyMsg(kind) {
   }, Date.now(), (typeof _localTZ === 'function') ? _localTZ() : undefined);
 }
 
+// Assessment advisory + NOTAMs-tab notice when the live NOTAM check failed.
+const NOTAM_MANUAL_UPDATE_CAUTION = 'NOTAMs NEED MANUAL UPDATE — automatic NOTAM check unavailable; import from FAA NOTAM Search (NOTAMs tab)';
+
+// Red notice above the NOTAM list whenever the live NOTAM leg failed for the
+// drawn area. Shown regardless of whether older NOTAMs are still listed —
+// those are not current — and hidden again the moment a live check succeeds.
+function renderNotamManualNotice() {
+  const el = document.getElementById('notamManualNotice'); if (!el) return;
+  const sm = (S.sectionMeta && S.sectionMeta.notam) || {};
+  const show = !!S.currentArea && sm.status === 'error';
+  el.style.display = show ? '' : 'none';
+  if (!show) return;
+  const why = sm.error ? ' (' + sm.error + ')' : '';
+  el.innerHTML = '<b>\u26a0 NOTAMs NEED MANUAL UPDATE</b> \u2014 the automatic NOTAM check is unavailable' + why.replace(/</g, '&lt;')
+    + '. NOTAM status for this area is UNKNOWN, not "none". To update: 1) open FAA NOTAM Search from the "Get the data" links above, '
+    + '2) run the search for this area, 3) copy the results, 4) paste them below and press Parse. '
+    + 'Or obtain an official briefing at 1800wxbrief.com.';
+}
+
 // Prominent "was this auto-checked?" panel at the top of the NOTAMs tab.
 // Reads S.autoCheck + whether a proxy is configured + whether an area is drawn.
 function renderAutoCheckStatus() {
@@ -3016,6 +3035,7 @@ function renderAutoCheckStatus() {
   if (ind) ind.style.background = color;
   if (sta) { sta.className = d.badgeCls; sta.textContent = d.badge; }
   if (det) det.textContent = d.detail;
+  renderNotamManualNotice();
   if (btn) btn.style.display = (proxySet && hasArea) ? '' : 'none';
   sec.style.borderLeftColor = color;
   sec.style.display = '';
@@ -3583,9 +3603,13 @@ async function fetchFireDanger(lat, lng, bounds) {
     // Fetch active fire perimeters (US-wide) and NFDRS fire danger (CA only) in parallel
     const isCA = lat >= 32.5 && lat <= 42.0 && lng >= -124.5 && lng <= -114.0;
     const fetches = [
-      fetch(`https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/Current_WildlandFire_Perimeters/FeatureServer/0/query`
+      // NIFC's Current_WildlandFire_Perimeters service went token-gated
+      // (499 "Token Required", Sept 2026); WFIGS_Interagency_Perimeters_Current
+      // on the same org is the public replacement (same poly_* fields,
+      // containment is attr_PercentContained).
+      fetch(`https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query`
         + `?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326`
-        + `&outFields=poly_IncidentName,poly_GISAcres,poly_PercentContained,poly_CreateDate`
+        + `&outFields=poly_IncidentName,poly_GISAcres,attr_PercentContained,poly_CreateDate`
         + `&outSR=4326&f=geojson&resultRecordCount=50`),
     ];
     if (isCA) {
@@ -3625,7 +3649,7 @@ async function fetchFireDanger(lat, lng, bounds) {
         return {
           name: p.poly_IncidentName || 'Unknown Fire',
           acres: Math.round(p.poly_GISAcres || 0),
-          contained: p.poly_PercentContained,
+          contained: (p.attr_PercentContained != null) ? p.attr_PercentContained : p.poly_PercentContained,
           date: p.poly_CreateDate,
           distNm: (distKm * 0.539957).toFixed(1),
           geometry: f.geometry,
@@ -4299,7 +4323,9 @@ async function fetchFAAairspace(bounds) {
 
   const urls = {
     classAirspace: `${base}/Class_Airspace/FeatureServer/0/query?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=IDENT,NAME,CLASS,UPPER_VAL,UPPER_UOM,LOWER_VAL,LOWER_UOM,LOCAL_TYPE&outSR=4326&f=geojson&resultRecordCount=500`,
-    sua: `${base}/Special_Use_Airspace/FeatureServer/0/query?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=NAME,TYPE_CODE,LOCAL_TYPE,UPPER_VAL,LOWER_VAL&outSR=4326&f=geojson&resultRecordCount=500`,
+    // No LOCAL_TYPE here: the SUA layer dropped that field (Sept 2026) and ArcGIS
+    // rejects the whole query with 400 when outFields names a missing field.
+    sua: `${base}/Special_Use_Airspace/FeatureServer/0/query?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=NAME,TYPE_CODE,UPPER_VAL,LOWER_VAL&outSR=4326&f=geojson&resultRecordCount=500`,
     tfrs: `${base}/National_Defense_Airspace_TFR_Areas/FeatureServer/0/query?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=NAME,TYPE_CODE,LOCAL_TYPE,CITY,STATE&outSR=4326&f=geojson&resultRecordCount=200`,
     laanc: `${base}/FAA_UAS_FacilityMap_Data_V5/FeatureServer/0/query?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=CEILING,APT1_FAAID,APT1_NAME&outSR=4326&f=geojson&resultRecordCount=2000`,
     nsRestrictions: `${base}/Part_Time_National_Security_UAS_Flight_Restrictions/FeatureServer/0/query?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=*&outSR=4326&f=geojson&resultRecordCount=200`,
@@ -7259,12 +7285,17 @@ function computeAssessment(snap) {
   }
 
   // A failed auto-check means TFR/NOTAM ABSENCE is unverified — never a clean
-  // GO. (Active-TFR NO-GO from stale data above stays: presence is conservative.)
+  // result. (Active-TFR limit from stale data above stays: presence is
+  // conservative.) Each leg gets its own line: the NOTAM one tells the
+  // operator to update manually, because the automatic NOTAM check has no
+  // working source (FAA NOTAM Search blocks automated access, Sept 2026).
   if (S.autoCheck && S.autoCheck.state === 'error' && S.currentArea &&
       typeof getCanopyProxyBase === 'function' && getCanopyProxyBase()) {
     if (result.level === 'GO') result.level = 'CAUTION';
     result.cautions = result.cautions || [];
-    result.cautions.push('TFR/NOTAM check FAILED — airspace unverified (1800wxbrief.com)');
+    const tfrFailed = S.autoCheck.tfrOk === false, notamFailed = S.autoCheck.notamOk === false;
+    if (notamFailed) result.cautions.push(NOTAM_MANUAL_UPDATE_CAUTION);
+    if (tfrFailed || !notamFailed) result.cautions.push('TFR check FAILED — airspace unverified (1800wxbrief.com)');
     if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
   }
 
@@ -14468,6 +14499,7 @@ if (typeof module !== 'undefined' && module.exports) {
     notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _assessBadgeColor, sendFeedback, openFeedback, closeFeedback,
     fetchFAAairspace, faaAirspaceUnavailableLayers, FAA_AIRSPACE_LAYER_LABELS, fetchFireDanger,
     UNKNOWN_CELL_TEXT, SECTION_CELLS, sectionCellsFor, markCellsUnknown, renderFireDangerUnknown,
+    NOTAM_MANUAL_UPDATE_CAUTION, renderNotamManualNotice,
     STALE_CELL_SUFFIX, markCellsStale, reapplyStaleCells, renderFireDangerStale, refreshPanelForHour,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
     renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, _isConstrained, setCanopyOpacity, setViewshedOpacity,

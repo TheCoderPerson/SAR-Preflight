@@ -344,7 +344,7 @@ describe('navigationStrategy(request)', () => {
 // area re-checked returned the original wildfire perimeters / NFDRS rating /
 // FAA airspace without contacting the server.
 describe('routeStrategy — changing data endpoints', () => {
-  const FIRES = 'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/Current_WildlandFire_Perimeters/FeatureServer/0/query?where=1=1&geometry=-121,38,-120,39&f=geojson';
+  const FIRES = 'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query?where=1=1&geometry=-121,38,-120,39&f=geojson';
   const NFDRS = 'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/CA_NFDRS/FeatureServer/1/query?where=1=1&geometry=-120.99,38.68&f=geojson';
   const RAWS = 'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/NFDRS_ERC_and_BI_Percentiles_and_Trends/FeatureServer/0/query?where=1=1&f=json';
   const FAA = 'https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/arcgis/rest/services/National_Defense_Airspace_TFR_Areas/FeatureServer/0/query?where=1=1&f=geojson';
@@ -388,7 +388,7 @@ describe('routeStrategy — changing data endpoints', () => {
 // fetcher stamps a week-old copy with a fresh "updated" time and labels it LIVE.
 describe('networkFirst(request) — cache-fallback stamping', () => {
   const { networkFirst, stampCachedAt, markSwCacheFallback, SW_CACHED_AT_HDR, SW_CACHE_FALLBACK_HDR } = require('../../sw.js');
-  const URL_ = 'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/Current_WildlandFire_Perimeters/FeatureServer/0/query?f=geojson';
+  const URL_ = 'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query?f=geojson';
   let savedCaches, savedFetch;
 
   function stub(cached) {

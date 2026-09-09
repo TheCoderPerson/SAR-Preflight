@@ -24,6 +24,15 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.09.08-e',
+    date: '2026-09-08',
+    changes: [
+      'Fire perimeters are back: NIFC made the service the app queried private ("Token Required"); the app now uses NIFC\'s public WFIGS current-perimeters service instead.',
+      'Special Use Airspace is back: the FAA layer dropped a field the query still asked for, so ArcGIS rejected the whole request. MOA / Restricted / Prohibited load again.',
+      'NOTAMs need manual update. The FAA NOTAM Search site the live check relied on now blocks automated access (it loads in a browser but rejects the data proxy), and no free keyless public NOTAM endpoint exists. The assessment now lists "NOTAMs NEED MANUAL UPDATE", the NOTAMs tab shows a red notice with the copy-and-paste steps, and the live check keeps retrying automatically in case access is restored. TFRs are unaffected and still update live. Next step: the app is being moved to the official FAA NOTAM Management Service API (credentialed access has been granted for the test environment).',
+    ],
+  },
+  {
     version: '2026.09.08-d',
     date: '2026-09-08',
     changes: [
@@ -3302,6 +3311,10 @@ function buildAutoCheckDisplay(inp, nowMs, tz) {
     let detail;
     if (!anyData) {
       detail = 'TFR/NOTAM data UNAVAILABLE — airspace restrictions cannot be verified. Obtain an official briefing at 1800wxbrief.com (1-800-WX-BRIEF) before flight, or import data manually below.';
+    } else if (n.status === 'error' && t.status !== 'error') {
+      // The NOTAM leg is the one with no working automatic source: say what to do.
+      detail = 'NOTAMs NEED MANUAL UPDATE — the automatic NOTAM check is unavailable. ' + _restrictionSourceFrag('TFR', t, nowMs, tz) +
+        ' Open FAA NOTAM Search via the links below, copy the results and paste them into the NOTAMs section, or obtain an official briefing at 1800wxbrief.com.';
     } else {
       detail = _restrictionSourceFrag('TFR', t, nowMs, tz) + ' • ' + _restrictionSourceFrag('NOTAM', n, nowMs, tz) +
         ' Do not treat missing items as "none" — obtain an official briefing at 1800wxbrief.com before flight.';
@@ -3333,8 +3346,10 @@ function buildRestrictionEmptyMsg(inp, nowMs, tz) {
   if (inp.srcStatus === 'cached' && inp.atMs != null) {
     return 'Cached data from ' + formatStamp(inp.atMs, nowMs, tz) + ' shows no ' + kind + ' — re-check before flight.';
   }
-  const singular = kind === 'TFRs' ? 'TFR' : 'NOTAM';
-  return singular + ' check FAILED — status UNKNOWN, not "none". Obtain an official briefing at 1800wxbrief.com, or import below.';
+  if (kind === 'NOTAMs') {
+    return 'NOTAMs NEED MANUAL UPDATE — automatic NOTAM check unavailable; status UNKNOWN, not "none". Open FAA NOTAM Search via the links above, copy the results and paste them below, or obtain an official briefing at 1800wxbrief.com.';
+  }
+  return 'TFR check FAILED — status UNKNOWN, not "none". Obtain an official briefing at 1800wxbrief.com, or import below.';
 }
 
 // ============================================================

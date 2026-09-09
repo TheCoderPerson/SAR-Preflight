@@ -4,6 +4,12 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.09.08-e — 2026-09-08
+
+- Fire perimeters are back: NIFC made the service the app queried private ("Token Required"); the app now uses NIFC's public WFIGS current-perimeters service instead.
+- Special Use Airspace is back: the FAA layer dropped a field the query still asked for, so ArcGIS rejected the whole request. MOA / Restricted / Prohibited load again.
+- NOTAMs need manual update. The FAA NOTAM Search site the live check relied on now blocks automated access (it loads in a browser but rejects the data proxy), and no free keyless public NOTAM endpoint exists. The assessment now lists "NOTAMs NEED MANUAL UPDATE", the NOTAMs tab shows a red notice with the copy-and-paste steps, and the live check keeps retrying automatically in case access is restored. TFRs are unaffected and still update live. Next step: the app is being moved to the official FAA NOTAM Management Service API (credentialed access has been granted for the test environment).
+
 ## v2026.09.08-d — 2026-09-08
 
 - Airspace tab: the Special Use Airspace row "TFRs" is now "National Defense TFR Areas" — it only ever reflected the FAA's standing national-defense areas (a handful of military installations nationwide), not the live TFR list. Live TFRs over your area are in the NOTAMs tab, drawn on the map, and drive the assessment. "NS UAS Restrictions" is now "NS UAS Restrictions (part-time only)": permanent §99.7 security areas such as Bureau of Reclamation dams are published only as FDC NOTAMs and appear in no FAA GIS layer.
