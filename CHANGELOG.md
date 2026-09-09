@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.09.08-d — 2026-09-08
+
+- Airspace tab: the Special Use Airspace row "TFRs" is now "National Defense TFR Areas" — it only ever reflected the FAA's standing national-defense areas (a handful of military installations nationwide), not the live TFR list. Live TFRs over your area are in the NOTAMs tab, drawn on the map, and drive the assessment. "NS UAS Restrictions" is now "NS UAS Restrictions (part-time only)": permanent §99.7 security areas such as Bureau of Reclamation dams are published only as FDC NOTAMs and appear in no FAA GIS layer.
+
 ## v2026.09.08-c — 2026-09-08
 
 - When an UPDATE fails but this area's earlier data is still on screen, every value that source feeds now turns amber with "(stale: Verify)" after it — the numbers are real but not current and may have changed. The marker survives timeline scrubbing. The fire card gets the same amber stale line.
