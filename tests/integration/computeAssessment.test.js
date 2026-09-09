@@ -12,8 +12,9 @@ describe('computeAssessment()', () => {
       <span id="assessBadge" class="assessment-badge">--</span>
       <span id="assessText">--</span>
     `;
-    // Reset state
-    S.wx = {};
+    // Reset state — nominal weather (missing visibility is a CAUTION on its
+    // own, so tests about OTHER cautions start from a checkable GO).
+    S.wx = { visibility: 16000, temperature_2m: 65, precipitation_probability: 0, weather_code: 0 };
     S.wind = {};
     S.elev = {};
   });
@@ -36,7 +37,7 @@ describe('computeAssessment()', () => {
       computeAssessment();
 
       const badge = document.getElementById('assessBadge');
-      expect(badge.textContent).toBe('GO');
+      expect(badge.textContent).toBe('NOMINAL');
       expect(badge.className).toBe('assessment-badge go');
     });
 
@@ -57,7 +58,7 @@ describe('computeAssessment()', () => {
       );
     });
 
-    it('GO when all state objects are empty (defaults are safe)', () => {
+    it('CAUTION, not GO, when all state objects are empty (unavailable weather is not clear weather)', () => {
       S.wx = {};
       S.wind = {};
       S.elev = {};
@@ -65,8 +66,9 @@ describe('computeAssessment()', () => {
       computeAssessment();
 
       const badge = document.getElementById('assessBadge');
-      expect(badge.textContent).toBe('GO');
-      expect(badge.className).toBe('assessment-badge go');
+      expect(badge.textContent).toMatch(/ADVISOR/);
+      expect(badge.className).toBe('assessment-badge caution');
+      expect(document.getElementById('assessText').textContent).toContain('Visibility unavailable');
     });
   });
 
@@ -84,7 +86,7 @@ describe('computeAssessment()', () => {
       computeAssessment();
 
       const badge = document.getElementById('assessBadge');
-      expect(badge.textContent).toBe('CAUTION');
+      expect(badge.textContent).toMatch(/ADVISOR/);
       expect(badge.className).toBe('assessment-badge caution');
     });
 
@@ -100,7 +102,7 @@ describe('computeAssessment()', () => {
 
       computeAssessment();
 
-      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
       expect(document.getElementById('assessText').textContent).toContain('visibility');
     });
 
@@ -116,7 +118,7 @@ describe('computeAssessment()', () => {
 
       computeAssessment();
 
-      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
       expect(document.getElementById('assessText').textContent).toContain('Cold');
     });
 
@@ -132,7 +134,7 @@ describe('computeAssessment()', () => {
 
       computeAssessment();
 
-      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
       expect(document.getElementById('assessText').textContent).toContain('elevation');
     });
 
@@ -148,7 +150,7 @@ describe('computeAssessment()', () => {
 
       computeAssessment();
 
-      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
       expect(document.getElementById('assessText').textContent).toContain('Precip');
     });
   });
@@ -167,7 +169,7 @@ describe('computeAssessment()', () => {
       computeAssessment();
 
       const badge = document.getElementById('assessBadge');
-      expect(badge.textContent).toBe('NO-GO');
+      expect(badge.textContent).toMatch(/LIMIT/);
       expect(badge.className).toBe('assessment-badge nogo');
     });
 
@@ -199,7 +201,7 @@ describe('computeAssessment()', () => {
       computeAssessment();
 
       const badge = document.getElementById('assessBadge');
-      expect(badge.textContent).toBe('NO-GO');
+      expect(badge.textContent).toMatch(/LIMIT/);
       expect(badge.className).toBe('assessment-badge nogo');
       expect(document.getElementById('assessText').textContent).toContain('Thunderstorm');
     });
@@ -216,7 +218,7 @@ describe('computeAssessment()', () => {
 
       computeAssessment();
 
-      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
       expect(document.getElementById('assessText').textContent).toContain('Visibility');
     });
 
@@ -232,7 +234,7 @@ describe('computeAssessment()', () => {
 
       computeAssessment();
 
-      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
       expect(document.getElementById('assessText').textContent).toContain('Precip');
     });
   });
@@ -252,7 +254,7 @@ describe('computeAssessment()', () => {
       computeAssessment();
 
       // 18 > 15 -> NO-GO
-      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
     });
 
     it('higher tolerance allows higher winds', () => {
@@ -270,7 +272,7 @@ describe('computeAssessment()', () => {
 
       // 30 > 35 is false, 35 > 40 is false -> no wind issue
       // But 30 > 15 -> CAUTION (elevated winds)
-      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
     });
 
     it('defaults to 27 when cfgMaxWind is empty', () => {
@@ -287,7 +289,7 @@ describe('computeAssessment()', () => {
       computeAssessment();
 
       // 28 > 27 -> NO-GO
-      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
     });
   });
 
@@ -332,7 +334,7 @@ describe('computeAssessment()', () => {
 
       const text = document.getElementById('assessText').textContent;
       expect(text).toContain('\u2022'); // bullet separator
-      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
     });
   });
 
@@ -360,7 +362,7 @@ describe('computeAssessment()', () => {
     it('active TFR overlapping the area forces NO-GO', () => {
       S.tfrs = [{ id: '6/1234', name: 'Fire TFR', polygons: [overlapRing], effectiveStart: null, effectiveEnd: null }];
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
       expect(document.getElementById('assessText').textContent).toContain('Active TFR over area');
       expect(document.getElementById('assessText').textContent).toContain('6/1234');
     });
@@ -368,27 +370,27 @@ describe('computeAssessment()', () => {
     it('a future (inactive) TFR over the area is CAUTION, not NO-GO', () => {
       S.tfrs = [{ id: '6/5678', name: 'Scheduled', polygons: [overlapRing], effectiveStart: '2099-01-01T00:00:00Z', effectiveEnd: '2099-01-02T00:00:00Z' }];
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
       expect(document.getElementById('assessText').textContent).toContain('not currently active');
     });
 
     it('a TFR that does not overlap the area does not change GO', () => {
       S.tfrs = [{ id: '6/9999', name: 'Elsewhere', polygons: [farRing], effectiveStart: null, effectiveEnd: null }];
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+      expect(document.getElementById('assessBadge').textContent).toBe('NOMINAL');
     });
 
     it('an active TFR NO-GO cannot be downgraded by a weather CAUTION', () => {
       S.wx = { visibility: 16000, temperature_2m: 30, precipitation_probability: 0, weather_code: 0 }; // cold -> CAUTION base
       S.tfrs = [{ id: '6/1111', name: 'Fire TFR', polygons: [overlapRing], effectiveStart: null, effectiveEnd: null }];
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
     });
 
     it('list-only TFRs (no geometry) do not trigger NO-GO', () => {
       S.tfrs = [{ id: '6/2222', name: 'list only', polygons: [], source: 'list', effectiveStart: null, effectiveEnd: null }];
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+      expect(document.getElementById('assessBadge').textContent).toBe('NOMINAL');
     });
   });
 
@@ -398,7 +400,7 @@ describe('computeAssessment()', () => {
     it('adds a CAUTION when part of the area is private', () => {
       S.landStatus = { sampled: 100, privateCount: 40, privateFrac: 0.4, anyPublic: true };
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
       expect(document.getElementById('assessText').textContent.toLowerCase()).toContain('private');
       expect(document.getElementById('assessText').textContent).toContain('40%');
     });
@@ -412,20 +414,20 @@ describe('computeAssessment()', () => {
     it('stays GO when the area is fully public', () => {
       S.landStatus = { sampled: 100, privateCount: 0, privateFrac: 0, anyPublic: true };
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+      expect(document.getElementById('assessBadge').textContent).toBe('NOMINAL');
     });
 
     it('is suppressed when SMA returned no coverage (sampled 0)', () => {
       S.landStatus = { sampled: 0, privateCount: 0, privateFrac: 0, anyPublic: false };
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+      expect(document.getElementById('assessBadge').textContent).toBe('NOMINAL');
     });
 
     it('does not downgrade an existing NO-GO and is advisory only', () => {
       S.wind = { maxWind: 40, maxGust: 50 }; // wind NO-GO
       S.landStatus = { sampled: 100, privateCount: 60, privateFrac: 0.6, anyPublic: true };
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
     });
   });
 
@@ -435,20 +437,20 @@ describe('computeAssessment()', () => {
     it('adds a CAUTION when in-region with zero carrier coverage', () => {
       S.cellStatus = { inRegion: true, count: 0, level: 'red' };
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
       expect(document.getElementById('assessText').textContent.toLowerCase()).toContain('cell');
     });
 
     it('stays GO when carriers cover the area', () => {
       S.cellStatus = { inRegion: true, count: 2, level: 'green' };
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+      expect(document.getElementById('assessBadge').textContent).toBe('NOMINAL');
     });
 
     it('does not fire when outside the bundled region (no data ≠ no coverage)', () => {
       S.cellStatus = { inRegion: false, count: null, level: 'green' };
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+      expect(document.getElementById('assessBadge').textContent).toBe('NOMINAL');
     });
   });
 });

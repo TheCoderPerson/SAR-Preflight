@@ -504,6 +504,23 @@ async function _proxyFetch(url, opts) {
   return res;
 }
 
+// Did the Service Worker answer this request from its OFFLINE FALLBACK cache
+// instead of the network? sw.js `networkFirst` sets X-SAR-SW-Cache only on
+// that path (value = ms epoch the entry was stored, or 'unknown' for entries
+// stored before stamping existed). Returns { cachedAt } (cachedAt may be null
+// when unknown) or null for a genuine network answer / non-SW environments.
+// Fetchers that label their data LIVE must consult this — a fallback carries
+// no other hint, so without it a week-old copy is stamped with a fresh time.
+function _swCacheStamp(res) {
+  try {
+    if (!res || !res.headers || typeof res.headers.get !== 'function') return null;
+    const v = res.headers.get('X-SAR-SW-Cache');
+    if (v == null || v === '') return null;
+    const n = Number(v);
+    return { cachedAt: (Number.isFinite(n) && n > 0) ? n : null };
+  } catch (_) { return null; }
+}
+
 // ============================================================
 // DOM HELPERS
 // ============================================================
@@ -2757,8 +2774,16 @@ async function fetchNotams(lat, lng, radiusNm) {
   try {
     const r = Math.max(5, Math.min(100, Math.round(radiusNm || 20)));
     const res = await _proxyFetch(base + '/notam?lat=' + lat.toFixed(5) + '&lng=' + lng.toFixed(5) + '&radius=' + r, { cache: 'no-store' });
-    if (!res.ok) throw new Error('NOTAM HTTP ' + res.status);
+    if (!res.ok) {
+      // The proxy answers 502 with { error } when the FAA backend failed or
+      // paging stopped short — carry that reason into the status line.
+      let detail = '';
+      try { const body = await res.json(); if (body && body.error) detail = ': ' + body.error; } catch (_) { /* non-JSON */ }
+      throw new Error('NOTAM HTTP ' + res.status + detail);
+    }
     const data = await res.json();
+    // A 200 whose body is not a search result must not become "0 NOTAMs · LIVE".
+    if (!data || !Array.isArray(data.notamList)) throw new Error('NOTAM response malformed' + (data && data.error ? ': ' + data.error : ''));
     const parsed = (typeof parseNotamSearchResponse === 'function') ? parseNotamSearchResponse(data) : [];
     const aoi = _buildNotamAoi(lat, lng, r);
     const notams = parsed.map(n => {
@@ -3365,7 +3390,7 @@ function parsePastedNotams() {
     msgEl.style.color = overArea ? 'var(--accent-red)' : 'var(--accent-green)';
     msgEl.textContent = `✓ Parsed ${r.notams.length} NOTAM(s)` +
       (withArea ? `, ${withArea} with an area drawn on the map` : '') +
-      (overArea ? ` — ${overArea} OVER your search area (see red on map + CAUTION banner)` : '') + '.';
+      (overArea ? ` — ${overArea} OVER your search area (see red on map + assessment banner)` : '') + '.';
   }
   ta.value = '';
 }
@@ -3472,12 +3497,22 @@ async function fetchFireDanger(lat, lng, bounds) {
     }
     // Outside California, resolve NFDRS from the nearest RAWS station via FEMS (national).
     const nationalNfdrs = isCA ? null : _fetchNationalNFDRS(lat, lng).catch(() => null);
-    const [firesRes, nfdrsRes] = await Promise.allSettled(fetches);
+    const results = await Promise.allSettled(fetches);
+    const firesRes = results[0];
+    // Only queued inside California — outside it this is null, and reading
+    // `.status` off `undefined` used to throw here, so a Colorado area never
+    // reached the national NFDRS fallback and its fires never hit state.
+    const nfdrsRes = isCA ? results[1] : null;
 
-    // Process active fires
+    // Process active fires. A failed perimeter request is an ERROR, not "no
+    // fires": it must not clear the map and report LIVE.
+    if (firesRes.status !== 'fulfilled') throw (firesRes.reason instanceof Error) ? firesRes.reason : new Error('Fire perimeters: ' + firesRes.reason);
+    if (!firesRes.value.ok) throw new Error('Fire perimeters HTTP ' + firesRes.value.status);
+    const firesSw = _swCacheStamp(firesRes.value);
     let fires = [];
-    if (firesRes.status === 'fulfilled' && firesRes.value.ok) {
+    {
       const data = await firesRes.value.json();
+      if (data && data.error) throw new Error('Fire perimeters: ' + (data.error.message || 'ArcGIS error'));
       fires = (data.features || []).map(f => {
         const p = f.properties;
         const coords = f.geometry?.coordinates;
@@ -3502,7 +3537,7 @@ async function fetchFireDanger(lat, lng, bounds) {
 
     // Process NFDRS fire danger
     let fireDanger = null;
-    if (nfdrsRes.status === 'fulfilled' && nfdrsRes.value.ok) {
+    if (nfdrsRes && nfdrsRes.status === 'fulfilled' && nfdrsRes.value.ok) {
       const data = await nfdrsRes.value.json();
       const f = data.features?.[0]?.properties;
       if (f) {
@@ -3527,7 +3562,13 @@ async function fetchFireDanger(lat, lng, bounds) {
     renderFireDangerCard(fires, fireDanger, lat, lng);
 
     clearDataSourceError('Fire Danger');
-    markSection('fireDanger', { status: 'live', updatedAt: Date.now(), error: null });
+    if (firesSw) {
+      // Perimeters came from the Service Worker's offline fallback, not NIFC —
+      // label them by their stored time instead of stamping "now".
+      markSection('fireDanger', { status: 'cached', cachedAt: firesSw.cachedAt, error: null });
+    } else {
+      markSection('fireDanger', { status: 'live', updatedAt: Date.now(), error: null });
+    }
   } catch (err) {
     console.warn('Fire danger fetch failed:', err);
     recordDataSourceError('Fire Danger', err);
@@ -4103,6 +4144,19 @@ function renderNWSAlertPolygons() {
 // ============================================================
 // API: FAA UDDS — Airspace, SUA, TFR, LAANC, NS Restrictions
 // ============================================================
+// Operator-facing names for the six FAA UDDS layers (status line + assessment caution).
+const FAA_AIRSPACE_LAYER_LABELS = {
+  classAirspace: 'Class airspace', sua: 'Special-use airspace', tfrs: 'National Defense TFR areas',
+  laanc: 'LAANC grid', nsRestrictions: 'NS UAS restrictions', prohibited: 'Prohibited areas',
+};
+
+// FAA layers whose fetch failed and for which no cached copy exists either —
+// the assessment turns these into a CAUTION (unverified ≠ clear).
+function faaAirspaceUnavailableLayers(data) {
+  if (!data) return [];
+  return Object.keys(FAA_AIRSPACE_LAYER_LABELS).filter(k => data[k] && data[k]._unavailable);
+}
+
 async function fetchFAAairspace(bounds) {
   trackFetchStart('FAA Airspace');
   setStatus('faaAirspaceStatus', 'loading', 'Fetching...');
@@ -4122,14 +4176,51 @@ async function fetchFAAairspace(bounds) {
 
   try {
     const keys = Object.keys(urls);
-    const results = await Promise.allSettled(keys.map(k => fetch(urls[k]).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })));
+    const results = await Promise.allSettled(keys.map(k => fetch(urls[k]).then(async r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const json = await r.json();
+      // ArcGIS reports most failures as a 200 carrying { error: {...} }.
+      if (json && json.error) throw new Error((json.error.message || 'ArcGIS error') + (json.error.code ? ` (${json.error.code})` : ''));
+      return { json, sw: _swCacheStamp(r) };
+    })));
 
+    // A failed request used to become an EMPTY feature collection, so six
+    // outages rendered as "LIVE — no restrictions", got written to the cache
+    // as if real, and cleared the error banner. Failures now stay failures:
+    // all six down → throw (cached copy, explicitly labeled, or ERROR);
+    // some down → PARTIAL, missing layers filled from the cached copy where
+    // one exists and flagged `_unavailable` (→ assessment CAUTION) where not.
     const data = {};
+    const failed = [];
+    let swCachedAt = null, swFallback = false;
     keys.forEach((k, i) => {
-      if (results[i].status === 'fulfilled') {
-        data[k] = results[i].value;
+      const r = results[i];
+      if (r.status === 'fulfilled') {
+        data[k] = r.value.json;
+        if (r.value.sw) {
+          swFallback = true;
+          if (r.value.sw.cachedAt != null) swCachedAt = (swCachedAt == null) ? r.value.sw.cachedAt : Math.min(swCachedAt, r.value.sw.cachedAt);
+        }
       } else {
-        data[k] = { type: 'FeatureCollection', features: [] };
+        failed.push({ key: k, reason: (r.reason && r.reason.message) ? r.reason.message : String(r.reason) });
+      }
+    });
+    if (failed.length === keys.length) {
+      throw new Error('All ' + keys.length + ' FAA airspace requests failed (' + failed[0].reason + ')');
+    }
+
+    let cached = null;
+    const cachedFilled = [];
+    if (failed.length && typeof getCachedApiResponse === 'function') {
+      try { cached = await getCachedApiResponse('faa_airspace', cacheKey); } catch (_) { cached = null; }
+    }
+    failed.forEach(f => {
+      const c = cached && cached.data && cached.data[f.key];
+      if (c && !c._unavailable) {
+        data[f.key] = Object.assign({}, c, { _cachedAt: cached.timestamp });
+        cachedFilled.push(f.key);
+      } else {
+        data[f.key] = { type: 'FeatureCollection', features: [], _unavailable: true };
       }
     });
 
@@ -4140,16 +4231,34 @@ async function fetchFAAairspace(bounds) {
     // Update airspace tab with live FAA data
     computeAirspace(S.areaCenter.lat, S.areaCenter.lng);
 
-    // Cache
-    if (typeof cacheApiResponse === 'function') {
+    // Cache — only a COMPLETE live result. A partial one would overwrite the
+    // last good copy with empties, and a SW offline fallback is already cached.
+    if (!failed.length && !swFallback && typeof cacheApiResponse === 'function') {
       cacheApiResponse('faa_airspace', cacheKey, data);
     }
     if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
-
-    clearDataSourceError('FAA Airspace');
-    setStatus('faaAirspaceStatus', 'live', 'LIVE');
     buildLayerControl();
-    markSection('airspace', { source: 'faa', status: 'live', updatedAt: Date.now(), error: null });
+
+    if (failed.length) {
+      const label = k => FAA_AIRSPACE_LAYER_LABELS[k] || k;
+      const msg = failed.length + ' of ' + keys.length + ' FAA airspace layers failed — '
+        + failed.map(f => label(f.key) + ' (' + f.reason + ')').join(', ')
+        + (cachedFilled.length ? '; cached copy used for ' + cachedFilled.map(label).join(', ') : '')
+        + (cachedFilled.length < failed.length ? '; ' + failed.filter(f => cachedFilled.indexOf(f.key) < 0).map(f => label(f.key)).join(', ') + ' UNAVAILABLE' : '');
+      recordDataSourceError('FAA Airspace', new Error(msg));
+      setStatus('faaAirspaceStatus', 'partial', 'PARTIAL \u00b7 ' + failed.length + '/' + keys.length + ' FAILED');
+      markSection('airspace', { source: 'faa', status: 'error', error: msg, cachedAt: cachedFilled.length ? cached.timestamp : null });
+    } else if (swFallback) {
+      // Every layer answered, but from the Service Worker's offline cache.
+      clearDataSourceError('FAA Airspace');
+      const age = swCachedAt != null ? Date.now() - swCachedAt : null;
+      setStatus('faaAirspaceStatus', 'cached', (age != null && typeof formatAge === 'function') ? 'CACHED ' + formatAge(age) : 'CACHED');
+      markSection('airspace', { source: 'faa', status: 'cached', cachedAt: swCachedAt, error: null });
+    } else {
+      clearDataSourceError('FAA Airspace');
+      setStatus('faaAirspaceStatus', 'live', 'LIVE');
+      markSection('airspace', { source: 'faa', status: 'live', updatedAt: Date.now(), error: null });
+    }
   } catch (err) {
     console.error('FAA Airspace fetch error:', err);
     recordDataSourceError('FAA Airspace', err);
@@ -7029,6 +7138,15 @@ function computeAssessment(snap) {
 
   // Integrate FAA airspace data into assessment
   if (S.faaAirspace) {
+    // CAUTION: a layer that failed to load with no cached copy is UNVERIFIED,
+    // not clear — an empty feature list must never read as "no restrictions".
+    const missing = faaAirspaceUnavailableLayers(S.faaAirspace);
+    if (missing.length) {
+      if (result.level === 'GO') result.level = 'CAUTION';
+      result.cautions = result.cautions || [];
+      result.cautions.push('FAA airspace data incomplete — ' + missing.map(k => FAA_AIRSPACE_LAYER_LABELS[k] || k).join(', ') + ' unavailable (unverified)');
+      if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+    }
     // NO-GO: active TFR
     if (S.faaAirspace.tfrs && S.faaAirspace.tfrs.features && S.faaAirspace.tfrs.features.length > 0) {
       result.level = 'NO-GO';
@@ -7218,20 +7336,32 @@ function computeAssessment(snap) {
     }
   }
 
+  // No verdict word: the banner names what was found and lists every item
+  // (limits first, then advisories); the decision stays with the RPIC.
+  const display = assessmentDisplay(result);
+
   // Append staleness warning if data is older than 30 minutes
   if (typeof _lastDataTimestamp !== 'undefined' && _lastDataTimestamp) {
     const dataAge = Date.now() - _lastDataTimestamp;
     if (dataAge > 30 * 60 * 1000) {
       const ageStr = typeof formatAge === 'function' ? formatAge(dataAge) : Math.round(dataAge / 60000) + 'm';
-      result.text = (result.text ? result.text + ' | ' : '') + 'DATA STALE (' + ageStr + ' old) — refresh recommended';
+      display.text = (display.text ? display.text + ' | ' : '') + 'DATA STALE (' + ageStr + ' old) — refresh recommended';
     }
   }
 
+  S.assessment = { level: result.level, label: display.label, cls: display.cls, limits: display.limits, advisories: display.advisories, text: display.text };
   const badge = document.getElementById('assessBadge');
-  badge.textContent = result.level;
-  badge.className = 'assessment-badge ' + (result.level === 'GO' ? 'go' : result.level === 'CAUTION' ? 'caution' : 'nogo');
-  document.getElementById('assessText').textContent = result.text;
+  badge.textContent = display.label;
+  badge.className = 'assessment-badge ' + display.cls;
+  document.getElementById('assessText').textContent = display.text;
 
+}
+
+// Colour of the assessment badge for exports — read from the last computed
+// assessment (never from the badge TEXT, which carries no verdict word).
+function _assessBadgeColor() {
+  const cls = (S.assessment && S.assessment.cls) || ((document.getElementById('assessBadge') || {}).className || '').replace('assessment-badge', '').trim();
+  return cls === 'go' ? '#22c55e' : cls === 'caution' ? '#f59e0b' : '#ef4444';
 }
 
 // ============================================================
@@ -9882,7 +10012,7 @@ function generatePDFBriefing() {
 
   const briefingText = buildBriefingText();
   const sections = briefingText.split('\n\n');
-  const badgeColor = assessBadge === 'GO' ? '#22c55e' : assessBadge === 'CAUTION' ? '#f59e0b' : '#ef4444';
+  const badgeColor = _assessBadgeColor();
 
   // Capture the map by compositing layers separately:
   // 1. html2canvas for tiles only (works correctly for <img> tiles)
@@ -10118,7 +10248,7 @@ function shareBriefingEmail() {
 function _openEmailBriefingWindow(mapDataUrl) {
   const assessBadge = document.getElementById('assessBadge')?.textContent || '--';
   const assessText = document.getElementById('assessText')?.textContent || '';
-  const badgeColor = assessBadge === 'GO' ? '#22c55e' : assessBadge === 'CAUTION' ? '#f59e0b' : '#ef4444';
+  const badgeColor = _assessBadgeColor();
   const rpic = document.getElementById('cfgRPIC')?.value || 'Not specified';
   const aircraft = (S.activeProfile && (S.activeProfile.model || S.activeProfile.name)) || 'Default';
   const now = new Date();
@@ -10564,7 +10694,10 @@ async function logMission() {
     areaCenter: S.areaCenter ? { lat: S.areaCenter.lat, lng: S.areaCenter.lng } : null,
     areaType: S.areaType,
     assessment: {
-      level: document.getElementById('assessBadge')?.textContent,
+      // `level` is the internal enum (colour + filtering); `label` is what the
+      // operator saw — the badge never shows a verdict word.
+      level: (S.assessment && S.assessment.level) || null,
+      label: document.getElementById('assessBadge')?.textContent,
       text: document.getElementById('assessText')?.textContent,
     },
     wx: {
@@ -10613,7 +10746,7 @@ async function showMissionLogs() {
       html += `<tr style="border-bottom:1px solid var(--border);">` +
         `<td style="padding:6px;color:var(--text-secondary);">${date}</td>` +
         `<td style="padding:6px;">${log.rpic || '--'}</td>` +
-        `<td style="padding:6px;color:${assessColor};font-weight:600;">${log.assessment?.level || '--'}</td>` +
+        `<td style="padding:6px;color:${assessColor};font-weight:600;">${assessmentLabelForLog(log.assessment)}</td>` +
         `<td style="padding:6px;color:var(--text-secondary);">${loc}</td>` +
         `<td style="padding:6px;">${log.aircraft || '--'}</td>` +
         `<td style="padding:6px;color:var(--text-muted);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${(log.notes || '').replace(/"/g, '&quot;')}">${log.notes || '--'}</td>` +
@@ -10644,7 +10777,7 @@ async function exportMissionLogsAsCSV() {
   const headers = ['Date', 'RPIC', 'Aircraft', 'Assessment', 'Lat', 'Lng', 'Area Type', 'Wind (mph)', 'Visibility', 'Temp (F)', 'SOP Profile', 'NWS Alerts', 'Wire Hazards', 'Notes'];
   const rows = logs.map(l => [
     l.timestamp ? new Date(l.timestamp).toISOString() : '',
-    l.rpic || '', l.aircraft || '', l.assessment?.level || '',
+    l.rpic || '', l.aircraft || '', assessmentLabelForLog(l.assessment),
     l.areaCenter?.lat?.toFixed(5) || '', l.areaCenter?.lng?.toFixed(5) || '',
     l.areaType || '', l.wx?.windSpeed || '', l.wx?.visibility || '',
     l.wx?.temp || '', l.sopProfile || '', l.nwsAlerts || 0, l.wireHazards || 0,
@@ -14200,7 +14333,8 @@ if (typeof module !== 'undefined' && module.exports) {
     checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitActivated,
     showUpdateModalIfNewer, _updateApplyStatus, _updateBannerHtml, _cachedShellVersion, _verifyShellFresh,
     getCanopyProxyBase, getCustomProxy, saveCanopyProxy, DEFAULT_DATA_PROXY, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
-    notifyProxyRateLimited, _proxyFetch, sendFeedback, openFeedback, closeFeedback,
+    notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _assessBadgeColor, sendFeedback, openFeedback, closeFeedback,
+    fetchFAAairspace, faaAirspaceUnavailableLayers, FAA_AIRSPACE_LAYER_LABELS, fetchFireDanger,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
     renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, _isConstrained, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,

@@ -10,7 +10,7 @@ A browser-based pre-flight intelligence tool that assists UAS (drone) operators 
 
 The data displayed in this application may be incomplete, inaccurate, outdated, or incorrect. Data is sourced from third-party APIs and open data services that may experience outages, delays, or errors. Calculated values (density altitude, airspace classification, risk assessments, etc.) are approximations and may not reflect actual conditions.
 
-**Users must independently verify all data before flight operations.** Always cross-check critical information (airspace, TFRs, NOTAMs, weather) against official FAA sources, certified weather briefings, and current aeronautical publications. The GO/CAUTION/NO-GO assessment is advisory only and does not replace the Remote Pilot In Command's responsibility to evaluate flight safety.
+**Users must independently verify all data before flight operations.** Always cross-check critical information (airspace, TFRs, NOTAMs, weather) against official FAA sources, certified weather briefings, and current aeronautical publications. The assessment banner (limits exceeded / advisories) is advisory only and does not replace the Remote Pilot In Command's responsibility to evaluate flight safety — it deliberately gives no GO / NO-GO verdict.
 
 ## Known Limitations
 
@@ -25,7 +25,7 @@ Beyond the per-source caveats in [Data Sources](#data-sources), these limits app
 - **Obstacle and wire data are incomplete by design.** The FAA DOF is not a complete low-altitude inventory, and utility/OSM wire layers miss lines routinely — absence of a plotted hazard is never proof of absence.
 - **Parcels are not survey-accurate.** Assessor compilations can be tens of meters off; never used for legal boundary decisions.
 - **ADS-B traffic is advisory.** Coverage is incomplete (no coverage of non-transponder aircraft), altitudes are raw barometric, and AGL is only as precise as the terrain cell — not deconfliction-grade.
-- **Calculated values are approximations.** Density altitude, battery derating, bird-strike risk, solar/lunar figures, and the GO/CAUTION/NO-GO assessment are computed estimates that may not reflect actual conditions.
+- **Calculated values are approximations.** Density altitude, battery derating, bird-strike risk, solar/lunar figures, and the assessment banner's limits/advisories are computed estimates that may not reflect actual conditions.
 - **Updates are not guaranteed.** This is a volunteer-maintained project provided as-is, with no uptime, update-cadence, or support commitments.
 
 ## Website
@@ -42,7 +42,7 @@ Version history is in [CHANGELOG.md](CHANGELOG.md). In the app, a **What's New**
 2. The map centers on your GPS location (or defaults to central California)
 3. **Draw an operational area** on the map using the rectangle, circle, or polygon tools (left toolbar), or enter coordinates manually
 4. All data tabs auto-populate with conditions for your area
-5. The **GO / CAUTION / NO-GO** assessment banner appears based on current conditions
+5. The **assessment banner** appears based on current conditions — it lists every limit exceeded and every advisory (colour-coded green / amber / red) without issuing a GO / NO-GO verdict; that decision stays with the RPIC
 6. Use the **Data Panel** tabs (Weather, Wind, Airspace, Traffic, Terrain, Sun/Moon, GNSS, NOTAMs, Ops) to review detailed information
 7. **Export** a pre-flight briefing as PDF, email, clipboard text, or KML. The KML export captures **every currently-visible map layer** as real geometry — airspace, TFRs, NOTAMs, obstacles, wires, airports, towers, fires, NWS alerts, ADS-B, etc. — with plain-text descriptions, category icons (plane for airports, circle-H for heliports), and NOTAM/TFR folders that lead with a plain-English summary before the raw text. It also adds **hourly sun & wind bearing lines** (24 h, time-slider animation; sun omitted while below the horizon, wind drawn downwind). Canopy and viewshed overlays export as **georeferenced GeoTIFFs in Web Mercator (EPSG:3857)** — the projection CalTopo's *Map Sheet* import expects — and, optionally, as **KMZ GroundOverlays** for Google Earth. Wire, obstacle, NOTAM and TFR folders carry a *"verify independently — not a complete inventory"* note
 
@@ -109,7 +109,7 @@ All data is fetched from free, public APIs. No API keys are required.
 | Dams | [USACE National Inventory of Dams](https://nid.sec.usace.army.mil/) data via an Esri-hosted ArcGIS service | Static |
 | Wilderness areas | [USFS](https://services1.arcgis.com/) via ArcGIS | Static |
 | National parks | [NPS](https://services1.arcgis.com/) via ArcGIS | Static |
-| Land ownership (public/private, surface management agency) + non-public-land CAUTION in the assessment | [BLM Surface Management Agency](https://gbp-blm-egis.hub.arcgis.com/) via the Worker's `/blm/` route | Cached 30 days |
+| Land ownership (public/private, surface management agency) + non-public-land advisory in the assessment | [BLM Surface Management Agency](https://gbp-blm-egis.hub.arcgis.com/) via the Worker's `/blm/` route | Cached 30 days |
 | Roads & trails — USFS roads/trails + Motor Vehicle Use Map | [USFS](https://data.fs.usda.gov/geodata/) via the Worker's `/usfs/` route | Cached 30 days |
 | Roads & trails — BLM ground transportation (GTLF) | [BLM](https://gbp-blm-egis.hub.arcgis.com/) via the Worker's `/blm/` route | Cached 30 days |
 | Water features (streams/rivers + lakes/reservoirs) | [USGS National Hydrography Dataset](https://www.usgs.gov/national-hydrography) via ArcGIS | Cached 30 days |

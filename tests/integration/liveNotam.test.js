@@ -86,3 +86,57 @@ describe('fetchNotams (live NOTAMs via proxy)', () => {
     expect(S.importedNotams.map(n => n.id)).toContain('M-1');
   });
 });
+
+// The proxy now answers 502 { error } when the FAA backend fails or paging
+// stops short. That must reach the operator as an ERROR — the previous live set
+// stays (so a failed check cannot look like "no NOTAMs") and the reason is kept.
+describe('fetchNotams — proxy failure semantics', () => {
+  beforeEach(() => {
+    setBody();
+    S.importedNotams = [];
+    S.currentArea = null;
+    S.dataSourceErrors = {};
+    localStorage.setItem('sar_canopy_proxy', 'https://x.workers.dev');
+  });
+  afterEach(() => {
+    S.importedNotams = []; document.body.innerHTML = '';
+    localStorage.removeItem('sar_canopy_proxy');
+    delete globalThis.fetch;
+  });
+
+  it('proxy 502 with an error body → ERROR carrying the upstream reason; previous live set kept', async () => {
+    S.importedNotams = [{ id: 'OLD', location: 'YYY', body: 'stale', _live: true }];
+    globalThis.fetch = () => Promise.resolve({ ok: false, status: 502, json: async () => ({ error: 'FAA NOTAM Search HTTP 503', partial: false, notamList: [] }) });
+    await fetchNotams(38.65, -120.99, 20);
+    expect(S.importedNotams.map(n => n.id)).toEqual(['OLD']);
+    expect(S.dataSourceErrors.NOTAM).toBeTruthy();
+    expect(S.dataSourceErrors.NOTAM.message).toContain('502');
+    expect(S.dataSourceErrors.NOTAM.message).toContain('HTTP 503');
+    expect(S.sectionMeta.notam.status).toBe('error');
+  });
+
+  it('a partial 502 does not merge its diagnostic items as live', async () => {
+    globalThis.fetch = () => Promise.resolve({ ok: false, status: 502, json: async () => ({ error: 'page 2 failed', partial: true, notamList: payload.notamList }) });
+    await fetchNotams(38.65, -120.99, 20);
+    expect(S.importedNotams.length).toBe(0);
+    expect(S.sectionMeta.notam.status).toBe('error');
+  });
+
+  it('a 200 whose body is not a search result is an ERROR, not "0 NOTAMs · LIVE"', async () => {
+    S.importedNotams = [{ id: 'OLD', location: 'YYY', body: 'stale', _live: true }];
+    globalThis.fetch = () => Promise.resolve({ ok: true, status: 200, json: async () => ({ message: 'maintenance' }) });
+    await fetchNotams(38.65, -120.99, 20);
+    expect(S.importedNotams.map(n => n.id)).toEqual(['OLD']);
+    expect(S.sectionMeta.notam.status).toBe('error');
+    expect(S.dataSourceErrors.NOTAM.message).toContain('malformed');
+  });
+
+  it('a genuine empty search (200, empty list) is LIVE and replaces the previous live set', async () => {
+    S.importedNotams = [{ id: 'OLD', location: 'YYY', body: 'stale', _live: true }];
+    globalThis.fetch = () => Promise.resolve({ ok: true, status: 200, json: async () => ({ notamList: [], totalNotamCount: 0 }) });
+    await fetchNotams(38.65, -120.99, 20);
+    expect(S.importedNotams.length).toBe(0);
+    expect(S.sectionMeta.notam.status).toBe('live');
+    expect(S.dataSourceErrors.NOTAM).toBeUndefined();
+  });
+});

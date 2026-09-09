@@ -222,6 +222,29 @@ function routeStrategy(url) {
   const path = urlPathname(url);
   if (path.startsWith('/tfr/') || path === '/notam' || path === '/adsb') return 'network-only';
 
+  // Direct ADS-B providers (the browser's fallback when the proxy /adsb route
+  // fails) — network-only, same reason as /adsb above: a pinned response
+  // freezes live traffic. The app's own back-off handles their outages.
+  if (url.includes('opendata.adsb.fi') ||
+      url.includes('api.airplanes.live') ||
+      url.includes('api.adsb.lol'))                return 'network-only';
+
+  // Changing data queried straight from the browser — network-first. Without
+  // an explicit rule these fell through to the cache-first DEFAULT below, which
+  // pins the FIRST response for a given query URL: re-checking the same area
+  // (same bbox → same URL) returned the original wildfire perimeters, NFDRS
+  // rating or FAA airspace without contacting the server, while the fetcher
+  // stamped it with a new "updated" time. Every ArcGIS feature/map-server
+  // QUERY is matched by shape so each ArcGIS-hosted source (NIFC fires, CA
+  // NFDRS, FAA UDDS, NOAA smoke, dams, utilities, parcels…) is covered
+  // uniformly; tile URLs (`/tile/`) never contain `/query` and are unaffected.
+  if (/\/rest\/services\/[^?]*\/(FeatureServer|MapServer)\/\d+\/query/i.test(url)) return 'network-first';
+  if (url.includes('fems.fs2c.usda.gov') ||        // national NFDRS (RAWS)
+      url.includes('api.avalanche.org') ||         // avalanche danger
+      url.includes('nowcoast.noaa.gov') ||         // lightning WMS
+      url.includes('mapservices.weather.noaa.gov')) // NOHRSC snow WMS
+                                                  return 'network-first';
+
   // API endpoints — network-first with cache fallback
   if (url.includes('api.open-meteo.com') ||
       url.includes('air-quality-api.open-meteo.com') ||
@@ -316,18 +339,46 @@ async function navigationStrategy(request) {
   }
 }
 
+// Headers that let the APP tell a cached fallback from a live answer.
+//   X-SAR-Cached-At  — stamped on every entry networkFirst stores (ms epoch).
+//   X-SAR-SW-Cache   — present ONLY on a response served as the offline
+//                      fallback; value = that entry's X-SAR-Cached-At, or
+//                      'unknown' for an entry stored before stamping existed.
+// Without these, a fetcher cannot distinguish "the server answered" from
+// "the SW handed back last week's copy" and labels both LIVE with a fresh
+// timestamp. `_swCacheStamp(res)` in sar-preflight.js reads the second one.
+const SW_CACHED_AT_HDR = 'X-SAR-Cached-At';
+const SW_CACHE_FALLBACK_HDR = 'X-SAR-SW-Cache';
+
+function stampCachedAt(response, nowMs) {
+  try {
+    const h = new Headers(response.headers);
+    h.set(SW_CACHED_AT_HDR, String(nowMs != null ? nowMs : Date.now()));
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: h });
+  } catch (_) { return response; }
+}
+
+function markSwCacheFallback(cached) {
+  try {
+    const h = new Headers(cached.headers);
+    const at = h.get(SW_CACHED_AT_HDR);
+    h.set(SW_CACHE_FALLBACK_HDR, (at && /^\d+$/.test(at)) ? at : 'unknown');
+    return new Response(cached.body, { status: cached.status, statusText: cached.statusText, headers: h });
+  } catch (_) { return cached; }
+}
+
 // --- Network-first: try network, fallback to cache ---
 async function networkFirst(request) {
   try {
     const response = await fetch(request);
     if (response.status === 200) {
       const cache = await caches.open(CACHE_API);
-      cache.put(request, response.clone()).catch(() => {});
+      cache.put(request, stampCachedAt(response.clone())).catch(() => {});
     }
     return response;
   } catch (err) {
     const cached = await caches.match(request);
-    if (cached) return cached;
+    if (cached) return markSwCacheFallback(cached);
     return new Response(JSON.stringify({ error: 'offline', cached: false }), {
       status: 503,
       headers: { 'Content-Type': 'application/json' },
@@ -506,6 +557,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     routeStrategy, latlngToTile, getCacheName, refreshAppShell,
     navigationStrategy, stripRedirect, useCachedResponse, cacheFirst,
+    networkFirst, stampCachedAt, markSwCacheFallback, SW_CACHED_AT_HDR, SW_CACHE_FALLBACK_HDR,
     CURRENT_CACHES, APP_SHELL, CDN_ASSETS,
     CACHE_STATIC, CACHE_CDN, CACHE_TILES, CACHE_API, CACHE_SECTIONAL,
     SAR_VERSION,

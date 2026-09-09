@@ -346,27 +346,27 @@ describe('NWS alerts integration with computeAssessment', () => {
   it('GO when no NWS alerts and conditions nominal', () => {
     S.nwsAlerts = [];
     computeAssessment();
-    expect(document.getElementById('assessBadge').textContent).toBe('GO');
+    expect(document.getElementById('assessBadge').textContent).toBe('NOMINAL');
   });
 
   it('NO-GO when severe NWS alert present', () => {
     S.nwsAlerts = [{ event: 'Red Flag Warning', severity: 'Severe' }];
     computeAssessment();
-    expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+    expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
     expect(document.getElementById('assessText').textContent).toContain('Red Flag Warning');
   });
 
   it('NO-GO when extreme NWS alert present', () => {
     S.nwsAlerts = [{ event: 'Tornado Warning', severity: 'Extreme' }];
     computeAssessment();
-    expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+    expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
     expect(document.getElementById('assessText').textContent).toContain('Tornado Warning');
   });
 
   it('CAUTION when moderate NWS alert present with otherwise GO conditions', () => {
     S.nwsAlerts = [{ event: 'Heat Advisory', severity: 'Moderate' }];
     computeAssessment();
-    expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+    expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
     expect(document.getElementById('assessText').textContent).toContain('Heat Advisory');
   });
 
@@ -375,7 +375,7 @@ describe('NWS alerts integration with computeAssessment', () => {
     S.wind = { maxWind: 35, maxGust: 40 };
     S.nwsAlerts = [{ event: 'Red Flag Warning', severity: 'Severe' }];
     computeAssessment();
-    expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+    expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
   });
 
   it('multiple alerts listed in text', () => {

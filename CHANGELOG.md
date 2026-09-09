@@ -4,6 +4,15 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.09.08-a — 2026-09-08
+
+- NOTAM check: a failed FAA NOTAM Search (outage, rejected session, or a page that never arrived) is now reported as an ERROR with the reason. Previously the data proxy answered with an empty list and the app showed "0 NOTAMs · LIVE".
+- FAA airspace: an outage no longer renders as "LIVE — no restrictions". If every layer fails you get the last cached copy, explicitly labeled CACHED with its age, or ERROR; if some layers fail the status reads PARTIAL, the missing layers come from the cached copy where one exists, and any layer that is simply unavailable drops the assessment to CAUTION as unverified. Failed results are never written to the cache.
+- The assessment banner no longer shows a GO / CAUTION / NO-GO verdict. It now names what was found — "NOMINAL", "N ADVISORIES" or "N LIMITS EXCEEDED" — and lists every item (limits exceeded first, then advisories, both shown at once instead of advisories being hidden behind a limit). The colour coding is unchanged. Briefings, the PDF/email export, the mission log and the Config threshold labels ("Wind limit", "Wind advisory", …) use the same wording. The decision stays with the Remote Pilot in Command.
+- Assessment: a reported visibility of ZERO is now flagged as a limit exceeded (it was previously treated as "no data" and assumed clear), and missing visibility is an advisory ("verify 3 SM minimum at launch") instead of contributing to a clean result.
+- Fire danger: areas outside California no longer fail with an error before their fire perimeters load — the national (RAWS) fire-danger fallback now runs as intended. A failed perimeter request is reported as an ERROR rather than "no fires".
+- Offline cache: live-changing data queried directly by the browser (wildfire perimeters, fire danger, FAA airspace and every other ArcGIS query, lightning and snow overlays, avalanche, RAWS) now always goes to the server when online instead of reusing the first response the app ever saw for that area. When offline, the cached copy is labeled CACHED with its stored time rather than stamped as a fresh update. Direct ADS-B providers are never cached.
+
 ## v2026.08.30-b — 2026-08-30
 
 - Replaced the base map: CARTO began stamping "API KEY REQUIRED" across its free basemap tiles, so the dark and light base maps now use Esri's keyless Dark/Light Gray Canvas (base + place-label layers) instead. Same aviation-HUD look; place names now come from a separate label layer that stays beneath your data overlays. Offline tile downloads and the 3D view use the new tiles too.

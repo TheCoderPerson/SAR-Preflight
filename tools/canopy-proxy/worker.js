@@ -107,6 +107,9 @@ function resolveTarget(url) {
   return { target: CANOPY_UPSTREAM + rel, cacheTtl: CANOPY_CACHE_TTL };
 }
 
+// Named exports for unit tests (wrangler ignores them; `default` is the Worker).
+export { handleNotam, dms };
+
 export default {
   async fetch(req, env) {
     const allow = allowedOriginFor(req);
@@ -281,6 +284,12 @@ async function handleNotam(url, allow) {
   };
 
   let all = [], total = 0, offset = 0, countsByType = null;
+  // `failure` is set the moment any page cannot be retrieved. It MUST turn into
+  // a non-200 response below: the app treats a 200 as a trustworthy search,
+  // drops its previous live NOTAM set and labels the result LIVE — so an
+  // upstream 503 used to reach the operator as "0 NOTAMs · LIVE".
+  let failure = null;
+  let complete = false;
   const MAX_PAGES = 6; // backstop: up to ~180 NOTAMs
   for (let page = 0; page < MAX_PAGES; page++) {
     let data;
@@ -297,19 +306,43 @@ async function handleNotam(url, allow) {
         },
         body: fields(offset),
       });
-      if (r.status !== 200) break;
+      if (r.status !== 200) {
+        failure = 'FAA NOTAM Search HTTP ' + r.status
+          + ((r.status >= 300 && r.status < 400) ? ' (session/params rejected)' : '');
+        break;
+      }
       data = await r.json();
-    } catch (_) { break; }
-    if (!data || data.error) break;
+    } catch (err) {
+      failure = 'FAA NOTAM Search unreachable: ' + ((err && err.message) ? err.message : 'fetch failed');
+      break;
+    }
+    if (!data || data.error) {
+      failure = 'FAA NOTAM Search error: ' + ((data && data.error) ? String(data.error) : 'empty response');
+      break;
+    }
     const list = Array.isArray(data.notamList) ? data.notamList : [];
     all = all.concat(list);
     if (!countsByType && data.countsByType) countsByType = data.countsByType;
     total = (data.totalNotamCount != null) ? Number(data.totalNotamCount) : all.length;
     offset += 30;
-    if (list.length === 0 || all.length >= total) break;
+    if (list.length === 0 || all.length >= total) { complete = true; break; }
   }
 
-  return jsonResponse({ notamList: all, totalNotamCount: total, countsByType }, 200, allow);
+  if (failure) {
+    // 502 Bad Gateway: the proxy itself is fine, the upstream is not. Whatever
+    // pages did arrive ride along as `notamList` for diagnostics, flagged
+    // `partial` so no consumer mistakes them for the full result.
+    return jsonResponse({
+      error: failure,
+      partial: all.length > 0,
+      notamList: all,
+      totalNotamCount: total,
+      countsByType,
+    }, 502, allow);
+  }
+  // `truncated`: the MAX_PAGES backstop stopped paging before `total` was
+  // reached. Still a successful search — just capped — so it stays 200.
+  return jsonResponse({ notamList: all, totalNotamCount: total, countsByType, truncated: !complete }, 200, allow);
 }
 
 // ---- ADS-B: first provider that responds wins; pass its JSON through ----
