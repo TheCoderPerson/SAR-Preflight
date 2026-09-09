@@ -24,6 +24,48 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.09.08-e',
+    date: '2026-09-08',
+    changes: [
+      'Fire perimeters are back: NIFC made the service the app queried private ("Token Required"); the app now uses NIFC\'s public WFIGS current-perimeters service instead.',
+      'Special Use Airspace is back: the FAA layer dropped a field the query still asked for, so ArcGIS rejected the whole request. MOA / Restricted / Prohibited load again.',
+      'NOTAMs need manual update. The FAA NOTAM Search site the live check relied on now blocks automated access (it loads in a browser but rejects the data proxy), and no free keyless public NOTAM endpoint exists. The assessment now lists "NOTAMs NEED MANUAL UPDATE", the NOTAMs tab shows a red notice with the copy-and-paste steps, and the live check keeps retrying automatically in case access is restored. TFRs are unaffected and still update live. Next step: the app is being moved to the official FAA NOTAM Management Service API (credentialed access has been granted for the test environment).',
+    ],
+  },
+  {
+    version: '2026.09.08-d',
+    date: '2026-09-08',
+    changes: [
+      'Airspace tab: the Special Use Airspace row "TFRs" is now "National Defense TFR Areas" — it only ever reflected the FAA\'s standing national-defense areas (a handful of military installations nationwide), not the live TFR list. Live TFRs over your area are in the NOTAMs tab, drawn on the map, and drive the assessment. "NS UAS Restrictions" is now "NS UAS Restrictions (part-time only)": permanent §99.7 security areas such as Bureau of Reclamation dams are published only as FDC NOTAMs and appear in no FAA GIS layer.',
+    ],
+  },
+  {
+    version: '2026.09.08-c',
+    date: '2026-09-08',
+    changes: [
+      'When an UPDATE fails but this area\'s earlier data is still on screen, every value that source feeds now turns amber with "(stale: Verify)" after it — the numbers are real but not current and may have changed. The marker survives timeline scrubbing. The fire card gets the same amber stale line.',
+    ],
+  },
+  {
+    version: '2026.09.08-b',
+    date: '2026-09-08',
+    changes: [
+      'A data source that fails now says so in the data itself. Every value that source feeds reads "UNKNOWN: NEEDS UPDATE" in red instead of a reassuring "None", "--" or the previous area\'s numbers — e.g. when the FAA Special Use Airspace query fails, MOA / Restricted / Prohibited show UNKNOWN rather than a green "None"; the same applies to TFR areas, NS restrictions, class airspace, weather, air quality, Kp, elevation, obstacles, sun/moon, traffic, fire danger, ground access, land ownership, water, hospitals and trails. Values filled from a cached copy are marked "(cached)" in amber. Freshness is now tracked per drawn area, so a failure on a new area can no longer be mistaken for "still showing this area\'s earlier data".',
+    ],
+  },
+  {
+    version: '2026.09.08-a',
+    date: '2026-09-08',
+    changes: [
+      'NOTAM check: a failed FAA NOTAM Search (outage, rejected session, or a page that never arrived) is now reported as an ERROR with the reason. Previously the data proxy answered with an empty list and the app showed "0 NOTAMs · LIVE".',
+      'FAA airspace: an outage no longer renders as "LIVE — no restrictions". If every layer fails you get the last cached copy, explicitly labeled CACHED with its age, or ERROR; if some layers fail the status reads PARTIAL, the missing layers come from the cached copy where one exists, and any layer that is simply unavailable drops the assessment to CAUTION as unverified. Failed results are never written to the cache.',
+      'The assessment banner no longer shows a GO / CAUTION / NO-GO verdict. It now names what was found — "NOMINAL", "N ADVISORIES" or "N LIMITS EXCEEDED" — and lists every item (limits exceeded first, then advisories, both shown at once instead of advisories being hidden behind a limit). The colour coding is unchanged. Briefings, the PDF/email export, the mission log and the Config threshold labels ("Wind limit", "Wind advisory", …) use the same wording. The decision stays with the Remote Pilot in Command.',
+      'Assessment: a reported visibility of ZERO is now flagged as a limit exceeded (it was previously treated as "no data" and assumed clear), and missing visibility is an advisory ("verify 3 SM minimum at launch") instead of contributing to a clean result.',
+      'Fire danger: areas outside California no longer fail with an error before their fire perimeters load — the national (RAWS) fire-danger fallback now runs as intended. A failed perimeter request is reported as an ERROR rather than "no fires".',
+      'Offline cache: live-changing data queried directly by the browser (wildfire perimeters, fire danger, FAA airspace and every other ArcGIS query, lightning and snow overlays, avalanche, RAWS) now always goes to the server when online instead of reusing the first response the app ever saw for that area. When offline, the cached copy is labeled CACHED with its stored time rather than stamped as a fresh update. Direct ADS-B providers are never cached.',
+    ],
+  },
+  {
     version: '2026.08.30-b',
     date: '2026-08-30',
     changes: [
@@ -953,7 +995,13 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
   const gustMargin = t.gustMargin ?? 5;
   const maxWind = wind.maxWind ?? 0;
   const maxGust = wind.maxGust ?? 0;
-  const vis = wx.visibility ? wx.visibility / 1609.34 : 99;
+  // Visibility (m → statute miles). `wx.visibility ? … : 99` used to treat a
+  // reported ZERO as "missing" and substitute 99 mi, so fog dense enough to
+  // read 0 m produced "All conditions nominal". Only null/undefined/NaN is
+  // missing; missing is handled on its own below rather than assumed clear.
+  const visRaw = wx.visibility;
+  const hasVis = visRaw != null && Number.isFinite(Number(visRaw));
+  const vis = hasVis ? Number(visRaw) / 1609.34 : null;
   const temp = wx.temperature_2m ?? 65;
   const precip = wx.precipitation_probability ?? 0;
   const weatherCode = wx.weather_code ?? 0;
@@ -961,7 +1009,7 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
 
   const issues = [];
   if (maxWind > windTol || maxGust > windTol + gustMargin) { issues.push(`Wind ${maxWind}/${maxGust}g exceeds limits`); }
-  if (vis < t.visNoGo) { issues.push(`Visibility ${vis.toFixed(1)} mi`); }
+  if (hasVis && vis < t.visNoGo) { issues.push(`Visibility ${vis.toFixed(1)} mi`); }
   if (precip > t.precipNoGo) { issues.push(`Precip ${precip}%`); }
   if (weatherCode >= t.weatherCodeNoGo) { issues.push('Thunderstorm activity'); }
   if (t.tempColdNoGo != null && wx.temperature_2m != null && temp < t.tempColdNoGo) { issues.push(`Temp ${Math.round(temp)}°F below aircraft limit`); }
@@ -970,7 +1018,11 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
 
   const cautions = [];
   if (maxWind > t.windCaution && maxWind <= windTol) { cautions.push('Elevated winds'); }
-  if (vis >= t.visNoGo && vis < t.visCaution) { cautions.push('Reduced visibility'); }
+  if (hasVis && vis >= t.visNoGo && vis < t.visCaution) { cautions.push('Reduced visibility'); }
+  // Unavailable weather is not the same as good weather: a Part 107 minimum
+  // (3 SM, §107.51) that cannot be checked must not contribute to a GO.
+  const unavailable = [];
+  if (!hasVis) { unavailable.push('visibility'); cautions.push('Visibility unavailable — verify 3 SM minimum at launch'); }
   if (precip > t.precipCaution && precip <= t.precipNoGo) { cautions.push(`Precip ${precip}%`); }
   if (temp < t.tempCaution && !(t.tempColdNoGo != null && temp < t.tempColdNoGo)) { cautions.push('Cold — battery impact'); }
   if (t.tempHotCaution != null && temp > t.tempHotCaution && !(t.tempHotNoGo != null && temp > t.tempHotNoGo)) { cautions.push('Heat — battery/motor stress'); }
@@ -1002,7 +1054,42 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
   if (issues.length > 0) { level = 'NO-GO'; text = issues.join(' • '); }
   else if (cautions.length > 0) { level = 'CAUTION'; text = cautions.join(' • '); }
 
-  return { level, text, issues, cautions };
+  return { level, text, issues, cautions, unavailable };
+}
+
+// Operator-facing rendering of an assessment WITHOUT a GO / CAUTION / NO-GO
+// verdict. The banner names what was found and lists EVERY item — limits
+// exceeded first, then advisories — and the Remote Pilot makes the call.
+// `result.level` stays the internal enum for code paths and tests; it is
+// never shown. Returns { label, cls, text, limits, advisories }:
+//   label — badge text: "NOMINAL" | "N ADVISOR(Y|IES)" | "N LIMIT(S) EXCEEDED"
+//   cls   — badge colour class (go / caution / nogo — CSS names, not shown)
+//   text  — full listing; limits and advisories separated by " | Advisory: "
+function assessmentDisplay(result) {
+  const limits = ((result && result.issues) || []).slice();
+  const advisories = ((result && result.cautions) || []).slice();
+  const n = limits.length, m = advisories.length;
+  let label, cls;
+  if (n) { label = n + ' LIMIT' + (n > 1 ? 'S' : '') + ' EXCEEDED'; cls = 'nogo'; }
+  else if (m) { label = m + ' ADVISOR' + (m > 1 ? 'IES' : 'Y'); cls = 'caution'; }
+  else { label = 'NOMINAL'; cls = 'go'; }
+  let text;
+  if (!n && !m) text = 'All conditions nominal for UAS operations';
+  else if (n && m) text = limits.join(' \u2022 ') + ' | Advisory: ' + advisories.join(' \u2022 ');
+  else text = (n ? limits : advisories).join(' \u2022 ');
+  return { label, cls, text, limits, advisories };
+}
+
+// Badge label for a stored mission-log entry: new entries carry `label`;
+// entries written before the verdict words were removed carry only `level`.
+function assessmentLabelForLog(assessment) {
+  if (!assessment) return '--';
+  if (assessment.label) return assessment.label;
+  const lv = assessment.level;
+  if (lv === 'GO') return 'NOMINAL';
+  if (lv === 'CAUTION') return 'ADVISORY';
+  if (lv === 'NO-GO') return 'LIMIT EXCEEDED';
+  return lv || '--';
 }
 
 // --- Freezing level (icing aloft) ---
@@ -3224,6 +3311,10 @@ function buildAutoCheckDisplay(inp, nowMs, tz) {
     let detail;
     if (!anyData) {
       detail = 'TFR/NOTAM data UNAVAILABLE — airspace restrictions cannot be verified. Obtain an official briefing at 1800wxbrief.com (1-800-WX-BRIEF) before flight, or import data manually below.';
+    } else if (n.status === 'error' && t.status !== 'error') {
+      // The NOTAM leg is the one with no working automatic source: say what to do.
+      detail = 'NOTAMs NEED MANUAL UPDATE — the automatic NOTAM check is unavailable. ' + _restrictionSourceFrag('TFR', t, nowMs, tz) +
+        ' Open FAA NOTAM Search via the links below, copy the results and paste them into the NOTAMs section, or obtain an official briefing at 1800wxbrief.com.';
     } else {
       detail = _restrictionSourceFrag('TFR', t, nowMs, tz) + ' • ' + _restrictionSourceFrag('NOTAM', n, nowMs, tz) +
         ' Do not treat missing items as "none" — obtain an official briefing at 1800wxbrief.com before flight.';
@@ -3255,8 +3346,10 @@ function buildRestrictionEmptyMsg(inp, nowMs, tz) {
   if (inp.srcStatus === 'cached' && inp.atMs != null) {
     return 'Cached data from ' + formatStamp(inp.atMs, nowMs, tz) + ' shows no ' + kind + ' — re-check before flight.';
   }
-  const singular = kind === 'TFRs' ? 'TFR' : 'NOTAM';
-  return singular + ' check FAILED — status UNKNOWN, not "none". Obtain an official briefing at 1800wxbrief.com, or import below.';
+  if (kind === 'NOTAMs') {
+    return 'NOTAMs NEED MANUAL UPDATE — automatic NOTAM check unavailable; status UNKNOWN, not "none". Open FAA NOTAM Search via the links above, copy the results and paste them below, or obtain an official briefing at 1800wxbrief.com.';
+  }
+  return 'TFR check FAILED — status UNKNOWN, not "none". Obtain an official briefing at 1800wxbrief.com, or import below.';
 }
 
 // ============================================================
@@ -4682,6 +4775,7 @@ function geojsonLineLatLngs(geometry) {
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    assessmentDisplay, assessmentLabelForLog,
     WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,
     calcSunPosition, calcMoonPhase, calcMoonPosition, lightVecENU, lightForTime, hillshadeParams,

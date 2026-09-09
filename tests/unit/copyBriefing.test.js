@@ -10,7 +10,7 @@ const { S, buildBriefingText, copyBriefing } = require('../../sar-preflight.js')
 describe('buildBriefingText()', () => {
   beforeEach(() => {
     document.body.innerHTML = `
-      <span id="assessBadge">GO</span>
+      <span id="assessBadge">NOMINAL</span>
       <span id="assessText">All conditions nominal</span>
       <span id="areaCenter">38.6850, -120.9900</span>
       <span id="areaSize">2.50 km²</span>
@@ -97,7 +97,7 @@ describe('buildBriefingText()', () => {
 
   it('includes assessment badge and text', () => {
     const text = buildBriefingText();
-    expect(text).toContain('ASSESSMENT: GO');
+    expect(text).toContain('ASSESSMENT: NOMINAL');
     expect(text).toContain('All conditions nominal');
   });
 
@@ -186,7 +186,7 @@ describe('copyBriefing()', () => {
   beforeEach(() => {
     document.body.innerHTML = `
       <button id="btnCopy">COPY</button>
-      <span id="assessBadge">GO</span>
+      <span id="assessBadge">NOMINAL</span>
       <span id="assessText">All conditions nominal</span>
       <span id="areaCenter">38.685, -120.99</span>
       <span id="areaSize">2 km²</span>

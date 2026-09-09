@@ -70,7 +70,7 @@ describe('readActiveThresholds() + profile-driven assessment', () => {
       S.wind = { maxWind: 20, maxGust: 22 };
       S.elev = { center: 2000 };
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
     });
 
     it('M300 (27 mph NO-GO) treats the same 20 mph as CAUTION', () => {
@@ -79,7 +79,7 @@ describe('readActiveThresholds() + profile-driven assessment', () => {
       S.wind = { maxWind: 20, maxGust: 22 };
       S.elev = { center: 2000 };
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
     });
 
     it('hazardous AQI forces NO-GO; unhealthy AQI is CAUTION', () => {
@@ -88,10 +88,10 @@ describe('readActiveThresholds() + profile-driven assessment', () => {
       S.elev = { center: 2000 };
       S.aqi = 300; // >= aqiNoGo 250
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
       S.aqi = 175; // between aqiCaution 150 and aqiNoGo 250
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
     });
 
     it('elevated Kp raises a GNSS caution', () => {
@@ -100,7 +100,7 @@ describe('readActiveThresholds() + profile-driven assessment', () => {
       S.elev = { center: 2000 };
       S.kp = 6; // >= kpCaution 5
       computeAssessment();
-      expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
       expect(document.getElementById('assessText').textContent).toMatch(/Kp/);
     });
   });

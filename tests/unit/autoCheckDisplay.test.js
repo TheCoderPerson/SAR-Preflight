@@ -131,6 +131,10 @@ describe('buildRestrictionEmptyMsg', () => {
     for (const srcStatus of ['error', 'never']) {
       const msg = buildRestrictionEmptyMsg({ ...b, srcStatus }, NOW, TZ);
       expect(msg).toMatch(/TFR check FAILED — status UNKNOWN, not "none"/);
+      const nmsg = buildRestrictionEmptyMsg({ ...b, kind: 'NOTAMs', srcStatus: 'error' }, NOW, TZ);
+      expect(nmsg).toMatch(/NOTAMs NEED MANUAL UPDATE/);
+      expect(nmsg).toMatch(/UNKNOWN, not "none"/);
+      expect(nmsg).toMatch(/1800wxbrief\.com/);
       expect(msg).toMatch(/1800wxbrief\.com/);
     }
   });

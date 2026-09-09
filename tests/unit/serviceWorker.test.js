@@ -338,3 +338,113 @@ describe('navigationStrategy(request)', () => {
     expect(await out.text()).toBe('redirected shell');
   });
 });
+
+// Changing data queried straight from the browser used to fall through to the
+// cache-first DEFAULT, which pins the first response for a query URL: the same
+// area re-checked returned the original wildfire perimeters / NFDRS rating /
+// FAA airspace without contacting the server.
+describe('routeStrategy — changing data endpoints', () => {
+  const FIRES = 'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query?where=1=1&geometry=-121,38,-120,39&f=geojson';
+  const NFDRS = 'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/CA_NFDRS/FeatureServer/1/query?where=1=1&geometry=-120.99,38.68&f=geojson';
+  const RAWS = 'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/NFDRS_ERC_and_BI_Percentiles_and_Trends/FeatureServer/0/query?where=1=1&f=json';
+  const FAA = 'https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/arcgis/rest/services/National_Defense_Airspace_TFR_Areas/FeatureServer/0/query?where=1=1&f=geojson';
+  const DOF = 'https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/arcgis/rest/services/Digital_Obstacle_File/FeatureServer/0/query?where=1=1&f=geojson';
+  const SMOKE = 'https://services2.arcgis.com/C8EMgrsFcRFL6LrL/arcgis/rest/services/NOAA_Satellite_Smoke_Detection_(v1)/FeatureServer/0/query?where=1=1&f=geojson';
+  const PARCELS = 'https://gis.eldoradocounty.ca.gov/mapping/rest/services/Property/Parcels/MapServer/0/query?where=1=1&f=geojson';
+
+  it('routes wildfire perimeters and NFDRS to network-first', () => {
+    expect(routeStrategy(FIRES)).toBe('network-first');
+    expect(routeStrategy(NFDRS)).toBe('network-first');
+    expect(routeStrategy(RAWS)).toBe('network-first');
+  });
+
+  it('routes every ArcGIS feature/map-server query to network-first (FAA, smoke, parcels…)', () => {
+    expect(routeStrategy(FAA)).toBe('network-first');
+    expect(routeStrategy(DOF)).toBe('network-first');
+    expect(routeStrategy(SMOKE)).toBe('network-first');
+    expect(routeStrategy(PARCELS)).toBe('network-first');
+  });
+
+  it('routes the other live sources (FEMS, avalanche, lightning + snow WMS) to network-first', () => {
+    expect(routeStrategy('https://fems.fs2c.usda.gov/api/climatology/graphql/')).toBe('network-first');
+    expect(routeStrategy('https://api.avalanche.org/v2/public/products/map-layer')).toBe('network-first');
+    expect(routeStrategy('https://nowcoast.noaa.gov/geoserver/lightning_detection/ows?service=WMS&request=GetMap&bbox=1,2,3,4')).toBe('network-first');
+    expect(routeStrategy('https://mapservices.weather.noaa.gov/raster/services/snow/NOHRSC_Snow_Analysis/MapServer/WMSServer?request=GetMap')).toBe('network-first');
+  });
+
+  it('routes the direct ADS-B providers to network-only (live traffic, never pinned)', () => {
+    expect(routeStrategy('https://opendata.adsb.fi/api/v2/lat/38.68/lon/-120.99/dist/25')).toBe('network-only');
+    expect(routeStrategy('https://api.airplanes.live/v2/point/38.68/-120.99/25')).toBe('network-only');
+    expect(routeStrategy('https://api.adsb.lol/v2/lat/38.68/lon/-120.99/dist/25')).toBe('network-only');
+  });
+
+  it('leaves ArcGIS/Esri TILES on cache-first (no /query in a tile URL)', () => {
+    expect(routeStrategy('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/11/785/335')).toBe('cache-first');
+    expect(routeStrategy(SECTIONAL_TILE)).toBe('cache-first');
+  });
+});
+
+// The offline fallback must be distinguishable from a live answer, otherwise a
+// fetcher stamps a week-old copy with a fresh "updated" time and labels it LIVE.
+describe('networkFirst(request) — cache-fallback stamping', () => {
+  const { networkFirst, stampCachedAt, markSwCacheFallback, SW_CACHED_AT_HDR, SW_CACHE_FALLBACK_HDR } = require('../../sw.js');
+  const URL_ = 'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query?f=geojson';
+  let savedCaches, savedFetch;
+
+  function stub(cached) {
+    const puts = [];
+    globalThis.caches = {
+      match: () => Promise.resolve(cached),
+      open: () => Promise.resolve({ put: (req, resp) => { puts.push([req, resp]); return Promise.resolve(); } }),
+    };
+    return puts;
+  }
+  beforeEach(() => { savedCaches = globalThis.caches; savedFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.caches = savedCaches; globalThis.fetch = savedFetch; });
+
+  it('a live answer is returned untouched and stored with a cached-at stamp', async () => {
+    const puts = stub(undefined);
+    const fresh = new Response('{"features":[]}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+    globalThis.fetch = () => Promise.resolve(fresh);
+    const before = Date.now();
+    const out = await networkFirst({ url: URL_ });
+    expect(out).toBe(fresh);
+    expect(out.headers.get(SW_CACHE_FALLBACK_HDR)).toBeNull();
+    expect(puts.length).toBe(1);
+    const stored = puts[0][1];
+    expect(Number(stored.headers.get(SW_CACHED_AT_HDR))).toBeGreaterThanOrEqual(before);
+    expect(stored.headers.get('Content-Type')).toBe('application/json');
+    expect(await stored.text()).toBe('{"features":[]}');
+  });
+
+  it('the offline fallback carries the fallback header with the stored time', async () => {
+    const stored = stampCachedAt(new Response('{"old":true}', { status: 200 }), 1700000000000);
+    stub(stored);
+    globalThis.fetch = () => Promise.reject(new Error('offline'));
+    const out = await networkFirst({ url: URL_ });
+    expect(out.status).toBe(200);
+    expect(out.headers.get(SW_CACHE_FALLBACK_HDR)).toBe('1700000000000');
+    expect(await out.text()).toBe('{"old":true}');
+  });
+
+  it('a legacy entry stored before stamping reports "unknown"', async () => {
+    stub(new Response('{"old":true}', { status: 200 }));
+    globalThis.fetch = () => Promise.reject(new Error('offline'));
+    const out = await networkFirst({ url: URL_ });
+    expect(out.headers.get(SW_CACHE_FALLBACK_HDR)).toBe('unknown');
+  });
+
+  it('nothing cached → 503 JSON offline answer', async () => {
+    stub(undefined);
+    globalThis.fetch = () => Promise.reject(new Error('offline'));
+    const out = await networkFirst({ url: URL_ });
+    expect(out.status).toBe(503);
+    expect((await out.json()).error).toBe('offline');
+  });
+
+  it('markSwCacheFallback keeps status and body', async () => {
+    const out = markSwCacheFallback(new Response('x', { status: 200, statusText: 'OK' }));
+    expect(out.status).toBe(200);
+    expect(await out.text()).toBe('x');
+  });
+});

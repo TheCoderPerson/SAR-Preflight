@@ -11,7 +11,10 @@ A small CORS+Range proxy so the browser-only app can read CORS-blocked sources:
 3. **Live NOTAMs** — the public FAA NOTAM Search backend (`notams.aim.faa.gov`). The
    `/notam?lat=&lng=&radius=` route does the session-cookie + full-form-params +
    pagination dance server-side and returns aggregated JSON. **Unofficial/undocumented
-   endpoint — advisory only.**
+   endpoint — advisory only.** A failed or incomplete retrieval (upstream error, rejected
+   session, network fault, a page that never arrived) answers **502** with `{ error, partial,
+   notamList }` — never a 200 with an empty list, which the app would show as "0 NOTAMs · LIVE".
+   A search capped by the page backstop is a 200 flagged `truncated: true`.
 4. **Live ADS-B traffic** — the public providers (adsb.fi / airplanes.live / adsb.lol)
    increasingly block browser CORS. The `/adsb?lat=&lon=&dist=` route fetches them
    server-side (first success wins), passes the JSON through, and adds CORS (real-time,

@@ -117,7 +117,7 @@ describe('fetchTrails', () => {
     globalThis.fetch = vi.fn(async () => { throw new Error('network down'); });
     await fetchTrails(bounds);
     expect(S.sectionMeta.trails.status).toBe('error');
-    expect(document.getElementById('terrTrails').textContent).toContain('Unavailable');
+    expect(document.getElementById('terrTrails').textContent).toBe('UNKNOWN: NEEDS UPDATE');
   });
 });
 

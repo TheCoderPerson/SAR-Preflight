@@ -59,14 +59,14 @@ describe('time-aware data panel', () => {
       const snap = snapshotAtIdx(0);
       renderWind(snap);
       computeAssessment(snap);
-      expect(document.getElementById('assessBadge').textContent).toBe('GO');
+      expect(document.getElementById('assessBadge').textContent).toBe('NOMINAL');
     });
 
     it('flips to NO-GO when scrubbed to a high-wind forecast hour', () => {
       const snap = snapshotAtIdx(2);
       renderWind(snap);          // rebuild S.wind for hour 2
       computeAssessment(snap);
-      expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+      expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
       expect(document.getElementById('assessText').textContent).toMatch(/wind/i);
     });
   });

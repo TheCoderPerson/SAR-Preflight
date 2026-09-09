@@ -234,25 +234,29 @@ describe('assessRisk(wx, wind, elev, maxWindTol)', () => {
     });
   });
 
-  describe('default safe with empty/missing data', () => {
-    it('empty objects default to safe / GO', () => {
+  describe('empty/missing data — never a NO-GO, never a silent GO', () => {
+    it('empty objects: no NO-GO issues, but CAUTION because visibility cannot be verified', () => {
       const result = assessRisk({}, {}, {}, 27);
-      expect(result.level).toBe('GO');
+      expect(result.issues).toEqual([]);
+      expect(result.level).toBe('CAUTION');
+      expect(result.cautions).toEqual(['Visibility unavailable — verify 3 SM minimum at launch']);
     });
 
-    it('null/undefined fields use safe defaults via ??', () => {
+    it('null/undefined fields use safe defaults via ?? (only the visibility caution remains)', () => {
       const wx = { visibility: undefined, temperature_2m: null, precipitation_probability: undefined, weather_code: undefined };
       const wind = { maxWind: undefined, maxGust: undefined };
       const elev = { center: undefined };
       const result = assessRisk(wx, wind, elev, 27);
-      expect(result.level).toBe('GO');
+      expect(result.issues).toEqual([]);
+      expect(result.level).toBe('CAUTION');
+      expect(result.cautions).toEqual(['Visibility unavailable — verify 3 SM minimum at launch']);
     });
 
-    it('missing visibility defaults to 99 miles (safe)', () => {
+    it('missing visibility is reported unavailable — not a NO-GO and not "Reduced visibility"', () => {
       const result = assessRisk({}, defaultWind(), defaultElev(), defaultMaxWindTol);
-      // No visibility issue or caution expected
       expect(result.issues.some(i => i.includes('Visibility'))).toBe(false);
-      expect(result.cautions.some(c => c.includes('visibility'))).toBe(false);
+      expect(result.cautions.some(c => c === 'Reduced visibility')).toBe(false);
+      expect(result.unavailable).toEqual(['visibility']);
     });
   });
 
@@ -353,5 +357,44 @@ describe('assessRisk(wx, wind, elev, maxWindTol)', () => {
       const result = assessRisk(wx, defaultWind(), defaultElev(), defaultMaxWindTol);
       expect(result.cautions.some(c => c.includes('Prop icing'))).toBe(true);
     });
+  });
+});
+
+// `wx.visibility ? … : 99` treated a reported ZERO as "missing" and substituted
+// 99 mi, so dense fog produced "All conditions nominal". Missing is now its
+// own case: a Part 107 minimum that cannot be checked must not feed a GO.
+describe('assessRisk visibility — zero vs missing', () => {
+  const wind = { maxWind: 5, maxGust: 8 };
+  const elev = { center: 2000 };
+  const nominal = { temperature_2m: 65, precipitation_probability: 0, weather_code: 0 };
+
+  it('visibility 0 m is NO-GO, not nominal', () => {
+    const r = assessRisk(Object.assign({}, nominal, { visibility: 0 }), wind, elev, 27);
+    expect(r.level).toBe('NO-GO');
+    expect(r.text).toContain('Visibility 0.0 mi');
+    expect(r.unavailable).toEqual([]);
+  });
+
+  it('missing visibility is CAUTION with an explicit "unavailable" note, never GO', () => {
+    for (const wx of [nominal, Object.assign({}, nominal, { visibility: null }), Object.assign({}, nominal, { visibility: NaN }), Object.assign({}, nominal, { visibility: 'n/a' })]) {
+      const r = assessRisk(wx, wind, elev, 27);
+      expect(r.level).toBe('CAUTION');
+      expect(r.issues).toEqual([]);
+      expect(r.cautions.some(c => /Visibility unavailable/.test(c))).toBe(true);
+      expect(r.cautions.some(c => /Reduced visibility/.test(c))).toBe(false);
+      expect(r.unavailable).toEqual(['visibility']);
+    }
+  });
+
+  it('missing visibility does not mask a real NO-GO', () => {
+    const r = assessRisk(nominal, { maxWind: 40, maxGust: 50 }, elev, 27);
+    expect(r.level).toBe('NO-GO');
+    expect(r.unavailable).toEqual(['visibility']);
+  });
+
+  it('a numeric string is accepted as a value', () => {
+    const r = assessRisk(Object.assign({}, nominal, { visibility: '16000' }), wind, elev, 27);
+    expect(r.level).toBe('GO');
+    expect(r.unavailable).toEqual([]);
   });
 });

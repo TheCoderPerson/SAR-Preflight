@@ -86,7 +86,7 @@ describe('TFR import → render → assessment (DOM)', () => {
   it('an imported active TFR over the area drives the assessment to NO-GO', () => {
     applyTfrImport(parseTfrGeoJson(geojson).tfrs, 'oakland.geojson', 'geojson');
     computeAssessment();
-    expect(document.getElementById('assessBadge').textContent).toBe('NO-GO');
+    expect(document.getElementById('assessBadge').textContent).toMatch(/LIMIT/);
     expect(document.getElementById('assessText').textContent).toContain('6/4112');
   });
 
@@ -121,7 +121,7 @@ describe('TFR import → render → assessment (DOM)', () => {
     parsePastedNotams();
     expect(S.importedNotams.length).toBe(1);
     expect(S.importedNotams[0].polygons.length).toBe(1);
-    expect(document.getElementById('assessBadge').textContent).toBe('CAUTION');
+    expect(document.getElementById('assessBadge').textContent).toMatch(/ADVISOR/);
     expect(document.getElementById('assessText').textContent).toContain('01/099');
     expect(document.getElementById('notamParseMsg').textContent).toContain('OVER your search area');
   });
