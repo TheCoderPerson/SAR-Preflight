@@ -9,3 +9,6 @@ tools/cell-coverage/input/
 
 # scratch folder for files the Claude device bridge cannot delete
 _to_delete/
+
+# FAA NMS-API spec files saved from email (local only; never commit)
+tools/canopy-proxy/nms-docs/
