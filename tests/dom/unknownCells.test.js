@@ -15,7 +15,7 @@ globalThis.L = {
 };
 
 const { S, markSection, computeAirspace, fetchFireDanger, renderFireDangerUnknown,
-        SECTION_CELLS, sectionCellsFor, UNKNOWN_CELL_TEXT } = require('../../sar-preflight.js');
+        SECTION_CELLS, sectionCellsFor, UNKNOWN_CELL_TEXT, STALE_CELL_SUFFIX, reapplyStaleCells } = require('../../sar-preflight.js');
 
 const ALL_IDS = Object.keys(SECTION_CELLS).reduce((a, k) => a.concat(sectionCellsFor(k)), []);
 const cells = () => ALL_IDS.map(id => `<div class="data-value" id="${id}">--</div>`).join('');
@@ -51,12 +51,40 @@ describe('markSection error → owned cells read UNKNOWN', () => {
     expect(text('wxAQI')).toBe('41');                 // airQuality is its own section
   });
 
-  it('keeps the values when this area already has that section\'s data (freshness line says so)', () => {
+  it('a failed refresh over this area\'s earlier data keeps the values, amber, flagged stale', () => {
     document.getElementById('wxTemp').textContent = '72°F';
+    document.getElementById('wxTemp').classList.add('green');
     markSection('weather', { status: 'live', updatedAt: Date.now() - 60000, error: null });
     markSection('weather', { status: 'error', error: 'HTTP 503' });
-    expect(text('wxTemp')).toBe('72°F');
+    expect(text('wxTemp')).toBe('72°F' + STALE_CELL_SUFFIX);
+    expect(document.getElementById('wxTemp').classList.contains('amber')).toBe(true);
+    expect(document.getElementById('wxTemp').classList.contains('green')).toBe(false);
     expect(document.getElementById('meta_wx').textContent).toContain('showing');
+    // cells that never held a value are not flagged, and a repeat failure does not stack suffixes
+    expect(text('wxDew')).toBe('--');
+    markSection('weather', { status: 'error', error: 'HTTP 503 again' });
+    expect(text('wxTemp')).toBe('72°F' + STALE_CELL_SUFFIX);
+  });
+
+  it('reapplyStaleCells restores the marker after a render rebuilt the cell from state', () => {
+    document.getElementById('windMax').textContent = '12 mph';
+    markSection('weather', { status: 'live', updatedAt: Date.now() - 60000, error: null });
+    markSection('weather', { status: 'error', error: 'HTTP 503' });
+    document.getElementById('windMax').textContent = '12 mph';   // e.g. renderWind on a time-bar scrub
+    reapplyStaleCells();
+    expect(text('windMax')).toBe('12 mph' + STALE_CELL_SUFFIX);
+    expect(document.getElementById('windMax').classList.contains('amber')).toBe(true);
+    expect(text('wxAQI')).toBe('--');   // other sections untouched
+  });
+
+  it('a live update clears the stale state: reapply no longer marks', () => {
+    document.getElementById('wxTemp').textContent = '72°F';
+    markSection('weather', { status: 'live', updatedAt: Date.now() - 60000, error: null });
+    markSection('weather', { status: 'error', error: 'x' });
+    markSection('weather', { status: 'live', updatedAt: Date.now(), error: null });
+    document.getElementById('wxTemp').textContent = '75°F';
+    reapplyStaleCells();
+    expect(text('wxTemp')).toBe('75°F');
   });
 
   it('a rollup section blanks only the failed sub-source\'s cells', () => {
@@ -171,10 +199,16 @@ describe('fire danger failure', () => {
     expect(text('wxFire')).toBe(UNKNOWN_CELL_TEXT);
   });
 
-  it('a failed refresh keeps this area\'s earlier card when one exists', async () => {
+  it('a failed refresh keeps this area\'s earlier card but leads with an amber stale line', async () => {
     markSection('fireDanger', { status: 'live', updatedAt: Date.now() - 60000, error: null });
     globalThis.fetch = () => Promise.resolve({ ok: false, status: 503 });
     await fetchFireDanger(38.68, -120.99, bounds);
-    expect(document.getElementById('fireDangerCards').textContent).toContain('No wildland fire perimeters detected');
+    const card = document.getElementById('fireDangerCards');
+    expect(card.textContent).toContain('No wildland fire perimeters detected');
+    expect(card.firstChild.className).toBe('fire-stale');
+    expect(card.firstChild.textContent).toContain('(stale: Verify)');
+    expect(card.firstChild.textContent).toContain('503');
+    await fetchFireDanger(38.68, -120.99, bounds);          // second failure: still one line
+    expect(card.querySelectorAll('.fire-stale').length).toBe(1);
   });
 });

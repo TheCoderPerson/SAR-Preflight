@@ -24,6 +24,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.09.08-c',
+    date: '2026-09-08',
+    changes: [
+      'When an UPDATE fails but this area\'s earlier data is still on screen, every value that source feeds now turns amber with "(stale: Verify)" after it — the numbers are real but not current and may have changed. The marker survives timeline scrubbing. The fire card gets the same amber stale line.',
+    ],
+  },
+  {
     version: '2026.09.08-b',
     date: '2026-09-08',
     changes: [

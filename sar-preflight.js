@@ -1575,6 +1575,35 @@ function markCellsUnknown(ids) {
   (ids || []).forEach(id => { setText(id, UNKNOWN_CELL_TEXT); setColor(id, 'red'); });
 }
 
+// An UPDATE that fails while this area's earlier data is still on screen: the
+// values stay (they are real, just not current) but every one of them turns
+// amber with this suffix so nobody reads them as fresh.
+const STALE_CELL_SUFFIX = ' (stale: Verify)';
+function markCellsStale(ids) {
+  (ids || []).forEach(id => {
+    const el = document.getElementById(id); if (!el) return;
+    const t = el.textContent || '';
+    if (!t || t === '--' || t === UNKNOWN_CELL_TEXT) return;   // nothing real to flag
+    if (!t.endsWith(STALE_CELL_SUFFIX)) el.textContent = t + STALE_CELL_SUFFIX;
+    setColor(id, 'amber');
+  });
+}
+
+// Renders that rebuild cells from stored state (time-bar scrubs, computeAirspace
+// re-runs) would wipe the stale suffix; call this after them.
+function reapplyStaleCells() {
+  if (typeof document === 'undefined') return;
+  Object.keys(SECTION_DEFS).forEach(key => {
+    const meta = S.sectionMeta[key]; if (!meta) return;
+    const stale = m => m && m.status === 'error' && !m.partial && _sectionHasPriorData(m);
+    if (meta.sources) {
+      Object.keys(meta.sources).forEach(src => { if (stale(meta.sources[src])) markCellsStale(sectionCellsFor(key, src)); });
+    } else if (stale(meta)) {
+      markCellsStale(sectionCellsFor(key));
+    }
+  });
+}
+
 // Has this section / sub-source ever produced data for the CURRENT area?
 // (S.sectionMeta is reset per area in processArea, so a prior updatedAt /
 // cachedAt here means "we are still showing this area's earlier data", which
@@ -1714,9 +1743,11 @@ function markSection(key, patch) {
   S.sectionMeta[key] = cur;
   if (typeof document !== 'undefined') {
     // A failure with nothing to show must not leave "None" / "--" / the last
-    // area's values on screen looking like an answer.
-    if (patch.status === 'error' && !patch.partial && !_sectionHasPriorData(prior)) {
-      markCellsUnknown(sectionCellsFor(key, patch.source));
+    // area's values on screen looking like an answer; a failure on top of this
+    // area's earlier data keeps it but flags every value as stale.
+    if (patch.status === 'error' && !patch.partial) {
+      if (_sectionHasPriorData(prior)) markCellsStale(sectionCellsFor(key, patch.source));
+      else markCellsUnknown(sectionCellsFor(key, patch.source));
     }
     renderSectionMeta(key);
   }
@@ -1938,6 +1969,7 @@ function refreshPanelForHour() {
     const kp = kpAtTime(S.kpForecast, new Date(snap._time).getTime());
     if (kp != null) { S.kp = kp; renderKp(kp); }
   }
+  reapplyStaleCells();
   if (S.currentArea) { computeOpsData(snap); computeAssessment(snap); }
   updateTimeContextBanner();
 }
@@ -3641,6 +3673,7 @@ async function fetchFireDanger(lat, lng, bounds) {
     recordDataSourceError('Fire Danger', err);
     markSection('fireDanger', { status: 'error', error: err && err.message ? err.message : String(err) });
     if (!_sectionHasPriorData(S.sectionMeta.fireDanger)) renderFireDangerUnknown(err);
+    else renderFireDangerStale(err);
   } finally {
     trackFetchEnd('Fire Danger');
   }
@@ -3659,6 +3692,19 @@ function renderFireDangerUnknown(err) {
       </div>
       <div class="notam-body">Active-fire perimeters and fire danger could not be retrieved (${reason.replace(/</g, '&lt;')}). Status is UNKNOWN, not clear \u2014 press UPDATE or check InciWeb / CAL FIRE before flight.</div>
     </div>`;
+}
+
+// Failed refresh with this area's earlier card still up: keep it, but lead
+// with an amber stale line so it is not read as current.
+function renderFireDangerStale(err) {
+  const fireDiv = document.getElementById('fireDangerCards');
+  if (!fireDiv || fireDiv.querySelector('.fire-stale')) return;
+  const reason = (err && err.message) ? err.message : String(err || 'fetch failed');
+  const note = document.createElement('div');
+  note.className = 'fire-stale';
+  note.style.cssText = 'color:var(--accent-amber);font-family:var(--font-mono);font-size:10px;margin:2px 0 6px;';
+  note.textContent = STALE_CELL_SUFFIX.trim() + ' \u2014 update failed (' + reason + '); showing this area\u2019s earlier fire data, which may have changed.';
+  fireDiv.insertBefore(note, fireDiv.firstChild);
 }
 
 function renderFirePerimeters(fires) {
@@ -3885,6 +3931,7 @@ function computeAirspace(lat, lng) {
   } else if (S.faaAirspace && S.faaAirspace.nsRestrictions && S.faaAirspace.nsRestrictions.features) {
     showLayer('airNSRestrict', 'nsRestrictions', S.faaAirspace.nsRestrictions.features, fs => fs.map(f => f.properties.NAME || 'NS Restriction').join(', '), 'red');
   }
+  reapplyStaleCells();
 }
 
 // ============================================================
@@ -14421,6 +14468,7 @@ if (typeof module !== 'undefined' && module.exports) {
     notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _assessBadgeColor, sendFeedback, openFeedback, closeFeedback,
     fetchFAAairspace, faaAirspaceUnavailableLayers, FAA_AIRSPACE_LAYER_LABELS, fetchFireDanger,
     UNKNOWN_CELL_TEXT, SECTION_CELLS, sectionCellsFor, markCellsUnknown, renderFireDangerUnknown,
+    STALE_CELL_SUFFIX, markCellsStale, reapplyStaleCells, renderFireDangerStale, refreshPanelForHour,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,
     renderRasterOverlay, _applyOverlayZoomCap, _hideOverlaysForZoom, _overlayDisplayPx, _isConstrained, setCanopyOpacity, setViewshedOpacity,
     toggleCanopyOverlay, loadCanopyForView,

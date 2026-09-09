@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.09.08-c — 2026-09-08
+
+- When an UPDATE fails but this area's earlier data is still on screen, every value that source feeds now turns amber with "(stale: Verify)" after it — the numbers are real but not current and may have changed. The marker survives timeline scrubbing. The fire card gets the same amber stale line.
+
 ## v2026.09.08-b — 2026-09-08
 
 - A data source that fails now says so in the data itself. Every value that source feeds reads "UNKNOWN: NEEDS UPDATE" in red instead of a reassuring "None", "--" or the previous area's numbers — e.g. when the FAA Special Use Airspace query fails, MOA / Restricted / Prohibited show UNKNOWN rather than a green "None"; the same applies to TFR areas, NS restrictions, class airspace, weather, air quality, Kp, elevation, obstacles, sun/moon, traffic, fire danger, ground access, land ownership, water, hospitals and trails. Values filled from a cached copy are marked "(cached)" in amber. Freshness is now tracked per drawn area, so a failure on a new area can no longer be mistaken for "still showing this area's earlier data".
