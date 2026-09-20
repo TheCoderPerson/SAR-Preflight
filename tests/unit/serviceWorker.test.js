@@ -56,7 +56,8 @@ describe('routeStrategy(url)', () => {
   });
 
   it('leaves proxy canopy tiles on the cache-first default (range reads skip routing anyway)', () => {
-    expect(routeStrategy('https://sar-canopy-proxy.joja15.workers.dev/chm/023010212.tif')).toBe('cache-first');
+    expect(routeStrategy('https://sar-canopy-proxy.joja15.workers.dev/chm2/0230102111.tif')).toBe('cache-first');
+    expect(routeStrategy('https://sar-canopy-proxy.joja15.workers.dev/chm/023010212.tif')).toBe('cache-first'); // legacy v1 route
   });
 
   it('routes API endpoints to network-first', () => {

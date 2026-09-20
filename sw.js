@@ -216,7 +216,7 @@ function routeStrategy(url) {
   // TFR/NOTAM with an explicit stale/expired UI; a cache-first hit here pins
   // the FIRST response for the life of the deployed version and lets
   // "Re-check now" report week-old airspace as LIVE. /adsb is included because
-  // a pinned response freezes live traffic. /chm/ canopy tiles are unaffected
+  // a pinned response freezes live traffic. /chm2/ (and legacy /chm/) canopy tiles are unaffected
   // (range requests are skipped before routing) and /feedback is POST (never
   // routed here).
   const path = urlPathname(url);

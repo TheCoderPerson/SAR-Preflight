@@ -22,14 +22,15 @@ describe('tileXYToQuadkey / quadkeyToTileXY', () => {
 });
 
 describe('Meta canopy quadkey for El Dorado County', () => {
-  // Verified against the live Meta bucket: (-120.99, 38.685) is tile "023010211".
-  it('computes the verified quadkey 023010211 at z9', () => {
+  // Verified against the live Meta bucket (CHMv2, z10): (-120.99, 38.685) is tile "0230102111".
+  it('computes the verified CHMv2 quadkey 0230102111 at z10', () => {
+    expect(META_ZOOM).toBe(10);
     const { x, y } = lngLatToTileXY(-120.99, 38.685, META_ZOOM);
-    expect(tileXYToQuadkey(x, y, META_ZOOM)).toBe('023010211');
+    expect(tileXYToQuadkey(x, y, META_ZOOM)).toBe('0230102111');
   });
 
   it('quadkeyBounds contains the source point', () => {
-    const b = quadkeyBounds('023010211');
+    const b = quadkeyBounds('0230102111');
     expect(b.west).toBeLessThanOrEqual(-120.99);
     expect(b.east).toBeGreaterThanOrEqual(-120.99);
     expect(b.south).toBeLessThanOrEqual(38.685);
@@ -38,7 +39,7 @@ describe('Meta canopy quadkey for El Dorado County', () => {
 
   it('metaQuadkeysForBBox covers the El Dorado point', () => {
     const qks = metaQuadkeysForBBox(-121.0, 38.6, -120.9, 38.7);
-    expect(qks).toContain('023010211');
+    expect(qks).toContain('0230102111');
     qks.forEach(qk => expect(qk).toHaveLength(META_ZOOM));
   });
 

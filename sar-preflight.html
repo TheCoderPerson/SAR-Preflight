@@ -1225,7 +1225,7 @@ select.api-input { cursor: pointer; }
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>Canopy &amp; Visibility <span class="fetch-status" id="canopyStatus"></span></div>
           <div class="section-meta" id="meta_canopy"></div>
           <div class="api-config">
-            <div style="font-size:12px;color:var(--text-secondary);">Vegetation height overlay (Meta 1&nbsp;m)
+            <div style="font-size:12px;color:var(--text-secondary);">Vegetation height overlay (Meta CHMv2, ~1&nbsp;m)
               <span style="font-size:10px;color:var(--text-muted);">— toggle in Map Layers &rsaquo; Analysis</span></div>
             <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
               <label style="font-size:11px;color:var(--text-secondary);white-space:nowrap;">Opacity:</label>
@@ -1522,7 +1522,7 @@ select.api-input { cursor: pointer; }
               <input class="api-input" id="cfgCanopyProxy" type="text" placeholder="Leave blank for built-in default (sar-canopy-proxy.joja15.workers.dev)" onchange="saveCanopyProxy(this.value)" />
               <button class="btn btn-ghost" onclick="saveCanopyProxy(document.getElementById('cfgCanopyProxy').value)">Save</button>
             </div>
-            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;"><b>Leave blank to use the built-in default proxy</b> — the app works out of the box. Enter your own Cloudflare Worker URL to override (e.g. for a fork hosted elsewhere; the built-in proxy only serves the official app origins). The proxy serves CORS-blocked sources: Meta/WRI 1&nbsp;m canopy tiles (vegetation overlay &amp; viewshed), the FAA TFR GeoServer (live TFRs), the FAA NOTAM Search backend (live NOTAMs), and the USFS/BLM ArcGIS servers (forest roads/trails/MVUM, BLM transport &amp; public-land ownership) — TFRs/NOTAMs auto-fetched per area. NOTAMs come from an unofficial endpoint: treat as advisory and verify officially. Heavy use may briefly rate-limit (⚠ PROXY LIMIT in the header); it clears in about a minute. <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Self-host your own free Cloudflare Worker ↗</a> (step-by-step instructions &amp; code).</div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;"><b>Leave blank to use the built-in default proxy</b> — the app works out of the box. Enter your own Cloudflare Worker URL to override (e.g. for a fork hosted elsewhere; the built-in proxy only serves the official app origins). The proxy serves CORS-blocked sources: Meta/WRI CHMv2 canopy tiles (vegetation overlay &amp; viewshed), the FAA TFR GeoServer (live TFRs), the FAA NOTAM Search backend (live NOTAMs), and the USFS/BLM ArcGIS servers (forest roads/trails/MVUM, BLM transport &amp; public-land ownership) — TFRs/NOTAMs auto-fetched per area. NOTAMs come from an unofficial endpoint: treat as advisory and verify officially. Heavy use may briefly rate-limit (⚠ PROXY LIMIT in the header); it clears in about a minute. <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Self-host your own free Cloudflare Worker ↗</a> (step-by-step instructions &amp; code).</div>
           </div>
         </div>
         <div class="data-section">

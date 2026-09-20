@@ -3,8 +3,11 @@
 //
 // A small CORS+Range proxy so the browser-only SAR Preflight app can read data
 // from upstreams that either block CORS or need server-side fetching:
-//   • /chm/{quadkey}.tif , /tiles.geojson  → Meta/WRI 1 m canopy COG tiles
-//       (public S3 bucket that serves Range but sends NO CORS headers)
+//   • /chm2/{quadkey}.tif                   → Meta/WRI Canopy Height Maps v2 (CHMv2)
+//       COG tiles — z10 quadkeys (10 digits). The current app uses this route.
+//   • /chm/{quadkey}.tif , /tiles.geojson  → Meta/WRI v1 canopy COG tiles (z9, 9 digits)
+//       Kept so older cached app builds keep loading canopy; nothing new uses it.
+//       (Both: public S3 bucket that serves Range but sends NO CORS headers.)
 //   • /tfr/...                              → FAA TFR GeoServer (live TFR polygons)
 //   • /usfs/...                             → USFS EDW ArcGIS (roads/trails/MVUM)
 //   • /blm/...                              → BLM ArcGIS (GTLF transport, surface mgmt agency)
@@ -27,6 +30,7 @@
 // ============================================================
 
 const CANOPY_UPSTREAM = 'https://dataforgood-fb-data.s3.amazonaws.com/forests/v1/alsgedi_global_v6_float/';
+const CANOPY_V2_UPSTREAM = 'https://dataforgood-fb-data.s3.amazonaws.com/forests/v2/global/dinov3_global_chm_v2_ml3/chm/';
 const CANOPY_CACHE_TTL = 604800; // 7 days — canopy is static
 
 // FAA NOTAM Search public backend (undocumented; advisory). The /notam route does
@@ -46,6 +50,9 @@ const ADSB_UPSTREAMS = [
 // Path-prefix routes (checked before the canopy default). TFR is safety-critical
 // and time-sensitive, so it is cached for only a few seconds.
 const ROUTES = [
+  // CHMv2 canopy tiles (the app's current canopy source). Only .tif files exist
+  // under this prefix; the edge-cache rule below never caches a .tif whole.
+  { prefix: '/chm2/', upstream: CANOPY_V2_UPSTREAM, cacheTtl: CANOPY_CACHE_TTL },
   { prefix: '/tfr/', upstream: 'https://tfr.faa.gov/', cacheTtl: 30 },
   // Self-hosted gov ArcGIS servers that block browser CORS. Static-ish vector data
   // (forest roads/trails/MVUM, BLM transport + surface-management-agency polygons),
@@ -108,7 +115,7 @@ function resolveTarget(url) {
 }
 
 // Named exports for unit tests (wrangler ignores them; `default` is the Worker).
-export { handleNotam, dms };
+export { handleNotam, dms, resolveTarget };
 
 export default {
   async fetch(req, env) {
@@ -172,7 +179,8 @@ export default {
     // only whole-object GETs (tiles.geojson, TFR/XML) use the edge cache.
     //
     // ...and NEVER edge-cache a canopy COG even without a Range header. These
-    // objects run 300 MB - 1 GB (023010300.tif is 1.08 GB / 65536^2 px). Caching
+    // objects run 20 MB - 1 GB (v1 023010300.tif is 1.08 GB / 65536^2 px; CHMv2
+    // tiles are 32768^2 px, up to ~240 MB). Caching
     // one poisons the edge with the whole object for CANOPY_CACHE_TTL, after
     // which a later Range request can be answered from that cached full object
     // as a 200 carrying the ENTIRE file instead of the requested bytes. The
@@ -181,7 +189,8 @@ export default {
     // headers — Chrome reports it as a bogus "blocked by CORS policy" error.
     // Observed live on the dev origin. Nothing is lost by skipping the cache
     // here: the app stores the processed raster in IndexedDB anyway.
-    const isCanopyTif = route.target.startsWith(CANOPY_UPSTREAM) && /\.tif$/i.test(reqUrl.pathname);
+    // Any .tif is a canopy COG (v1 under /chm/, CHMv2 under /chm2/) — never whole-cache either.
+    const isCanopyTif = /\.tif$/i.test(reqUrl.pathname);
     const cf = (range || isCanopyTif)
       ? { cacheEverything: false }
       : { cacheEverything: true, cacheTtl: route.cacheTtl };

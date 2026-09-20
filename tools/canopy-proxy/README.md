@@ -2,10 +2,12 @@
 
 A small CORS+Range proxy so the browser-only app can read CORS-blocked sources:
 
-1. **Canopy** — Meta/WRI Global Canopy Height 1 m tiles for the **vegetation overlay**
-   and **viewshed** (`dataforgood-fb-data.s3.amazonaws.com/forests/v1/alsgedi_global_v6_float`).
+1. **Canopy** — Meta/WRI **Canopy Height Maps v2 (CHMv2)** tiles for the **vegetation
+   overlay** and **viewshed** (`dataforgood-fb-data.s3.amazonaws.com/forests/v2/global/dinov3_global_chm_v2_ml3/chm/`).
    That public S3 bucket serves HTTP Range but **sends no CORS headers**, so the
-   in-browser GeoTIFF reader can't fetch COG windows directly. Served at `/chm/{quadkey}.tif`.
+   in-browser GeoTIFF reader can't fetch COG windows directly. Served at
+   `/chm2/{quadkey}.tif` (z10 quadkeys, 10 digits). The older `/chm/{quadkey}.tif`
+   route (v1, z9 quadkeys) is kept so previously cached app builds keep working.
 2. **Live TFRs** — the FAA TFR GeoServer (`tfr.faa.gov`), also CORS-restricted. Served
    at the `/tfr/...` route with a near-zero cache (TFRs are time-critical).
 3. **Live NOTAMs** — the public FAA NOTAM Search backend (`notams.aim.faa.gov`). The
@@ -55,7 +57,7 @@ https://sar-canopy-proxy.<your-subdomain>.workers.dev
 ```
 
 Paste that URL into the app: **Config tab → "Data proxy URL"**. The app stores it
-in `localStorage` and appends `/chm/{quadkey}.tif` to fetch tiles.
+in `localStorage` and appends `/chm2/{quadkey}.tif` to fetch tiles.
 
 ## Feedback → Discord
 

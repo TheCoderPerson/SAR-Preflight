@@ -15,10 +15,56 @@ const WORK_RES_M = 3.0;                   // working grid resolution (config.py)
 const MAX_GRID = 512;                     // cap on grid dimension for browser perf
 const KERNEL_SENTINEL = -1e6;             // NaN obstacle sentinel (pipeline.py)
 
-// Meta/WRI Global Canopy Height (1 m) — Bing-quadkey z9 COG tiles.
-// Verified: (-120.99, 38.685) → quadkey "023010211".
-const META_ZOOM = 9;
-const META_BASE_DEFAULT = 'https://dataforgood-fb-data.s3.amazonaws.com/forests/v1/alsgedi_global_v6_float';
+// Meta/WRI Canopy Height Maps v2 (CHMv2, DINOv3) — Bing-quadkey z10 COG tiles,
+// 32768² px each on the SAME 1.194 m Mercator lattice the v1 z9/65536² tiles used
+// (so saved canopy edits still align). Verified: (-120.99, 38.685) → "0230102111".
+const META_ZOOM = 10;
+const META_BASE_DEFAULT = 'https://dataforgood-fb-data.s3.amazonaws.com/forests/v2/global/dinov3_global_chm_v2_ml3';
+
+// --- COG level selection (pure; the app builds `levels` from geotiff.js IFDs) ---
+// A CHMv2 tile's IFDs are INTERLEAVED: [data 32768, MASK 32768, data 16384 … 512,
+// mask 16384 … 512]. A TIFF transparency mask (NewSubfileType bit 4 / Photometric 4 /
+// 1-bit) is the cloud mask, not a coarser copy of the heights, so "walk the IFDs by
+// index until one fits" would read a mask as canopy. levels = [{width, height, mask}]
+// in file order; fracW/fracH = the AOI window as a fraction of the tile extent.
+// Returns the first NON-mask level whose window is ≤ maxPx per side, else the
+// coarsest non-mask level (never a mask index; -1 only if there is no data level).
+function cogPickLevel(levels, fracW, fracH, maxPx) {
+  let coarsest = -1, coarsestPx = Infinity;
+  for (let i = 0; i < levels.length; i++) {
+    const lv = levels[i];
+    if (!lv || lv.mask) continue;
+    const win = Math.max(fracW * lv.width, fracH * lv.height);
+    if (win <= maxPx) return i;
+    if (lv.width < coarsestPx) { coarsestPx = lv.width; coarsest = i; }
+  }
+  return coarsest;
+}
+
+// Index of the mask level with the same dimensions as levels[dataIdx], or -1.
+function cogMaskLevelFor(levels, dataIdx) {
+  const d = levels[dataIdx];
+  if (!d) return -1;
+  for (let i = 0; i < levels.length; i++) {
+    const lv = levels[i];
+    if (lv && lv.mask && lv.width === d.width && lv.height === d.height) return i;
+  }
+  return -1;
+}
+
+// Cloud mask: 0 = the input imagery was cloud-flagged (the data band holds 0 m
+// there — indistinguishable from bare ground). Those cells become NaN ("no data",
+// transparent in the overlay, bare earth in the DSM like an uncovered cell).
+// Returns the number of cells masked.
+function applyCloudMask(data, mask) {
+  if (!data || !mask) return 0;
+  const n = Math.min(data.length, mask.length);
+  let masked = 0;
+  for (let i = 0; i < n; i++) {
+    if (mask[i] === 0) { data[i] = NaN; masked++; }
+  }
+  return masked;
+}
 
 function ftToM(ft) { return ft * M_PER_FT; }
 function mToFt(m) { return m * FT_PER_M; }
@@ -2413,6 +2459,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     M_PER_FT, FT_PER_M, R_EARTH_M, PILOT_EYE_M, VLOS_DEFAULT_M, WORK_RES_M,
     MAX_GRID, KERNEL_SENTINEL, META_ZOOM, META_BASE_DEFAULT,
+    cogPickLevel, cogMaskLevelFor, applyCloudMask,
     ftToM, mToFt, mercatorY, mercatorLatFromY, WEBMERC_R,
     lngToMercX, latToMercY, mercXToLng, mercYToLat,
     lngLatToTileXY, tileXYToQuadkey, quadkeyToTileXY, tileXYBounds, quadkeyBounds, metaQuadkeysForBBox,
