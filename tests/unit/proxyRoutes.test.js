@@ -23,3 +23,28 @@ describe('resolveTarget canopy routes', () => {
     expect(resolveTarget(u('/tfr/download/x.xml')).target).toBe('https://tfr.faa.gov/download/x.xml');
   });
 });
+
+// /naipchm/ serves the NAIP-CHM canopy+structure COGs (Univ. of Montana). The
+// route is shape-checked: only the dataset's own asset paths may pass through.
+describe('resolveTarget /naipchm/ route', () => {
+  it('maps a quarter-quad COG path to the rangeland.ntsg.umt.edu upstream', () => {
+    const r = resolveTarget(u('/naipchm/2022/10/m_3812001_ne_10_060_20220721_chm.tif'));
+    expect(r.target).toBe('https://rangeland.ntsg.umt.edu/data/naip-chm/2022/10/m_3812001_ne_10_060_20220721_chm.tif');
+    expect(r.cacheTtl).toBe(604800);
+  });
+
+  it('accepts two-date 30 cm names and the manifest JSON', () => {
+    expect(resolveTarget(u('/naipchm/2023/17/m_2408002_ne_17_030_20230111_20230530_chm.tif')).target)
+      .toBe('https://rangeland.ntsg.umt.edu/data/naip-chm/2023/17/m_2408002_ne_17_030_20230111_20230530_chm.tif');
+    expect(resolveTarget(u('/naipchm/2022/10/m_3812001_ne_10_060_20220721_chm_manifest.json')).target)
+      .toMatch(/_chm_manifest\.json$/);
+  });
+
+  it('rejects anything that is not a dataset asset path', () => {
+    expect(resolveTarget(u('/naipchm/'))).toBeNull();
+    expect(resolveTarget(u('/naipchm/index.csv'))).toBeNull();
+    expect(resolveTarget(u('/naipchm/2022/10/'))).toBeNull();
+    expect(resolveTarget(u('/naipchm/2022/10/../../README'))).toBeNull();
+    expect(resolveTarget(u('/naipchm/inference-resources/conditioning-data/climate_pca.tif'))).toBeNull();
+  });
+});

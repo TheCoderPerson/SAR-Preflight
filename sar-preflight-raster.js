@@ -151,6 +151,162 @@ function metaQuadkeysForBBox(west, south, east, north, z) {
 }
 
 // ============================================================
+// NAIP-CHM (Univ. of Montana NTSG; Morford et al. 2026) — 0.6 m canopy AND
+// STRUCTURE height model, one Cloud-Optimized GeoTIFF per NAIP quarter-quad in
+// NAD83 / UTM (EPSG:269xx), uint16 centimetres (height m = value / 100), nodata
+// 65535, tiled 512² Deflate with 2×-averaged overviews. Unlike CHMv2 it contains
+// buildings, power lines and other elevated features, so a DSM built from it
+// must NOT also stamp OSM building footprints (canopySourceIncludesStructures).
+// Verified layout facts (tile m_3812001_ne, Sept 2026) live in CLAUDE.md.
+// ============================================================
+const NAIP_CHM_LABEL = 'NAIP-CHM';
+const NAIP_CHM_NODATA = 65535;
+const NAIP_CHM_SCALE = 100;                // stored centimetres → metres
+const NAIP_QUAD_DEG = 0.125;               // USGS 7.5' quadrangle
+const NAIP_QQ_DEG = 0.0625;                // quarter-quad (3.75')
+
+// True when a canopy `source` label names a dataset whose heights already
+// include buildings/structures (NAIP-CHM, incl. its "(cached)"/"(edited)" forms).
+// Used by the viewshed (skip OSM stamping), the result line, KML descriptions and
+// the 3D buildings mode. A CHMv2 label — even the "(NAIP-CHM unavailable)"
+// fallback one — is vegetation-only and returns false.
+function canopySourceIncludesStructures(src) {
+  return typeof src === 'string' && src.startsWith(NAIP_CHM_LABEL);
+}
+
+// Forward Transverse Mercator → UTM (northern hemisphere) on GRS80 (NAD83).
+// Snyder's series; sub-metre against reference implementations. Works for any
+// zone, including projecting a point into a neighbouring zone's system (NAIP
+// quads along the -120° seam are stored in zone 10 or 11 by quad, not by point).
+function latLngToUtm(lat, lng, zone) {
+  const a = 6378137, f = 1 / 298.257222101, k0 = 0.9996;
+  const e2 = f * (2 - f), ep2 = e2 / (1 - e2);
+  const phi = lat * Math.PI / 180;
+  const dl = (lng - (zone * 6 - 183)) * Math.PI / 180;
+  const sp = Math.sin(phi), cp = Math.cos(phi), tp = Math.tan(phi);
+  const N = a / Math.sqrt(1 - e2 * sp * sp);
+  const T = tp * tp, C = ep2 * cp * cp, A = cp * dl;
+  const e4 = e2 * e2, e6 = e4 * e2;
+  const M = a * ((1 - e2 / 4 - 3 * e4 / 64 - 5 * e6 / 256) * phi
+    - (3 * e2 / 8 + 3 * e4 / 32 + 45 * e6 / 1024) * Math.sin(2 * phi)
+    + (15 * e4 / 256 + 45 * e6 / 1024) * Math.sin(4 * phi)
+    - (35 * e6 / 3072) * Math.sin(6 * phi));
+  const A2 = A * A, A3 = A2 * A, A4 = A3 * A, A5 = A4 * A, A6 = A5 * A;
+  const x = k0 * N * (A + (1 - T + C) * A3 / 6 + (5 - 18 * T + T * T + 72 * C - 58 * ep2) * A5 / 120) + 500000;
+  const y = k0 * (M + N * tp * (A2 / 2 + (5 - T + 9 * C + 4 * C * C) * A4 / 24
+    + (61 - 58 * T + T * T + 600 * C - 330 * ep2) * A6 / 720));
+  return { x, y };
+}
+
+// 1°×1° index block containing a point: `{lat°}{lon°W}` zero-padded (2+3 digits),
+// e.g. (38.685, -120.99) → '38120' = lat [38,39), lon [-121,-120). CONUS only
+// (north + west hemispheres); returns null elsewhere.
+function naipIndexBlockKey(lat, lng) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < 0 || lat >= 90 || lng >= 0 || lng < -180) return null;
+  const latDeg = Math.floor(lat);
+  const lonId = Math.floor(-lng);           // -120.99 → 120 (block spans (-121, -120])
+  return String(latDeg).padStart(2, '0') + String(lonId).padStart(3, '0');
+}
+
+// Nominal footprint of a 7-digit quad id + quarter (the files carry ~200 m of
+// buffer beyond it). Quad index 01–64 is ROW-MAJOR FROM THE NW CORNER: row
+// north→south, column west→east (verified against 5 tie points).
+function naipQuadBounds(quadId, qq) {
+  const latDeg = parseInt(quadId.slice(0, 2), 10);
+  const lonId = parseInt(quadId.slice(2, 5), 10);
+  const idx = parseInt(quadId.slice(5, 7), 10) - 1;
+  if (!(idx >= 0 && idx < 64)) return null;
+  const row = Math.floor(idx / 8), col = idx % 8;
+  const north = latDeg + 1 - row * NAIP_QUAD_DEG, west = -(lonId + 1) + col * NAIP_QUAD_DEG;
+  const qn = qq[0] === 'n' ? north : north - NAIP_QQ_DEG;
+  const qw = qq[1] === 'w' ? west : west + NAIP_QQ_DEG;
+  return { west: qw, south: qn - NAIP_QQ_DEG, east: qw + NAIP_QQ_DEG, north: qn };
+}
+
+// Quarter-quad containing a point → { block, quadId, qq, key, bounds } where
+// `key` = quad index + quarter ('17sw') is the lookup key inside the block's
+// index file and quadId is the 7-digit id used in filenames ('3812017').
+function naipQuarterQuadFor(lat, lng) {
+  const block = naipIndexBlockKey(lat, lng);
+  if (!block) return null;
+  const north = Math.floor(lat) + 1, west = -(Math.floor(-lng) + 1);
+  const row = Math.min(7, Math.max(0, Math.floor((north - lat) / NAIP_QUAD_DEG)));
+  const col = Math.min(7, Math.max(0, Math.floor((lng - west) / NAIP_QUAD_DEG)));
+  const quadNorth = north - row * NAIP_QUAD_DEG, quadWest = west + col * NAIP_QUAD_DEG;
+  const qq = (lat >= quadNorth - NAIP_QQ_DEG ? 'n' : 's') + (lng < quadWest + NAIP_QQ_DEG ? 'w' : 'e');
+  const quad = String(row * 8 + col + 1).padStart(2, '0');
+  const quadId = block + quad;
+  return { block, quadId, qq, key: quad + qq, bounds: naipQuadBounds(quadId, qq) };
+}
+
+// Every quarter-quad intersecting a lat/lng bbox (deduped, row-major), capped
+// so a runaway bbox cannot enqueue thousands of 230 MB COGs.
+function naipQuarterQuadsForBBox(west, south, east, north, maxCount) {
+  const cap = maxCount || 64;
+  const out = [], seen = new Set();
+  const eps = 1e-9;
+  const lat0 = Math.floor(south / NAIP_QQ_DEG) * NAIP_QQ_DEG + NAIP_QQ_DEG / 2;
+  const lng0 = Math.floor(west / NAIP_QQ_DEG) * NAIP_QQ_DEG + NAIP_QQ_DEG / 2;
+  for (let lat = lat0; lat - NAIP_QQ_DEG / 2 < north - eps; lat += NAIP_QQ_DEG) {
+    for (let lng = lng0; lng - NAIP_QQ_DEG / 2 < east - eps; lng += NAIP_QQ_DEG) {
+      const q = naipQuarterQuadFor(lat, lng);
+      if (!q || seen.has(q.quadId + q.qq)) continue;
+      seen.add(q.quadId + q.qq);
+      out.push(q);
+      if (out.length >= cap) return out;
+    }
+  }
+  return out;
+}
+
+// Relative asset path from a block-index entry value ('2022/10_060_20220721' =
+// year + '/' + the filename tail zone_res_date[_date2]) and the quad + quarter:
+// '2022/10/m_3812017_sw_10_060_20220721_chm.tif'. Null for a malformed entry.
+function naipChmPathFor(entryValue, quadId, qq) {
+  if (typeof entryValue !== 'string') return null;
+  const m = /^(\d{4})\/(\d{1,2}_[0-9a-z]{1,3}(?:_\d{8}){1,2})$/.exec(entryValue); // res code 060 | 030 | 1 | h
+  if (!m || !/^\d{7}$/.test(String(quadId)) || !/^[ns][ew]$/.test(String(qq))) return null;
+  const zone = m[2].split('_')[0];
+  return `${m[1]}/${zone}/m_${quadId}_${qq}_${m[2]}_chm.tif`;
+}
+
+// Resample a UTM-projected source window onto the lat/lng working grid.
+// src = { data, cols, rows, originX, originY (UL corner, UTM m), resX, resY (m/px,
+// positive), zone, nodata, scale }. Each grid cell is MAX-POOLED over the source
+// pixels its footprint covers (never fewer than 1): a taller neighbour makes the
+// DSM higher and the viewshed smaller, which is the safe error for VLOS — the
+// same bias canopyApplyMask uses. nodata → NaN (uncovered), output in metres.
+function resampleUtmToGrid(grid, src) {
+  const out = new Float32Array(grid.rows * grid.cols).fill(NaN);
+  const { data, cols, rows, originX, originY, resX, resY, zone } = src;
+  const nodata = src.nodata, scale = src.scale || 1;
+  const cellM = grid.resM || 1;
+  const kx = Math.max(1, Math.round(cellM / resX)), ky = Math.max(1, Math.round(cellM / resY));
+  for (let row = 0; row < grid.rows; row++) {
+    const lat = gridRowToLat(grid, row);
+    for (let col = 0; col < grid.cols; col++) {
+      const lng = gridColToLng(grid, col);
+      const u = latLngToUtm(lat, lng, zone);
+      const fx = (u.x - originX) / resX, fy = (originY - u.y) / resY;
+      if (fx < 0 || fy < 0 || fx >= cols || fy >= rows) continue; // centre outside the window
+      const ix0 = Math.max(0, Math.round(fx - kx / 2)), iy0 = Math.max(0, Math.round(fy - ky / 2));
+      const ix1 = Math.min(cols - 1, ix0 + kx - 1), iy1 = Math.min(rows - 1, iy0 + ky - 1);
+      let best = -Infinity;
+      for (let iy = iy0; iy <= iy1; iy++) {
+        const base = iy * cols;
+        for (let ix = ix0; ix <= ix1; ix++) {
+          const v = data[base + ix];
+          if (v === nodata || !Number.isFinite(v)) continue;
+          if (v > best) best = v;
+        }
+      }
+      if (best > -Infinity) out[row * grid.cols + col] = best / scale;
+    }
+  }
+  return out;
+}
+
+// ============================================================
 // GRID GEOMETRY — local equirectangular metres grid over an AOI.
 // Sub-metre error at <=1.5 km AOI, so no UTM needed.
 // row 0 = north edge, col 0 = west edge; values are cell-centre sampled.
@@ -2135,6 +2291,7 @@ function makeViewshedRecord(opts) {
     demSource: opts.demSource || null,
     canopySource: opts.canopySource || null,
     buildingCount: Number.isFinite(+opts.buildingCount) ? +opts.buildingCount : null, // null = OSM buildings not included in this compute
+    structuresInCanopy: !!opts.structuresInCanopy, // heights came from NAIP-CHM (buildings inside the surface; OSM not stamped)
     backdrop: Array.isArray(opts.backdrop) ? Array.from(opts.backdrop, Number) : null, // per-sector terrain-backdrop fractions (computeBackdropSectors)
     horizon: (opts.horizon && Array.isArray(opts.horizon.angles))
       ? { stepDeg: +opts.horizon.stepDeg || 3, angles: Array.from(opts.horizon.angles, Number) }
@@ -2182,7 +2339,9 @@ function observerKmlDescription(rec, extras) {
     `Viewshed: ${cov}`,
     rec.demSource ? `Terrain: ${rec.demSource}` : '',
     rec.canopySource ? `Canopy: ${rec.canopySource}` : '',
-    rec.buildingCount != null ? `Buildings: ${rec.buildingCount} OSM footprints as obstacles` : '',
+    (rec.structuresInCanopy || canopySourceIncludesStructures(rec.canopySource))
+      ? 'Buildings: included in the NAIP-CHM height surface (OSM footprints not added)'
+      : (rec.buildingCount != null ? `Buildings: ${rec.buildingCount} OSM footprints as obstacles` : ''),
     (extras && extras.glareText) ? `Sun glare (export day): ${extras.glareText} — near-overhead passes can glare any time the sun is up` : '',
     (extras && extras.backdropText) ? `Terrain backdrop toward ${extras.backdropText} — drone below skyline, hard to see` : '',
     rec.computedAt ? `Computed: ${new Date(rec.computedAt).toISOString()}` : '',
@@ -2460,6 +2619,8 @@ if (typeof module !== 'undefined' && module.exports) {
     M_PER_FT, FT_PER_M, R_EARTH_M, PILOT_EYE_M, VLOS_DEFAULT_M, WORK_RES_M,
     MAX_GRID, KERNEL_SENTINEL, META_ZOOM, META_BASE_DEFAULT,
     cogPickLevel, cogMaskLevelFor, applyCloudMask,
+    NAIP_CHM_LABEL, NAIP_CHM_NODATA, NAIP_CHM_SCALE, canopySourceIncludesStructures, latLngToUtm,
+    naipIndexBlockKey, naipQuadBounds, naipQuarterQuadFor, naipQuarterQuadsForBBox, naipChmPathFor, resampleUtmToGrid,
     ftToM, mToFt, mercatorY, mercatorLatFromY, WEBMERC_R,
     lngToMercX, latToMercY, mercXToLng, mercYToLat,
     lngLatToTileXY, tileXYToQuadkey, quadkeyToTileXY, tileXYBounds, quadkeyBounds, metaQuadkeysForBBox,

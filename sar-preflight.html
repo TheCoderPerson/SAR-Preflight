@@ -1225,8 +1225,8 @@ select.api-input { cursor: pointer; }
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-green)"></div>Canopy &amp; Visibility <span class="fetch-status" id="canopyStatus"></span></div>
           <div class="section-meta" id="meta_canopy"></div>
           <div class="api-config">
-            <div style="font-size:12px;color:var(--text-secondary);">Vegetation height overlay (Meta CHMv2, ~1&nbsp;m)
-              <span style="font-size:10px;color:var(--text-muted);">— toggle in Map Layers &rsaquo; Analysis</span></div>
+            <div style="font-size:12px;color:var(--text-secondary);"><span id="canopySourceCaption">Vegetation height overlay (Meta CHMv2, ~1&nbsp;m)</span>
+              <span style="font-size:10px;color:var(--text-muted);">— toggle in Map Layers &rsaquo; Analysis · source in Config</span></div>
             <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
               <label style="font-size:11px;color:var(--text-secondary);white-space:nowrap;">Opacity:</label>
               <input type="range" id="canopyOpacity" min="0" max="1" step="0.05" value="0.6" style="width:110px;" oninput="setCanopyOpacity(this.value)">
@@ -1517,12 +1517,20 @@ select.api-input { cursor: pointer; }
             <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">Flat mode drapes the shaded building footprints on the terrain instead of extruding them — lighter on memory and GPU for resource-constrained devices.</div>
           </div>
           <div class="api-config">
+            <div class="data-label">Canopy / structure height source (vegetation overlay, viewshed DSM, 3D canopy)</div>
+            <select class="api-input" id="cfgCanopySource" onchange="setCanopySource(this.value)">
+              <option value="chmv2" selected>Meta/WRI CHMv2 — vegetation only (~1 m, global); buildings added from OSM footprints</option>
+              <option value="naip">NAIP-CHM — vegetation + buildings/structures (0.6 m, CONUS only, 2022–23 imagery); OSM buildings not added</option>
+            </select>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;"><b>NAIP-CHM</b> (Univ. of Montana NTSG, <a href="https://doi.org/10.1038/s41597-026-07549-w" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Morford et al. 2026</a>, MIT) models the height of <em>everything</em> standing above ground — trees, buildings, towers, power lines — from 0.6 m NAIP aerial imagery (pixel RMSE ≈ 2.3 m), so the viewshed uses that surface directly and does <b>not</b> stamp OSM building footprints on top of it; in 3D, "Auto" buildings switch to flat footprints so prisms don't rise through the mesh. Contiguous US only, with gaps (e.g. parts of southern Nevada): where it has no coverage or fails to load, the app falls back to <b>CHMv2 + OSM buildings</b> and labels the result <span style="font-family:var(--font-mono);">CHMv2 · NO NAIP-CHM</span>. Imagery is mostly 2022–2023 (some older) — trees grow, burn and get cut, and new construction is missing. Changing the source reloads the canopy overlay; existing viewsheds keep their labeled source until recomputed. Tiles are ~230 MB files read by byte range through the data proxy; loads take a few seconds longer than CHMv2.</div>
+          </div>
+          <div class="api-config">
             <div class="data-label">Data proxy URL — canopy + live TFR/NOTAM (optional override — <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">self-host guide ↗</a>)</div>
             <div class="api-input-group">
               <input class="api-input" id="cfgCanopyProxy" type="text" placeholder="Leave blank for built-in default (sar-canopy-proxy.joja15.workers.dev)" onchange="saveCanopyProxy(this.value)" />
               <button class="btn btn-ghost" onclick="saveCanopyProxy(document.getElementById('cfgCanopyProxy').value)">Save</button>
             </div>
-            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;"><b>Leave blank to use the built-in default proxy</b> — the app works out of the box. Enter your own Cloudflare Worker URL to override (e.g. for a fork hosted elsewhere; the built-in proxy only serves the official app origins). The proxy serves CORS-blocked sources: Meta/WRI CHMv2 canopy tiles (vegetation overlay &amp; viewshed), the FAA TFR GeoServer (live TFRs), the FAA NOTAM Search backend (live NOTAMs), and the USFS/BLM ArcGIS servers (forest roads/trails/MVUM, BLM transport &amp; public-land ownership) — TFRs/NOTAMs auto-fetched per area. NOTAMs come from an unofficial endpoint: treat as advisory and verify officially. Heavy use may briefly rate-limit (⚠ PROXY LIMIT in the header); it clears in about a minute. <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Self-host your own free Cloudflare Worker ↗</a> (step-by-step instructions &amp; code).</div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;"><b>Leave blank to use the built-in default proxy</b> — the app works out of the box. Enter your own Cloudflare Worker URL to override (e.g. for a fork hosted elsewhere; the built-in proxy only serves the official app origins). The proxy serves CORS-blocked sources: Meta/WRI CHMv2 canopy tiles and NAIP-CHM canopy/structure tiles (vegetation overlay &amp; viewshed), the FAA TFR GeoServer (live TFRs), the FAA NOTAM Search backend (live NOTAMs), and the USFS/BLM ArcGIS servers (forest roads/trails/MVUM, BLM transport &amp; public-land ownership) — TFRs/NOTAMs auto-fetched per area. NOTAMs come from an unofficial endpoint: treat as advisory and verify officially. Heavy use may briefly rate-limit (⚠ PROXY LIMIT in the header); it clears in about a minute. <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Self-host your own free Cloudflare Worker ↗</a> (step-by-step instructions &amp; code).</div>
           </div>
         </div>
         <div class="data-section">
