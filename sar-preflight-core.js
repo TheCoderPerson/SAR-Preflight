@@ -24,6 +24,15 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.09.19-a',
+    date: '2026-09-19',
+    changes: [
+      'Canopy height now comes from Meta/WRI Canopy Height Maps v2 (CHMv2): a markedly more accurate global model (R² 0.86 vs 0.53 against lidar) on the same ~1 m grid, so the vegetation overlay, the viewshed and the 3D canopy all use it. Saved canopy edits still line up. The Canopy status pill now names the dataset (LIVE · CHMv2).',
+      'CHMv2 flags pixels where its satellite imagery was cloud-covered. Those cells are shown as no data (transparent) instead of being drawn as bare ground, and the status pill reports the share (e.g. "LIVE · CHMv2 · 12% CLOUD") when it is 1% or more. The California areas checked had no cloud-masked pixels.',
+      'The data proxy keeps serving the previous canopy tiles at the old route, so an app copy that has not updated yet keeps working. Previously cached canopy grids are not reused for CHMv2; a viewed area reloads once online.',
+    ],
+  },
+  {
     version: '2026.09.08-e',
     date: '2026-09-08',
     changes: [

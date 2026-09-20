@@ -40,7 +40,7 @@ describe('_cogTileToGrid strip-wise read', () => {
     const nativePx = 8000;                  // 8000x8000 = 64M px window > budget
     const tiff = makeMockTiff(grid, nativePx, windows, 7);
 
-    const out = await _cogTileToGrid(tiff, grid);
+    const { arr: out } = await _cogTileToGrid(tiff, grid);
 
     // More than one strip (64M / 32M budget => 2)
     expect(windows.length).toBeGreaterThan(1);
@@ -66,7 +66,7 @@ describe('_cogTileToGrid strip-wise read', () => {
     const nativePx = 1000;                  // 1M px window << budget
     const tiff = makeMockTiff(grid, nativePx, windows, 3);
 
-    const out = await _cogTileToGrid(tiff, grid);
+    const { arr: out } = await _cogTileToGrid(tiff, grid);
     expect(windows.length).toBe(1);
     expect(Array.from(out).every(v => v === 3)).toBe(true);
   });

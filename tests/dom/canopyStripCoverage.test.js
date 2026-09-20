@@ -7,9 +7,11 @@
 //     almost nothing (geotiff.js coalesces contiguous strips, so striping cost
 //     ~10 requests, not thousands) while the longest uninterruptible chunk was
 //     4.5 s — and a full-view AOI locked the tab for over 90 s.
-// Also pins the per-row cost model: these COGs are STRIPPED with
+// Also pins the per-row cost model: the v1 COGs were STRIPPED with
 // RowsPerStrip = 1, so decoding a row costs the FILE's full width, not the
 // window's. Budgeting by window width made the guard vanish on narrow windows.
+// (CHMv2 tiles are tiled, so they take the cheaper branch — kept for any
+// stripped source.)
 const core = require('../../sar-preflight-core.js');
 Object.assign(globalThis, core);
 const raster = require('../../sar-preflight-raster.js');
@@ -47,7 +49,7 @@ async function runCoverage(grid, native, fileDirectory) {
     },
   };
   const tiff = { getImageCount: async () => 1, getImage: async () => img };
-  const out = await _cogTileToGrid(tiff, grid);
+  const { arr: out } = await _cogTileToGrid(tiff, grid);
   return { out, windows };
 }
 

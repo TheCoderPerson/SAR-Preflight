@@ -4,6 +4,12 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.09.19-a — 2026-09-19
+
+- Canopy height now comes from Meta/WRI Canopy Height Maps v2 (CHMv2): a markedly more accurate global model (R² 0.86 vs 0.53 against lidar) on the same ~1 m grid, so the vegetation overlay, the viewshed and the 3D canopy all use it. Saved canopy edits still line up. The Canopy status pill now names the dataset (LIVE · CHMv2).
+- CHMv2 flags pixels where its satellite imagery was cloud-covered. Those cells are shown as no data (transparent) instead of being drawn as bare ground, and the status pill reports the share (e.g. "LIVE · CHMv2 · 12% CLOUD") when it is 1% or more. The California areas checked had no cloud-masked pixels.
+- The data proxy keeps serving the previous canopy tiles at the old route, so an app copy that has not updated yet keeps working. Previously cached canopy grids are not reused for CHMv2; a viewed area reloads once online.
+
 ## v2026.09.08-e — 2026-09-08
 
 - Fire perimeters are back: NIFC made the service the app queried private ("Token Required"); the app now uses NIFC's public WFIGS current-perimeters service instead.

@@ -27,7 +27,7 @@ function installCacheMock({ ops }) {
   const store = new Map();
   for (const grid of [overlayGrid, viewshedGrid]) {
     const b = grid.bounds;
-    const key = 'canopy_' + [b.west, b.south, b.east, b.north].map(v => v.toFixed(3)).join('_') + '_' + grid.cols + 'x' + grid.rows;
+    const key = 'canopy2_' + [b.west, b.south, b.east, b.north].map(v => v.toFixed(3)).join('_') + '_' + grid.cols + 'x' + grid.rows;
     store.set('canopy|' + key, { canopyArr: new Float32Array(grid.rows * grid.cols).fill(20) });
   }
   if (ops) store.set('canopyedit|global', { ops });
@@ -71,14 +71,14 @@ describe('fetchCanopyRaster replays saved edits', () => {
   it('returns the raster unchanged when there are no saved edits', async () => {
     installCacheMock({ ops: null });
     const { canopyFlat, source } = await fetchCanopyRaster(overlayGrid);
-    expect(source).toBe('Meta 1 m (cached)');
+    expect(source).toBe('Meta CHMv2 (cached)');
     expect(canopyFlat.every(x => x === 20)).toBe(true);
   });
 
   it('an empty op log (after Clear Canopy Edits) restores original data', async () => {
     installCacheMock({ ops: [] });
     const { canopyFlat, source } = await fetchCanopyRaster(overlayGrid);
-    expect(source).toBe('Meta 1 m (cached)');
+    expect(source).toBe('Meta CHMv2 (cached)');
     expect(canopyFlat.every(x => x === 20)).toBe(true);
   });
 });

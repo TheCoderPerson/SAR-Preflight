@@ -10956,8 +10956,8 @@ async function exportMissionLogsAsCSV() {
 
 // ============================================================
 // VEGETATION (CANOPY) OVERLAY + VIEWSHED
-// Canopy: Meta/WRI 1 m COG tiles via a user-configured CORS proxy (Cloudflare
-// Worker — see tools/canopy-proxy). DEM: USGS 3DEP exportImage (CORS-enabled).
+// Canopy: Meta/WRI Canopy Height Maps v2 (CHMv2) COG tiles via the data proxy
+// (Cloudflare Worker — see tools/canopy-proxy). DEM: USGS 3DEP exportImage (CORS-enabled).
 // Line-of-sight math lives in sar-preflight-raster.js. Processed rasters are
 // cached in IndexedDB so previously-viewed areas work offline.
 // ============================================================
@@ -10965,25 +10965,36 @@ async function exportMissionLogsAsCSV() {
 const CANOPY_OVERLAY_OPACITY = 0.6;
 const VIEWSHED_OVERLAY_OPACITY = 0.5;
 const SHADOW_OVERLAY_OPACITY = 0.45;
-const CANOPY_MAX_M = 60;        // clamp canopy heights (guards COG fill/nodata artifacts)
-// Cap the per-tile COG window read; a coarser overview is chosen if larger.
-// (Meta canopy COGs turned out to have NO usable overviews, so this rarely
-// helps for them — the real bound is the strip-wise read below.)
+const CANOPY_MAX_M = 60;        // clamp canopy heights (guards COG fill/nodata artifacts; CHMv2 is uint8 and a few 255 px exist)
+// Canopy dataset: Meta/WRI CHMv2 through the data proxy's /chm2/ route (the
+// Worker's /chm/ route still serves v1 for older cached builds). Tiles are z10
+// quadkeys, 32768² px on the same 1.194 m Mercator lattice as v1, uint8 integer
+// metres, TILED 512² + Deflate, with six 2×2-AVERAGED overviews (16384 → 512)
+// and a separate 1-bit cloud-mask IFD for every level (interleaved — see
+// cogPickLevel in raster.js). The data band reads 0 m under clouds.
+const CANOPY_PROXY_ROUTE = '/chm2/';
+const CANOPY_DATASET_LABEL = 'CHMv2';
+// Cap the per-tile COG window read; the first overview whose window fits is
+// chosen (cogPickLevel). With MAX_GRID = 512 this never reads coarser than the
+// working grid: a level that fits ≤1024 px is still ≥512 px across the AOI.
 const COG_MAX_READ_PX = 1024;
 // Peak decode budget for the strip-wise COG read (~128 MB at 4 bytes/px).
-// GeoTIFF.js decodes the ENTIRE requested window before downsampling, and the
-// Meta tiles lack overviews, so a wide AOI needs a multi-thousand-px native
-// window — a 22,727×20,756 single read hit ~1.8 GB and crashed the iOS PWA.
-// We read the window in row strips capped to this budget so peak stays bounded.
+// GeoTIFF.js decodes the ENTIRE requested window before downsampling. The v1
+// tiles (stripped, RowsPerStrip = 1, NO overviews) forced a multi-thousand-px
+// native window on wide AOIs — a 22,727×20,756 single read hit ~1.8 GB and
+// crashed the iOS PWA. CHMv2 has real overviews, so the picked window is ≤1024 px
+// and normally one strip; the strip loop stays as defence-in-depth.
 const CANOPY_DECODE_BUDGET_PX = 32000000;
-// Block size for geotiff.js's BlockedSource on the canopy COGs. Its 64 KB
-// default is too small for these files (stripped, RowsPerStrip = 1) and makes
-// wide reads throw "reading 'offset'" — see the call site in
-// _fetchCanopyFromProxy for the reproduction.
+// Block size for geotiff.js's BlockedSource on the canopy COGs. The 64 KB
+// default BROKE on the v1 tiles (a strip batch spanning many non-contiguous
+// ~7 KB strips asked for a block that was never registered — "reading
+// 'offset'"). CHMv2 is tiled so that failure is gone, but 1 MB blocks still
+// mean ONE Range request per row of ~50 KB tiles (contiguous in the file)
+// instead of several — fewer requests against the proxy's per-IP limit.
 const CANOPY_COG_BLOCK_BYTES = 1048576;
 // Skip the canopy overlay when the view half-width exceeds this (~12 km AOI):
-// 1 m canopy over a wider area is hundreds of MB–GB to fetch/decode and is only
-// upscaled blur at that scale, so we tell the user to zoom in instead.
+// that is already 4+ z10 tiles × up to 4 attempts each, and 1 m canopy over a
+// wider area is only upscaled blur at that scale, so we tell the user to zoom in.
 const MAX_CANOPY_HALF_M = 6000;
 const CANOPY_TILE_ATTEMPTS = 4; // retry a tile this many times (with backoff) on transient proxy/S3 5xx before skipping it
 
@@ -11232,20 +11243,22 @@ async function _applyCanopyEdits(grid, flat) {
   } catch (_) { return { flat, edited: false }; }
 }
 
-// --- Canopy: Meta 1 m COG tiles via the proxy (online), else IndexedDB cache ---
+// --- Canopy: Meta CHMv2 COG tiles via the proxy (online), else IndexedDB cache ---
 async function fetchCanopyRaster(grid) {
   const base = getCanopyProxyBase();
   const b = grid.bounds;
-  const cacheKey = 'canopy_' + _aoiKey(b) + '_' + grid.cols + 'x' + grid.rows;
+  // 'canopy2_': namespaced to the dataset, so a grid cached from the v1 tiles
+  // ('canopy_' keys, which age out on the store's TTL) is never served as CHMv2.
+  const cacheKey = 'canopy2_' + _aoiKey(b) + '_' + grid.cols + 'x' + grid.rows;
   if (base && (typeof isOnline !== 'function' || isOnline())) {
     try {
       const res = await _fetchCanopyFromProxy(base, grid);
       if (res && res.canopy) {
-        if (typeof cacheRaster === 'function') cacheRaster('canopy', cacheKey, { canopyArr: res.canopy });
+        if (typeof cacheRaster === 'function') cacheRaster('canopy', cacheKey, { canopyArr: res.canopy, cloudFrac: res.cloudFrac || 0 });
         if (res.tilesFailed > 0) recordDataSourceError('Canopy', new Error(`${res.tilesFailed} of ${res.tilesTotal} canopy tiles failed to load (proxy/data-service errors)`));
         else clearDataSourceError('Canopy');
         const ed = await _applyCanopyEdits(grid, res.canopy);
-        return { canopyFlat: ed.flat, source: 'Meta 1 m' + (ed.edited ? ' (edited)' : ''), tilesTotal: res.tilesTotal, tilesLoaded: res.tilesLoaded, tilesFailed: res.tilesFailed };
+        return { canopyFlat: ed.flat, source: 'Meta CHMv2' + (ed.edited ? ' (edited)' : ''), tilesTotal: res.tilesTotal, tilesLoaded: res.tilesLoaded, tilesFailed: res.tilesFailed, cloudFrac: res.cloudFrac || 0 };
       }
     } catch (e) {
       recordDataSourceError('Canopy', e);
@@ -11255,7 +11268,7 @@ async function fetchCanopyRaster(grid) {
     const c = await getCachedRaster('canopy', cacheKey);
     if (c && c.data && c.data.canopyArr) {
       const ed = await _applyCanopyEdits(grid, c.data.canopyArr);
-      return { canopyFlat: ed.flat, source: 'Meta 1 m (cached)' + (ed.edited ? ' (edited)' : '') };
+      return { canopyFlat: ed.flat, source: 'Meta CHMv2 (cached)' + (ed.edited ? ' (edited)' : ''), cloudFrac: c.data.cloudFrac || 0 };
     }
   }
   return { canopyFlat: null, source: base ? 'unavailable' : 'no proxy' };
@@ -11267,10 +11280,10 @@ async function _fetchCanopyFromProxy(base, grid) {
   S._canopyTileError = null; // stale reason must not outlive its load
   try { Diag.note('canopy.tiles', { qk: qks.length }); } catch (_) {}
   const canopy = new Float32Array(grid.rows * grid.cols).fill(NaN);
-  let any = false, loaded = 0, failed = 0;
+  let any = false, loaded = 0, failed = 0, maskedPx = 0, totalPx = 0;
   for (let t = 0; t < qks.length; t++) {
     const qk = qks[t];
-    const url = base + '/chm/' + qk + '.tif';
+    const url = base + CANOPY_PROXY_ROUTE + qk + '.tif';
     let tileGrid = null;
     // Retry transient proxy/S3 errors: cold Range fetches of these large COGs
     // intermittently 5xx even though the tile is valid. Back off between tries.
@@ -11278,15 +11291,7 @@ async function _fetchCanopyFromProxy(base, grid) {
     for (let attempt = 0; attempt < CANOPY_TILE_ATTEMPTS && tileGrid == null; attempt++) {
       if (attempt > 0) await new Promise(r => setTimeout(r, 300 * attempt)); // 300/600/900ms backoff
       try {
-        // blockSize: geotiff.js's BlockedSource defaults to 64 KB blocks, which
-        // BREAKS on these tiles. They are stripped with RowsPerStrip = 1, and a
-        // strip runs ~7 KB over dense canopy, so one strip-batch read spans
-        // ~3.8 MB of non-contiguous small strips; the reader then asks for a
-        // block that was never registered and throws
-        // "Cannot read properties of undefined (reading 'offset')".
-        // Reproduced on 023010212 over a real search area: the default fails
-        // every time, cacheSize: 1000 does NOT help (so it is not eviction),
-        // and 1 MB blocks read the full grid successfully.
+        // blockSize: see CANOPY_COG_BLOCK_BYTES — MUST stay explicit.
         const tiff = await GeoTIFF.fromUrl(url, { blockSize: CANOPY_COG_BLOCK_BYTES });
         tileGrid = await _cogTileToGrid(tiff, grid);
       } catch (e) { tileGrid = null; lastErr = e; } // missing tile / CORS / transient
@@ -11315,15 +11320,23 @@ async function _fetchCanopyFromProxy(base, grid) {
       continue;
     }
     loaded++;
+    maskedPx += tileGrid.maskedPx || 0;
+    totalPx += tileGrid.totalPx || 0;
+    const arr = tileGrid.arr;
     for (let i = 0; i < canopy.length; i++) {
-      if (Number.isNaN(canopy[i]) && Number.isFinite(tileGrid[i])) { canopy[i] = tileGrid[i]; any = true; }
+      if (Number.isNaN(canopy[i]) && Number.isFinite(arr[i])) { canopy[i] = arr[i]; any = true; }
     }
   }
-  return any ? { canopy, tilesTotal: qks.length, tilesLoaded: loaded, tilesFailed: failed } : null;
+  // cloudFrac: share of the SAMPLED source pixels the dataset flags as cloud
+  // (across all tiles read for this grid). Those grid cells stay NaN.
+  const cloudFrac = totalPx > 0 ? maskedPx / totalPx : 0;
+  return any ? { canopy, tilesTotal: qks.length, tilesLoaded: loaded, tilesFailed: failed, cloudFrac } : null;
 }
 
 // Read the AOI window from a (Web-Mercator) COG, choosing an overview so the read
-// stays under COG_MAX_READ_PX per side, and resample onto the grid.
+// stays under COG_MAX_READ_PX per side, and resample onto the grid. Returns
+// { arr: Float32Array(grid cells; NaN = not covered / cloud-masked), maskedPx, totalPx }
+// or null when the tile does not overlap the grid.
 async function _cogTileToGrid(tiff, grid) {
   const b = grid.bounds;
   const count = await tiff.getImageCount();
@@ -11334,16 +11347,31 @@ async function _cogTileToGrid(tiff, grid) {
   if (axMax <= bbox[0] || axMin >= bbox[2] || ayMax <= bbox[1] || ayMin >= bbox[3]) return null; // no overlap
   const ovX = Math.max(axMin, bbox[0]), ovX2 = Math.min(axMax, bbox[2]);
   const ovY = Math.max(ayMin, bbox[1]), ovY2 = Math.min(ayMax, bbox[3]);
-  // COG IFDs are ordered full-res first, then progressively coarser overviews.
-  let img = base;
+  // Level selection. CHMv2 IFDs INTERLEAVE the data overviews with 1-bit cloud
+  // mask IFDs (full-res mask right after the full-res data, mask overviews after
+  // the data overviews), so "walk by index until one fits" would read a mask as
+  // canopy. Classify every IFD, then let the pure helper pick (never a mask).
+  const levels = [], imgs = [];
   for (let i = 0; i < count; i++) {
-    const cand = await tiff.getImage(i);
-    img = cand;
-    const w = cand.getWidth(), h = cand.getHeight();
-    const winW = (ovX2 - ovX) / (bbox[2] - bbox[0]) * w;
-    const winH = (ovY2 - ovY) / (bbox[3] - bbox[1]) * h;
-    if (Math.max(winW, winH) <= COG_MAX_READ_PX) break;
+    const cand = i === 0 ? base : await tiff.getImage(i);
+    const fd = cand.fileDirectory || {};
+    const bps = fd.BitsPerSample;
+    const mask = !!((fd.NewSubfileType || 0) & 4) || fd.PhotometricInterpretation === 4
+      || (bps != null && (bps.length ? bps[0] : bps) === 1);
+    imgs.push(cand);
+    levels.push({ width: cand.getWidth(), height: cand.getHeight(), mask });
   }
+  const fracW = (ovX2 - ovX) / (bbox[2] - bbox[0]);
+  const fracH = (ovY2 - ovY) / (bbox[3] - bbox[1]);
+  const li = cogPickLevel(levels, fracW, fracH, COG_MAX_READ_PX);
+  if (li < 0) throw new Error('COG has no data level (mask-only?)');
+  const img = imgs[li];
+  // Cloud mask at the same level (CHMv2). Read best-effort: if geotiff.js
+  // cannot decode the 1-bit band this degrades to unmasked data (v1 behaviour)
+  // rather than failing the tile.
+  const mi = cogMaskLevelFor(levels, li);
+  let maskImg = mi >= 0 ? imgs[mi] : null;
+  let maskedPx = 0, totalPx = 0;
   const w = img.getWidth(), h = img.getHeight();
   const resX = (bbox[2] - bbox[0]) / w, resY = (bbox[3] - bbox[1]) / h;
   let px0 = Math.max(0, Math.min(w, Math.floor((axMin - bbox[0]) / resX)));
@@ -11365,9 +11393,11 @@ async function _cogTileToGrid(tiff, grid) {
   // pixels however narrow the AOI is. Budgeting by winW therefore under-counted
   // badly: at a 1200 px window the mobile guard worked out 26k rows, i.e. no
   // bound whatsoever, and the iOS protection only ever bit on wide AOIs.
+  // (CHMv2 is TILED 512², so rowCostPx = winW there; the strip branch is what
+  // the v1 files needed and still protects any stripped source.)
   const rowCostPx = img.fileDirectory && img.fileDirectory.TileWidth ? winW : w;
   // Bounded on desktop too. The old Infinity read the whole window in one call
-  // to save proxy Range requests — but measured on the 1.08 GB tile, striping
+  // to save proxy Range requests — but measured on the 1.08 GB v1 tile, striping
   // costs ~1 extra request per strip (10, not thousands: geotiff.js coalesces
   // contiguous strips into ONE range) and barely moves total time, while the
   // longest uninterruptible chunk drops from 4.5 s to ~1.2 s. Unbounded, a
@@ -11390,10 +11420,23 @@ async function _cogTileToGrid(tiff, grid) {
     } finally {
       try { Diag.free('canopyDecode', stripBytes); } catch (_) {}
     }
-    const data = strip[0];
-    // Clamp to a sane canopy range (guards COG fill/nodata artifacts).
+    // Float32 copy: the band is uint8, which cannot hold the NaN the cloud mask writes.
+    const data = strip[0] instanceof Float32Array ? strip[0] : new Float32Array(strip[0]);
+    if (maskImg) {
+      try {
+        const m = await maskImg.readRasters({ window: [px0, ny, px1, nyEnd], width: sampleW, height: sampleH, resampleMethod: 'nearest', samples: [0] });
+        maskedPx += applyCloudMask(data, m[0]);
+      } catch (e) {
+        maskImg = null; // degrade once, for the rest of this tile
+        try { Diag.note('canopy.maskUnsupported', { why: (e && e.message) || String(e) }); } catch (_) {}
+      }
+    }
+    totalPx += data.length;
+    // Clamp to a sane canopy range (guards COG fill/nodata artifacts). NaN =
+    // cloud-masked and must survive as "no data".
     for (let i = 0; i < data.length; i++) {
       const v = data[i];
+      if (Number.isNaN(v)) continue;
       if (!Number.isFinite(v) || v < 0) data[i] = 0;
       else if (v > CANOPY_MAX_M) data[i] = CANOPY_MAX_M;
     }
@@ -11411,7 +11454,7 @@ async function _cogTileToGrid(tiff, grid) {
     // a multi-second read.
     if (nStrips > 1 && typeof _uiYield === 'function') await _uiYield();
   }
-  return out;
+  return { arr: out, maskedPx, totalPx };
 }
 
 // --- Render a computed raster as a semi-transparent image overlay ---
@@ -11560,18 +11603,12 @@ async function loadCanopyForView() {
       center.distanceTo(L.latLng(vb.getNorth(), center.lng))
     );
     if (halfWidthM > MAX_CANOPY_HALF_M) {
-      // 1 m canopy over a very wide view is hundreds of MB-GB to decode and
-      // only blur at that scale — guide the user to zoom in rather than hang.
-      //
-      // This used to be mobile-only, on the reasoning that desktop has no
-      // memory ceiling. Memory was never the binding constraint: these COGs
-      // are stripped with RowsPerStrip = 1 and have no overviews, so cost
-      // scales with the AOI's ROW COUNT times the file's full 65536-px width.
-      // Traced on desktop at a 70 km half-width, that is 12 quadkey tiles of
-      // ~59,000 rows each — tens of billions of pixels. Every tile timed out
-      // after its 4 attempts (~24 s per read) and the load never finished,
-      // leaving "Fetching..." on screen indefinitely. Bounding the strip size
-      // caps peak memory (27 MB, confirmed) but cannot make that request sane.
+      // 1 m canopy over a very wide view is only blur at that scale, and the
+      // tile count grows with the area (a 70 km half-width is ~50 z10 tiles,
+      // each retried up to 4 times) — guide the user to zoom in rather than
+      // hang. (With the v1 tiles — stripped, no overviews — a wide view was
+      // also tens of billions of decoded pixels and never finished; CHMv2's
+      // overviews remove that cost, but the guard is still the right UX.)
       setStatus('canopyStatus', 'error', 'ZOOM IN');
       markSection('canopy', { status: 'error', error: 'Zoom in to load 1 m canopy for this view' });
       try { Diag.note('canopy.skip', { halfKm: Math.round(halfWidthM / 100) / 10 }); } catch (_) {}
@@ -11582,7 +11619,7 @@ async function loadCanopyForView() {
     const resM = Math.max(WORK_RES_M, (2 * halfWidthM) / MAX_GRID);
     const grid = makeGrid(center.lat, center.lng, halfWidthM, resM);
     try { Diag.note('canopy.start', { z: S.map.getZoom(), cols: grid.cols, rows: grid.rows, halfKm: Math.round(halfWidthM / 100) / 10 }); } catch (_) {}
-    const { canopyFlat, source, tilesFailed, tilesLoaded, tilesTotal } = await fetchCanopyRaster(grid);
+    const { canopyFlat, source, tilesFailed, tilesLoaded, tilesTotal, cloudFrac } = await fetchCanopyRaster(grid);
     if (S._canopyEditing) return; // user entered edit mode while this load was in flight — don't fight the edit canvas
     if (!canopyFlat) {
       setStatus('canopyStatus', 'error', source === 'no proxy' ? 'NO PROXY' : 'NO DATA');
@@ -11603,14 +11640,20 @@ async function loadCanopyForView() {
     const op = parseFloat((document.getElementById('canopyOpacity') || {}).value) || CANOPY_OVERLAY_OPACITY;
     renderRasterOverlay('canopy', canopyGridToRGBA(grid, canopyFlat), grid, op);
     try { if (S.canopy && S.canopy.canopyFlat && S.canopy.canopyFlat.byteLength) Diag.free('canopyFlat', S.canopy.canopyFlat.byteLength); } catch (_) {}
-    S.canopy = { grid, source, canopyFlat }; // retain pixels for GeoTIFF export
-    try { Diag.alloc('canopyFlat', canopyFlat.byteLength); Diag.note('canopy.loaded', { src: source }); } catch (_) {}
+    S.canopy = { grid, source, canopyFlat, cloudFrac: cloudFrac || 0 }; // retain pixels for GeoTIFF export
+    try { Diag.alloc('canopyFlat', canopyFlat.byteLength); Diag.note('canopy.loaded', { src: source, cloud: Math.round((cloudFrac || 0) * 1000) / 1000 }); } catch (_) {}
     const cached = source.includes('cached');
+    // The pill names the dataset so the operator can see CHMv2 is what loaded
+    // (the cache key is dataset-scoped, so this is never a relabelled v1 grid),
+    // and flags cloud-masked coverage: those cells are NO DATA, shown
+    // transparent and treated as bare earth by the viewshed.
+    const cloudTag = (cloudFrac || 0) >= 0.01 ? ` · ${Math.round(cloudFrac * 100)}% CLOUD` : '';
+    const tag = ' · ' + CANOPY_DATASET_LABEL + cloudTag;
     if (tilesFailed > 0) {
       // Some tiles failed even after retries — tell the user coverage is incomplete and why.
-      setStatus('canopyStatus', 'partial', `PARTIAL ${tilesLoaded}/${tilesTotal} TILES`);
+      setStatus('canopyStatus', 'partial', `PARTIAL ${tilesLoaded}/${tilesTotal} TILES${tag}`);
     } else {
-      setStatus('canopyStatus', cached ? 'cached' : 'live', cached ? 'CACHED' : 'LIVE');
+      setStatus('canopyStatus', cached ? 'cached' : 'live', (cached ? 'CACHED' : 'LIVE') + tag);
     }
     // Canopy is view-based; record when this view's overlay was loaded.
     markSection('canopy', { status: 'live', updatedAt: Date.now(), error: null });
@@ -11873,7 +11916,7 @@ async function canopyEditSave() {
     if (typeof cacheRaster === 'function') await cacheRaster('canopyedit', 'global', { ops });
     // Adopt the edited raster into app state. New object identity on purpose —
     // the 3D canopy mesh cache is keyed by it and must invalidate.
-    const src = (S.canopy && S.canopy.source) || 'Meta 1 m';
+    const src = (S.canopy && S.canopy.source) || 'Meta CHMv2';
     S.canopy = { grid: ce.grid, source: src.includes('(edited)') ? src : src + ' (edited)', canopyFlat: ce.workFlat.slice() };
     const n = ce.sessionOps.length;
     ce.sessionOps = [];
