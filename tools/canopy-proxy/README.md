@@ -8,6 +8,14 @@ A small CORS+Range proxy so the browser-only app can read CORS-blocked sources:
    in-browser GeoTIFF reader can't fetch COG windows directly. Served at
    `/chm2/{quadkey}.tif` (z10 quadkeys, 10 digits). The older `/chm/{quadkey}.tif`
    route (v1, z9 quadkeys) is kept so previously cached app builds keep working.
+ * **NAIP-CHM canopy + structure height tiles** (Univ. of Montana NTSG, Morford et
+   al. 2026; MIT) for the optional "NAIP-CHM" canopy source — 0.6 m COGs, one per
+   NAIP quarter-quad in NAD83/UTM, served at `/naipchm/{year}/{zone}/m_…_chm.tif`
+   from `rangeland.ntsg.umt.edu/data/naip-chm/`, which supports Range but sends no
+   CORS headers. The path is shape-checked (only the dataset's own asset names
+   pass) and `.tif` files are never whole-cached at the edge (they are ~230 MB).
+   **Self-hosters must redeploy this Worker** to enable the option; an old Worker
+   answers 400 and the app falls back to CHMv2 + OSM buildings.
 2. **Live TFRs** — the FAA TFR GeoServer (`tfr.faa.gov`), also CORS-restricted. Served
    at the `/tfr/...` route with a near-zero cache (TFRs are time-critical).
 3. **Live NOTAMs** — the public FAA NOTAM Search backend (`notams.aim.faa.gov`). The

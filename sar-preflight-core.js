@@ -24,6 +24,16 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.09.20-a',
+    date: '2026-09-20',
+    changes: [
+      'New Config option "Canopy / structure height source": keep Meta/WRI CHMv2 (default, vegetation only — the viewshed adds buildings from OSM footprints) or switch to NAIP-CHM, a 0.6 m model of everything standing above ground (trees, buildings, towers, power lines) from 2022–23 NAIP aerial imagery (Univ. of Montana, Morford et al. 2026). With NAIP-CHM the viewshed uses that surface directly and does not stamp OSM buildings on top; the observer line reads "structures in NAIP-CHM" and KML exports say so.',
+      'NAIP-CHM covers the contiguous US only. Where it has no coverage or fails to load, the app falls back to CHMv2 plus OSM buildings and labels the canopy pill "CHMv2 · NO NAIP-CHM" so the surface in use is never ambiguous. Previously computed viewsheds keep their labeled source until recomputed.',
+      'In the 3D view, "Auto" buildings switch to flat footprints while a NAIP-CHM canopy is shown, so OSM prisms do not rise through a mesh that already contains the buildings. "Always 3D buildings" still forces prisms.',
+      'The data proxy gained a /naipchm/ route for the NAIP-CHM tiles (the dataset sends no CORS headers). Self-hosted proxies need the updated Worker code; until then NAIP-CHM reports no data and the CHMv2 fallback applies.',
+    ],
+  },
+  {
     version: '2026.09.19-a',
     date: '2026-09-19',
     changes: [
@@ -3658,10 +3668,13 @@ function clampBBoxSpan(south, west, north, east, maxSpanDeg) {
 
 // Buildings-in-3D display mode: 'prisms' (extruded) or 'flat' (draped 2D
 // footprints only — cheaper). 'auto' (or anything unrecognized) picks flat
-// on resource-constrained devices, prisms otherwise.
-function resolveBuildings3dMode(setting, constrained) {
+// on resource-constrained devices, prisms otherwise — and flat whenever the
+// displayed canopy surface already carries structure heights (NAIP-CHM), so
+// OSM prisms don't rise through a mesh that already shows the buildings.
+// An explicit 'prisms' still wins.
+function resolveBuildings3dMode(setting, constrained, structuresInCanopy) {
   if (setting === 'prisms' || setting === 'flat') return setting;
-  return constrained ? 'flat' : 'prisms';
+  return (constrained || structuresInCanopy) ? 'flat' : 'prisms';
 }
 
 // Building height in meters from OSM tags: explicit height tag (any unit)

@@ -5933,7 +5933,8 @@ function setBuildings3dMode(v) {
 
 function _buildings3dMode() {
   return resolveBuildings3dMode(getBuildings3dSetting(),
-    typeof _isConstrained === 'function' && _isConstrained());
+    typeof _isConstrained === 'function' && _isConstrained(),
+    typeof _canopyHasStructures === 'function' && _canopyHasStructures());
 }
 
 async function fetchBuildings(bounds) {
@@ -9889,6 +9890,10 @@ async function restoreConfig() {
   // Restore the buildings-in-3D mode select (localStorage).
   const bld3dEl = document.getElementById('cfgBuildings3d');
   if (bld3dEl) bld3dEl.value = getBuildings3dSetting();
+  // Canopy / structure height source (localStorage) + the Terrain-tab caption.
+  const canSrcEl = document.getElementById('cfgCanopySource');
+  if (canSrcEl) canSrcEl.value = getCanopySourceSetting();
+  if (typeof _updateCanopyCaption === 'function') _updateCanopyCaption();
   // Restore custom proxy URL (localStorage) + hint. Field stays empty when the
   // built-in default proxy is in use.
   const proxyEl = document.getElementById('cfgCanopyProxy');
@@ -10973,7 +10978,7 @@ const CANOPY_MAX_M = 60;        // clamp canopy heights (guards COG fill/nodata 
 // and a separate 1-bit cloud-mask IFD for every level (interleaved — see
 // cogPickLevel in raster.js). The data band reads 0 m under clouds.
 const CANOPY_PROXY_ROUTE = '/chm2/';
-const CANOPY_DATASET_LABEL = 'CHMv2';
+const CANOPY_DATASET_LABEL = 'CHMv2'; // pill tag for the default dataset (see canopyDatasetLabel)
 // Cap the per-tile COG window read; the first overview whose window fits is
 // chosen (cogPickLevel). With MAX_GRID = 512 this never reads coarser than the
 // working grid: a level that fits ≤1024 px is still ≥512 px across the AOI.
@@ -10997,6 +11002,72 @@ const CANOPY_COG_BLOCK_BYTES = 1048576;
 // wider area is only upscaled blur at that scale, so we tell the user to zoom in.
 const MAX_CANOPY_HALF_M = 6000;
 const CANOPY_TILE_ATTEMPTS = 4; // retry a tile this many times (with backoff) on transient proxy/S3 5xx before skipping it
+
+// ---- Canopy SOURCE selector (Config → "Canopy / structure height source") ----
+// 'chmv2' (default) = Meta/WRI CHMv2, vegetation only — the viewshed stamps OSM
+// building footprints onto the DSM itself. 'naip' = NAIP-CHM (Univ. of Montana
+// NTSG, Morford et al. 2026): 0.6 m canopy AND structure heights, CONUS only,
+// one NAD83/UTM COG per NAIP quarter-quad (uint16 cm, nodata 65535, tiled 512²
+// Deflate, 2×-averaged overviews) served through the proxy's /naipchm/ route
+// and located via the per-1°-block lookup files in data/naipchm/ (built by
+// tools/naip-chm-index). Its heights already include buildings, so OSM stamping
+// is SKIPPED for it. When NAIP-CHM has no coverage (outside CONUS, southern
+// Nevada, a missing quad) or every tile fails, fetchCanopyRaster falls back to
+// CHMv2 with a "(NAIP-CHM unavailable)" label and `structures:false`, which
+// turns building stamping back on — the decision follows the data actually
+// used, never the setting.
+const CANOPY_SOURCE_KEY = 'sar_canopy_source';
+const NAIP_CHM_PROXY_ROUTE = '/naipchm/';
+const NAIP_CHM_INDEX_BASE = 'data/naipchm/';   // relative: resolves under the app's own path on every origin
+const NAIP_CHM_MAX_M = 120;                    // dataset valid range 0–120 m (towers/buildings exceed CANOPY_MAX_M)
+const NAIP_CHM_MAX_TILES = 16;                 // quarter-quads per load (a 12 km view is ≤ 3×3)
+
+function getCanopySourceSetting() {
+  try { return localStorage.getItem(CANOPY_SOURCE_KEY) === 'naip' ? 'naip' : 'chmv2'; } catch (e) { return 'chmv2'; }
+}
+
+// Persist the choice and re-load whatever is showing. S.canopy is dropped (a new
+// object identity also invalidates the 3D canopy-mesh cache); saved viewsheds
+// keep their own canopySource label until recomputed.
+function setCanopySource(v) {
+  const val = v === 'naip' ? 'naip' : 'chmv2';
+  try { localStorage.setItem(CANOPY_SOURCE_KEY, val); } catch (e) { /* private mode */ }
+  const sel = document.getElementById('cfgCanopySource');
+  if (sel && sel.value !== val) sel.value = val;
+  _updateCanopyCaption();
+  if (S._canopyEditing) return; // the edit canvas owns the grid until SAVE/cancel
+  const wanted = S._overlayWanted && S._overlayWanted.canopy;
+  S.canopy = null;
+  if (wanted && typeof loadCanopyForView === 'function') loadCanopyForView();
+  else if (S.map && typeof buildLayerControl === 'function') buildLayerControl();
+  if (S.is3D && typeof sync3d === 'function') sync3d();
+}
+
+// Dataset tag for the status pill, from the label the fetch actually returned
+// (never from the setting): 'NAIP-CHM', 'CHMv2', or 'CHMv2 · NO NAIP-CHM' when
+// the NAIP-CHM request fell back to CHMv2.
+function canopyDatasetLabel(source) {
+  const src = String(source || '');
+  if (canopySourceIncludesStructures(src)) return NAIP_CHM_LABEL;
+  if (src.includes('(NAIP-CHM unavailable)')) return 'CHMv2 · NO NAIP-CHM';
+  return 'CHMv2';
+}
+
+// Terrain-tab caption follows the SETTING (what a load will try), the pill the result.
+function _updateCanopyCaption() {
+  const el = document.getElementById('canopySourceCaption');
+  if (!el) return;
+  el.textContent = getCanopySourceSetting() === 'naip'
+    ? 'Vegetation + structure height overlay (NAIP-CHM, 0.6\u00a0m)'
+    : 'Vegetation height overlay (Meta CHMv2, ~1\u00a0m)';
+}
+
+// True when the canopy grid currently shown carries structure heights (NAIP-CHM),
+// so 3D must not ALSO extrude OSM prisms over it (resolveBuildings3dMode).
+function _canopyHasStructures() {
+  return !!(S.canopy && S.canopy.canopyFlat && S._overlayWanted && S._overlayWanted.canopy
+    && canopySourceIncludesStructures(S.canopy.source));
+}
 
 // ============================================================
 // ANONYMOUS USAGE ANALYTICS (Cloudflare Web Analytics)
@@ -11243,12 +11314,36 @@ async function _applyCanopyEdits(grid, flat) {
   } catch (_) { return { flat, edited: false }; }
 }
 
-// --- Canopy: Meta CHMv2 COG tiles via the proxy (online), else IndexedDB cache ---
+// --- Canopy raster for a grid: the selected source, with fallback ---
+// Result contract: { canopyFlat: Float32Array|null, source: string, tilesTotal?,
+// tilesLoaded?, tilesFailed?, cloudFrac, structures: boolean }. `structures` is
+// true ONLY when the heights returned already include buildings (NAIP-CHM data,
+// live or cached); the viewshed stamps OSM footprints when it is false.
 async function fetchCanopyRaster(grid) {
   const base = getCanopyProxyBase();
+  const wantNaip = getCanopySourceSetting() === 'naip';
+  if (wantNaip) {
+    const naip = await _fetchNaipChmRaster(base, grid);
+    if (naip) { clearDataSourceError('Canopy (NAIP-CHM)'); return naip; }
+    // No NAIP-CHM data for this grid (no coverage, every tile failed, or offline
+    // without a cached grid) → CHMv2 + OSM buildings, labeled so nobody mistakes
+    // it for the structure-aware surface they asked for.
+    recordDataSourceError('Canopy (NAIP-CHM)', new Error('NAIP-CHM unavailable here — ' + (S._canopyTileError || 'no coverage') + '; using CHMv2 + OSM buildings'));
+  }
+  const res = await _fetchChmv2Raster(base, grid);
+  if (wantNaip && res.canopyFlat) {
+    res.source = res.source.replace('Meta CHMv2', 'Meta CHMv2 (NAIP-CHM unavailable)');
+    res.naipFallback = true;
+  }
+  return res;
+}
+
+// --- Canopy: Meta CHMv2 COG tiles via the proxy (online), else IndexedDB cache ---
+async function _fetchChmv2Raster(base, grid) {
   const b = grid.bounds;
   // 'canopy2_': namespaced to the dataset, so a grid cached from the v1 tiles
-  // ('canopy_' keys, which age out on the store's TTL) is never served as CHMv2.
+  // ('canopy_' keys, which age out on the store's TTL) is never served as CHMv2
+  // (and a NAIP-CHM grid — 'naipchm_' — is never served as CHMv2 or vice versa).
   const cacheKey = 'canopy2_' + _aoiKey(b) + '_' + grid.cols + 'x' + grid.rows;
   if (base && (typeof isOnline !== 'function' || isOnline())) {
     try {
@@ -11258,7 +11353,7 @@ async function fetchCanopyRaster(grid) {
         if (res.tilesFailed > 0) recordDataSourceError('Canopy', new Error(`${res.tilesFailed} of ${res.tilesTotal} canopy tiles failed to load (proxy/data-service errors)`));
         else clearDataSourceError('Canopy');
         const ed = await _applyCanopyEdits(grid, res.canopy);
-        return { canopyFlat: ed.flat, source: 'Meta CHMv2' + (ed.edited ? ' (edited)' : ''), tilesTotal: res.tilesTotal, tilesLoaded: res.tilesLoaded, tilesFailed: res.tilesFailed, cloudFrac: res.cloudFrac || 0 };
+        return { canopyFlat: ed.flat, source: 'Meta CHMv2' + (ed.edited ? ' (edited)' : ''), tilesTotal: res.tilesTotal, tilesLoaded: res.tilesLoaded, tilesFailed: res.tilesFailed, cloudFrac: res.cloudFrac || 0, structures: false };
       }
     } catch (e) {
       recordDataSourceError('Canopy', e);
@@ -11268,10 +11363,226 @@ async function fetchCanopyRaster(grid) {
     const c = await getCachedRaster('canopy', cacheKey);
     if (c && c.data && c.data.canopyArr) {
       const ed = await _applyCanopyEdits(grid, c.data.canopyArr);
-      return { canopyFlat: ed.flat, source: 'Meta CHMv2 (cached)' + (ed.edited ? ' (edited)' : ''), cloudFrac: c.data.cloudFrac || 0 };
+      return { canopyFlat: ed.flat, source: 'Meta CHMv2 (cached)' + (ed.edited ? ' (edited)' : ''), cloudFrac: c.data.cloudFrac || 0, structures: false };
     }
   }
-  return { canopyFlat: null, source: base ? 'unavailable' : 'no proxy' };
+  return { canopyFlat: null, source: base ? 'unavailable' : 'no proxy', structures: false };
+}
+
+// --- Canopy + structures: NAIP-CHM quarter-quad COGs via the proxy, else IndexedDB ---
+// Returns the fetchCanopyRaster result shape with structures:true, or null when
+// no NAIP-CHM data exists for this grid (the caller falls back to CHMv2).
+async function _fetchNaipChmRaster(base, grid) {
+  const b = grid.bounds;
+  const cacheKey = 'naipchm_' + _aoiKey(b) + '_' + grid.cols + 'x' + grid.rows;
+  if (base && (typeof isOnline !== 'function' || isOnline())) {
+    try {
+      const res = await _fetchNaipChmFromProxy(base, grid);
+      if (res && res.canopy) {
+        if (typeof cacheRaster === 'function') cacheRaster('canopy', cacheKey, { canopyArr: res.canopy, structures: true });
+        if (res.tilesFailed > 0) recordDataSourceError('Canopy', new Error(`${res.tilesFailed} of ${res.tilesTotal} NAIP-CHM quarter-quads did not load (${S._canopyTileError || 'no coverage / proxy error'})`));
+        else clearDataSourceError('Canopy');
+        const ed = await _applyCanopyEdits(grid, res.canopy);
+        return { canopyFlat: ed.flat, source: NAIP_CHM_LABEL + (ed.edited ? ' (edited)' : ''), tilesTotal: res.tilesTotal, tilesLoaded: res.tilesLoaded, tilesFailed: res.tilesFailed, cloudFrac: 0, structures: true };
+      }
+    } catch (e) {
+      recordDataSourceError('Canopy', e);
+      if (!S._canopyTileError) S._canopyTileError = (e && e.message) || String(e);
+    }
+  }
+  if (typeof getCachedRaster === 'function') {
+    const c = await getCachedRaster('canopy', cacheKey);
+    if (c && c.data && c.data.canopyArr) {
+      const ed = await _applyCanopyEdits(grid, c.data.canopyArr);
+      return { canopyFlat: ed.flat, source: NAIP_CHM_LABEL + ' (cached)' + (ed.edited ? ' (edited)' : ''), cloudFrac: 0, structures: true };
+    }
+  }
+  return null;
+}
+
+// Lazy per-1°-block lookup: data/naipchm/{block}.json → { v, e: { '17sw': '2022/10_060_20220721', … } }.
+// Successes are memoized (a 404 = definitively no coverage → empty index) and
+// mirrored into IndexedDB so an installed PWA keeps resolving offline; a
+// transient failure returns null without memoizing so the next load retries.
+async function _naipIndexForBlock(block) {
+  S._naipIndex = S._naipIndex || {};
+  if (Object.prototype.hasOwnProperty.call(S._naipIndex, block)) return S._naipIndex[block];
+  let idx = null;
+  try {
+    if (typeof isOnline !== 'function' || isOnline()) {
+      const res = await fetch(NAIP_CHM_INDEX_BASE + block + '.json');
+      if (res.ok) {
+        const j = await res.json();
+        if (j && j.e && typeof j.e === 'object') {
+          idx = j;
+          if (typeof cacheApiResponse === 'function') { try { cacheApiResponse('naipidx', block, j); } catch (_) {} }
+        }
+      } else if (res.status === 404) {
+        idx = { v: 1, e: {} };
+      }
+    }
+  } catch (_) { /* offline / file:// / network fault → try the IndexedDB mirror */ }
+  if (!idx && typeof getCachedApiResponse === 'function') {
+    try { const c = await getCachedApiResponse('naipidx', block); if (c && c.data && c.data.e) idx = c.data; } catch (_) {}
+  }
+  if (idx) S._naipIndex[block] = idx;
+  return idx;
+}
+
+async function _fetchNaipChmFromProxy(base, grid) {
+  const b = grid.bounds;
+  const quads = naipQuarterQuadsForBBox(b.west, b.south, b.east, b.north, NAIP_CHM_MAX_TILES);
+  S._canopyTileError = null; // stale reason must not outlive its load
+  // Resolve each quarter-quad to its asset path through the block index. A
+  // quad the index lacks has no NAIP-CHM file (outside CONUS, southern Nevada,
+  // or simply missing) and counts as a failed tile so the pill says PARTIAL.
+  const jobs = [];
+  let absent = 0;
+  for (const q of quads) {
+    const idx = await _naipIndexForBlock(q.block);
+    const val = idx && idx.e ? idx.e[q.key] : null;
+    const path = val ? naipChmPathFor(val, q.quadId, q.qq) : null;
+    if (!path) { absent++; continue; }
+    jobs.push({ q, path });
+  }
+  try { Diag.note('naipchm.tiles', { quads: quads.length, absent }); } catch (_) {}
+  if (!jobs.length) {
+    S._canopyTileError = quads.length ? 'no NAIP-CHM coverage for this area' : 'outside the NAIP-CHM index (CONUS only)';
+    return null;
+  }
+  const canopy = new Float32Array(grid.rows * grid.cols).fill(NaN);
+  let any = false, loaded = 0, failed = absent, totalPx = 0;
+  for (let t = 0; t < jobs.length; t++) {
+    const { q, path } = jobs[t];
+    const url = base + NAIP_CHM_PROXY_ROUTE + path;
+    let tileGrid = null, lastErr = null;
+    for (let attempt = 0; attempt < CANOPY_TILE_ATTEMPTS && tileGrid == null; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 300 * attempt));
+      try {
+        // blockSize: see CANOPY_COG_BLOCK_BYTES — MUST stay explicit.
+        const tiff = await GeoTIFF.fromUrl(url, { blockSize: CANOPY_COG_BLOCK_BYTES });
+        tileGrid = await _naipTileToGrid(tiff, grid);
+        if (tileGrid === null) break; // no overlap (buffered footprint math) — not an error, nothing to retry
+      } catch (e) { tileGrid = null; lastErr = e; }
+    }
+    if (!tileGrid) {
+      if (lastErr) {
+        failed++;
+        const why = (lastErr.name || 'Error') + ': ' + (lastErr.message || String(lastErr));
+        try { Diag.note('naipchm.tileFail', { quad: q.quadId + q.qq, why }); } catch (_) {}
+        if (!S._canopyTileError) S._canopyTileError = why;
+        try {
+          const probe = await fetch(url, { method: 'HEAD' });
+          if (probe && probe.status === 429) {
+            if (typeof notifyProxyRateLimited === 'function') notifyProxyRateLimited(parseInt(probe.headers.get('Retry-After') || '', 10));
+            failed += jobs.length - t - 1;
+            break;
+          }
+        } catch (_) { /* probe is best-effort */ }
+      } else {
+        loaded++; // overlapped nothing after projection — the quad is covered, just not by our cells
+      }
+      continue;
+    }
+    loaded++;
+    totalPx += tileGrid.totalPx || 0;
+    const arr = tileGrid.arr;
+    for (let i = 0; i < canopy.length; i++) {
+      if (Number.isNaN(canopy[i]) && Number.isFinite(arr[i])) { canopy[i] = arr[i]; any = true; }
+    }
+  }
+  if (!any && !S._canopyTileError) S._canopyTileError = 'NAIP-CHM tiles held no data over this area';
+  return any ? { canopy, tilesTotal: quads.length, tilesLoaded: loaded, tilesFailed: failed, cloudFrac: 0 } : null;
+}
+
+// Read the AOI window from a NAIP-CHM COG (NAD83/UTM, uint16 cm) at the overview
+// that keeps the read ≤ COG_MAX_READ_PX per side, and MAX-POOL it onto the grid
+// (resampleUtmToGrid). Returns { arr, maskedPx: 0, totalPx } or null when the
+// file does not overlap the grid.
+async function _naipTileToGrid(tiff, grid) {
+  const b = grid.bounds;
+  const count = await tiff.getImageCount();
+  const base = await tiff.getImage(0);
+  const geo = (typeof base.getGeoKeys === 'function' && base.getGeoKeys()) || {};
+  const epsg = geo.ProjectedCSTypeGeoKey;
+  let zone = null;
+  if (epsg >= 26901 && epsg <= 26923) zone = epsg - 26900;       // NAD83 / UTM zone N (the dataset)
+  else if (epsg >= 32601 && epsg <= 32660) zone = epsg - 32600;  // WGS84 / UTM N — tolerated
+  if (!zone) throw new Error('NAIP-CHM tile: unsupported projection EPSG:' + epsg);
+  const origin = base.getOrigin();          // [x, y] of the UL corner in UTM metres
+  const res0 = base.getResolution();        // [resX, -resY]
+  const W = base.getWidth(), H = base.getHeight();
+  const imgMinX = origin[0], imgMaxY = origin[1];
+  const imgMaxX = imgMinX + W * Math.abs(res0[0]), imgMinY = imgMaxY - H * Math.abs(res0[1]);
+  // Grid bbox in this file's zone: corners + edge midpoints (graticule edges bow slightly in UTM).
+  let axMin = Infinity, axMax = -Infinity, ayMin = Infinity, ayMax = -Infinity;
+  for (const lat of [b.south, (b.south + b.north) / 2, b.north]) {
+    for (const lng of [b.west, (b.west + b.east) / 2, b.east]) {
+      const u = latLngToUtm(lat, lng, zone);
+      if (u.x < axMin) axMin = u.x; if (u.x > axMax) axMax = u.x;
+      if (u.y < ayMin) ayMin = u.y; if (u.y > ayMax) ayMax = u.y;
+    }
+  }
+  if (axMax <= imgMinX || axMin >= imgMaxX || ayMax <= imgMinY || ayMin >= imgMaxY) return null; // no overlap
+  const ovX = Math.max(axMin, imgMinX), ovX2 = Math.min(axMax, imgMaxX);
+  const ovY = Math.max(ayMin, imgMinY), ovY2 = Math.min(ayMax, imgMaxY);
+  const levels = [], imgs = [];
+  for (let i = 0; i < count; i++) {
+    const cand = i === 0 ? base : await tiff.getImage(i);
+    const fd = cand.fileDirectory || {};
+    const bps = fd.BitsPerSample;
+    const mask = !!((fd.NewSubfileType || 0) & 4) || fd.PhotometricInterpretation === 4
+      || (bps != null && (bps.length ? bps[0] : bps) === 1);
+    imgs.push(cand);
+    levels.push({ width: cand.getWidth(), height: cand.getHeight(), mask });
+  }
+  const fracW = (ovX2 - ovX) / (imgMaxX - imgMinX);
+  const fracH = (ovY2 - ovY) / (imgMaxY - imgMinY);
+  const li = cogPickLevel(levels, fracW, fracH, COG_MAX_READ_PX);
+  if (li < 0) throw new Error('NAIP-CHM COG has no data level');
+  const img = imgs[li];
+  const w = img.getWidth(), h = img.getHeight();
+  const resX = (imgMaxX - imgMinX) / w, resY = (imgMaxY - imgMinY) / h;
+  const px0 = Math.max(0, Math.min(w, Math.floor((ovX - imgMinX) / resX)));
+  const px1 = Math.max(0, Math.min(w, Math.ceil((ovX2 - imgMinX) / resX)));
+  const py0 = Math.max(0, Math.min(h, Math.floor((imgMaxY - ovY2) / resY)));
+  const py1 = Math.max(0, Math.min(h, Math.ceil((imgMaxY - ovY) / resY)));
+  if (px1 <= px0 || py1 <= py0) return null;
+  // Strip-wise like _cogTileToGrid (defence-in-depth; the picked level keeps the
+  // window ≤ ~1024 px so this is normally one strip). Read at the level's native
+  // resolution — the max-pool in resampleUtmToGrid is the downsampling step.
+  const winW = px1 - px0;
+  const rowCostPx = img.fileDirectory && img.fileDirectory.TileWidth ? winW : w;
+  const stripRows = Math.max(1, Math.floor(CANOPY_DECODE_BUDGET_PX / rowCostPx));
+  const nStrips = Math.ceil((py1 - py0) / stripRows);
+  try { Diag.note('naipchm.read', { zone, level: li, winW, winH: py1 - py0, strips: nStrips, resM: Math.round(resX * 100) / 100 }); } catch (_) {}
+  const out = new Float32Array(grid.rows * grid.cols).fill(NaN);
+  let totalPx = 0;
+  for (let ny = py0; ny < py1; ny += stripRows) {
+    const nyEnd = Math.min(py1, ny + stripRows);
+    const stripBytes = (nyEnd - ny) * winW * 2;
+    let strip;
+    try {
+      try { Diag.alloc('canopyDecode', stripBytes); } catch (_) {}
+      strip = await img.readRasters({ window: [px0, ny, px1, nyEnd], samples: [0] });
+    } finally {
+      try { Diag.free('canopyDecode', stripBytes); } catch (_) {}
+    }
+    const data = strip[0];
+    totalPx += data.length;
+    const partial = resampleUtmToGrid(grid, {
+      data, cols: winW, rows: nyEnd - ny,
+      originX: imgMinX + px0 * resX, originY: imgMaxY - ny * resY, resX, resY, zone,
+      nodata: NAIP_CHM_NODATA, scale: NAIP_CHM_SCALE,
+    });
+    for (let i = 0; i < out.length; i++) {
+      if (!Number.isNaN(out[i]) || !Number.isFinite(partial[i])) continue;
+      const v = partial[i];
+      out[i] = v < 0 ? 0 : (v > NAIP_CHM_MAX_M ? NAIP_CHM_MAX_M : v);
+    }
+    if (nStrips > 1 && typeof _uiYield === 'function') await _uiYield();
+  }
+  return { arr: out, maskedPx: 0, totalPx };
 }
 
 async function _fetchCanopyFromProxy(base, grid) {
@@ -11648,7 +11959,7 @@ async function loadCanopyForView() {
     // and flags cloud-masked coverage: those cells are NO DATA, shown
     // transparent and treated as bare earth by the viewshed.
     const cloudTag = (cloudFrac || 0) >= 0.01 ? ` · ${Math.round(cloudFrac * 100)}% CLOUD` : '';
-    const tag = ' · ' + CANOPY_DATASET_LABEL + cloudTag;
+    const tag = ' · ' + canopyDatasetLabel(source) + cloudTag;
     if (tilesFailed > 0) {
       // Some tiles failed even after retries — tell the user coverage is incomplete and why.
       setStatus('canopyStatus', 'partial', `PARTIAL ${tilesLoaded}/${tilesTotal} TILES${tag}`);
@@ -13038,6 +13349,7 @@ function _toPersistable(rec) {
     aglFt: rec.aglFt, vlosFt: rec.vlosFt, grid: rec.grid, mask: rec.mask,
     coverage: rec.coverage, demSource: rec.demSource, canopySource: rec.canopySource,
     buildingCount: rec.buildingCount != null ? rec.buildingCount : null,
+    structuresInCanopy: !!rec.structuresInCanopy,
     backdrop: rec.backdrop || null,
     horizon: rec.horizon || null,
     computedAt: rec.computedAt, visible: rec.visible !== false,
@@ -13093,7 +13405,9 @@ function _renderVisibleViewsheds() {
   if (r) {
     const rec = computed.find(x => x.id === S.activeViewshedId) || computed[computed.length - 1];
     const canLabel = rec.canopySource ? ('canopy ' + rec.canopySource) : 'bare earth (no canopy)';
-    const bldLabel = rec.buildingCount != null ? ` · ${rec.buildingCount} OSM bldgs` : '';
+    const bldLabel = (rec.structuresInCanopy || canopySourceIncludesStructures(rec.canopySource))
+      ? ' · structures in NAIP-CHM'
+      : (rec.buildingCount != null ? ` · ${rec.buildingCount} OSM bldgs` : '');
     const activeShown = computed.length > 1 && computed.some(x => x.id === S.activeViewshedId);
     r.textContent = `${rec.name}: ${Math.round((rec.coverage || 0) * 100)}% of ${rec.vlosFt} ft VLOS visible @ ${rec.aglFt} ft AGL · DEM ${rec.demSource} · ${canLabel}${bldLabel}`
       + (computed.length > 1 ? ` · ${computed.length} viewsheds shown (${activeShown ? 'red = selected, ' : ''}darker green = overlap)` : '');
@@ -13297,17 +13611,29 @@ async function runViewshed(id) {
     // a ridge well beyond VLOS can still hide the rising/setting sun.
     const hGrid = makeGrid(obs.lat, obs.lng, HORIZON_RADIUS_M, HORIZON_RES_M);
     _vsProgress(0.05);
+    // NAIP-CHM heights already include buildings, so with that source selected
+    // the OSM footprint fetch is skipped up front (no Overpass call for data the
+    // DSM must not stamp). If NAIP-CHM then falls back to CHMv2, the footprints
+    // are fetched late below — stamping follows the data actually used.
+    const wantNaip = getCanopySourceSetting() === 'naip';
     const [demRes, canRes, bldRes, horRes] = await Promise.allSettled([
-      fetch3DEPDEM(grid), fetchCanopyRaster(grid), fetchBuildingsForGrid(grid), fetch3DEPDEM(hGrid)]);
+      fetch3DEPDEM(grid), fetchCanopyRaster(grid),
+      wantNaip ? Promise.resolve(undefined) : fetchBuildingsForGrid(grid), fetch3DEPDEM(hGrid)]);
     const dem = demRes.status === 'fulfilled' ? demRes.value : { demFlat: null, source: 'unavailable' };
-    const can = canRes.status === 'fulfilled' ? canRes.value : { canopyFlat: null, source: 'unavailable' };
-    const blds = bldRes.status === 'fulfilled' ? bldRes.value : null; // null = OSM unavailable
+    const can = canRes.status === 'fulfilled' ? canRes.value : { canopyFlat: null, source: 'unavailable', structures: false };
+    const structures = !!(can.canopyFlat && can.structures); // heights include buildings → never stamp OSM
+    let blds = bldRes.status === 'fulfilled' ? bldRes.value : null; // null = OSM unavailable
+    if (!structures && blds === undefined) {
+      try { blds = await fetchBuildingsForGrid(grid); } catch (_) { blds = null; }
+    }
+    if (blds === undefined) blds = null;
     const horDem = (horRes.status === 'fulfilled' && horRes.value && horRes.value.demFlat) ? horRes.value.demFlat : null;
     if (!dem.demFlat) {
       setStatus('viewshedStatus', 'error', 'NO DEM');
       rec.grid = null; rec.mask = null; rec.coverage = null;
       rec.demSource = 'unavailable'; rec.canopySource = can.canopyFlat ? can.source : null;
       rec.buildingCount = null;
+      rec.structuresInCanopy = structures;
       rec.backdrop = null;
       rec.horizon = null;
       rec.computedAt = Date.now();
@@ -13319,8 +13645,10 @@ async function runViewshed(id) {
     _vsProgress(0.2);
     const n = grid.rows * grid.cols;
     const dsmRaw = buildDSM(dem.demFlat, can.canopyFlat, n);
-    // Buildings become solid obstacles: dsm = max(dsm, ground + building height).
-    rec.buildingCount = blds ? stampBuildingsOnDSM(grid, dsmRaw, dem.demFlat, blds) : null;
+    // Buildings become solid obstacles: dsm = max(dsm, ground + building height) —
+    // unless the canopy surface (NAIP-CHM) already carries them.
+    rec.buildingCount = (!structures && blds) ? stampBuildingsOnDSM(grid, dsmRaw, dem.demFlat, blds) : null;
+    rec.structuresInCanopy = structures;
     const dsm = sanitizeForKernel(dsmRaw, n);
     const { col: obsCol, row: obsRow } = latLngToCell(grid, obs.lat, obs.lng);
     const mask = await _runViewshedKernel({ grid, dem: dem.demFlat, dsm, obsCol, obsRow, aglM, vlosRangeM: vlosM });
@@ -14539,6 +14867,9 @@ if (typeof module !== 'undefined' && module.exports) {
     checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitActivated,
     showUpdateModalIfNewer, _updateApplyStatus, _updateBannerHtml, _cachedShellVersion, _verifyShellFresh,
     getCanopyProxyBase, getCustomProxy, saveCanopyProxy, DEFAULT_DATA_PROXY, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,
+    CANOPY_SOURCE_KEY, NAIP_CHM_PROXY_ROUTE, NAIP_CHM_INDEX_BASE, NAIP_CHM_MAX_M, getCanopySourceSetting, setCanopySource,
+    canopyDatasetLabel, _updateCanopyCaption, _canopyHasStructures, _fetchChmv2Raster, _fetchNaipChmRaster,
+    _naipIndexForBlock, _fetchNaipChmFromProxy, _naipTileToGrid,
     notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _assessBadgeColor, sendFeedback, openFeedback, closeFeedback,
     fetchFAAairspace, faaAirspaceUnavailableLayers, FAA_AIRSPACE_LAYER_LABELS, fetchFireDanger,
     UNKNOWN_CELL_TEXT, SECTION_CELLS, sectionCellsFor, markCellsUnknown, renderFireDangerUnknown,

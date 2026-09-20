@@ -18,6 +18,13 @@ describe('resolveBuildings3dMode(setting, constrained)', () => {
     expect(resolveBuildings3dMode(null, true)).toBe('flat');
     expect(resolveBuildings3dMode('bogus', false)).toBe('prisms');
   });
+
+  it('auto goes flat when the displayed canopy already carries structure heights (NAIP-CHM); explicit prisms still win', () => {
+    expect(resolveBuildings3dMode('auto', false, true)).toBe('flat');
+    expect(resolveBuildings3dMode('auto', false, false)).toBe('prisms');
+    expect(resolveBuildings3dMode('prisms', false, true)).toBe('prisms');
+    expect(resolveBuildings3dMode(undefined, false, true)).toBe('flat');
+  });
 });
 
 describe('clampBBoxSpan(south, west, north, east, maxSpanDeg)', () => {

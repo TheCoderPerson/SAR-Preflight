@@ -17,6 +17,21 @@ describe('makeViewshedRecord', () => {
     expect(r.buildingCount).toBeNull(); // buildings not included until a compute stamps them
   });
 
+  it('structuresInCanopy defaults false (records saved before the NAIP-CHM option) and round-trips true', () => {
+    expect(makeViewshedRecord({ id: 'x', observer: { lat: 1, lng: 2 } }).structuresInCanopy).toBe(false);
+    expect(makeViewshedRecord({ id: 'x', observer: { lat: 1, lng: 2 }, structuresInCanopy: true }).structuresInCanopy).toBe(true);
+  });
+
+  it('KML description says buildings are inside the NAIP-CHM surface instead of an OSM count', () => {
+    const naip = makeViewshedRecord({ id: 'x', observer: { lat: 38.7, lng: -120.99 }, canopySource: 'NAIP-CHM', structuresInCanopy: true, coverage: 0.5 });
+    const d = observerKmlDescription(naip);
+    expect(d).toContain('Canopy: NAIP-CHM');
+    expect(d).toContain('Buildings: included in the NAIP-CHM height surface');
+    expect(d).not.toContain('OSM footprints as obstacles');
+    const osm = makeViewshedRecord({ id: 'y', observer: { lat: 38.7, lng: -120.99 }, canopySource: 'Meta CHMv2', buildingCount: 4, coverage: 0.5 });
+    expect(observerKmlDescription(osm)).toContain('Buildings: 4 OSM footprints as obstacles');
+  });
+
   it('keeps a persisted buildingCount (including 0)', () => {
     expect(makeViewshedRecord({ id: 'x', observer: { lat: 1, lng: 2 }, buildingCount: 37 }).buildingCount).toBe(37);
     expect(makeViewshedRecord({ id: 'x', observer: { lat: 1, lng: 2 }, buildingCount: 0 }).buildingCount).toBe(0);

@@ -4,7 +4,11 @@
 // A small CORS+Range proxy so the browser-only SAR Preflight app can read data
 // from upstreams that either block CORS or need server-side fetching:
 //   • /chm2/{quadkey}.tif                   → Meta/WRI Canopy Height Maps v2 (CHMv2)
-//       COG tiles — z10 quadkeys (10 digits). The current app uses this route.
+//       COG tiles — z10 quadkeys (10 digits). The app's default canopy source.
+//   • /naipchm/{year}/{zone}/m_…_chm.tif    → NAIP-CHM (Univ. of Montana NTSG) 0.6 m
+//       canopy + STRUCTURE height COGs, one per NAIP quarter-quad, UTM. Optional
+//       canopy source (Config → Canopy / structure height source). The server
+//       (rangeland.ntsg.umt.edu) serves Range but sends no CORS headers at all.
 //   • /chm/{quadkey}.tif , /tiles.geojson  → Meta/WRI v1 canopy COG tiles (z9, 9 digits)
 //       Kept so older cached app builds keep loading canopy; nothing new uses it.
 //       (Both: public S3 bucket that serves Range but sends NO CORS headers.)
@@ -32,6 +36,11 @@
 const CANOPY_UPSTREAM = 'https://dataforgood-fb-data.s3.amazonaws.com/forests/v1/alsgedi_global_v6_float/';
 const CANOPY_V2_UPSTREAM = 'https://dataforgood-fb-data.s3.amazonaws.com/forests/v2/global/dinov3_global_chm_v2_ml3/chm/';
 const CANOPY_CACHE_TTL = 604800; // 7 days — canopy is static
+// NAIP-CHM direct-download site (MIT; Morford et al. 2026, doi:10.1038/s41597-026-07549-w).
+const NAIP_CHM_UPSTREAM = 'https://rangeland.ntsg.umt.edu/data/naip-chm/';
+// Only real asset paths may pass: {year}/{zone}/m_{quad7}_{qq}_{zone}_{res}_{date}[_{date2}]_chm(.tif|_manifest.json)
+// (res = 060 | 030 | 1 | h — a few 2016 zone-11 quads use the letter code)
+const NAIP_CHM_PATH_RE = /^\d{4}\/\d{1,2}\/m_\d{7}_[ns][ew]_\d{1,2}_[0-9a-z]{1,3}(?:_\d{8}){1,2}_chm(?:\.tif|_manifest\.json)$/;
 
 // FAA NOTAM Search public backend (undocumented; advisory). The /notam route does
 // the session-cookie + full-form-params + pagination dance the browser can't.
@@ -53,6 +62,10 @@ const ROUTES = [
   // CHMv2 canopy tiles (the app's current canopy source). Only .tif files exist
   // under this prefix; the edge-cache rule below never caches a .tif whole.
   { prefix: '/chm2/', upstream: CANOPY_V2_UPSTREAM, cacheTtl: CANOPY_CACHE_TTL },
+  // NAIP-CHM canopy+structure COGs. Same never-whole-cache rule for .tif below;
+  // the path is additionally shape-checked (pathRe) so the route can only ever
+  // reach the dataset's own asset files on that host.
+  { prefix: '/naipchm/', upstream: NAIP_CHM_UPSTREAM, cacheTtl: CANOPY_CACHE_TTL, pathRe: NAIP_CHM_PATH_RE },
   { prefix: '/tfr/', upstream: 'https://tfr.faa.gov/', cacheTtl: 30 },
   // Self-hosted gov ArcGIS servers that block browser CORS. Static-ish vector data
   // (forest roads/trails/MVUM, BLM transport + surface-management-agency polygons),
@@ -106,6 +119,7 @@ function resolveTarget(url) {
     if (url.pathname.startsWith(r.prefix)) {
       const rest = url.pathname.slice(r.prefix.length);
       if (!rest || rest.includes('..')) return null;
+      if (r.pathRe && !r.pathRe.test(rest)) return null;
       return { target: r.upstream + rest + url.search, cacheTtl: r.cacheTtl };
     }
   }
@@ -189,7 +203,8 @@ export default {
     // headers — Chrome reports it as a bogus "blocked by CORS policy" error.
     // Observed live on the dev origin. Nothing is lost by skipping the cache
     // here: the app stores the processed raster in IndexedDB anyway.
-    // Any .tif is a canopy COG (v1 under /chm/, CHMv2 under /chm2/) — never whole-cache either.
+    // Any .tif is a canopy COG (v1 under /chm/, CHMv2 under /chm2/, NAIP-CHM under
+    // /naipchm/ — those run ~230 MB each) — never whole-cache any of them.
     const isCanopyTif = /\.tif$/i.test(reqUrl.pathname);
     const cf = (range || isCanopyTif)
       ? { cacheEverything: false }
