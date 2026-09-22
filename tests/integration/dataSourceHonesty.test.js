@@ -260,7 +260,7 @@ describe('elevation (USGS 3DEP, Open-Meteo fallback)', () => {
   it('uses 3DEP, matching out-of-order string samples by locationId', async () => {
     route({ getSamples: dep(2000) });
     await app.fetchElevation(A, bbox(A.lat, A.lng));
-    expect(S.elev.center).toBe(2000);           // locationId 0 = the centre point
+    expect(S.elev.center).toBe(2000 + 10 * 12); // grid index 12 = the centre (row-major from the SW corner)
     expect(S.elev.max).toBe(2000 + 10 * 24);    // 25-point grid
     expect(text('elevStatus')).toBe('LIVE · 3DEP');
     expect(S.sectionMeta.elevation.status).toBe('live');
@@ -287,7 +287,7 @@ describe('elevation (USGS 3DEP, Open-Meteo fallback)', () => {
   it("failure on a NEW area drops the old area's elevation → 'Elevation missing, assuming 9,000 ft (worst case)'", async () => {
     route({ getSamples: dep(7000) });
     await app.fetchElevation(A, bbox(A.lat, A.lng));
-    expect(S.elev.center).toBe(7000);
+    expect(S.elev.center).toBe(7120);
     route({ getSamples: resp({}, { status: 504 }), '/v1/elevation': resp({}, { status: 502 }) });
     S.areaCenter = B;
     await app.fetchElevation(B, bbox(B.lat, B.lng));
@@ -315,7 +315,7 @@ describe('elevation (USGS 3DEP, Open-Meteo fallback)', () => {
     expect(signalA.aborted).toBe(true);
     releaseA();
     await a;
-    expect(S.elev.center).toBe(4000);
+    expect(S.elev.center).toBe(4120);
   });
 });
 
@@ -483,5 +483,147 @@ describe('Overpass sources (airports, hospitals, trails, wires)', () => {
     releaseA(resp(line));
     await a;
     expect(Object.values(S.wireHazardCounts).reduce((x, y) => x + y, 0)).toBe(0);
+  });
+});
+
+// ------------------------------------------------------------------
+// Second review round (four findings).
+const areaLayer = (lat, lng, d = 0.02) => ({
+  getBounds: () => bbox(lat, lng, d),
+  getLatLngs: () => [[{ lat: lat - d, lng: lng - d }, { lat: lat - d, lng: lng + d }, { lat: lat + d, lng: lng + d }, { lat: lat + d, lng: lng - d }]],
+});
+
+describe('FAA airspace — ownership and total failure', () => {
+  const FAA = 'ssFJjBXIUyZDrSYZ';
+  const prohibited = fc([{ type: 'Feature', properties: { NAME: 'P-99 TEST', TYPE_CODE: 'P' },
+    geometry: { type: 'Polygon', coordinates: [[[-120, 39.5], [-119.7, 39.5], [-119.7, 39.6], [-120, 39.6], [-120, 39.5]]] } }]);
+
+  it("a delayed empty answer for area A cannot erase area B's prohibited airspace", async () => {
+    const pendingA = [];
+    route({ [FAA]: url => new Promise(r => pendingA.push({ url, r })) });
+    const a = app.fetchFAAairspace(bbox(A.lat, A.lng));
+    app.invalidateAreaRequests();            // area B selected
+    S.areaCenter = B; S.areaBounds = bbox(B.lat, B.lng); S.currentArea = areaLayer(B.lat, B.lng);
+    route({ [FAA]: url => Promise.resolve(resp(url.includes('Special_Use_Airspace') ? prohibited : fc([]))) });
+    await app.fetchFAAairspace(bbox(B.lat, B.lng));
+    computeAssessment();
+    expect(S.assessment.limits.some(l => /Prohibited airspace: P-99 TEST/.test(l))).toBe(true);
+    pendingA.forEach(p => p.r(resp(fc([]))));      // A answers late: "nothing here"
+    await a;
+    expect(S.faaAirspace.sua.features.length).toBe(1);
+    computeAssessment();
+    expect(S.assessment.label).not.toBe('NOMINAL');
+    expect(S.assessment.limits.some(l => /Prohibited airspace/.test(l))).toBe(true);
+  });
+
+  it('all six FAA requests failing with no cache → "airspace unverified" advisory, never NOMINAL', async () => {
+    S.currentArea = areaLayer(A.lat, A.lng);
+    route({ [FAA]: resp({}, { status: 503 }) });
+    await app.fetchFAAairspace(bbox(A.lat, A.lng));
+    expect(text('faaAirspaceStatus')).toBe('ERROR');
+    computeAssessment();
+    expect(S.assessment.label).not.toBe('NOMINAL');
+    expect(S.assessment.advisories.some(a => /FAA airspace UNVERIFIED/.test(a))).toBe(true);
+  });
+
+  it("total failure on a NEW area drops the old area's airspace instead of judging by it", async () => {
+    S.areaCenter = B; S.currentArea = areaLayer(B.lat, B.lng);
+    route({ [FAA]: url => Promise.resolve(resp(url.includes('Special_Use_Airspace') ? prohibited : fc([]))) });
+    await app.fetchFAAairspace(bbox(B.lat, B.lng));
+    S.areaCenter = A; S.currentArea = areaLayer(A.lat, A.lng);
+    route({ [FAA]: resp({}, { status: 503 }) });
+    await app.fetchFAAairspace(bbox(A.lat, A.lng));
+    computeAssessment();
+    expect(S.assessment.limits.some(l => /P-99/.test(l))).toBe(false);
+    expect(S.assessment.advisories.some(a => /FAA airspace UNVERIFIED/.test(a))).toBe(true);
+  });
+
+  it('an area with no airspace data loaded at all is unverified, not clear', () => {
+    S.currentArea = areaLayer(A.lat, A.lng);
+    S.faaAirspace = null;
+    computeAssessment();
+    expect(S.assessment.advisories.some(a => /FAA airspace UNVERIFIED/.test(a))).toBe(true);
+  });
+});
+
+describe('elevation grid — launch elevation is the CENTRE sample', () => {
+  // 25-point grid, row-major from the SW corner: index 12 is the centre.
+  const samples = url => {
+    const n = JSON.parse(new URL(url).searchParams.get('geometry')).points.length;
+    return { samples: Array.from({ length: n }, (_, i) => ({ locationId: i, value: String((i === 12 ? 6562 : 328) / 3.28084) })) };
+  };
+
+  it('live: the centre is 6,562 ft even though the SW corner is 328 ft', async () => {
+    route({ getSamples: url => Promise.resolve(resp(samples(url))) });
+    await app.fetchElevation(A, bbox(A.lat, A.lng));
+    expect(S.elev.center).toBe(6562);
+    expect(text('terrLaunch')).toMatch(/6,562/);
+  });
+
+  it('cached: the IndexedDB copy also yields the centre sample', async () => {
+    route({ getSamples: url => Promise.resolve(resp(samples(url))) });
+    await app.fetchElevation(A, bbox(A.lat, A.lng));
+    S.elev = {};
+    route({ getSamples: resp({}, { status: 503 }), '/v1/elevation': resp({}, { status: 503 }) });
+    await app.fetchElevation(A, bbox(A.lat, A.lng));
+    expect(S.sectionMeta.elevation.status).toBe('cached');
+    expect(S.elev.center).toBe(6562);
+  });
+
+  it('cached copies written before the fix (no stored centre index) still resolve the centre', async () => {
+    cacheStore['elevation_' + areaKey(A.lat, A.lng)] = {
+      timestamp: Date.now() - 3600e3, status: 'stale',
+      data: { results: Array.from({ length: 25 }, (_, i) => ({ elevation: (i === 12 ? 6562 : 328) / 3.28084 })) },
+    };
+    route({ getSamples: resp({}, { status: 503 }), '/v1/elevation': resp({}, { status: 503 }) });
+    await app.fetchElevation(A, bbox(A.lat, A.lng));
+    expect(S.elev.center).toBe(6562);
+  });
+});
+
+describe('ADS-B — the assessment follows live traffic', () => {
+  const emergency = { ac: [{ hex: 'a1b2c3', flight: 'TEST77', lat: A.lat, lon: A.lng, alt_baro: 2300, gs: 90, track: 90, squawk: '7700' }] };
+  beforeEach(() => {
+    S.currentArea = areaLayer(A.lat, A.lng);
+    S.faaAirspace = { classAirspace: fc([]), sua: fc([]), tfrs: fc([]), laanc: fc([]), nsRestrictions: fc([]), prohibited: fc([]) };
+    S.elev = { center: 2000 };
+    S.adsbSearchRadiusNm = 10; S.adsbAircraft = []; S._adsbFailStreak = 0; S._adsbApiIndex = 0;
+    S._adsbHiresCache = new Map(); S._adsbHiresFetching = false; S.adsbDem = null;
+    computeAssessment();
+  });
+
+  it('a poll that brings a squawk-7700 aircraft updates the banner without a separate recompute', async () => {
+    expect(S.assessment.label).toBe('NOMINAL');
+    route({ adsb: resp(emergency), getSamples: resp({ samples: [] }), 'airplanes.live': resp(emergency) });
+    await app.fetchAdsb();
+    expect(S.adsbAircraft.length).toBe(1);
+    expect(S.assessment.advisories.some(a => /Emergency aircraft nearby \(squawk 7700\)/.test(a))).toBe(true);
+    expect(S.assessment.advisories.some(a => /below 500ft AGL within 3nm/.test(a))).toBe(true);
+  });
+
+  it('a hi-res terrain refinement that changes AGL recomputes the banner', async () => {
+    // Coarse ground 2,000 ft → the aircraft at 3,500 ft reads 1,500 AGL (not "low").
+    // 3DEP says the ground under it is 3,200 ft → AGL 300.
+    route({ adsb: resp({ ac: [{ hex: 'd4e5f6', flight: 'LOW1', lat: A.lat, lon: A.lng, alt_baro: 3499, squawk: '1200' }] }),
+            getSamples: resp({ samples: [] }), 'airplanes.live': resp({ ac: [] }) });
+    await app.fetchAdsb();
+    await Promise.resolve();
+    expect(S.assessment.advisories.some(a => /below 500ft/.test(a))).toBe(false);
+    S._adsbHiresCache = new Map(); S._adsbHiresFetching = false;
+    route({ getSamples: resp({ samples: [{ locationId: 0, value: String(3200 / 3.28084) }] }) });
+    await app.refineLowCloseAdsbAgl();
+    expect(S.adsbAircraft[0].agl).toBeLessThan(500);
+    expect(S.assessment.advisories.some(a => /below 500ft AGL within 3nm/.test(a))).toBe(true);
+  });
+
+  it('a poll answer for a previous area is dropped', async () => {
+    let release;
+    route({ adsb: () => new Promise(r => { release = r; }), 'airplanes.live': () => new Promise(() => {}) });
+    const p = app.fetchAdsb();
+    await Promise.resolve();
+    app.invalidateAreaRequests();           // a new area was drawn meanwhile
+    release(resp(emergency));
+    await p;
+    expect(S.adsbAircraft).toEqual([]);
   });
 });

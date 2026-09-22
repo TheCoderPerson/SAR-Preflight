@@ -278,7 +278,10 @@ describe('BUG-03 — the combined restriction re-check recomputes the assessment
     S.map = { hasLayer: () => false, addLayer() {}, removeLayer() {}, fitBounds: vi.fn(), setView: vi.fn() };
     S.wx = { ...nominalWeather }; S.wind = { maxWind: 5, maxGust: 5 }; S.elev = { center: 2000 };
     S.tfrs = []; S.importedNotams = []; S.tfrImportMeta = null; S.notamFetchMeta = null;
-    S.nwsAlerts = []; S.activeFires = []; S.adsbAircraft = []; S.faaAirspace = null; S.faaObstacles = null;
+    S.nwsAlerts = []; S.activeFires = []; S.adsbAircraft = []; S.faaObstacles = null;
+    // FAA airspace loaded and clear (a selected area with NO airspace data is unverified)
+    const emptyFc = () => ({ type: 'FeatureCollection', features: [] });
+    S.faaAirspace = { classAirspace: emptyFc(), sua: emptyFc(), tfrs: emptyFc(), laanc: emptyFc(), nsRestrictions: emptyFc(), prohibited: emptyFc() };
     S.protectedAreas = null; S.hmsSmoke = null; S.avalanche = null; S.landStatus = null; S.cellStatus = null;
     S.kp = null; S.aqi = null; S.metar = null; S.fireDanger = null;
     S.sectionMeta = {}; S.dataSourceErrors = {};

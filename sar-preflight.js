@@ -2771,38 +2771,43 @@ async function fetchElevation(center, bounds) {
   const k = typeof areaKey === 'function' ? areaKey(center.lat, center.lng) : `${center.lat.toFixed(3)}_${center.lng.toFixed(3)}`;
   trackFetchStart('Elevation');
   setStatus('elevStatus', 'loading', 'Fetching...');
+  const ne = bounds.getNorthEast(), sw = bounds.getSouthWest();
+
+  // Use 25-point grid if core function is available, else fall back to 9-point
+  let points;
+  let gridSize = 0;
+  if (typeof generateElevationGrid === 'function') {
+    points = generateElevationGrid(center.lat, center.lng, ne, sw, 5);
+    gridSize = 5;
+  } else {
+    const mid = center;
+    points = [
+      { latitude: center.lat, longitude: center.lng },
+      { latitude: ne.lat, longitude: ne.lng },
+      { latitude: ne.lat, longitude: sw.lng },
+      { latitude: sw.lat, longitude: ne.lng },
+      { latitude: sw.lat, longitude: sw.lng },
+      { latitude: mid.lat, longitude: ne.lng },
+      { latitude: mid.lat, longitude: sw.lng },
+      { latitude: ne.lat, longitude: mid.lng },
+      { latitude: sw.lat, longitude: mid.lng },
+    ];
+    gridSize = 3;
+  }
+  // Launch elevation = the sample NEAREST the area centre. The 25-point grid
+  // is row-major from the SW corner, so [0] is that corner (it was read as
+  // "launch" and could be thousands of feet off in mountain terrain).
+  const centerIdx = gridCenterIndex(points, center.lat, center.lng);
+
   try {
-    const ne = bounds.getNorthEast(), sw = bounds.getSouthWest();
-
-    // Use 25-point grid if core function is available, else fall back to 9-point
-    let points;
-    let gridSize = 0;
-    if (typeof generateElevationGrid === 'function') {
-      points = generateElevationGrid(center.lat, center.lng, ne, sw, 5);
-      gridSize = 5;
-    } else {
-      const mid = center;
-      points = [
-        { latitude: center.lat, longitude: center.lng },
-        { latitude: ne.lat, longitude: ne.lng },
-        { latitude: ne.lat, longitude: sw.lng },
-        { latitude: sw.lat, longitude: ne.lng },
-        { latitude: sw.lat, longitude: sw.lng },
-        { latitude: mid.lat, longitude: ne.lng },
-        { latitude: mid.lat, longitude: sw.lng },
-        { latitude: ne.lat, longitude: mid.lng },
-        { latitude: sw.lat, longitude: mid.lng },
-      ];
-      gridSize = 3;
-    }
-
     // Every requested point must come back with a real elevation: a short or
     // null-filled answer would skew min/max/launch elevation silently.
     const grid = await _fetchElevationGrid(points, tok.signal);
     if (!_requestCurrent(tok)) return;
     const swHit = grid.sw;
-    // Stored in the { results: [{ elevation: m }] } shape older cached copies use.
-    const data = { results: grid.elevationsM.map(e => ({ elevation: e })), source: grid.source };
+    // Stored in the { results: [{ elevation: m }] } shape older cached copies
+    // use, plus the launch sample's index so a cached copy never has to guess.
+    const data = { results: grid.elevationsM.map(e => ({ elevation: e })), source: grid.source, centerIndex: centerIdx };
 
     // Store full point array with elevation data
     const elevPoints = data.results.map((r, i) => ({
@@ -2811,7 +2816,7 @@ async function fetchElevation(center, bounds) {
       elevFt: Math.round(r.elevation * 3.28084),
     }));
     const elevations = elevPoints.map(p => p.elevFt);
-    const centerElev = elevations[0];
+    const centerElev = elevations[centerIdx];
     const minElev = Math.min(...elevations);
     const maxElev = Math.max(...elevations);
     const range = maxElev - minElev;
@@ -2890,11 +2895,18 @@ async function fetchElevation(center, bounds) {
       try {
         const cached = await getCachedApiResponse('elevation', k);
         if (!_requestCurrent(tok)) return;
-        if (cached && cached.data && Array.isArray(cached.data.results) && cached.data.results.length &&
-            cached.data.results.every(r => r && Number.isFinite(r.elevation))) {
+        // Launch sample: the index stored with the copy, else (copies written
+        // before it was stored) the same grid rebuilt from these bounds — only
+        // when the sample count matches; otherwise the centre is unknowable.
+        const cres = cached && cached.data && cached.data.results;
+        const cIdx = !Array.isArray(cres) ? -1
+          : (Number.isInteger(cached.data.centerIndex) && cached.data.centerIndex >= 0 && cached.data.centerIndex < cres.length)
+            ? cached.data.centerIndex
+            : (cres.length === points.length ? centerIdx : -1);
+        if (cIdx >= 0 && cres.every(r => r && Number.isFinite(r.elevation))) {
           usedCache = true;
-          const elevations = cached.data.results.map(r => Math.round(r.elevation * 3.28084));
-          const centerElev = elevations[0];
+          const elevations = cres.map(r => Math.round(r.elevation * 3.28084));
+          const centerElev = elevations[cIdx];
           const minElev = Math.min(...elevations);
           const maxElev = Math.max(...elevations);
           const range = maxElev - minElev;
@@ -4623,6 +4635,9 @@ function faaAirspaceUnavailableLayers(data) {
 }
 
 async function fetchFAAairspace(bounds) {
+  // A late answer for a previous area (or an older refresh) must never land:
+  // an EMPTY response for area A used to erase area B's prohibited airspace.
+  const tok = _beginRequest('faaAirspace');
   trackFetchStart('FAA Airspace');
   setStatus('faaAirspaceStatus', 'loading', 'Fetching...');
   const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
@@ -4643,13 +4658,14 @@ async function fetchFAAairspace(bounds) {
 
   try {
     const keys = Object.keys(urls);
-    const results = await Promise.allSettled(keys.map(k => fetch(urls[k]).then(async r => {
+    const results = await Promise.allSettled(keys.map(k => fetch(urls[k], { signal: tok.signal }).then(async r => {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const json = await r.json();
       // ArcGIS reports most failures as a 200 carrying { error: {...} }.
       if (json && json.error) throw new Error((json.error.message || 'ArcGIS error') + (json.error.code ? ` (${json.error.code})` : ''));
       return { json, sw: _swCacheStamp(r) };
     })));
+    if (!_requestCurrent(tok)) return;   // superseded (cancelled or late)
 
     // A failed request used to become an EMPTY feature collection, so six
     // outages rendered as "LIVE — no restrictions", got written to the cache
@@ -4691,7 +4707,9 @@ async function fetchFAAairspace(bounds) {
       }
     });
 
+    if (!_requestCurrent(tok)) return;   // the cache read above awaited
     S.faaAirspace = data;
+    _setDataArea('faaAirspace', cacheKey);
 
     // Render map layers
     renderFAAairspaceLayers();
@@ -4727,16 +4745,31 @@ async function fetchFAAairspace(bounds) {
       markSection('airspace', { source: 'faa', status: 'live', updatedAt: Date.now(), error: null });
     }
   } catch (err) {
+    if (!_requestCurrent(tok)) return;
     console.error('FAA Airspace fetch error:', err);
     recordDataSourceError('FAA Airspace', err);
     const _airErrMsg = err && err.message ? err.message : String(err);
     markSection('airspace', { source: 'faa', status: 'error', error: _airErrMsg });
+    // Nothing usable for THIS area: every layer is UNVERIFIED (never "no
+    // restrictions"), and another area's airspace must not stand in for it.
+    // faaAirspaceUnavailableLayers() turns this into the assessment advisory.
+    const markAllUnavailable = () => {
+      if (_dataIsForArea('faaAirspace', cacheKey)) return; // keep this area's own (stale-flagged) data
+      const none = { type: 'FeatureCollection', features: [], _unavailable: true };
+      S.faaAirspace = {};
+      Object.keys(urls).forEach(k => { S.faaAirspace[k] = Object.assign({}, none); });
+      _setDataArea('faaAirspace', cacheKey);
+      renderFAAairspaceLayers();
+      if (S.areaCenter) computeAirspace(S.areaCenter.lat, S.areaCenter.lng);
+    };
     // Try cached data
     if (typeof getCachedApiResponse === 'function') {
       try {
         const cached = await getCachedApiResponse('faa_airspace', cacheKey);
+        if (!_requestCurrent(tok)) return;
         if (cached && cached.data) {
           S.faaAirspace = cached.data;
+          _setDataArea('faaAirspace', cacheKey);
           renderFAAairspaceLayers();
           computeAirspace(S.areaCenter.lat, S.areaCenter.lng);
           buildLayerControl();
@@ -4745,13 +4778,16 @@ async function fetchFAAairspace(bounds) {
           setStatus('faaAirspaceStatus', 'cached', label);
           markSection('airspace', { source: 'faa', status: 'cached', cachedAt: cached.timestamp, error: _airErrMsg });
         } else {
+          markAllUnavailable();
           setStatus('faaAirspaceStatus', 'error', 'ERROR');
         }
       } catch (cacheErr) {
         console.warn('FAA airspace cache fallback failed:', cacheErr);
+        markAllUnavailable();
         setStatus('faaAirspaceStatus', 'error', 'ERROR');
       }
     } else {
+      markAllUnavailable();
       setStatus('faaAirspaceStatus', 'error', 'ERROR');
     }
   } finally {
@@ -6605,6 +6641,7 @@ async function ensureAdsbDem() {
           S.adsbAircraft.map(_adsbToRaw), S.areaCenter.lat, S.areaCenter.lng, groundFn);
         renderAdsbMap();
         renderAdsbTab();
+        _onAdsbTrafficChanged(); // AGL moved — "below 500 ft" may have changed
       }
     }
   } catch (e) {
@@ -6749,6 +6786,7 @@ async function refineLowCloseAdsbAgl() {
         S.adsbAircraft.map(_adsbToRaw), S.areaCenter.lat, S.areaCenter.lng, groundFn);
       renderAdsbMap();
       renderAdsbTab();
+      _onAdsbTrafficChanged(); // AGL moved — "below 500 ft" may have changed
     }
   } catch (e) {
     console.warn('ADS-B hi-res elevation sample failed:', e && e.message);
@@ -6757,8 +6795,17 @@ async function refineLowCloseAdsbAgl() {
   }
 }
 
+// Live traffic feeds the assessment (emergency squawks, low + close aircraft),
+// so every change to S.adsbAircraft — a poll or an AGL refinement — must
+// recompute the banner; the traffic panel alone used to update.
+function _onAdsbTrafficChanged() {
+  if (S.currentArea) computeAssessment();
+}
+
 async function fetchAdsb() {
   if (!S.areaCenter || !S.adsbSearchRadiusNm) return;
+  // A poll that started before the area changed must not land on the new one.
+  const tok = _beginRequest('adsb');
   trackFetchStart('ADS-B');
   setStatus('adsbStatus', 'loading', 'Polling...');
   const fails = []; // per-source reasons, folded into ONE summary line on total failure
@@ -6771,9 +6818,10 @@ async function fetchAdsb() {
     let usedApi = null;
     for (const a of _adsbAttemptUrls(lat, lon, dist)) {
       try {
-        const res = await _proxyFetch(a.url);
+        const res = await _proxyFetch(a.url, { signal: tok.signal });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         json = await res.json();
+        if (!_requestCurrent(tok)) return;
         if (a.idx != null) S._adsbApiIndex = a.idx;
         usedApi = a.proxy ? ('proxy (' + (res.headers && res.headers.get && res.headers.get('X-Adsb-Source') || '?') + ')') : a.name;
         break;
@@ -6793,6 +6841,7 @@ async function fetchAdsb() {
     updateAdsbTrails(aircraft);
     renderAdsbMap();
     renderAdsbTab(usedApi);
+    _onAdsbTrafficChanged();
     refineLowCloseAdsbAgl(); // sharpen AGL for low+close traffic via 3DEP point sampling (non-blocking)
     clearDataSourceError('ADS-B');
     markSection('adsb', { status: 'live', updatedAt: S._adsbLastFetch, error: null });
@@ -6802,6 +6851,7 @@ async function fetchAdsb() {
     const pollEl = document.getElementById('adsbPollStatus');
     if (pollEl) pollEl.textContent = 'Updated ' + timeStr;
   } catch (err) {
+    if (!_requestCurrent(tok)) return;   // cancelled by an area change — not an outage
     recordDataSourceError('ADS-B', err);
     markSection('adsb', { status: 'error', error: err && err.message ? err.message : String(err) });
     // Both the proxy /adsb route and the direct providers are unreachable
@@ -7749,11 +7799,21 @@ function computeAssessment(snap) {
   }
 
   // Integrate FAA airspace data into assessment
+  // No FAA airspace data at all for a selected area (never loaded, or every
+  // request failed with no cached copy) is UNVERIFIED — skipping the block
+  // used to leave a NOMINAL banner over an area nobody checked.
+  const FAA_UNVERIFIED_HINT = 'check B4UFLY / LAANC and the current sectional before flight';
+  if (S.currentArea && !S.faaAirspace) {
+    addAdvisory('FAA airspace UNVERIFIED — no FAA airspace data loaded for this area; ' + FAA_UNVERIFIED_HINT);
+  }
   if (S.faaAirspace) {
     // CAUTION: a layer that failed to load with no cached copy is UNVERIFIED,
     // not clear — an empty feature list must never read as "no restrictions".
     const missing = faaAirspaceUnavailableLayers(S.faaAirspace);
-    if (missing.length) {
+    const allLayers = Object.keys(FAA_AIRSPACE_LAYER_LABELS);
+    if (missing.length && allLayers.every(k => missing.includes(k))) {
+      addAdvisory('FAA airspace UNVERIFIED — all ' + allLayers.length + ' FAA airspace layers unavailable; ' + FAA_UNVERIFIED_HINT);
+    } else if (missing.length) {
       addAdvisory('FAA airspace data incomplete — ' + missing.map(k => FAA_AIRSPACE_LAYER_LABELS[k] || k).join(', ') + ' unavailable (unverified)');
     }
     // NO-GO: active TFR

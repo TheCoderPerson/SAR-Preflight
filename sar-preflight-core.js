@@ -24,6 +24,16 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.09.22-b',
+    date: '2026-09-22',
+    changes: [
+      'Launch elevation now comes from the centre of the area. It had been read from the south-west corner of the terrain grid, which in steep terrain could be thousands of feet off and skewed battery estimates, the service-ceiling check and aircraft height-above-ground.',
+      'FAA airspace can no longer cross between areas: a late answer for a previously drawn area is discarded instead of replacing the current area (an empty late answer had erased a prohibited area).',
+      'If no FAA airspace data could be loaded for the area, the assessment now says "FAA airspace UNVERIFIED" instead of reading nominal.',
+      'Live traffic now updates the assessment as it arrives: an emergency squawk or a low, close aircraft appears in the banner without a manual refresh.',
+    ],
+  },
+  {
     version: '2026.09.22-a',
     date: '2026-09-22',
     changes: [
@@ -1382,6 +1392,22 @@ function generateElevationGrid(centerLat, centerLng, boundsNE, boundsSW, gridSiz
     }
   }
   return points;
+}
+
+// Index of the grid point nearest (lat, lng) — the LAUNCH sample. The grid is
+// row-major from the SW corner, so index 0 is a corner, not the centre (the
+// old 9-point layout listed the centre first; the 25-point grid kept reading
+// [0] and reported the SW corner's elevation as launch elevation).
+function gridCenterIndex(points, lat, lng) {
+  let best = -1, bestD = Infinity;
+  const cosLat = Math.cos(lat * Math.PI / 180);
+  (points || []).forEach((p, i) => {
+    const pLat = p.latitude != null ? p.latitude : p.lat;
+    const pLng = p.longitude != null ? p.longitude : p.lng;
+    const d = (pLat - lat) ** 2 + ((pLng - lng) * cosLat) ** 2;
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  return best;
 }
 
 // --- Slope Calculation from Grid ---
@@ -4917,7 +4943,7 @@ if (typeof module !== 'undefined' && module.exports) {
     SMA_NONPUBLIC_CODES, smaAgencyInfo, smaIsPublic, classifyAreaPublicPrivate, cellCoverageAt,
     filterAirportsByDistance, classifyAirspace,
     calcGustFactor, calcWindShear,
-    generateElevationGrid, parse3depSamples, parseOpenMeteoElevation, overpassMirrorTimeoutMs, calcSlopeFromGrid, calcAspect,
+    generateElevationGrid, gridCenterIndex, parse3depSamples, parseOpenMeteoElevation, overpassMirrorTimeoutMs, calcSlopeFromGrid, calcAspect,
     detectTerrainFeatures, scoreLZFitness, findEmergencyLZs,
     assessTerrainTurbulence, analyzeGPSMasking,
     calcSwapRecommendation,

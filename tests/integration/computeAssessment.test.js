@@ -351,6 +351,9 @@ describe('computeAssessment()', () => {
       S.elev = { center: 2000 };
       S.areaType = 'POLYGON';
       S.currentArea = { getLatLngs: () => [areaRing] };
+      // FAA airspace loaded and clear (a selected area with NO airspace data is unverified)
+      const empty = () => ({ type: 'FeatureCollection', features: [] });
+      S.faaAirspace = { classAirspace: empty(), sua: empty(), tfrs: empty(), laanc: empty(), nsRestrictions: empty(), prohibited: empty() };
     });
 
     afterEach(() => {

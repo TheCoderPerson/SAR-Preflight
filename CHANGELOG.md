@@ -4,6 +4,13 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.09.22-b — 2026-09-22
+
+- Launch elevation now comes from the centre of the area. It had been read from the south-west corner of the terrain grid, which in steep terrain could be thousands of feet off and skewed battery estimates, the service-ceiling check and aircraft height-above-ground.
+- FAA airspace can no longer cross between areas: a late answer for a previously drawn area is discarded instead of replacing the current area (an empty late answer had erased a prohibited area).
+- If no FAA airspace data could be loaded for the area, the assessment now says "FAA airspace UNVERIFIED" instead of reading nominal.
+- Live traffic now updates the assessment as it arrives: an emergency squawk or a low, close aircraft appears in the banner without a manual refresh.
+
 ## v2026.09.22-a — 2026-09-22
 
 - Data served from the offline cache (weather, air quality, Kp, NWS alerts, sun times, obstacles, protected areas, utility circuits) is now labeled CACHED with its original age instead of LIVE. Failed weather requests (rate limits, server errors) are reported as errors instead of leaving the panel on "Fetching...".
