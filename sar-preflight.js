@@ -521,6 +521,81 @@ function _swCacheStamp(res) {
   } catch (_) { return null; }
 }
 
+// markSection patch for a successful fetch: 'cached' at the stored time when
+// the SW answered from its offline fallback (`sw` from _swCacheStamp), else
+// 'live' now. updatedAt is cleared so an old body never reads as fresh.
+function _freshPatch(sw) {
+  return sw ? { status: 'cached', cachedAt: sw.cachedAt, updatedAt: null, error: null }
+            : { status: 'live', updatedAt: Date.now(), error: null };
+}
+
+// Status-pill text for a SW-fallback body: its age, or "age unknown".
+function _swCachedLabel(sw) {
+  return (sw && sw.cachedAt && typeof formatAge === 'function')
+    ? 'CACHED ' + formatAge(Date.now() - sw.cachedAt) : 'CACHED (age unknown)';
+}
+
+// ------------------------------------------------------------
+// Request ownership. A response may only be committed by the request that
+// still owns its source: S._areaGen advances whenever the selected area
+// changes or is cleared (so a late answer for an old area is dropped), and
+// each source keeps its own sequence (so overlapping refreshes of the same
+// area keep the NEWEST, not the last to arrive). Check before every commit,
+// including the error and cache-fallback paths.
+// ------------------------------------------------------------
+//
+// Each request also carries an AbortController (`tok.signal`): superseding it
+// CANCELS the network work instead of letting it run on unseen, holding a
+// connection slot (browsers allow ~6 per host) and a rate-limit token.
+// Cancellation is the fast path only — commits must still check
+// _requestCurrent, since a response can land before the abort does.
+function _abortRequest(source) {
+  const c = S._reqAbort && S._reqAbort[source];
+  if (c) { try { c.abort(); } catch (_) {} delete S._reqAbort[source]; }
+}
+function invalidateAreaRequests() {
+  S._areaGen = (S._areaGen || 0) + 1;
+  Object.keys(S._reqAbort || {}).forEach(src => { if (!(S._reqGlobal || {})[src]) _abortRequest(src); });
+}
+function _beginRequest(source, opts) {
+  S._reqSeq = S._reqSeq || {};
+  S._reqAbort = S._reqAbort || {};
+  S._reqGlobal = S._reqGlobal || {};
+  const seq = (S._reqSeq[source] || 0) + 1;
+  S._reqSeq[source] = seq;
+  _abortRequest(source); // an older request for this source is now obsolete
+  const global = !!(opts && opts.global);
+  S._reqGlobal[source] = global;
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  if (controller) S._reqAbort[source] = controller;
+  // Global (not area-bound) sources such as Kp ignore area changes.
+  return { source, seq, gen: global ? null : (S._areaGen || 0), signal: controller ? controller.signal : undefined };
+}
+function _requestCurrent(tok) {
+  if (!tok) return true;
+  if (tok.gen != null && tok.gen !== (S._areaGen || 0)) return false;
+  return !!S._reqSeq && S._reqSeq[tok.source] === tok.seq;
+}
+
+// Which area a held result belongs to, per source. Drawing a new area does
+// not clear the old one's state, so a failed fetch with no cached copy must
+// drop values that belong to a DIFFERENT area instead of letting them judge
+// this one (a same-area failure keeps them, flagged stale by markSection).
+function _setDataArea(source, key) { (S._dataArea = S._dataArea || {})[source] = key; }
+function _dataIsForArea(source, key) { return !!(S._dataArea && S._dataArea[source] === key); }
+
+// Read an ArcGIS FeatureServer query answered as GeoJSON. ArcGIS reports query
+// faults as HTTP 200 + { error: { code, message } }, and a body with no
+// features array is not a result either — both must FAIL, never read as "none".
+async function _readArcgisGeoJson(res, label) {
+  if (!res.ok) throw new Error(label + ' HTTP ' + res.status);
+  let j;
+  try { j = await res.json(); } catch (_) { throw new Error(label + ' response is not valid JSON'); }
+  if (j && j.error) throw new Error(label + ': ' + (j.error.message || 'ArcGIS error') + (j.error.code ? ' (' + j.error.code + ')' : ''));
+  if (!j || !Array.isArray(j.features)) throw new Error(label + ' response has no features list');
+  return { json: j, sw: _swCacheStamp(res) };
+}
+
 // ============================================================
 // DOM HELPERS
 // ============================================================
@@ -880,6 +955,7 @@ function startDraw(type) {
 }
 function clearDrawBtns() { document.querySelectorAll('.draw-btn').forEach(b => b.classList.remove('active')); }
 function clearArea() {
+  invalidateAreaRequests(); // pending area requests must not repopulate a cleared area
   stopAdsbPolling();
   S.drawnItems.clearLayers(); S.currentArea = null; S.areaCenter = null;
   Object.keys(WIRE_CATEGORIES).forEach(k => { if (S.mapLayers['wire_' + k]) S.mapLayers['wire_' + k].clearLayers(); });
@@ -1325,6 +1401,10 @@ function locateMe() {
 // ============================================================
 async function processArea(layer, type) {
   try { Diag.note('area.process', { type: type, dom: Diag._domSnapshot() }); } catch (_) {}
+  // Every request still in flight for the previous area (or an earlier load
+  // of this one) loses ownership: its late answer must not land here.
+  invalidateAreaRequests();
+  const areaGen = S._areaGen;
   // Freshness is per area: without this reset a failed fetch on a NEW area
   // would count the previous area's last update as "prior data" and keep its
   // values on screen. View-based sections (canopy) are not tied to the area.
@@ -1411,6 +1491,9 @@ async function processArea(layer, type) {
     fetchHospitals(bounds),
     fetchTrails(bounds),
   ]);
+  // A newer area (or a clear) took over while these were loading: its own
+  // processArea computes the derived data — don't overwrite it with ours.
+  if (S._areaGen !== areaGen) return;
 
   // Start ADS-B polling (needs elevation data for AGL)
   stopAdsbPolling();
@@ -1444,6 +1527,7 @@ async function retryFailedSource(source) {
   const bounds = S.areaBounds;
   const retryMap = {
     'Weather': () => fetchWeather(lat, lng),
+    'Air Quality': () => fetchWeather(lat, lng),
     'Aviation Wx': () => fetchAviationWeather(S.areaCenter, bounds),
     'Elevation': () => fetchElevation(S.areaCenter, bounds),
     'Sun/Moon': () => fetchSunMoon(lat, lng),
@@ -1911,44 +1995,80 @@ function renderWind(snap) {
   snap = snap || snapshotAtIdx(S.timeIdx || 0);
   const groundWind = Math.round(snap.wind_speed_10m);
   const groundGust = Math.round(snap.wind_gusts_10m);
-  const groundDir = Math.round(snap.wind_direction_10m);
+  // Bearings are normalized, rounded, then wrapped so 359.6° shows as 0°, never 360°.
+  const bearing = d => Math.round(((d % 360) + 360) % 360) % 360;
+  const groundDir = bearing(snap.wind_direction_10m);
 
   const w80 = Math.round(snap.wind_speed_80m ?? groundWind * 1.3);
   const w120 = Math.round(snap.wind_speed_120m ?? groundWind * 1.5);
   const w180 = Math.round(snap.wind_speed_180m ?? groundWind * 1.7);
-  const d80 = Math.round(snap.wind_direction_80m ?? groundDir);
-  const d120 = Math.round(snap.wind_direction_120m ?? groundDir);
-  const d180 = Math.round(snap.wind_direction_180m ?? groundDir);
+  const d80 = bearing(snap.wind_direction_80m ?? groundDir);
+  const d120 = bearing(snap.wind_direction_120m ?? groundDir);
+  const d180 = bearing(snap.wind_direction_180m ?? groundDir);
 
+  // Directions interpolate on the compass (shorter arc); speeds stay scalar.
   const windProfile = [
     { alt: 'Ground (10m)', speed: groundWind, gust: groundGust, dir: groundDir },
-    { alt: '100 ft AGL', speed: Math.round(lerp(groundWind, w80, 0.37)), gust: Math.round(groundGust * 1.1), dir: Math.round(lerp(groundDir, d80, 0.37)) },
-    { alt: '200 ft AGL', speed: Math.round(lerp(groundWind, w80, 0.74)), gust: Math.round(groundGust * 1.2), dir: Math.round(lerp(groundDir, d80, 0.74)) },
-    { alt: '300 ft AGL', speed: Math.round(lerp(w80, w120, 0.5)), gust: Math.round(groundGust * 1.3), dir: Math.round(lerp(d80, d120, 0.5)) },
+    { alt: '100 ft AGL', speed: Math.round(lerp(groundWind, w80, 0.37)), gust: Math.round(groundGust * 1.1), dir: bearing(lerpBearing(groundDir, d80, 0.37)) },
+    { alt: '200 ft AGL', speed: Math.round(lerp(groundWind, w80, 0.74)), gust: Math.round(groundGust * 1.2), dir: bearing(lerpBearing(groundDir, d80, 0.74)) },
+    { alt: '300 ft AGL', speed: Math.round(lerp(w80, w120, 0.5)), gust: Math.round(groundGust * 1.3), dir: bearing(lerpBearing(d80, d120, 0.5)) },
     { alt: '400 ft AGL', speed: w120, gust: Math.round(groundGust * 1.4), dir: d120 },
   ];
-  S.wind = { profile: windProfile, maxWind: Math.max(...windProfile.map(w => w.speed)), maxGust: Math.max(...windProfile.map(w => w.gust)) };
+  // Every level is derived from the 10 m reading, so a missing ground wind
+  // (or gust) makes the whole column UNAVAILABLE — null, never NaN or 0, so
+  // assessRisk reports "Wind unavailable" instead of judging it calm.
+  const hasWind = Number.isFinite(snap.wind_speed_10m);
+  const hasGust = Number.isFinite(snap.wind_gusts_10m);
+  const hasDir = Number.isFinite(snap.wind_direction_10m);
+  S.wind = {
+    profile: windProfile,
+    maxWind: hasWind ? Math.max(...windProfile.map(w => w.speed)) : null,
+    maxGust: hasGust ? Math.max(...windProfile.map(w => w.gust)) : null,
+  };
 
+  const mph = v => Number.isFinite(v) ? `${v} mph` : '--';
+  const dirText = d => Number.isFinite(d) ? `${d}° (${degToCompass(d)})` : '--';
   document.getElementById('windTableBody').innerHTML = windProfile.map(w =>
-    `<tr><td>${w.alt}</td><td>${w.speed} mph</td><td>${w.gust} mph</td><td>${w.dir}° (${degToCompass(w.dir)})</td></tr>`
+    `<tr><td>${w.alt}</td><td>${hasWind ? mph(w.speed) : '--'}</td><td>${hasGust ? mph(w.gust) : '--'}</td><td>${hasDir ? dirText(w.dir) : '--'}</td></tr>`
   ).join('');
 
-  setText('windMax', `${S.wind.maxWind} mph`);
-  setColor('windMax', S.wind.maxWind < 15 ? 'green' : S.wind.maxWind < 25 ? 'amber' : 'red');
-  setText('windGustMax', `${S.wind.maxGust} mph`);
-  setColor('windGustMax', S.wind.maxGust < 20 ? 'green' : S.wind.maxGust < 30 ? 'amber' : 'red');
-  setText('windDir', `${groundDir}° (${degToCompass(groundDir)})`);
-  setText('windImpact', S.wind.maxWind < 10 ? 'Minimal — full flight time' : S.wind.maxWind < 20 ? 'Moderate — ~15% battery penalty' : 'Significant — ~30% battery penalty');
+  if (hasWind) {
+    setText('windMax', `${S.wind.maxWind} mph`);
+    setColor('windMax', S.wind.maxWind < 15 ? 'green' : S.wind.maxWind < 25 ? 'amber' : 'red');
+    setText('windImpact', S.wind.maxWind < 10 ? 'Minimal — full flight time' : S.wind.maxWind < 20 ? 'Moderate — ~15% battery penalty' : 'Significant — ~30% battery penalty');
+  } else {
+    setText('windMax', 'UNAVAILABLE');
+    setColor('windMax', 'amber');
+    setText('windImpact', 'Unknown — wind unavailable');
+  }
+  if (hasGust) {
+    setText('windGustMax', `${S.wind.maxGust} mph`);
+    setColor('windGustMax', S.wind.maxGust < 20 ? 'green' : S.wind.maxGust < 30 ? 'amber' : 'red');
+  } else {
+    setText('windGustMax', 'UNAVAILABLE');
+    setColor('windGustMax', 'amber');
+  }
+  setText('windDir', hasDir ? dirText(groundDir) : 'UNAVAILABLE');
 
-  const gustFactor = calcGustFactor(S.wind.maxGust, S.wind.maxWind);
-  setText('windGustFactor', gustFactor > 0 ? `${gustFactor.toFixed(1)}x` : '--');
-  setColor('windGustFactor', gustFactor < 1.5 ? 'green' : gustFactor <= 2.0 ? 'amber' : 'red');
+  if (hasWind && hasGust) {
+    const gustFactor = calcGustFactor(S.wind.maxGust, S.wind.maxWind);
+    setText('windGustFactor', gustFactor > 0 ? `${gustFactor.toFixed(1)}x` : '--');
+    setColor('windGustFactor', gustFactor < 1.5 ? 'green' : gustFactor <= 2.0 ? 'amber' : 'red');
+  } else {
+    setText('windGustFactor', '--');
+    setColor('windGustFactor', 'amber');
+  }
 
-  const shear = calcWindShear(windProfile);
-  setText('windShear', `${shear.maxSpeedChange}mph / ${shear.maxDirChange}°`);
-  setColor('windShear', shear.level);
+  if (hasWind && hasDir) {
+    const shear = calcWindShear(windProfile);
+    setText('windShear', `${shear.maxSpeedChange}mph / ${shear.maxDirChange}°`);
+    setColor('windShear', shear.level);
+  } else {
+    setText('windShear', '--');
+    setColor('windShear', 'amber');
+  }
 
-  if (S.elev.points && typeof assessTerrainTurbulence === 'function') {
+  if (hasWind && hasDir && S.elev.points && typeof assessTerrainTurbulence === 'function') {
     const elevFtArray = S.elev.points.map(p => p.elevFt);
     const turbulence = assessTerrainTurbulence(elevFtArray, S.elev.gridSize, S.elev.range, groundDir, groundWind);
     const factorText = turbulence.factors.join('; ');
@@ -1994,7 +2114,159 @@ function updateTimeContextBanner() {
 // ============================================================
 // API: OPEN-METEO — Weather + Wind + AQI (FREE, no key)
 // ============================================================
+// Read one Open-Meteo response. HTTP status, JSON syntax, the API's own error
+// object ({ error: true, reason }) and the required `current` block are all
+// checked BEFORE the body is trusted: an HTTP 429/500 carries a valid JSON
+// body, so neither fetch() nor res.json() rejects on its own.
+async function _readOpenMeteo(res, label) {
+  if (!res.ok) {
+    let reason = '';
+    try { const b = await res.json(); if (b && b.reason) reason = ': ' + b.reason; } catch (_) { /* non-JSON */ }
+    throw new Error(label + ' HTTP ' + res.status + reason);
+  }
+  let j;
+  try { j = await res.json(); } catch (_) { throw new Error(label + ' response is not valid JSON'); }
+  if (!j || typeof j !== 'object') throw new Error(label + ' response malformed');
+  if (j.error) throw new Error(label + ': ' + (j.reason || 'API error'));
+  if (!j.current || typeof j.current !== 'object') throw new Error(label + ' response has no current conditions');
+  return { json: j, sw: _swCacheStamp(res) };
+}
+
+// Commit a validated forecast to state + panel. `src` is { live: true } for a
+// network answer, else { cachedAt, badge, label, error } for an offline copy.
+function _commitWeather(wx, k, src, keepHourly) {
+  S.wx = wx.current;
+  S.wxAreaKey = k;
+  // Store hourly forecast arrays BEFORE rendering so the panel can render any
+  // selected timeline hour via snapshotAtIdx(). Includes upper winds (80/120/180m
+  // — previously fetched then discarded) and the fields needed for a fully
+  // time-aware panel (humidity, apparent temp, pressure, visibility, UV).
+  const h = keepHourly && wx.hourly && wx.hourly.time ? wx.hourly : null;
+  if (h) {
+    S.wx.hourly = {
+      time: h.time,
+      temperature_2m: h.temperature_2m,
+      dew_point_2m: h.dew_point_2m,
+      apparent_temperature: h.apparent_temperature,
+      relative_humidity_2m: h.relative_humidity_2m,
+      surface_pressure: h.surface_pressure,
+      visibility: h.visibility,
+      uv_index: h.uv_index,
+      precipitation_probability: h.precipitation_probability,
+      wind_speed_10m: h.wind_speed_10m,
+      wind_direction_10m: h.wind_direction_10m,
+      wind_gusts_10m: h.wind_gusts_10m,
+      wind_speed_80m: h.wind_speed_80m,
+      wind_speed_120m: h.wind_speed_120m,
+      wind_speed_180m: h.wind_speed_180m,
+      wind_direction_80m: h.wind_direction_80m,
+      wind_direction_120m: h.wind_direction_120m,
+      wind_direction_180m: h.wind_direction_180m,
+      cloud_cover: h.cloud_cover,
+      weather_code: h.weather_code,
+      freezing_level_height: h.freezing_level_height,
+      is_day: h.is_day,
+    };
+  }
+
+  // New data → reset the timeline to NOW and render hour 0 into the panel.
+  S.timeIdx = 0;
+  const snap = snapshotAtIdx(0);
+  renderWeather(snap);
+  renderWind(snap);
+
+  if (src.live) {
+    setStatus('wxStatus', 'live', 'LIVE');
+    setStatus('windStatus', 'live', 'LIVE');
+    markSection('weather', { status: 'live', updatedAt: Date.now(), error: null });
+  } else {
+    setStatus('wxStatus', src.badge || 'cached', src.label);
+    setStatus('windStatus', src.badge || 'cached', src.label);
+    markSection('weather', { status: 'cached', cachedAt: src.cachedAt, updatedAt: null, error: src.error || null });
+  }
+
+  if (h) {
+    renderForecastChart(S.wx.hourly);
+    initTimeBar();
+  } else {
+    renderForecastChart(null);
+    if (typeof hideTimeBar === 'function') hideTimeBar();
+  }
+  updateTimeContextBanner();
+}
+
+function _commitAqi(aqi, k, src) {
+  const c = aqi.current;
+  S.aqi = c.us_aqi;  // expose for the risk assessment (AQI gate)
+  S.aqiAreaKey = k;
+  setText('wxAQI', `${c.us_aqi}`);
+  setColor('wxAQI', c.us_aqi < 50 ? 'green' : c.us_aqi < 100 ? 'amber' : 'red');
+  if (c.pm2_5 != null) setText('wxPM25', `${c.pm2_5.toFixed(1)} µg/m³`);
+  setText('wxPM10', `${c.pm10?.toFixed(1) ?? '--'} µg/m³`);
+  setText('wxOzone', `${c.ozone?.toFixed(1) ?? '--'} µg/m³`);
+  markSection('airQuality', src.live
+    ? { status: 'live', updatedAt: Date.now(), error: null }
+    : { status: 'cached', cachedAt: src.cachedAt, updatedAt: null, error: src.error || null });
+}
+
+// Label for an IndexedDB copy ({ data, timestamp, status }).
+function _idbCachedSrc(rec, errMsg) {
+  return {
+    cachedAt: rec.timestamp,
+    badge: rec.status === 'stale' ? 'cached' : 'expired',
+    label: typeof formatAge === 'function' ? 'CACHED ' + formatAge(Date.now() - rec.timestamp) : 'CACHED',
+    error: errMsg,
+  };
+}
+
+// Weather request failed: this area's IndexedDB copy if there is one (current
+// conditions only — an old hourly forecast would put past hours on the time
+// bar), else ERROR. Values held from a DIFFERENT area are dropped so the
+// assessment cannot judge this area by another area's weather; this area's
+// own earlier values stay on screen flagged "(stale: Verify)" by markSection.
+async function _weatherFailed(err, k, tok) {
+  console.error('Weather fetch error:', err);
+  const msg = err && err.message ? err.message : String(err);
+  let rec = null;
+  if (typeof getCachedApiResponse === 'function') {
+    try { rec = await getCachedApiResponse('weather', k); } catch (e) { console.warn('Weather cache fallback failed:', e); }
+  }
+  if (!_requestCurrent(tok)) return;
+  recordDataSourceError('Weather', err);
+  if (rec && rec.data && rec.data.current) {
+    _commitWeather(rec.data, k, _idbCachedSrc(rec, msg), false);
+    return;
+  }
+  if (S.wxAreaKey !== k) {
+    S.wx = {}; S.wind = {}; S.wxAreaKey = null;
+    renderForecastChart(null);
+    if (typeof hideTimeBar === 'function') hideTimeBar();
+  }
+  markSection('weather', { status: 'error', error: msg });
+  setStatus('wxStatus', 'error', 'ERROR');
+  setStatus('windStatus', 'error', 'ERROR');
+}
+
+async function _aqiFailed(err, k, tok) {
+  console.warn('Air quality fetch error:', err);
+  const msg = err && err.message ? err.message : String(err);
+  let rec = null;
+  if (typeof getCachedApiResponse === 'function') {
+    try { rec = await getCachedApiResponse('aqi', k); } catch (e) { console.warn('AQI cache fallback failed:', e); }
+  }
+  if (!_requestCurrent(tok)) return;
+  recordDataSourceError('Air Quality', err);
+  if (rec && rec.data && rec.data.current) {
+    _commitAqi(rec.data, k, _idbCachedSrc(rec, msg));
+    return;
+  }
+  if (S.aqiAreaKey !== k) { S.aqi = null; S.aqiAreaKey = null; }
+  markSection('airQuality', { status: 'error', error: msg });
+}
+
 async function fetchWeather(lat, lng) {
+  const tok = _beginRequest('weather');
+  const k = typeof areaKey === 'function' ? areaKey(lat, lng) : `${lat.toFixed(3)}_${lng.toFixed(3)}`;
   trackFetchStart('Weather');
   setStatus('wxStatus', 'loading', 'Fetching...');
   setStatus('windStatus', 'loading', 'Fetching...');
@@ -2012,136 +2284,47 @@ async function fetchWeather(lat, lng) {
     const aqiUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lng}` +
       `&current=us_aqi,pm2_5,pm10,ozone&timezone=auto`;
 
-    const [wxRes, aqiRes] = await Promise.all([fetch(wxUrl), fetch(aqiUrl)]);
-    const wx = await wxRes.json();
-    const aqi = await aqiRes.json();
+    // Weather and AQI succeed or fail independently: one bad answer must not
+    // discard the other's valid result.
+    const settle = (url, label) => fetch(url).then(r => _readOpenMeteo(r, label))
+      .then(v => ({ ok: true, ...v }), err => ({ ok: false, err }));
+    const [wxOut, aqiOut] = await Promise.all([settle(wxUrl, 'Weather'), settle(aqiUrl, 'Air quality')]);
+    if (!_requestCurrent(tok)) return; // a newer request / area owns the panel
 
-    if (wx.current) {
-      S.wx = wx.current;
-    }
-
-    // Store hourly forecast arrays BEFORE rendering so the panel can render any
-    // selected timeline hour via snapshotAtIdx(). Includes upper winds (80/120/180m
-    // — previously fetched then discarded) and the fields needed for a fully
-    // time-aware panel (humidity, apparent temp, pressure, visibility, UV).
-    if (wx.hourly && wx.hourly.time) {
-      S.wx.hourly = {
-        time: wx.hourly.time,
-        temperature_2m: wx.hourly.temperature_2m,
-        dew_point_2m: wx.hourly.dew_point_2m,
-        apparent_temperature: wx.hourly.apparent_temperature,
-        relative_humidity_2m: wx.hourly.relative_humidity_2m,
-        surface_pressure: wx.hourly.surface_pressure,
-        visibility: wx.hourly.visibility,
-        uv_index: wx.hourly.uv_index,
-        precipitation_probability: wx.hourly.precipitation_probability,
-        wind_speed_10m: wx.hourly.wind_speed_10m,
-        wind_direction_10m: wx.hourly.wind_direction_10m,
-        wind_gusts_10m: wx.hourly.wind_gusts_10m,
-        wind_speed_80m: wx.hourly.wind_speed_80m,
-        wind_speed_120m: wx.hourly.wind_speed_120m,
-        wind_speed_180m: wx.hourly.wind_speed_180m,
-        wind_direction_80m: wx.hourly.wind_direction_80m,
-        wind_direction_120m: wx.hourly.wind_direction_120m,
-        wind_direction_180m: wx.hourly.wind_direction_180m,
-        cloud_cover: wx.hourly.cloud_cover,
-        weather_code: wx.hourly.weather_code,
-        freezing_level_height: wx.hourly.freezing_level_height,
-        is_day: wx.hourly.is_day,
-      };
-    }
-
-    if (wx.current) {
-      // New data → reset the timeline to NOW and render hour 0 into the panel.
-      S.timeIdx = 0;
-      const snap = snapshotAtIdx(0);
-      renderWeather(snap);
-      renderWind(snap);
-
-      setStatus('wxStatus', 'live', 'LIVE');
-      setStatus('windStatus', 'live', 'LIVE');
+    if (wxOut.ok) {
+      const sw = wxOut.sw;
+      _commitWeather(wxOut.json, k, sw ? { cachedAt: sw.cachedAt, label: _swCachedLabel(sw) } : { live: true }, true);
       clearDataSourceError('Weather');
-      markSection('weather', { status: 'live', updatedAt: Date.now(), error: null });
+      // Only a genuine network answer is cached / stamped: re-caching the SW's
+      // offline copy would give an old body a fresh acquisition time.
+      if (!sw && typeof cacheApiResponse === 'function') cacheApiResponse('weather', k, wxOut.json);
+      if (!sw && typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+    } else {
+      await _weatherFailed(wxOut.err, k, tok);
+      if (!_requestCurrent(tok)) return;
     }
 
-    if (wx.hourly && wx.hourly.time) {
-      renderForecastChart(S.wx.hourly);
-      initTimeBar();
-      updateTimeContextBanner();
+    if (aqiOut.ok) {
+      const sw = aqiOut.sw;
+      _commitAqi(aqiOut.json, k, sw ? { cachedAt: sw.cachedAt } : { live: true });
+      clearDataSourceError('Air Quality');
+      if (!sw && typeof cacheApiResponse === 'function') cacheApiResponse('aqi', k, aqiOut.json);
+    } else {
+      await _aqiFailed(aqiOut.err, k, tok);
+      if (!_requestCurrent(tok)) return;
     }
-
-    // AQI
-    if (aqi.current) {
-      S.aqi = aqi.current.us_aqi;  // expose for the risk assessment (AQI gate)
-      setText('wxAQI', `${aqi.current.us_aqi}`);
-      setColor('wxAQI', aqi.current.us_aqi < 50 ? 'green' : aqi.current.us_aqi < 100 ? 'amber' : 'red');
-      setText('wxPM25', `${aqi.current.pm2_5?.toFixed(1)} µg/m³`);
-      setText('wxPM10', `${aqi.current.pm10?.toFixed(1) ?? '--'} µg/m³`);
-      setText('wxOzone', `${aqi.current.ozone?.toFixed(1) ?? '--'} µg/m³`);
-      markSection('airQuality', { status: 'live', updatedAt: Date.now(), error: null });
-    }
-
-    // Cache weather and AQI data to IndexedDB
-    if (typeof cacheApiResponse === 'function') {
-      const k = areaKey(lat, lng);
-      cacheApiResponse('weather', k, wx);
-      cacheApiResponse('aqi', k, aqi);
-    }
-    if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
 
     await fetchKpIndex();
 
   } catch (err) {
-    console.error('Weather fetch error:', err);
+    // A render fault after a valid response: report it rather than leave the
+    // panel on "Fetching...".
+    if (!_requestCurrent(tok)) return;
+    console.error('Weather render error:', err);
     recordDataSourceError('Weather', err);
-    const _wxErrMsg = err && err.message ? err.message : String(err);
-    markSection('weather', { status: 'error', error: _wxErrMsg });
-    markSection('airQuality', { status: 'error', error: _wxErrMsg });
-    // Try cached weather data before showing ERROR
-    if (typeof getCachedApiResponse === 'function') {
-      try {
-        const k = typeof areaKey === 'function' ? areaKey(lat, lng) : `${lat.toFixed(3)}_${lng.toFixed(3)}`;
-        const cachedWx = await getCachedApiResponse('weather', k);
-        if (cachedWx && cachedWx.data) {
-          const c = cachedWx.data.current || cachedWx.data;
-          S.wx = c;
-          setText('wxTemp', `${Math.round(c.temperature_2m)}°F`);
-          const visMi = (c.visibility / 1609.34).toFixed(1);
-          setText('wxVis', `${visMi} mi`);
-          setColor('wxVis', visMi > 5 ? 'green' : visMi > 3 ? 'amber' : 'red');
-          setText('wxPrecip', `${c.precipitation_probability ?? 0}%`);
-          const groundWind = Math.round(c.wind_speed_10m);
-          const groundGust = Math.round(c.wind_gusts_10m);
-          setText('windMax', `${groundWind} mph`);
-          setColor('windMax', groundWind < 15 ? 'green' : groundWind < 25 ? 'amber' : 'red');
-          setText('windGustMax', `${groundGust} mph`);
-          setColor('windGustMax', groundGust < 20 ? 'green' : groundGust < 30 ? 'amber' : 'red');
-          const age = Date.now() - cachedWx.timestamp;
-          const badge = cachedWx.status === 'stale' ? 'cached' : 'expired';
-          const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
-          setStatus('wxStatus', badge, label);
-          setStatus('windStatus', badge, label);
-          markSection('weather', { status: 'cached', cachedAt: cachedWx.timestamp, error: _wxErrMsg });
-        } else {
-          setStatus('wxStatus', 'error', 'ERROR');
-          setStatus('windStatus', 'error', 'ERROR');
-        }
-        const cachedAqi = await getCachedApiResponse('aqi', k);
-        if (cachedAqi && cachedAqi.data && cachedAqi.data.current) {
-          S.aqi = cachedAqi.data.current.us_aqi;  // expose for the risk assessment (AQI gate)
-          setText('wxAQI', `${cachedAqi.data.current.us_aqi}`);
-          setColor('wxAQI', cachedAqi.data.current.us_aqi < 50 ? 'green' : cachedAqi.data.current.us_aqi < 100 ? 'amber' : 'red');
-          markSection('airQuality', { status: 'cached', cachedAt: cachedAqi.timestamp, error: _wxErrMsg });
-        }
-      } catch (cacheErr) {
-        console.warn('Weather cache fallback failed:', cacheErr);
-        setStatus('wxStatus', 'error', 'ERROR');
-        setStatus('windStatus', 'error', 'ERROR');
-      }
-    } else {
-      setStatus('wxStatus', 'error', 'ERROR');
-      setStatus('windStatus', 'error', 'ERROR');
-    }
+    markSection('weather', { status: 'error', error: err && err.message ? err.message : String(err) });
+    setStatus('wxStatus', 'error', 'ERROR');
+    setStatus('windStatus', 'error', 'ERROR');
   } finally {
     trackFetchEnd('Weather');
   }
@@ -2259,34 +2442,55 @@ function renderKp(kp) {
   }).join('');
 }
 
-// Parse the SWPC forecast JSON (row 0 is headers) into [{t, kp}] (t in ms).
+// Parse the SWPC forecast JSON into [{t, kp}] (t in ms). Two shapes exist:
+// the current array of objects ({ time_tag: '2026-09-15T00:00:00', kp: 3.0 },
+// ISO without a zone, UTC) and the legacy array of arrays whose row 0 is a
+// header (['2026-06-20 00:00:00', '2.00', …]). Reading only the legacy shape
+// silently yielded NO rows after SWPC switched, and fetchKpIndex then showed
+// a made-up Kp 2 as LIVE.
 function _parseKpForecast(data) {
   const rows = [];
   if (!Array.isArray(data)) return rows;
-  for (let i = 1; i < data.length; i++) {
-    const t = new Date(data[i][0] + ' UTC').getTime();
-    const kpv = parseFloat(data[i][1]);
-    if (!isNaN(t) && !isNaN(kpv)) rows.push({ t, kp: kpv });
+  for (const r of data) {
+    let tag, kpRaw;
+    if (Array.isArray(r)) { tag = r[0]; kpRaw = r[1]; }
+    else if (r && typeof r === 'object') { tag = r.time_tag; kpRaw = r.kp; }
+    else continue;
+    if (typeof tag !== 'string') continue;
+    const iso = tag.trim().replace(' ', 'T');
+    const t = new Date(/(Z|[+-]\d\d:?\d\d)$/.test(iso) ? iso : iso + 'Z').getTime();
+    const kpv = parseFloat(kpRaw);
+    if (!isNaN(t) && !isNaN(kpv)) rows.push({ t, kp: kpv }); // legacy header row fails both
   }
   return rows;
 }
 
 async function fetchKpIndex() {
+  // Kp is global, so only a newer Kp request (not an area change) supersedes this one.
+  const tok = _beginRequest('kp', { global: true });
   trackFetchStart('Kp Index');
   try {
     const res = await fetch('https://services.swpc.noaa.gov/products/noaa-planetary-k-index-forecast.json');
+    if (!res.ok) throw new Error('Kp HTTP ' + res.status);
+    const sw = _swCacheStamp(res);
     const data = await res.json();
     // Keep the whole 3-hourly forecast so the timeline can show Kp per selected hour.
-    S.kpForecast = _parseKpForecast(data);
+    const rows = _parseKpForecast(data);
+    if (!rows.length) throw new Error('Kp response malformed');
+    if (!_requestCurrent(tok)) return;
+    S.kpForecast = rows;
     const kp = kpAtTime(S.kpForecast, Date.now()) ?? 2;
     S.kp = kp;  // expose for the risk assessment (Kp caution gate)
     renderKp(kp);
 
-    // Cache Kp data
-    if (typeof cacheApiResponse === 'function') cacheApiResponse('kp', 'global', data);
-    if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
-    markSection('spaceWx', { status: 'live', updatedAt: Date.now(), error: null });
+    // Cache Kp data — only a genuine network answer (see _freshPatch).
+    if (!sw) {
+      if (typeof cacheApiResponse === 'function') cacheApiResponse('kp', 'global', data);
+      if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+    }
+    markSection('spaceWx', _freshPatch(sw));
   } catch(e) {
+    if (!_requestCurrent(tok)) return;
     console.warn('Kp fetch failed', e);
     const _kpErrMsg = e && e.message ? e.message : String(e);
     markSection('spaceWx', { status: 'error', error: _kpErrMsg });
@@ -2294,9 +2498,11 @@ async function fetchKpIndex() {
     if (typeof getCachedApiResponse === 'function') {
       try {
         const cached = await getCachedApiResponse('kp', 'global');
-        if (cached && cached.data) {
-          S.kpForecast = _parseKpForecast(cached.data);
-          const kp = kpAtTime(S.kpForecast, Date.now()) ?? (parseFloat(cached.data[1]?.[1]) || 2);
+        if (!_requestCurrent(tok)) return;
+        const cachedRows = cached && cached.data ? _parseKpForecast(cached.data) : [];
+        if (cachedRows.length) {   // never invent a Kp from an unreadable copy
+          S.kpForecast = cachedRows;
+          const kp = kpAtTime(S.kpForecast, Date.now());
           S.kp = kp;  // expose for the risk assessment (Kp caution gate)
           renderKp(kp);
           markSection('spaceWx', { status: 'cached', cachedAt: cached.timestamp, error: _kpErrMsg });
@@ -2507,9 +2713,62 @@ function _fcTooltipHide(svg) {
 }
 
 // ============================================================
-// API: OPEN-ELEVATION (FREE)
+// API: TERRAIN ELEVATION GRID — USGS 3DEP, Open-Meteo fallback (FREE, no key)
 // ============================================================
+// USGS 3DEP (best-available, ~1 m in most of CONUS) via the ImageServer's
+// getSamples, the same service the viewshed DEM uses. Outside 3DEP coverage
+// (ocean, most non-US land) points come back missing, so the whole grid falls
+// back to Open-Meteo's Copernicus GLO-90 DEM. Open-Elevation was dropped Sept
+// 2026: its TLS certificate expired and every browser request failed.
+const ELEV_3DEP_SAMPLES_URL = 'https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/getSamples';
+const ELEV_OPEN_METEO_URL = 'https://api.open-meteo.com/v1/elevation';
+
+async function _fetch3depElevations(points, signal) {
+  const geometry = JSON.stringify({ points: points.map(p => [p.longitude, p.latitude]), spatialReference: { wkid: 4326 } });
+  const url = ELEV_3DEP_SAMPLES_URL + '?geometry=' + encodeURIComponent(geometry)
+    + '&geometryType=esriGeometryMultipoint&returnFirstValueOnly=true&f=json';
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error('3DEP HTTP ' + res.status);
+  let j;
+  try { j = await res.json(); } catch (_) { throw new Error('3DEP response is not valid JSON'); }
+  if (j && j.error) throw new Error('3DEP: ' + (j.error.message || 'ArcGIS error'));
+  const elevationsM = parse3depSamples(j, points.length);
+  if (!elevationsM) throw new Error('3DEP has no data for part of the area');
+  return { elevationsM, sw: _swCacheStamp(res), source: 'USGS 3DEP' };
+}
+
+async function _fetchOpenMeteoElevations(points, signal) {
+  const url = ELEV_OPEN_METEO_URL + '?latitude=' + points.map(p => p.latitude.toFixed(5)).join(',')
+    + '&longitude=' + points.map(p => p.longitude.toFixed(5)).join(',');
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error('Open-Meteo elevation HTTP ' + res.status);
+  let j;
+  try { j = await res.json(); } catch (_) { throw new Error('Open-Meteo elevation response is not valid JSON'); }
+  if (j && j.error) throw new Error('Open-Meteo elevation: ' + (j.reason || 'API error'));
+  const elevationsM = parseOpenMeteoElevation(j, points.length);
+  if (!elevationsM) throw new Error('Open-Meteo elevation response malformed');
+  return { elevationsM, sw: _swCacheStamp(res), source: 'Copernicus DEM (Open-Meteo)' };
+}
+
+// Every point from ONE source (a mixed grid would compare two different DEMs).
+async function _fetchElevationGrid(points, signal) {
+  try {
+    return await _fetch3depElevations(points, signal);
+  } catch (e3) {
+    if (e3 && e3.name === 'AbortError') throw e3;
+    console.warn('3DEP elevation unavailable, trying Open-Meteo:', e3.message);
+    try {
+      return await _fetchOpenMeteoElevations(points, signal);
+    } catch (eo) {
+      if (eo && eo.name === 'AbortError') throw eo;
+      throw new Error('Elevation unavailable — 3DEP: ' + e3.message + '; Open-Meteo: ' + eo.message);
+    }
+  }
+}
+
 async function fetchElevation(center, bounds) {
+  const tok = _beginRequest('elevation');
+  const k = typeof areaKey === 'function' ? areaKey(center.lat, center.lng) : `${center.lat.toFixed(3)}_${center.lng.toFixed(3)}`;
   trackFetchStart('Elevation');
   setStatus('elevStatus', 'loading', 'Fetching...');
   try {
@@ -2537,12 +2796,13 @@ async function fetchElevation(center, bounds) {
       gridSize = 3;
     }
 
-    const res = await fetch('https://api.open-elevation.com/api/v1/lookup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ locations: points }),
-    });
-    const data = await res.json();
+    // Every requested point must come back with a real elevation: a short or
+    // null-filled answer would skew min/max/launch elevation silently.
+    const grid = await _fetchElevationGrid(points, tok.signal);
+    if (!_requestCurrent(tok)) return;
+    const swHit = grid.sw;
+    // Stored in the { results: [{ elevation: m }] } shape older cached copies use.
+    const data = { results: grid.elevationsM.map(e => ({ elevation: e })), source: grid.source };
 
     // Store full point array with elevation data
     const elevPoints = data.results.map((r, i) => ({
@@ -2563,6 +2823,7 @@ async function fetchElevation(center, bounds) {
     }
 
     S.elev = { center: centerElev, min: minElev, max: maxElev, range, points: elevPoints, gridSize, cellSizeKm };
+    _setDataArea('elevation', k);
 
     setText('terrMin', `${minElev.toLocaleString()} ft AMSL`);
     setText('terrMax', `${maxElev.toLocaleString()} ft AMSL`);
@@ -2608,30 +2869,37 @@ async function fetchElevation(center, bounds) {
     }
     setText('terrRID', centerElev > 5000 ? 'Internet unlikely — use RID module' : 'Internet likely available');
 
-    // Cache elevation data
-    if (typeof cacheApiResponse === 'function') cacheApiResponse('elevation', areaKey(center.lat, center.lng), data);
-    if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+    // Cache elevation data — only a genuine network answer (see _freshPatch).
+    if (!swHit) {
+      if (typeof cacheApiResponse === 'function') cacheApiResponse('elevation', k, data);
+      if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+    }
 
-    setStatus('elevStatus', 'live', 'LIVE');
+    const srcTag = data.source === 'USGS 3DEP' ? '3DEP' : 'COPERNICUS';
+    setStatus('elevStatus', swHit ? 'cached' : 'live', (swHit ? _swCachedLabel(swHit) : 'LIVE') + ' · ' + srcTag);
     clearDataSourceError('Elevation');
-    markSection('elevation', { status: 'live', updatedAt: Date.now(), error: null });
+    markSection('elevation', _freshPatch(swHit));
   } catch (err) {
+    if (!_requestCurrent(tok)) return;
     console.error('Elevation fetch error:', err);
     recordDataSourceError('Elevation', err);
     const _elevErrMsg = err && err.message ? err.message : String(err);
     markSection('elevation', { status: 'error', error: _elevErrMsg });
-    // Try cached elevation data
+    let usedCache = false;
     if (typeof getCachedApiResponse === 'function') {
       try {
-        const k = typeof areaKey === 'function' ? areaKey(center.lat, center.lng) : `${center.lat.toFixed(3)}_${center.lng.toFixed(3)}`;
         const cached = await getCachedApiResponse('elevation', k);
-        if (cached && cached.data && cached.data.results) {
+        if (!_requestCurrent(tok)) return;
+        if (cached && cached.data && Array.isArray(cached.data.results) && cached.data.results.length &&
+            cached.data.results.every(r => r && Number.isFinite(r.elevation))) {
+          usedCache = true;
           const elevations = cached.data.results.map(r => Math.round(r.elevation * 3.28084));
           const centerElev = elevations[0];
           const minElev = Math.min(...elevations);
           const maxElev = Math.max(...elevations);
           const range = maxElev - minElev;
           S.elev = { center: centerElev, min: minElev, max: maxElev, range };
+          _setDataArea('elevation', k);
           setText('terrMin', `${minElev.toLocaleString()} ft AMSL`);
           setText('terrMax', `${maxElev.toLocaleString()} ft AMSL`);
           setText('terrRange', `${range.toLocaleString()} ft`);
@@ -2652,6 +2920,14 @@ async function fetchElevation(center, bounds) {
     } else {
       setStatus('elevStatus', 'error', 'ERROR');
     }
+    // Nothing for this area: another area's terrain must not stand in for it
+    // (launch elevation feeds the service-ceiling limit, cell coverage and
+    // the landing zones). The assessment then reports elevation unavailable.
+    if (!usedCache && !_dataIsForArea('elevation', k)) {
+      S.elev = {}; S.cellStatus = null; S.lzs = [];
+      if (typeof renderLZMarkers === 'function') renderLZMarkers(S.lzs);
+      _setDataArea('elevation', k);
+    }
   } finally {
     trackFetchEnd('Elevation');
   }
@@ -2661,64 +2937,72 @@ async function fetchElevation(center, bounds) {
 // API: SUNRISE-SUNSET.ORG (FREE)
 // ============================================================
 async function fetchSunMoon(lat, lng) {
+  const tok = _beginRequest('sunMoon');
   trackFetchStart('Sun/Moon');
   setStatus('astroStatus', 'loading', 'Fetching...');
   try {
     const today = new Date().toISOString().split('T')[0];
     const res = await fetch(`https://api.sunrise-sunset.org/json?lat=${lat}&lng=${lng}&date=${today}&formatted=0`);
-    const data = await res.json();
+    if (!res.ok) throw new Error('Sun times HTTP ' + res.status);
+    const swHit = _swCacheStamp(res);
+    let data;
+    try { data = await res.json(); } catch (_) { throw new Error('Sun times response is not valid JSON'); }
+    // A refused request (status INVALID_REQUEST etc.) used to skip every
+    // update silently, leaving the panel on "Fetching..." with no error.
+    if (!data || data.status !== 'OK' || !data.results) throw new Error('Sun times: ' + ((data && data.status) || 'malformed response'));
+    if (!_requestCurrent(tok)) return;
+    const r = data.results;
+    const fmt = iso => new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: _localTZ() });
 
-    if (data.status === 'OK') {
-      const r = data.results;
-      const fmt = iso => new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: _localTZ() });
+    setText('astSunrise', fmt(r.sunrise));
+    setText('astSunset', fmt(r.sunset));
+    setText('astTwilightAM', fmt(r.civil_twilight_begin));
+    setText('astTwilightPM', fmt(r.civil_twilight_end));
+    setText('astNauticalAM', fmt(r.nautical_twilight_begin));
+    setText('astNauticalPM', fmt(r.nautical_twilight_end));
+    setText('astSolarNoon', fmt(r.solar_noon));
 
-      setText('astSunrise', fmt(r.sunrise));
-      setText('astSunset', fmt(r.sunset));
-      setText('astTwilightAM', fmt(r.civil_twilight_begin));
-      setText('astTwilightPM', fmt(r.civil_twilight_end));
-      setText('astNauticalAM', fmt(r.nautical_twilight_begin));
-      setText('astNauticalPM', fmt(r.nautical_twilight_end));
-      setText('astSolarNoon', fmt(r.solar_noon));
+    const twAM = fmt(r.civil_twilight_begin);
+    const twPM = fmt(r.civil_twilight_end);
+    setText('astDayWindow', `${twAM} — ${twPM} ${new Date().toLocaleTimeString('en-US',{timeZoneName:'short'}).split(' ').pop()}`);
 
-      const twAM = fmt(r.civil_twilight_begin);
-      const twPM = fmt(r.civil_twilight_end);
-      setText('astDayWindow', `${twAM} — ${twPM} ${new Date().toLocaleTimeString('en-US',{timeZoneName:'short'}).split(' ').pop()}`);
+    const sunPos = calcSunPosition(lat, lng);
+    setText('astSunAz', `${sunPos.azimuth.toFixed(1)}°`);
+    setText('astSunEl', `${sunPos.elevation.toFixed(1)}°`);
 
-      const sunPos = calcSunPosition(lat, lng);
-      setText('astSunAz', `${sunPos.azimuth.toFixed(1)}°`);
-      setText('astSunEl', `${sunPos.elevation.toFixed(1)}°`);
+    if (sunPos.elevation > 5) {
+      const shadowMult = (1 / Math.tan(sunPos.elevation * Math.PI / 180)).toFixed(1);
+      setText('astShadow', `${shadowMult}x object height`);
+    } else {
+      setText('astShadow', 'Sun low — long shadows');
+    }
 
-      if (sunPos.elevation > 5) {
-        const shadowMult = (1 / Math.tan(sunPos.elevation * Math.PI / 180)).toFixed(1);
-        setText('astShadow', `${shadowMult}x object height`);
-      } else {
-        setText('astShadow', 'Sun low — long shadows');
-      }
+    const moonPhase = calcMoonPhase();
+    setText('astMoonPhase', moonPhase.name);
+    setText('astMoonIllum', `${moonPhase.illumination}%`);
 
-      const moonPhase = calcMoonPhase();
-      setText('astMoonPhase', moonPhase.name);
-      setText('astMoonIllum', `${moonPhase.illumination}%`);
+    const nightAssess = moonPhase.illumination > 50 ? 'Good lunar illumination for night ops' :
+                        moonPhase.illumination > 20 ? 'Moderate lunar light — supplement with anti-collision' :
+                        'Low illumination — ensure adequate anti-collision lighting';
+    setText('astNightOps', nightAssess);
 
-      const nightAssess = moonPhase.illumination > 50 ? 'Good lunar illumination for night ops' :
-                          moonPhase.illumination > 20 ? 'Moderate lunar light — supplement with anti-collision' :
-                          'Low illumination — ensure adequate anti-collision lighting';
-      setText('astNightOps', nightAssess);
+    // Simplified WMM 2025 magnetic declination approximation for CONUS
+    const magDec = -5.24 + 0.12 * (lat - 39) + 0.19 * (lng + 98);
+    setText('astMagDec', `${Math.abs(magDec).toFixed(1)}° ${magDec >= 0 ? 'E' : 'W'} (approx)`);
 
-      // Simplified WMM 2025 magnetic declination approximation for CONUS
-      const magDec = -5.24 + 0.12 * (lat - 39) + 0.19 * (lng + 98);
-      setText('astMagDec', `${Math.abs(magDec).toFixed(1)}° ${magDec >= 0 ? 'E' : 'W'} (approx)`);
+    S.astro = { sunrise: r.sunrise, sunset: r.sunset, twAM: r.civil_twilight_begin, twPM: r.civil_twilight_end, moonPhase };
 
-      S.astro = { sunrise: r.sunrise, sunset: r.sunset, twAM: r.civil_twilight_begin, twPM: r.civil_twilight_end, moonPhase };
-
-      // Cache sunrise data
+    // Cache sunrise data — only a genuine network answer (see _freshPatch).
+    if (!swHit) {
       if (typeof cacheApiResponse === 'function') cacheApiResponse('sunrise', areaKey(lat, lng), data);
       if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
-
-      setStatus('astroStatus', 'live', 'LIVE');
-      clearDataSourceError('Sun/Moon');
-      markSection('solar', { status: 'live', updatedAt: Date.now(), error: null });
     }
+
+    setStatus('astroStatus', swHit ? 'cached' : 'live', swHit ? _swCachedLabel(swHit) : 'LIVE');
+    clearDataSourceError('Sun/Moon');
+    markSection('solar', _freshPatch(swHit));
   } catch (err) {
+    if (!_requestCurrent(tok)) return;
     console.error('Sun/Moon fetch error:', err);
     recordDataSourceError('Sun/Moon', err);
     const _astroErrMsg = err && err.message ? err.message : String(err);
@@ -2728,6 +3012,7 @@ async function fetchSunMoon(lat, lng) {
       try {
         const k = typeof areaKey === 'function' ? areaKey(lat, lng) : `${lat.toFixed(3)}_${lng.toFixed(3)}`;
         const cached = await getCachedApiResponse('sunrise', k);
+        if (!_requestCurrent(tok)) return;
         if (cached && cached.data && cached.data.status === 'OK') {
           const r = cached.data.results;
           const fmt = iso => new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: _localTZ() });
@@ -2783,7 +3068,7 @@ function tfrGeoJsonUrlForBounds(bounds) {
 // Live TFR retrieval through the data proxy (Cloudflare Worker, /tfr/ route).
 // No-op when no proxy is configured — the manual download/import flow in the
 // NOTAMs tab still applies. Reuses the same parse/merge/render pipeline as import.
-async function fetchLiveTFRs(bounds) {
+async function fetchLiveTFRs(bounds, tok) {
   const base = (typeof getCanopyProxyBase === 'function') ? getCanopyProxyBase() : null;
   if (!base || !bounds) return;
   if (typeof isOnline === 'function' && !isOnline()) return;
@@ -2798,19 +3083,23 @@ async function fetchLiveTFRs(bounds) {
     const gj = await res.json();
     const parsed = (typeof parseTfrGeoJson === 'function') ? parseTfrGeoJson(gj) : { tfrs: [] };
     const tfrs = (parsed.tfrs || []).map(t => Object.assign({}, t, { _live: true }));
+    // Enrich each live TFR with altitude band + effective/expire times from its
+    // detail XML (the GeoServer WFS feed carries geometry + id + title only).
+    // Done BEFORE committing so an obsolete answer never touches S.tfrs.
+    const enriched = await enrichLiveTfrDetails(base, tfrs);
+    if (!_requestCurrent(tok)) return;
     // Replace the previously live-fetched set; keep any manually-imported TFRs.
     S.tfrs = (S.tfrs || []).filter(t => !t._live);
     if (tfrs.length) mergeTfrs(tfrs);
+    if (enriched.length) mergeTfrs(enriched);
     S.tfrImportMeta = { fileName: 'live', importedAtMs: Date.now(), source: 'FAA GeoServer (live via proxy)' };
-    // Enrich each live TFR with altitude band + effective/expire times from its
-    // detail XML (the GeoServer WFS feed carries geometry + id + title only).
-    await enrichLiveTfrDetails(base, tfrs);
     afterFaaImport();
     markSection('tfr', { status: 'live', updatedAt: S.tfrImportMeta.importedAtMs, error: null });
     if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
     setStatus('notamStatus', 'live', tfrs.length ? `${tfrs.length} TFR${tfrs.length > 1 ? 'S' : ''} LIVE` : 'NO TFR (LIVE)');
     clearDataSourceError('TFR');
   } catch (e) {
+    if (!_requestCurrent(tok)) return;
     console.warn('Live TFR fetch failed:', e);
     recordDataSourceError('TFR', e);
     markSection('tfr', { status: 'error', error: (e && e.message) ? e.message : String(e) });
@@ -2824,13 +3113,13 @@ async function fetchLiveTFRs(bounds) {
 // Fetch each live TFR's detail XML (altitude + effective/expire times) through the
 // proxy and merge it in by id. The WFS feed only carries geometry+id+title, so
 // without this every listed TFR is treated as active (conservative). Best-effort:
-// a failed/absent detail file just leaves that TFR geometry-only.
+// a failed/absent detail file just leaves that TFR geometry-only. Returns the
+// detail records for the caller to merge (it commits only if still current).
 async function enrichLiveTfrDetails(base, tfrs) {
-  if (!base || !Array.isArray(tfrs) || !tfrs.length || typeof parseTfrDetailXml !== 'function') return;
+  if (!base || !Array.isArray(tfrs) || !tfrs.length || typeof parseTfrDetailXml !== 'function') return [];
   const targets = tfrs.slice(0, 20); // the bbox already limits results; cap as a backstop
   const results = await Promise.allSettled(targets.map(t => _fetchTfrDetail(base, t.id)));
-  const enriched = results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value);
-  if (enriched.length) mergeTfrs(enriched);
+  return results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value);
 }
 
 async function _fetchTfrDetail(base, id) {
@@ -2865,7 +3154,7 @@ function _buildNotamAoi(lat, lng, searchRadiusNm) {
   };
 }
 
-async function fetchNotams(lat, lng, radiusNm) {
+async function fetchNotams(lat, lng, radiusNm, tok) {
   const base = (typeof getCanopyProxyBase === 'function') ? getCanopyProxyBase() : null;
   if (!base || lat == null || lng == null) return;
   if (typeof isOnline === 'function' && !isOnline()) return;
@@ -2881,6 +3170,7 @@ async function fetchNotams(lat, lng, radiusNm) {
       throw new Error('NOTAM HTTP ' + res.status + detail);
     }
     const data = await res.json();
+    if (!_requestCurrent(tok)) return;
     // A 200 whose body is not a search result must not become "0 NOTAMs · LIVE".
     if (!data || !Array.isArray(data.notamList)) throw new Error('NOTAM response malformed' + (data && data.error ? ': ' + data.error : ''));
     const parsed = (typeof parseNotamSearchResponse === 'function') ? parseNotamSearchResponse(data) : [];
@@ -2904,6 +3194,7 @@ async function fetchNotams(lat, lng, radiusNm) {
     _persistRestrictionCache();
     clearDataSourceError('NOTAM');
   } catch (e) {
+    if (!_requestCurrent(tok)) return;
     console.warn('Live NOTAM fetch failed:', e);
     recordDataSourceError('NOTAM', e);
     markSection('notam', { status: 'error', error: (e && e.message) ? e.message : String(e) });
@@ -2928,20 +3219,32 @@ function _notamSearchRadiusNm(center, bounds) {
 // Orchestrate live TFR + NOTAM for an area and set a single combined status.
 async function fetchLiveRestrictions(center, bounds) {
   if (!center) return;
+  // The combined check owns S.autoCheck and both legs' commits; a newer check
+  // or a new/cleared area supersedes it (see _beginRequest).
+  const tok = _beginRequest('restrictions');
+  // Every exit recomputes the assessment: S.autoCheck drives the TFR/NOTAM
+  // "unverified" advisories, and the legs' own recomputes run mid-check.
+  const reassess = () => { if (S.currentArea) computeAssessment(); };
   const proxySet = typeof getCanopyProxyBase === 'function' && !!getCanopyProxyBase();
-  if (!proxySet) { S.autoCheck = { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 }; renderAutoCheckStatus(); return; }
+  if (!proxySet) { S.autoCheck = { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 }; renderAutoCheckStatus(); reassess(); return; }
   if (typeof isOnline === 'function' && !isOnline()) {
     S.autoCheck = { state: 'error', ms: Date.now(), tfrCount: 0, notamCount: 0, tfrOk: false, notamOk: false };
     renderAutoCheckStatus();
+    reassess();
     return;
   }
 
   clearDataSourceError('TFR'); clearDataSourceError('NOTAM');
-  S.autoCheck = { state: 'checking', ms: 0, tfrCount: 0, notamCount: 0 };
+  // The previous pass's leg outcomes stay in force while this one runs, so a
+  // failed check keeps its advisory until a newer check actually succeeds.
+  const prev = S.autoCheck || {};
+  S.autoCheck = { state: 'checking', ms: 0, tfrCount: 0, notamCount: 0, tfrOk: prev.tfrOk, notamOk: prev.notamOk };
   renderAutoCheckStatus();
 
-  await fetchLiveTFRs(bounds);
-  await fetchNotams(center.lat, center.lng, _notamSearchRadiusNm(center, bounds));
+  await fetchLiveTFRs(bounds, tok);
+  if (!_requestCurrent(tok)) return;
+  await fetchNotams(center.lat, center.lng, _notamSearchRadiusNm(center, bounds), tok);
+  if (!_requestCurrent(tok)) return;
 
   const nt = (S.tfrs || []).filter(t => t._live).length;
   const nn = (S.importedNotams || []).filter(n => n._live).length;
@@ -2962,6 +3265,7 @@ async function fetchLiveRestrictions(center, bounds) {
   if (nn) parts.push(`${nn} NTM`);
   setStatus('notamStatus', state === 'error' ? 'error' : 'live',
     state === 'error' ? 'CHECK FAILED' : (parts.length ? parts.join(' · ') + ' LIVE' : 'NONE (LIVE)'));
+  reassess();
 }
 
 function reCheckRestrictionsNow() {
@@ -3962,26 +4266,31 @@ function computeAirspace(lat, lng) {
 // DYNAMIC AIRPORT QUERY VIA OVERPASS
 // ============================================================
 async function fetchNearbyAirports(center, bounds) {
+  const tok = _beginRequest('airports');
   trackFetchStart('Airports');
+  const cacheKey = typeof areaKey === 'function' ? areaKey(center.lat, center.lng) : `${center.lat.toFixed(3)}_${center.lng.toFixed(3)}`;
+  const commit = elements => {
+    S.nearbyAirports = _parseOverpassAirports(elements);
+    _setDataArea('airports', cacheKey);
+    renderAirportMarkers(center.lat, center.lng);
+    computeAirspace(center.lat, center.lng);
+  };
   try {
     const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
     const pad = 0.8; // ~55nm buffer for airport search
     const bbox = `${sw.lat - pad},${sw.lng - pad},${ne.lat + pad},${ne.lng + pad}`;
-    const cacheKey = typeof areaKey === 'function' ? areaKey(center.lat, center.lng) : `${center.lat.toFixed(3)}_${center.lng.toFixed(3)}`;
 
     // Try cached first
     if (typeof getCachedApiResponse === 'function') {
       const cached = await getCachedApiResponse('airports', cacheKey);
+      if (!_requestCurrent(tok)) return;
       if (cached && cached.data && cached.status !== 'expired') {
-        S.nearbyAirports = _parseOverpassAirports(cached.data);
-        renderAirportMarkers(center.lat, center.lng);
-        computeAirspace(center.lat, center.lng);
+        commit(cached.data);
         clearDataSourceError('Airports');
         const _aptFresh = cached.status === 'fresh';
         markSection('airspace', _aptFresh
           ? { source: 'airports', status: 'live', updatedAt: cached.timestamp, error: null }
           : { source: 'airports', status: 'cached', cachedAt: cached.timestamp, error: null });
-        trackFetchEnd('Airports');
         return;
       }
     }
@@ -3990,43 +4299,37 @@ async function fetchNearbyAirports(center, bounds) {
       + `nwr["aeroway"="aerodrome"](${bbox});`
       + `nwr["aeroway"="helipad"](${bbox});`
       + `);out body center;`;
+    const data = await _overpassFetch(query, { signal: tok.signal });
+    if (!_requestCurrent(tok)) return;
 
-    const overpassServers = [
-      'https://overpass-api.de/api/interpreter',
-      'https://overpass.kumi.systems/api/interpreter',
-      'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
-    ];
-    let data = null;
-    for (const server of overpassServers) {
-      try {
-        const res = await fetch(server, {
-          method: 'POST',
-          body: 'data=' + encodeURIComponent(query),
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        data = await res.json();
-        break;
-      } catch (e) {
-        console.warn(`Overpass airport mirror ${server} failed:`, e.message);
-        if (server === overpassServers[overpassServers.length - 1]) throw e;
-      }
-    }
-
-    S.nearbyAirports = _parseOverpassAirports(data);
-
+    commit(data);
     // Cache results
     if (typeof cacheApiResponse === 'function') cacheApiResponse('airports', cacheKey, data);
-
-    renderAirportMarkers(center.lat, center.lng);
-    computeAirspace(center.lat, center.lng);
     clearDataSourceError('Airports');
     markSection('airspace', { source: 'airports', status: 'live', updatedAt: Date.now(), error: null });
   } catch (err) {
+    if (!_requestCurrent(tok)) return;
     console.warn('Airport fetch failed:', err);
+    const msg = err && err.message ? err.message : String(err);
+    // An expired copy for THIS area beats nothing — labeled cached, with its age.
+    let cached = null;
+    if (typeof getCachedApiResponse === 'function') {
+      try { cached = await getCachedApiResponse('airports', cacheKey); } catch (_) { cached = null; }
+    }
+    if (!_requestCurrent(tok)) return;
     recordDataSourceError('Airports', err);
-    markSection('airspace', { source: 'airports', status: 'error', error: err && err.message ? err.message : String(err) });
-    S.nearbyAirports = [];
+    if (cached && cached.data) {
+      commit(cached.data);
+      markSection('airspace', { source: 'airports', status: 'cached', cachedAt: cached.timestamp, error: msg });
+      return;
+    }
+    // Keep this area's own earlier list (flagged stale); drop another area's.
+    if (!_dataIsForArea('airports', cacheKey)) {
+      S.nearbyAirports = [];
+      _setDataArea('airports', cacheKey);
+      renderAirportMarkers(center.lat, center.lng);
+    }
+    markSection('airspace', { source: 'airports', status: 'error', error: msg });
   } finally {
     trackFetchEnd('Airports');
   }
@@ -4156,6 +4459,7 @@ async function fetchNWSAlerts(lat, lng) {
       headers: { 'User-Agent': '(SAR-Preflight-Tool, github.com/TheCoderPerson/SAR-Preflight)' },
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const alertsSw = _swCacheStamp(res);
     const data = await res.json();
     const features = data.features || [];
 
@@ -4177,17 +4481,22 @@ async function fetchNWSAlerts(lat, lng) {
     renderNWSAlertPolygons();
     buildLayerControl();
 
-    // Cache NWS alerts data
-    if (typeof cacheApiResponse === 'function') cacheApiResponse('nws', areaKey(lat, lng), data);
-    if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+    // Cache NWS alerts data — only a genuine network answer: re-caching the
+    // SW's offline copy would restamp an old body with a fresh time.
+    if (!alertsSw) {
+      if (typeof cacheApiResponse === 'function') cacheApiResponse('nws', areaKey(lat, lng), data);
+      if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+    }
 
     clearDataSourceError('NWS Alerts');
+    const alertPill = alertsSw ? 'cached' : 'live';
+    const alertAge = alertsSw ? ' · ' + _swCachedLabel(alertsSw) : '';
     if (S.nwsAlerts.length > 0) {
-      setStatus('alertStatus', 'live', `${S.nwsAlerts.length} ALERT${S.nwsAlerts.length > 1 ? 'S' : ''}`);
+      setStatus('alertStatus', alertPill, `${S.nwsAlerts.length} ALERT${S.nwsAlerts.length > 1 ? 'S' : ''}${alertAge}`);
     } else {
-      setStatus('alertStatus', 'live', 'CLEAR');
+      setStatus('alertStatus', alertPill, alertsSw ? _swCachedLabel(alertsSw) : 'CLEAR');
     }
-    markSection('alerts', { status: 'live', updatedAt: Date.now(), error: null });
+    markSection('alerts', _freshPatch(alertsSw));
   } catch (err) {
     console.error('NWS Alerts fetch error:', err);
     recordDataSourceError('NWS Alerts', err);
@@ -4570,6 +4879,7 @@ function renderFAAairspaceLayers() {
 const UAS_CEILING_FT = 400; // Part 107 max AGL — the drone's operating band ceiling
 
 async function fetchFaaObstacles(bounds) {
+  const tok = _beginRequest('faaObstacles');
   trackFetchStart('FAA Obstacles');
   setStatus('obstacleStatus', 'loading', 'Fetching...');
   const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
@@ -4585,51 +4895,61 @@ async function fetchFaaObstacles(bounds) {
   const cacheKey = `${sw.lat.toFixed(3)}_${sw.lng.toFixed(3)}_${ne.lat.toFixed(3)}_${ne.lng.toFixed(3)}`;
 
   try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    // An ArcGIS error body (HTTP 200 + { error }) must fail, not read as "no obstacles".
+    const { json: data, sw: swHit } = await _readArcgisGeoJson(await fetch(url), 'FAA obstacles');
+    if (!_requestCurrent(tok)) return;
     S.faaObstacles = data;
+    _setDataArea('faaObstacles', cacheKey);
     renderObstacleLayer();
     updateObstacleDisplay(summarizeObstacles(data.features, UAS_CEILING_FT));
     computeAssessment();
 
-    if (typeof cacheApiResponse === 'function') cacheApiResponse('faa_obstacles', cacheKey, data);
-    if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+    // Only a genuine network answer is cached / stamped (see _freshPatch).
+    if (!swHit) {
+      if (typeof cacheApiResponse === 'function') cacheApiResponse('faa_obstacles', cacheKey, data);
+      if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+    }
 
     clearDataSourceError('FAA Obstacles');
-    const n = (data.features || []).length;
+    const n = data.features.length;
     // maxRecordCount on the service is 2000; flag if a large AO was clipped.
-    setStatus('obstacleStatus', 'live', n >= 2000 ? '2000+ (clipped)' : `${n}`);
+    const count = n >= 2000 ? '2000+ (clipped)' : `${n}`;
+    setStatus('obstacleStatus', swHit ? 'cached' : 'live', swHit ? count + ' · ' + _swCachedLabel(swHit) : count);
     buildLayerControl();
-    markSection('obstacles', { source: 'dof', status: 'live', updatedAt: Date.now(), error: null });
+    markSection('obstacles', Object.assign({ source: 'dof' }, _freshPatch(swHit)));
   } catch (err) {
+    if (!_requestCurrent(tok)) return;
     console.error('FAA Obstacles fetch error:', err);
-    recordDataSourceError('FAA Obstacles', err);
     const _dofErrMsg = err && err.message ? err.message : String(err);
-    markSection('obstacles', { source: 'dof', status: 'error', error: _dofErrMsg });
+    let cached = null;
     if (typeof getCachedApiResponse === 'function') {
-      try {
-        const cached = await getCachedApiResponse('faa_obstacles', cacheKey);
-        if (cached && cached.data) {
-          S.faaObstacles = cached.data;
-          renderObstacleLayer();
-          updateObstacleDisplay(summarizeObstacles(cached.data.features, UAS_CEILING_FT));
-          computeAssessment();
-          buildLayerControl();
-          const age = Date.now() - cached.timestamp;
-          const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
-          setStatus('obstacleStatus', 'cached', label);
-          markSection('obstacles', { source: 'dof', status: 'cached', cachedAt: cached.timestamp, error: _dofErrMsg });
-        } else {
-          setStatus('obstacleStatus', 'error', 'ERROR');
-        }
-      } catch (cacheErr) {
-        console.warn('FAA obstacles cache fallback failed:', cacheErr);
-        setStatus('obstacleStatus', 'error', 'ERROR');
-      }
-    } else {
-      setStatus('obstacleStatus', 'error', 'ERROR');
+      try { cached = await getCachedApiResponse('faa_obstacles', cacheKey); } catch (cacheErr) { console.warn('FAA obstacles cache fallback failed:', cacheErr); }
     }
+    if (!_requestCurrent(tok)) return;
+    recordDataSourceError('FAA Obstacles', err);
+    if (cached && cached.data && Array.isArray(cached.data.features)) {
+      S.faaObstacles = cached.data;
+      _setDataArea('faaObstacles', cacheKey);
+      renderObstacleLayer();
+      updateObstacleDisplay(summarizeObstacles(cached.data.features, UAS_CEILING_FT));
+      computeAssessment();
+      buildLayerControl();
+      const age = Date.now() - cached.timestamp;
+      setStatus('obstacleStatus', 'cached', typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED');
+      markSection('obstacles', { source: 'dof', status: 'cached', cachedAt: cached.timestamp, error: _dofErrMsg });
+      return;
+    }
+    // Nothing for this area: drop another area's obstacles and put
+    // "unchecked" in the banner rather than letting it read as "none".
+    if (!_dataIsForArea('faaObstacles', cacheKey)) {
+      S.faaObstacles = { type: 'FeatureCollection', features: [], _unavailable: true };
+      _setDataArea('faaObstacles', cacheKey);
+      renderObstacleLayer();
+      buildLayerControl();
+    }
+    markSection('obstacles', { source: 'dof', status: 'error', error: _dofErrMsg });
+    setStatus('obstacleStatus', 'error', 'ERROR');
+    if (S.currentArea) computeAssessment();
   } finally {
     trackFetchEnd('FAA Obstacles');
   }
@@ -4685,7 +5005,18 @@ function updateObstacleDisplay(summary) {
 // API: CRITICAL INFRASTRUCTURE & PROTECTED AREAS (FREE, no key)
 // Dams (49 USC § 46307), Wilderness (USFS), National Parks (NPS)
 // ============================================================
+const PROTECTED_LAYER_LABELS = { dams: 'Dams', wilderness: 'Wilderness', nationalParks: 'National Parks' };
+
+// Show the dam line (or UNKNOWN when the dam layer could not be checked).
+function _renderProtectedDamCell(data) {
+  if ((data._unavailable || []).includes('dams')) { markCellsUnknown(['terrHwy']); return; }
+  if (data.dams.length > 0) {
+    setText('terrHwy', `${data.dams.length} dam${data.dams.length > 1 ? 's' : ''} within area — see map`);
+  }
+}
+
 async function fetchProtectedAreas(bounds) {
+  const tok = _beginRequest('protectedAreas');
   trackFetchStart('Protected Areas');
   setStatus('protectedAreasStatus', 'loading', 'Fetching...');
   const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
@@ -4702,65 +5033,108 @@ async function fetchProtectedAreas(bounds) {
 
   try {
     const keys = Object.keys(urls);
-    const results = await Promise.allSettled(keys.map(k => fetch(urls[k]).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })));
+    const results = await Promise.allSettled(keys.map(k =>
+      fetch(urls[k]).then(r => _readArcgisGeoJson(r, PROTECTED_LAYER_LABELS[k]))));
 
+    // Failure is never "none found" (the dam advisory would silently vanish):
+    // a failed layer takes this area's cached copy where one exists, else it
+    // is listed in `_unavailable` → an "unverified" advisory in the banner.
     const data = { dams: [], wilderness: [], nationalParks: [] };
+    const failed = [];
+    let swCachedAt = null, swFallback = false;
     keys.forEach((k, i) => {
-      if (results[i].status === 'fulfilled') {
-        const gj = results[i].value;
-        data[k] = (gj && gj.features) ? gj.features : [];
+      const r = results[i];
+      if (r.status === 'fulfilled') {
+        data[k] = r.value.json.features;
+        if (r.value.sw) {
+          swFallback = true;
+          const t = r.value.sw.cachedAt;
+          if (t != null) swCachedAt = swCachedAt == null ? t : Math.min(swCachedAt, t);
+        }
+      } else {
+        failed.push({ key: k, reason: (r.reason && r.reason.message) ? r.reason.message : String(r.reason) });
       }
     });
+    if (failed.length === keys.length) throw new Error('All protected-area requests failed (' + failed[0].reason + ')');
+
+    let cached = null;
+    if (failed.length && typeof getCachedApiResponse === 'function') {
+      try { cached = await getCachedApiResponse('protected_areas', cacheKey); } catch (_) { cached = null; }
+    }
+    if (!_requestCurrent(tok)) return;
+    const cachedFilled = [], unavailable = [];
+    failed.forEach(f => {
+      const c = cached && cached.data;
+      if (c && Array.isArray(c[f.key]) && !(c._unavailable || []).includes(f.key)) {
+        data[f.key] = c[f.key]; cachedFilled.push(f.key);
+      } else {
+        unavailable.push(f.key);
+      }
+    });
+    if (unavailable.length) data._unavailable = unavailable;
 
     S.protectedAreas = data;
+    _setDataArea('protectedAreas', cacheKey);
     renderProtectedAreaLayers();
+    _renderProtectedDamCell(data);
 
-    // Update terrain tab dam info
-    if (data.dams.length > 0) {
-      setText('terrHwy', `${data.dams.length} dam${data.dams.length > 1 ? 's' : ''} within area \u2014 see map`);
+    // Cache — only a COMPLETE live result (a partial one would overwrite the
+    // last good copy with holes; a SW offline copy would get a fresh stamp).
+    if (!failed.length && !swFallback) {
+      if (typeof cacheApiResponse === 'function') cacheApiResponse('protected_areas', cacheKey, data);
+      if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
     }
-
-    // Cache
-    if (typeof cacheApiResponse === 'function') {
-      cacheApiResponse('protected_areas', cacheKey, data);
-    }
-    if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
-
-    clearDataSourceError('Protected Areas');
-    const total = data.dams.length + data.wilderness.length + data.nationalParks.length;
-    setStatus('protectedAreasStatus', 'live', total > 0 ? `${total} FOUND` : 'CLEAR');
     buildLayerControl();
-    markSection('obstacles', { source: 'protected', status: 'live', updatedAt: Date.now(), error: null });
-  } catch (err) {
-    console.error('Protected Areas fetch error:', err);
-    recordDataSourceError('Protected Areas', err);
-    const _protErrMsg = err && err.message ? err.message : String(err);
-    markSection('obstacles', { source: 'protected', status: 'error', error: _protErrMsg });
-    // Try cached data
-    if (typeof getCachedApiResponse === 'function') {
-      try {
-        const cached = await getCachedApiResponse('protected_areas', cacheKey);
-        if (cached && cached.data) {
-          S.protectedAreas = cached.data;
-          renderProtectedAreaLayers();
-          if (cached.data.dams && cached.data.dams.length > 0) {
-            setText('terrHwy', `${cached.data.dams.length} dam${cached.data.dams.length > 1 ? 's' : ''} within area \u2014 see map`);
-          }
-          buildLayerControl();
-          const age = Date.now() - cached.timestamp;
-          const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
-          setStatus('protectedAreasStatus', 'cached', label);
-          markSection('obstacles', { source: 'protected', status: 'cached', cachedAt: cached.timestamp, error: _protErrMsg });
-        } else {
-          setStatus('protectedAreasStatus', 'error', 'ERROR');
-        }
-      } catch (cacheErr) {
-        console.warn('Protected areas cache fallback failed:', cacheErr);
-        setStatus('protectedAreasStatus', 'error', 'ERROR');
-      }
+
+    const total = data.dams.length + data.wilderness.length + data.nationalParks.length;
+    if (failed.length) {
+      const label = k => PROTECTED_LAYER_LABELS[k];
+      const msg = failed.length + ' of ' + keys.length + ' protected-area layers failed — '
+        + failed.map(f => f.reason).join(', ')
+        + (cachedFilled.length ? '; cached copy used for ' + cachedFilled.map(label).join(', ') : '')
+        + (unavailable.length ? '; ' + unavailable.map(label).join(', ') + ' UNAVAILABLE' : '');
+      recordDataSourceError('Protected Areas', new Error(msg));
+      setStatus('protectedAreasStatus', 'partial', 'PARTIAL · ' + failed.length + '/' + keys.length + ' FAILED');
+      markSection('obstacles', { source: 'protected', status: 'error', error: msg, partial: true,
+        cachedAt: cachedFilled.length ? cached.timestamp : null });
     } else {
-      setStatus('protectedAreasStatus', 'error', 'ERROR');
+      clearDataSourceError('Protected Areas');
+      const sw = swFallback ? { cachedAt: swCachedAt } : null;
+      setStatus('protectedAreasStatus', sw ? 'cached' : 'live',
+        sw ? _swCachedLabel(sw) : (total > 0 ? `${total} FOUND` : 'CLEAR'));
+      markSection('obstacles', Object.assign({ source: 'protected' }, _freshPatch(sw)));
     }
+  } catch (err) {
+    if (!_requestCurrent(tok)) return;
+    console.error('Protected Areas fetch error:', err);
+    const _protErrMsg = err && err.message ? err.message : String(err);
+    let cached = null;
+    if (typeof getCachedApiResponse === 'function') {
+      try { cached = await getCachedApiResponse('protected_areas', cacheKey); } catch (cacheErr) { console.warn('Protected areas cache fallback failed:', cacheErr); }
+    }
+    if (!_requestCurrent(tok)) return;
+    recordDataSourceError('Protected Areas', err);
+    if (cached && cached.data) {
+      S.protectedAreas = cached.data;
+      _setDataArea('protectedAreas', cacheKey);
+      renderProtectedAreaLayers();
+      _renderProtectedDamCell(cached.data);
+      buildLayerControl();
+      const age = Date.now() - cached.timestamp;
+      setStatus('protectedAreasStatus', 'cached', typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED');
+      markSection('obstacles', { source: 'protected', status: 'cached', cachedAt: cached.timestamp, error: _protErrMsg });
+      return;
+    }
+    // Nothing for this area: another area's dams/parks must not stand in, and
+    // "unchecked" must reach the banner rather than read as "none nearby".
+    if (!_dataIsForArea('protectedAreas', cacheKey)) {
+      S.protectedAreas = { dams: [], wilderness: [], nationalParks: [], _unavailable: Object.keys(urls) };
+      _setDataArea('protectedAreas', cacheKey);
+      renderProtectedAreaLayers();
+      buildLayerControl();
+    }
+    markSection('obstacles', { source: 'protected', status: 'error', error: _protErrMsg });
+    setStatus('protectedAreasStatus', 'error', 'ERROR');
   } finally {
     trackFetchEnd('Protected Areas');
   }
@@ -5395,6 +5769,7 @@ function _renderHospitals(elements) {
   return { total: nH + nL, hospitals: nH, helipads: nL };
 }
 async function fetchHospitals(bounds) {
+  const tok = _beginRequest('hospitals');
   trackFetchStart('Hospitals');
   setStatus('hospitalsStatus', 'loading', 'Fetching...');
   const cacheKey = _bboxCacheKey(bounds);
@@ -5406,30 +5781,34 @@ async function fetchHospitals(bounds) {
     + `nwr["aeroway"="helipad"](${bbox});`
     + `nwr["emergency"="landing_site"](${bbox});`
     + `);out center tags;`;
-  let data = null, fromCache = false, cachedAt = null;
+  let data = null, fromCache = false, cachedAt = null, fetchErr = null;
   try {
     if ((typeof isOnline !== 'function') || isOnline()) {
-      for (const server of OVERPASS_MIRRORS) {
-        try {
-          const res = await fetch(server, { method: 'POST', body: 'data=' + encodeURIComponent(query), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-          if (!res.ok) throw new Error('HTTP ' + res.status);
-          data = await res.json(); break;
-        } catch (_) { /* try next mirror */ }
-      }
+      try { data = await _overpassFetch(query, { signal: tok.signal }); } catch (e) { fetchErr = e; }
+    } else {
+      fetchErr = new Error('offline');
     }
+    if (!_requestCurrent(tok)) return;
     if (data) { if (typeof cacheApiResponse === 'function') cacheApiResponse('hospitals', cacheKey, data); }
     else if (typeof getCachedApiResponse === 'function') {
       try { const c = await getCachedApiResponse('hospitals', cacheKey); if (c && c.data) { data = c.data; fromCache = true; cachedAt = c.timestamp; } } catch (_) { /* ignore */ }
+      if (!_requestCurrent(tok)) return;
     }
-    let counts = { total: 0, hospitals: 0, helipads: 0 };
-    if (data) counts = _renderHospitals(data.elements || []);
-    setText('terrHospitals', data
-      ? (counts.total ? `${counts.hospitals} hospitals · ${counts.helipads} helipads` : 'None found in area')
-      : 'Unavailable (offline, no cache)');
+    const errMsg = fetchErr ? (fetchErr.message || String(fetchErr)) : null;
+    if (data) {
+      const counts = _renderHospitals(data.elements || []);
+      _setDataArea('hospitals', cacheKey);
+      setText('terrHospitals', counts.total ? `${counts.hospitals} hospitals · ${counts.helipads} helipads` : 'None found in area');
+    } else if (!_dataIsForArea('hospitals', cacheKey)) {
+      // Another area's hospitals/helipads must not stay on this area's map.
+      _renderHospitals([]);
+      _setDataArea('hospitals', cacheKey);
+      setText('terrHospitals', 'Unavailable (no data or cache)');
+    }
     if (typeof markSection === 'function') {
       if (data && !fromCache) markSection('hospitals', { status: 'live', updatedAt: Date.now(), error: null });
-      else if (data && fromCache) markSection('hospitals', { status: 'cached', cachedAt: cachedAt || Date.now(), error: null });
-      else markSection('hospitals', { status: 'error', error: 'No data' });
+      else if (data && fromCache) markSection('hospitals', { status: 'cached', cachedAt: cachedAt || Date.now(), error: errMsg });
+      else markSection('hospitals', { status: 'error', error: errMsg || 'No data' });
     }
     _syncStatusFromMeta('hospitalsStatus', 'hospitals');
     buildLayerControl();
@@ -5460,6 +5839,7 @@ function _renderTrails(records) {
   return (records || []).length;
 }
 async function fetchTrails(bounds) {
+  const tok = _beginRequest('trails');
   trackFetchStart('Trails');
   setStatus('trailsStatus', 'loading', 'Fetching...');
   const cacheKey = _bboxCacheKey(bounds);
@@ -5467,30 +5847,34 @@ async function fetchTrails(bounds) {
   const pad = 0.015; // hug the ops area — trails are dense data
   const bbox = `${sw.lat - pad},${sw.lng - pad},${ne.lat + pad},${ne.lng + pad}`;
   const query = buildTrailsOverpassQuery(bbox);
-  let data = null, fromCache = false, cachedAt = null;
+  let data = null, fromCache = false, cachedAt = null, fetchErr = null;
   try {
     if ((typeof isOnline !== 'function') || isOnline()) {
-      for (const server of OVERPASS_MIRRORS) {
-        try {
-          const res = await fetch(server, { method: 'POST', body: 'data=' + encodeURIComponent(query), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-          if (!res.ok) throw new Error('HTTP ' + res.status);
-          data = await res.json(); break;
-        } catch (_) { /* try next mirror */ }
-      }
+      try { data = await _overpassFetch(query, { signal: tok.signal }); } catch (e) { fetchErr = e; }
+    } else {
+      fetchErr = new Error('offline');
     }
+    if (!_requestCurrent(tok)) return;
     if (data) { if (typeof cacheApiResponse === 'function') cacheApiResponse('trails', cacheKey, data); }
     else if (typeof getCachedApiResponse === 'function') {
       try { const c = await getCachedApiResponse('trails', cacheKey); if (c && c.data) { data = c.data; fromCache = true; cachedAt = c.timestamp; } } catch (_) { /* ignore */ }
+      if (!_requestCurrent(tok)) return;
     }
-    let count = 0;
-    if (data) count = _renderTrails(parseOverpassTrails(data));
-    setText('terrTrails', data
-      ? (count ? `${count} named trail${count === 1 ? '' : 's'} / paths` : 'None found in area')
-      : 'Unavailable (offline, no cache)');
+    const errMsg = fetchErr ? (fetchErr.message || String(fetchErr)) : null;
+    if (data) {
+      const count = _renderTrails(parseOverpassTrails(data));
+      _setDataArea('trails', cacheKey);
+      setText('terrTrails', count ? `${count} named trail${count === 1 ? '' : 's'} / paths` : 'None found in area');
+    } else if (!_dataIsForArea('trails', cacheKey)) {
+      // Another area's trails must not stay on this area's map.
+      _renderTrails([]);
+      _setDataArea('trails', cacheKey);
+      setText('terrTrails', 'Unavailable (no data or cache)');
+    }
     if (typeof markSection === 'function') {
       if (data && !fromCache) markSection('trails', { status: 'live', updatedAt: Date.now(), error: null });
-      else if (data && fromCache) markSection('trails', { status: 'cached', cachedAt: cachedAt || Date.now(), error: null });
-      else markSection('trails', { status: 'error', error: 'No data' });
+      else if (data && fromCache) markSection('trails', { status: 'cached', cachedAt: cachedAt || Date.now(), error: errMsg });
+      else markSection('trails', { status: 'error', error: errMsg || 'No data' });
     }
     _syncStatusFromMeta('trailsStatus', 'trails');
     buildLayerControl();
@@ -5590,29 +5974,58 @@ function cellCoverageReadout(lat, lng, centerElevFt) {
 // POST an Overpass QL query, trying each public mirror in turn (the primary
 // is frequently overloaded). Resolves the parsed JSON; rejects only when
 // every mirror fails.
-async function _overpassFetch(query) {
-  const overpassServers = [
-    'https://overpass-api.de/api/interpreter',
-    'https://overpass.kumi.systems/api/interpreter',
-    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
-  ];
-  for (const server of overpassServers) {
+//   opts.signal    — caller cancellation (e.g. tok.signal): stops at once,
+//                    tries no further mirror, rejects with an AbortError.
+//   opts.timeoutMs — per-mirror limit (default overpassMirrorTimeoutMs);
+//                    the whole call is also capped at twice that, so a run
+//                    of slow mirrors fails in bounded time instead of minutes.
+function _abortError() { const e = new Error('cancelled'); e.name = 'AbortError'; return e; }
+async function _overpassFetch(query, opts) {
+  const signal = opts && opts.signal;
+  const perMirrorMs = (opts && opts.timeoutMs) || overpassMirrorTimeoutMs(query);
+  const deadline = Date.now() + 2 * perMirrorMs;
+  let lastErr = null;
+  for (const server of OVERPASS_MIRRORS) {
+    if (signal && signal.aborted) throw _abortError();
+    const left = deadline - Date.now();
+    if (left <= 0) { lastErr = new Error(`no answer within ${Math.round(2 * perMirrorMs / 1000)} s overall`); break; }
+    const limit = Math.min(perMirrorMs, left);
+    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    let timedOut = false;
+    const timer = ctl ? setTimeout(() => { timedOut = true; ctl.abort(); }, limit) : null;
+    const onCancel = () => { if (ctl) ctl.abort(); };
+    if (signal) signal.addEventListener('abort', onCancel, { once: true });
     try {
       const res = await fetch(server, {
         method: 'POST',
         body: 'data=' + encodeURIComponent(query),
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        signal: ctl ? ctl.signal : undefined,
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
+      let data;
+      try { data = await res.json(); } catch (_) { throw new Error('response is not valid JSON'); }
+      if (!data || !Array.isArray(data.elements)) throw new Error('response has no elements list');
+      // A timed-out / out-of-memory query answers HTTP 200 with an EMPTY
+      // elements list and a "runtime error" remark — a failure (try the next
+      // mirror), never "nothing here".
+      if (data.remark && /error/i.test(data.remark)) throw new Error(String(data.remark).slice(0, 160));
+      return data;
     } catch (e) {
-      console.warn(`Overpass mirror ${server} failed:`, e.message);
-      if (server === overpassServers[overpassServers.length - 1]) throw e;
+      if (signal && signal.aborted) throw _abortError(); // superseded: no further mirrors
+      const err = timedOut ? new Error(`no answer within ${Math.round(limit / 1000)} s`) : e;
+      console.warn(`Overpass mirror ${server} failed:`, err.message);
+      lastErr = err;
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onCancel);
     }
   }
+  throw new Error('Overpass: all mirrors failed (' + (lastErr ? lastErr.message : 'unknown') + ')');
 }
 
 async function fetchWireHazards(bounds) {
+  const tok = _beginRequest('wireHazards');
   trackFetchStart('Wire Hazards');
   setStatus('wireStatus', 'loading', 'Fetching...');
   // Only the OSM-sourced categories — the utility_* layers belong to
@@ -5646,8 +6059,14 @@ async function fetchWireHazards(bounds) {
     + `node["man_made"="antenna"](${bbox});`
     + `);out body;>;out skel qt;`;
 
+  const wireKey = typeof areaKey === 'function'
+    ? areaKey((sw.lat + ne.lat) / 2, (sw.lng + ne.lng) / 2)
+    : `${((sw.lat + ne.lat) / 2).toFixed(3)}_${((sw.lng + ne.lng) / 2).toFixed(3)}`;
+
   try {
-    const data = await _overpassFetch(query);
+    const data = await _overpassFetch(query, { signal: tok.signal });
+    // A newer area/refresh owns the wire layers now — don't draw into them.
+    if (!_requestCurrent(tok)) return;
     const elements = data.elements || [];
 
     const nodes = {};
@@ -5734,6 +6153,7 @@ async function fetchWireHazards(bounds) {
     S.towerCount = towerCount;
 
     S.wireHazardCounts = counts;
+    _setDataArea('wireHazards', wireKey);
     const total = Object.values(counts).reduce((a, b) => a + b, 0);
     updateWireDisplay(counts, towerCount);
     buildLayerControl();
@@ -5750,6 +6170,7 @@ async function fetchWireHazards(bounds) {
     clearDataSourceError('Wire Hazards');
     markSection('obstacles', { source: 'wire', status: 'live', updatedAt: Date.now(), error: null });
   } catch (err) {
+    if (!_requestCurrent(tok)) return;
     console.error('Wire hazard fetch error:', err);
     recordDataSourceError('Wire Hazards', err);
     const _wireErrMsg = err && err.message ? err.message : String(err);
@@ -5761,6 +6182,7 @@ async function fetchWireHazards(bounds) {
         const cLng = (sw.lng + ne.lng) / 2;
         const k = typeof areaKey === 'function' ? areaKey(cLat, cLng) : `${cLat.toFixed(3)}_${cLng.toFixed(3)}`;
         const cached = await getCachedApiResponse('overpass', k);
+        if (!_requestCurrent(tok)) return;
         if (cached && cached.data && cached.data.elements) {
           const elements = cached.data.elements;
           const nodes = {};
@@ -5778,6 +6200,7 @@ async function fetchWireHazards(bounds) {
             if (cat) counts[cat] = (counts[cat] || 0) + 1;
           });
           S.wireHazardCounts = counts;
+          _setDataArea('wireHazards', wireKey);
           const total = Object.values(counts).reduce((a, b) => a + b, 0);
           updateWireDisplay(counts, 0);
           const age = Date.now() - cached.timestamp;
@@ -5795,6 +6218,12 @@ async function fetchWireHazards(bounds) {
     } else {
       setStatus('wireStatus', 'error', 'ERROR');
     }
+    // The layers were cleared up front; drop another area's counts too so
+    // the mission log / exports never report them for this area.
+    if (!_dataIsForArea('wireHazards', wireKey)) {
+      S.wireHazardCounts = {}; S.towerCount = 0;
+      _setDataArea('wireHazards', wireKey);
+    }
   } finally {
     trackFetchEnd('Wire Hazards');
   }
@@ -5808,6 +6237,7 @@ async function fetchWireHazards(bounds) {
 // the OSM Overpass fetch runs everywhere regardless, so non-PG&E territory
 // (Tahoe basin, Roseville, out of state) keeps exactly the old behavior.
 async function fetchUtilityWires(bounds) {
+  const tok = _beginRequest('utilityWires');
   // Clear/create only the utility categories; the OSM ones belong to fetchWireHazards.
   Object.keys(WIRE_CATEGORIES).filter(k => WIRE_CATEGORIES[k].src === 'utility').forEach(k => {
     const lid = 'wire_' + k;
@@ -5826,29 +6256,37 @@ async function fetchUtilityWires(bounds) {
   trackFetchStart('Utility Circuits');
   const cLat = (sw.lat + ne.lat) / 2, cLng = (sw.lng + ne.lng) / 2;
   const k = typeof areaKey === 'function' ? areaKey(cLat, cLng) : `${cLat.toFixed(3)}_${cLng.toFixed(3)}`;
-  let anyLive = false, anyFailed = false, lastErr = null, oldestCache = null;
+  let anyLive = false, anyFailed = false, anyCached = false, lastErr = null, oldestCache = null;
+  const noteCache = t => { anyCached = true; if (t != null && (oldestCache == null || t < oldestCache)) oldestCache = t; };
 
   await Promise.all(sources.map(async cfg => {
     try {
-      const res = await fetch(utilityWireQueryUrl(cfg, bbox));
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const gj = await res.json();
-      // ArcGIS can report failure inside an HTTP-200 body (same lesson as parcels).
-      if (gj && gj.error) throw new Error(gj.error.message || 'ArcGIS query error');
+      // HTTP status, ArcGIS error-in-200 bodies and a missing features list
+      // all fail here (same lesson as parcels) — never "no circuits".
+      const { json: gj, sw: swHit } = await _readArcgisGeoJson(await fetch(utilityWireQueryUrl(cfg, bbox)), cfg.label);
+      if (!_requestCurrent(tok)) return; // a newer area owns the utility layers
       const recs = normalizeUtilityWires(gj.features, cfg, Date.now(), bbox);
       const truncated = !!(gj.properties && gj.properties.exceededTransferLimit) || !!gj.exceededTransferLimit;
       _renderUtilityWires(recs);
       S.utilityWireCounts[cfg.category] = (S.utilityWireCounts[cfg.category] || 0) + recs.length;
-      S.utilityWireInfo[cfg.id] = { label: cfg.label, count: recs.length, truncated };
-      anyLive = true;
-      if (typeof cacheApiResponse === 'function') cacheApiResponse('utility_wires', `${k}:${cfg.id}`, { recs, truncated });
+      S.utilityWireInfo[cfg.id] = swHit
+        ? { label: cfg.label, count: recs.length, truncated, fromCache: true, cachedAt: swHit.cachedAt }
+        : { label: cfg.label, count: recs.length, truncated };
+      // A SW offline copy is labeled cached and not re-saved with a fresh time.
+      if (swHit) noteCache(swHit.cachedAt);
+      else {
+        anyLive = true;
+        if (typeof cacheApiResponse === 'function') cacheApiResponse('utility_wires', `${k}:${cfg.id}`, { recs, truncated });
+      }
     } catch (err) {
+      if (!_requestCurrent(tok)) return;
       console.warn(`Utility circuits (${cfg.label}) fetch failed:`, err);
       lastErr = err;
       let served = false;
       if (typeof getCachedApiResponse === 'function') {
         try {
           const cached = await getCachedApiResponse('utility_wires', `${k}:${cfg.id}`);
+          if (!_requestCurrent(tok)) return;
           if (cached && cached.data && Array.isArray(cached.data.recs)) {
             _renderUtilityWires(cached.data.recs);
             S.utilityWireCounts[cfg.category] = (S.utilityWireCounts[cfg.category] || 0) + cached.data.recs.length;
@@ -5856,7 +6294,7 @@ async function fetchUtilityWires(bounds) {
               label: cfg.label, count: cached.data.recs.length, truncated: !!cached.data.truncated,
               fromCache: true, cachedAt: cached.timestamp,
             };
-            if (oldestCache == null || cached.timestamp < oldestCache) oldestCache = cached.timestamp;
+            noteCache(cached.timestamp);
             served = true;
           }
         } catch (cacheErr) { console.warn('Utility circuits cache fallback failed:', cacheErr); }
@@ -5864,6 +6302,7 @@ async function fetchUtilityWires(bounds) {
       if (!served) { anyFailed = true; S.utilityWireInfo[cfg.id] = { label: cfg.label, failed: true }; }
     }
   }));
+  if (!_requestCurrent(tok)) { trackFetchEnd('Utility Circuits'); return; }
 
   updateWireDisplay(S.wireHazardCounts, S.towerCount);
   buildLayerControl();
@@ -5872,8 +6311,10 @@ async function fetchUtilityWires(bounds) {
     markSection('obstacles', { source: 'utility', status: 'error', error: lastErr && lastErr.message ? lastErr.message : 'fetch failed' });
   } else {
     clearDataSourceError('Utility Circuits');
-    if (anyLive) markSection('obstacles', { source: 'utility', status: 'live', updatedAt: Date.now(), error: null });
-    else markSection('obstacles', { source: 'utility', status: 'cached', cachedAt: oldestCache });
+    // Any circuit layer served from a cache makes the whole line "cached"
+    // (oldest time) — a live answer for one source must not relabel the other.
+    if (anyCached) markSection('obstacles', { source: 'utility', status: 'cached', cachedAt: oldestCache, updatedAt: null, error: null });
+    else if (anyLive) markSection('obstacles', { source: 'utility', status: 'live', updatedAt: Date.now(), error: null });
   }
   trackFetchEnd('Utility Circuits');
 }
@@ -7027,28 +7468,61 @@ function onThresholdEdit() {
   if (S.currentArea) { computeOpsData(); computeAssessment(); }
 }
 
+// Wind assumed for battery planning when the wind is UNAVAILABLE: the worst
+// band calcBatteryDerating knows (> 25 mph → 65%). `?? 5` used to assume near
+// calm, i.e. full endurance and the widest swap radius — the unsafe direction.
+const OPS_UNKNOWN_WIND_MPH = 30;
+
 function computeOpsData(snap) {
   snap = snap || snapshotAtIdx(S.timeIdx || 0);
   const _t = readActiveThresholds();
-  const temp = snap.temperature_2m ?? 65;
-  const elev = S.elev.center ?? 1500;
-  const maxWind = S.wind.maxWind ?? 5;
+  // A missing reading falls back to a stated assumption, and every cell that
+  // depends on it says so (the assessment banner carries the same warning).
+  const tempKnown = Number.isFinite(snap.temperature_2m);
+  const temp = tempKnown ? snap.temperature_2m : ASSUMED_TEMP_F;
+  const elevKnown = !!S.elev && Number.isFinite(S.elev.center);
+  const elev = elevKnown ? S.elev.center : ASSUMED_ELEV_FT;
+  const windKnown = !!S.wind && Number.isFinite(S.wind.maxWind);
+  const maxWind = windKnown ? S.wind.maxWind : OPS_UNKNOWN_WIND_MPH;
   const nomTime = _t.flightTime || 38;
+  const tempAssumed = `assuming ${ASSUMED_TEMP_F} °F (worst case)`;
+  const elevAssumed = `assuming ${ASSUMED_ELEV_FT.toLocaleString('en-US')} ft (worst case)`;
 
   // Uses extracted core function
   const d = calcBatteryDerating(temp, elev, maxWind);
   const estTime = Math.round(nomTime * d.combined);
   const capacity = Math.round(d.combined * 100);
+  const assumed = [];
+  if (!windKnown) assumed.push('wind unknown — worst case');
+  if (!tempKnown) assumed.push(`temp missing, ${tempAssumed}`);
+  if (!elevKnown) assumed.push(`elevation missing, ${elevAssumed}`);
+  const assumeNote = assumed.length ? ` (${assumed.join('; ')})` : '';
 
-  setText('opsTempFactor', `${(d.tempFactor*100).toFixed(0)}%`);
-  setColor('opsTempFactor', d.tempFactor > 0.9 ? 'green' : d.tempFactor > 0.8 ? 'amber' : 'red');
-  setText('opsAltFactor', `${(d.altFactor*100).toFixed(0)}%`);
-  setColor('opsAltFactor', d.altFactor > 0.9 ? 'green' : d.altFactor > 0.8 ? 'amber' : 'red');
-  setText('opsWindFactor', `${(d.windFactor*100).toFixed(0)}%`);
-  setColor('opsWindFactor', d.windFactor > 0.85 ? 'green' : d.windFactor > 0.7 ? 'amber' : 'red');
-  setText('opsFlightTime', `~${estTime} min`);
-  setColor('opsFlightTime', estTime > 28 ? 'green' : estTime > 20 ? 'amber' : 'red');
-  setText('opsCapacity', `${capacity}% of nominal`);
+  if (tempKnown) {
+    setText('opsTempFactor', `${(d.tempFactor*100).toFixed(0)}%`);
+    setColor('opsTempFactor', d.tempFactor > 0.9 ? 'green' : d.tempFactor > 0.8 ? 'amber' : 'red');
+  } else {
+    setText('opsTempFactor', `Temp missing, ${tempAssumed} → ${(d.tempFactor*100).toFixed(0)}%`);
+    setColor('opsTempFactor', 'amber');
+  }
+  if (elevKnown) {
+    setText('opsAltFactor', `${(d.altFactor*100).toFixed(0)}%`);
+    setColor('opsAltFactor', d.altFactor > 0.9 ? 'green' : d.altFactor > 0.8 ? 'amber' : 'red');
+  } else {
+    setText('opsAltFactor', `Elevation missing, ${elevAssumed} → ${(d.altFactor*100).toFixed(0)}%`);
+    setColor('opsAltFactor', 'amber');
+  }
+  if (windKnown) {
+    setText('opsWindFactor', `${(d.windFactor*100).toFixed(0)}%`);
+    setColor('opsWindFactor', d.windFactor > 0.85 ? 'green' : d.windFactor > 0.7 ? 'amber' : 'red');
+  } else {
+    setText('opsWindFactor', `UNKNOWN — assumes ${(d.windFactor*100).toFixed(0)}%`);
+    setColor('opsWindFactor', 'amber');
+  }
+  setText('opsFlightTime', `~${estTime} min${assumeNote}`);
+  // An estimate resting on an assumed input is never shown green.
+  setColor('opsFlightTime', estTime > 28 && !assumed.length ? 'green' : estTime > 20 ? 'amber' : 'red');
+  setText('opsCapacity', `${capacity}% of nominal${assumeNote}`);
   const bar = document.getElementById('opsCapBar');
   bar.style.width = `${capacity}%`;
   bar.style.background = capacity > 85 ? 'var(--accent-green)' : capacity > 70 ? 'var(--accent-amber)' : 'var(--accent-red)';
@@ -7134,7 +7608,7 @@ function computeOpsData(snap) {
   if (typeof calcSwapRecommendation === 'function') {
     const cruiseSpeed = 20; // mph default for SAR ops
     const swap = calcSwapRecommendation(estTime, cruiseSpeed, S.lzs || []);
-    setText('opsSwapTime', `~${Math.round(swap.swapTimeMin)} min`);
+    setText('opsSwapTime', `~${Math.round(swap.swapTimeMin)} min${assumeNote}`);
     setText('opsSwapRadius', `${swap.swapRadiusKm.toFixed(1)} km`);
     if (swap.nearestLZ) {
       setText('opsSwapLZ', `Score ${Math.round(swap.nearestLZ.score * 100)}% at (${swap.nearestLZ.lat.toFixed(4)}, ${swap.nearestLZ.lng.toFixed(4)})`);
@@ -7178,21 +7652,22 @@ function computeAssessment(snap) {
   // (NWS/TFR/NOTAM/airspace/fire/ADS-B/Kp/AQI) remain current-time — the
   // timeline banner notes this when a forecast hour is selected.
   const result = assessRisk(snap, S.wind, S.elev, thresholds.maxWindTol, thresholds);
+  result.issues = result.issues || [];
+  result.cautions = result.cautions || [];
+  // Every applicable item is COLLECTED regardless of the current level; only
+  // the severity promotion is guarded. (Gating collection on `level !== 'NO-GO'`
+  // made one exceeded limit silently erase unrelated advisories such as
+  // emergency traffic.) The banner text is rebuilt by assessmentDisplay.
+  const addLimit = msg => { result.level = 'NO-GO'; result.issues.push(msg); };
+  const addAdvisory = msg => { if (result.level === 'GO') result.level = 'CAUTION'; result.cautions.push(msg); };
 
   // Observed-METAR cloud-clearance + minimum-visibility gate (Part 107 §107.51(c)).
   // Current-time observation from the nearest reporting station; applied to every
   // timeline hour (the banner notes overlays are current-time when scrubbing).
   if (S.metar && S.metar.ok) {
     const cc = assessCloudClearance(S.metar.ceilingFt, S.metar.visSm, thresholds.maxAltAGL, thresholds);
-    if (cc.issues.length) {
-      result.level = 'NO-GO';
-      result.issues = (result.issues || []).concat(cc.issues.map(s => `${s} (${S.metar.station})`));
-      result.text = result.issues.join(' • ');
-    }
-    if (cc.cautions.length) {
-      result.cautions = (result.cautions || []).concat(cc.cautions.map(s => `${s} (${S.metar.station})`));
-      if (result.level === 'GO') { result.level = 'CAUTION'; result.text = result.cautions.join(' • '); }
-    }
+    cc.issues.forEach(s => addLimit(`${s} (${S.metar.station})`));
+    cc.cautions.forEach(s => addAdvisory(`${s} (${S.metar.station})`));
   }
 
   // Wildfire smoke plume (NOAA HMS) over the area — reduced visibility / VLOS (CAUTION).
@@ -7204,12 +7679,7 @@ function computeAssessment(snap) {
         if (!(dens.includes('medium') || dens.includes('heavy'))) return false;
         return geoJsonOuterRings(f.geometry).some(r => polygonsIntersect(r, areaPoly));
       });
-      if (hit && result.level !== 'NO-GO') {
-        if (result.level === 'GO') result.level = 'CAUTION';
-        result.cautions = result.cautions || [];
-        result.cautions.push('Wildfire smoke plume over area — reduced visibility/VLOS');
-        if (!result.issues || !result.issues.length) result.text = result.cautions.join(' • ');
-      }
+      if (hit) addAdvisory('Wildfire smoke plume over area — reduced visibility/VLOS');
     }
   }
 
@@ -7222,12 +7692,9 @@ function computeAssessment(snap) {
       if (!((p.danger_level != null && p.danger_level >= 3) || p.warning)) return false;
       return geoJsonOuterRings(f.geometry).some(r => pointInPolygon(c.lat, c.lng, r));
     });
-    if (danger && result.level !== 'NO-GO') {
+    if (danger) {
       const p = danger.properties || {};
-      if (result.level === 'GO') result.level = 'CAUTION';
-      result.cautions = result.cautions || [];
-      result.cautions.push(p.warning ? 'Avalanche warning in effect for area' : `Avalanche danger level ${p.danger_level} — ground-team hazard`);
-      if (!result.issues || !result.issues.length) result.text = result.cautions.join(' • ');
+      addAdvisory(p.warning ? 'Avalanche warning in effect for area' : `Avalanche danger level ${p.danger_level} — ground-team hazard`);
     }
   }
 
@@ -7235,17 +7702,8 @@ function computeAssessment(snap) {
   if (S.nwsAlerts && S.nwsAlerts.length > 0) {
     const severeAlerts = S.nwsAlerts.filter(a => a.severity === 'Extreme' || a.severity === 'Severe');
     const moderateAlerts = S.nwsAlerts.filter(a => a.severity === 'Moderate');
-    if (severeAlerts.length > 0) {
-      result.level = 'NO-GO';
-      result.issues = result.issues || [];
-      result.issues.push(`NWS: ${severeAlerts.map(a => a.event).join(', ')}`);
-      result.text = result.issues.join(' \u2022 ');
-    } else if (moderateAlerts.length > 0 && result.level === 'GO') {
-      result.level = 'CAUTION';
-      result.cautions = result.cautions || [];
-      result.cautions.push(`NWS: ${moderateAlerts.map(a => a.event).join(', ')}`);
-      result.text = result.cautions.join(' \u2022 ');
-    }
+    if (severeAlerts.length > 0) addLimit(`NWS: ${severeAlerts.map(a => a.event).join(', ')}`);
+    if (moderateAlerts.length > 0) addAdvisory(`NWS: ${moderateAlerts.map(a => a.event).join(', ')}`);
   }
 
   // Imported FAA TFRs (manual file import) — authoritative, take precedence.
@@ -7255,17 +7713,9 @@ function computeAssessment(snap) {
     if (areaPoly) {
       const intersecting = filterTfrsIntersectingArea(S.tfrs, areaPoly);
       const activeHits = intersecting.filter(t => isTfrActiveNow(t, Date.now()));
-      if (activeHits.length) {
-        result.level = 'NO-GO';
-        result.issues = result.issues || [];
-        result.issues.push('Active TFR over area: ' + activeHits.map(t => t.id).join(', '));
-        result.text = result.issues.join(' • ');
-      } else if (intersecting.length && result.level !== 'NO-GO') {
-        if (result.level === 'GO') result.level = 'CAUTION';
-        result.cautions = result.cautions || [];
-        result.cautions.push('TFR over area not currently active — verify times: ' + intersecting.map(t => t.id).join(', '));
-        if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
-      }
+      const inactive = intersecting.filter(t => !activeHits.includes(t));
+      if (activeHits.length) addLimit('Active TFR over area: ' + activeHits.map(t => t.id).join(', '));
+      if (inactive.length) addAdvisory('TFR over area not currently active — verify times: ' + inactive.map(t => t.id).join(', '));
     }
   }
 
@@ -7276,12 +7726,7 @@ function computeAssessment(snap) {
     if (areaPoly) {
       const hits = S.importedNotams.filter(n => n.polygons && n.polygons.length &&
         n.polygons.some(r => polygonsIntersect(r, areaPoly)) && isTfrActiveNow(n, Date.now()));
-      if (hits.length && result.level !== 'NO-GO') {
-        if (result.level === 'GO') result.level = 'CAUTION';
-        result.cautions = result.cautions || [];
-        result.cautions.push('NOTAM over area — review: ' + hits.map(n => n.id).join(', '));
-        if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
-      }
+      if (hits.length) addAdvisory('NOTAM over area — review: ' + hits.map(n => n.id).join(', '));
     }
   }
 
@@ -7290,14 +7735,17 @@ function computeAssessment(snap) {
   // conservative.) Each leg gets its own line: the NOTAM one tells the
   // operator to update manually, because the automatic NOTAM check has no
   // working source (FAA NOTAM Search blocks automated access, Sept 2026).
-  if (S.autoCheck && S.autoCheck.state === 'error' && S.currentArea &&
+  // A re-check in progress keeps the previous pass's failed legs in force
+  // (fetchLiveRestrictions carries tfrOk/notamOk into the 'checking' state),
+  // so the banner never reads clean while the outcome is still unknown.
+  const ac = S.autoCheck;
+  const acUnverified = ac && (ac.state === 'error' ||
+    (ac.state === 'checking' && (ac.tfrOk === false || ac.notamOk === false)));
+  if (acUnverified && S.currentArea &&
       typeof getCanopyProxyBase === 'function' && getCanopyProxyBase()) {
-    if (result.level === 'GO') result.level = 'CAUTION';
-    result.cautions = result.cautions || [];
-    const tfrFailed = S.autoCheck.tfrOk === false, notamFailed = S.autoCheck.notamOk === false;
-    if (notamFailed) result.cautions.push(NOTAM_MANUAL_UPDATE_CAUTION);
-    if (tfrFailed || !notamFailed) result.cautions.push('TFR check FAILED — airspace unverified (1800wxbrief.com)');
-    if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
+    const tfrFailed = ac.tfrOk === false, notamFailed = ac.notamOk === false;
+    if (notamFailed) addAdvisory(NOTAM_MANUAL_UPDATE_CAUTION);
+    if (tfrFailed || !notamFailed) addAdvisory('TFR check FAILED — airspace unverified (1800wxbrief.com)');
   }
 
   // Integrate FAA airspace data into assessment
@@ -7306,34 +7754,22 @@ function computeAssessment(snap) {
     // not clear — an empty feature list must never read as "no restrictions".
     const missing = faaAirspaceUnavailableLayers(S.faaAirspace);
     if (missing.length) {
-      if (result.level === 'GO') result.level = 'CAUTION';
-      result.cautions = result.cautions || [];
-      result.cautions.push('FAA airspace data incomplete — ' + missing.map(k => FAA_AIRSPACE_LAYER_LABELS[k] || k).join(', ') + ' unavailable (unverified)');
-      if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+      addAdvisory('FAA airspace data incomplete — ' + missing.map(k => FAA_AIRSPACE_LAYER_LABELS[k] || k).join(', ') + ' unavailable (unverified)');
     }
     // NO-GO: active TFR
     if (S.faaAirspace.tfrs && S.faaAirspace.tfrs.features && S.faaAirspace.tfrs.features.length > 0) {
-      result.level = 'NO-GO';
-      result.issues = result.issues || [];
-      result.issues.push('Active TFR: ' + S.faaAirspace.tfrs.features.map(f => f.properties.NAME || 'TFR').join(', '));
-      result.text = result.issues.join(' \u2022 ');
+      addLimit('Active TFR: ' + S.faaAirspace.tfrs.features.map(f => f.properties.NAME || 'TFR').join(', '));
     }
     // NO-GO: prohibited airspace
     if (S.faaAirspace.sua && S.faaAirspace.sua.features) {
       const prohibited = S.faaAirspace.sua.features.filter(f => (f.properties.TYPE_CODE || '').startsWith('P'));
       if (prohibited.length > 0) {
-        result.level = 'NO-GO';
-        result.issues = result.issues || [];
-        result.issues.push('Prohibited airspace: ' + prohibited.map(f => f.properties.NAME || 'P-area').join(', '));
-        result.text = result.issues.join(' \u2022 ');
+        addLimit('Prohibited airspace: ' + prohibited.map(f => f.properties.NAME || 'P-area').join(', '));
       }
     }
     // NO-GO: national security UAS restrictions
     if (S.faaAirspace.nsRestrictions && S.faaAirspace.nsRestrictions.features && S.faaAirspace.nsRestrictions.features.length > 0) {
-      result.level = 'NO-GO';
-      result.issues = result.issues || [];
-      result.issues.push('NS UAS restriction: ' + S.faaAirspace.nsRestrictions.features.map(f => f.properties.NAME || 'NS area').join(', '));
-      result.text = result.issues.join(' \u2022 ');
+      addLimit('NS UAS restriction: ' + S.faaAirspace.nsRestrictions.features.map(f => f.properties.NAME || 'NS area').join(', '));
     }
     // CAUTION: Class B/C/D without LAANC
     if (S.faaAirspace.classAirspace && S.faaAirspace.classAirspace.features) {
@@ -7343,92 +7779,61 @@ function computeAssessment(snap) {
       });
       if (controlled.length > 0) {
         const hasLaanc = S.faaAirspace.laanc && S.faaAirspace.laanc.features && S.faaAirspace.laanc.features.length > 0;
-        if (!hasLaanc && result.level !== 'NO-GO') {
-          if (result.level === 'GO') result.level = 'CAUTION';
-          result.cautions = result.cautions || [];
-          result.cautions.push('Controlled airspace without LAANC data');
-          if (result.level === 'CAUTION' && result.issues.length === 0) {
-            result.text = result.cautions.join(' \u2022 ');
-          }
-        }
+        if (!hasLaanc) addAdvisory('Controlled airspace without LAANC data');
       }
     }
     // CAUTION: MOA present
     if (S.faaAirspace.sua && S.faaAirspace.sua.features) {
       const moas = S.faaAirspace.sua.features.filter(f => (f.properties.TYPE_CODE || '').startsWith('M'));
-      if (moas.length > 0 && result.level !== 'NO-GO') {
-        if (result.level === 'GO') result.level = 'CAUTION';
-        result.cautions = result.cautions || [];
-        result.cautions.push('MOA active \u2014 check with ATC');
-        if (result.level === 'CAUTION' && result.issues.length === 0) {
-          result.text = result.cautions.join(' \u2022 ');
-        }
-      }
+      if (moas.length > 0) addAdvisory('MOA active — check with ATC');
     }
   }
 
   // Integrate Protected Areas into assessment
   if (S.protectedAreas) {
+    // A layer that could not be checked is UNVERIFIED, not "none nearby".
+    const pMissing = S.protectedAreas._unavailable || [];
+    if (pMissing.length) {
+      addAdvisory('Protected-area data incomplete — ' + pMissing.map(k => PROTECTED_LAYER_LABELS[k] || k).join(', ') + ' unavailable (unverified)');
+    }
     if (S.protectedAreas.dams && S.protectedAreas.dams.length > 0) {
-      if (result.level === 'GO') result.level = 'CAUTION';
-      result.cautions = result.cautions || [];
-      result.cautions.push('Dam nearby \u2014 UAS prohibited within 400ft per 49 USC \u00A7 46307');
-      if (result.level === 'CAUTION' && (!result.issues || result.issues.length === 0)) {
-        result.text = result.cautions.join(' \u2022 ');
-      }
+      addAdvisory('Dam nearby — UAS prohibited within 400ft per 49 USC § 46307');
     }
     if (S.protectedAreas.wilderness && S.protectedAreas.wilderness.length > 0) {
-      if (result.level === 'GO') result.level = 'CAUTION';
-      result.cautions = result.cautions || [];
-      result.cautions.push('Wilderness Area \u2014 UAS requires USFS permit');
-      if (result.level === 'CAUTION' && (!result.issues || result.issues.length === 0)) {
-        result.text = result.cautions.join(' \u2022 ');
-      }
+      addAdvisory('Wilderness Area — UAS requires USFS permit');
     }
     if (S.protectedAreas.nationalParks && S.protectedAreas.nationalParks.length > 0) {
-      if (result.level === 'GO') result.level = 'CAUTION';
-      result.cautions = result.cautions || [];
-      result.cautions.push('National Park \u2014 UAS requires NPS authorization per 36 CFR 1.5');
-      if (result.level === 'CAUTION' && (!result.issues || result.issues.length === 0)) {
-        result.text = result.cautions.join(' \u2022 ');
-      }
+      addAdvisory('National Park — UAS requires NPS authorization per 36 CFR 1.5');
     }
   }
 
-  // Non-public-land CAUTION (BLM Surface Management Agency). Advisory only \u2014 surface
+  // Non-public-land CAUTION (BLM Surface Management Agency). Advisory only — surface
   // management data is parcel-coarse and "Undetermined" lumps with true-private, so
   // this prompts verification and is never an auto NO-GO. Suppressed entirely when
-  // SMA returned no features for the area (no coverage \u2260 private).
-  if (S.landStatus && S.landStatus.sampled > 0 && S.landStatus.privateFrac > 0.03 && result.level !== 'NO-GO') {
-    if (result.level === 'GO') result.level = 'CAUTION';
-    result.cautions = result.cautions || [];
+  // SMA returned no features for the area (no coverage ≠ private).
+  if (S.landStatus && S.landStatus.sampled > 0 && S.landStatus.privateFrac > 0.03) {
     const pct = Math.round(S.landStatus.privateFrac * 100);
-    const msg = (pct >= 97)
-      ? 'Operating area appears to be entirely on private / non-public land \u2014 verify landowner permission before flight'
-      : `Part of operating area (~${pct}%) is on private / non-public land \u2014 verify landowner permission before flight`;
-    result.cautions.push(msg);
-    if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+    addAdvisory((pct >= 97)
+      ? 'Operating area appears to be entirely on private / non-public land — verify landowner permission before flight'
+      : `Part of operating area (~${pct}%) is on private / non-public land — verify landowner permission before flight`);
   }
 
-  // Cell-coverage CAUTION \u2014 only when the FCC overlay is loaded AND the area center
-  // falls inside the bundled region but no carrier covers it (no data \u2260 no coverage).
-  if (S.cellStatus && S.cellStatus.inRegion && S.cellStatus.count === 0 && result.level !== 'NO-GO') {
-    if (result.level === 'GO') result.level = 'CAUTION';
-    result.cautions = result.cautions || [];
-    result.cautions.push('Area outside all mapped carrier LTE coverage (FCC) \u2014 plan for no cell connectivity');
-    if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+  // Cell-coverage CAUTION — only when the FCC overlay is loaded AND the area center
+  // falls inside the bundled region but no carrier covers it (no data ≠ no coverage).
+  if (S.cellStatus && S.cellStatus.inRegion && S.cellStatus.count === 0) {
+    addAdvisory('Area outside all mapped carrier LTE coverage (FCC) — plan for no cell connectivity');
   }
 
   // Integrate FAA DOF obstacles into assessment. CAUTION-only and never an auto
   // NO-GO: this is advisory hazard data and the DOF is not a complete
   // low-altitude inventory, so it must not give false confidence either way.
+  if (S.faaObstacles && S.faaObstacles._unavailable) {
+    addAdvisory('FAA obstacle data unavailable (unverified) — scan for towers and other tall obstacles');
+  }
   if (S.faaObstacles && S.faaObstacles.features && S.faaObstacles.features.length > 0) {
     const obs = summarizeObstacles(S.faaObstacles.features, UAS_CEILING_FT);
-    if (obs.tallCount > 0 && result.level !== 'NO-GO') {
-      if (result.level === 'GO') result.level = 'CAUTION';
-      result.cautions = result.cautions || [];
-      result.cautions.push(`${obs.tallCount} tall obstacle${obs.tallCount === 1 ? '' : 's'} in area (tallest ${obs.maxAgl} ft AGL) — verify clearance`);
-      if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
+    if (obs.tallCount > 0) {
+      addAdvisory(`${obs.tallCount} tall obstacle${obs.tallCount === 1 ? '' : 's'} in area (tallest ${obs.maxAgl} ft AGL) — verify clearance`);
     }
   }
 
@@ -7438,65 +7843,39 @@ function computeAssessment(snap) {
     const fireCautionNm = thresholds.fireCautionNm ?? 30;
     const nearFires = S.activeFires.filter(f => parseFloat(f.distNm) < fireNoGoNm);
     if (nearFires.length > 0) {
-      result.level = 'NO-GO';
-      result.issues = result.issues || [];
-      result.issues.push(`Active fire within ${fireNoGoNm}nm: ` + nearFires.map(f => f.name).join(', '));
-      result.text = result.issues.join(' \u2022 ');
-    } else if (result.level !== 'NO-GO') {
-      if (result.level === 'GO') result.level = 'CAUTION';
-      result.cautions = result.cautions || [];
-      result.cautions.push(`Active fire within ${fireCautionNm}nm \u2014 monitor for TFRs`);
-      if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+      addLimit(`Active fire within ${fireNoGoNm}nm: ` + nearFires.map(f => f.name).join(', '));
+    } else {
+      addAdvisory(`Active fire within ${fireCautionNm}nm — monitor for TFRs`);
     }
   }
-  if (S.fireDanger && S.fireDanger.ercPct >= 90 && result.level !== 'NO-GO') {
-    if (result.level === 'GO') result.level = 'CAUTION';
-    result.cautions = result.cautions || [];
-    result.cautions.push('Very high/extreme fire danger \u2014 wildfire TFR risk');
-    if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+  if (S.fireDanger && S.fireDanger.ercPct >= 90) {
+    addAdvisory('Very high/extreme fire danger — wildfire TFR risk');
   }
 
   // Integrate ADS-B traffic into assessment (CAUTION only, never NO-GO)
-  if (S.adsbAircraft && S.adsbAircraft.length > 0 && result.level !== 'NO-GO') {
+  if (S.adsbAircraft && S.adsbAircraft.length > 0) {
     const emergencyAc = S.adsbAircraft.filter(ac =>
       ac.squawk === '7500' || ac.squawk === '7600' || ac.squawk === '7700' ||
       (ac.emergency && ac.emergency !== 'none')
     );
     if (emergencyAc.length > 0) {
-      if (result.level === 'GO') result.level = 'CAUTION';
-      result.cautions = result.cautions || [];
-      result.cautions.push('Emergency aircraft nearby (squawk ' + emergencyAc.map(a => a.squawk).join(', ') + ')');
-      if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
+      addAdvisory('Emergency aircraft nearby (squawk ' + emergencyAc.map(a => a.squawk).join(', ') + ')');
     }
     const lowClose = S.adsbAircraft.filter(ac => ac.agl > 0 && ac.agl < 500 && ac.distNm < 3);
-    if (lowClose.length > 0) {
-      if (result.level === 'GO') result.level = 'CAUTION';
-      result.cautions = result.cautions || [];
-      result.cautions.push(lowClose.length + ' aircraft below 500ft AGL within 3nm');
-      if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' \u2022 ');
-    }
+    if (lowClose.length > 0) addAdvisory(lowClose.length + ' aircraft below 500ft AGL within 3nm');
   }
 
   // Geomagnetic (Kp) CAUTION — elevated Kp degrades GNSS positioning
-  if (S.kp != null && thresholds.kpCaution != null && S.kp >= thresholds.kpCaution && result.level !== 'NO-GO') {
-    if (result.level === 'GO') result.level = 'CAUTION';
-    result.cautions = result.cautions || [];
-    result.cautions.push(`Geomagnetic Kp ${S.kp} — GNSS accuracy may degrade`);
-    if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
+  if (S.kp != null && thresholds.kpCaution != null && S.kp >= thresholds.kpCaution) {
+    addAdvisory(`Geomagnetic Kp ${S.kp} — GNSS accuracy may degrade`);
   }
 
   // Air quality — hazardous AQI (often wildfire smoke) is NO-GO; unhealthy is CAUTION
   if (S.aqi != null) {
     if (thresholds.aqiNoGo != null && S.aqi >= thresholds.aqiNoGo) {
-      result.level = 'NO-GO';
-      result.issues = result.issues || [];
-      result.issues.push(`Hazardous air quality (AQI ${S.aqi})`);
-      result.text = result.issues.join(' • ');
-    } else if (thresholds.aqiCaution != null && S.aqi >= thresholds.aqiCaution && result.level !== 'NO-GO') {
-      if (result.level === 'GO') result.level = 'CAUTION';
-      result.cautions = result.cautions || [];
-      result.cautions.push(`Unhealthy air quality / smoke (AQI ${S.aqi})`);
-      if (!result.issues || result.issues.length === 0) result.text = result.cautions.join(' • ');
+      addLimit(`Hazardous air quality (AQI ${S.aqi})`);
+    } else if (thresholds.aqiCaution != null && S.aqi >= thresholds.aqiCaution) {
+      addAdvisory(`Unhealthy air quality / smoke (AQI ${S.aqi})`);
     }
   }
 
@@ -14870,7 +15249,7 @@ if (typeof module !== 'undefined' && module.exports) {
     CANOPY_SOURCE_KEY, NAIP_CHM_PROXY_ROUTE, NAIP_CHM_INDEX_BASE, NAIP_CHM_MAX_M, getCanopySourceSetting, setCanopySource,
     canopyDatasetLabel, _updateCanopyCaption, _canopyHasStructures, _fetchChmv2Raster, _fetchNaipChmRaster,
     _naipIndexForBlock, _fetchNaipChmFromProxy, _naipTileToGrid,
-    notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _assessBadgeColor, sendFeedback, openFeedback, closeFeedback,
+    notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _freshPatch, invalidateAreaRequests, _beginRequest, _requestCurrent, _setDataArea, _dataIsForArea, _readArcgisGeoJson, PROTECTED_LAYER_LABELS, _assessBadgeColor, sendFeedback, openFeedback, closeFeedback,
     fetchFAAairspace, faaAirspaceUnavailableLayers, FAA_AIRSPACE_LAYER_LABELS, fetchFireDanger,
     UNKNOWN_CELL_TEXT, SECTION_CELLS, sectionCellsFor, markCellsUnknown, renderFireDangerUnknown,
     NOTAM_MANUAL_UPDATE_CAUTION, renderNotamManualNotice,

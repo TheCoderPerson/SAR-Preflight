@@ -3,6 +3,8 @@ Element.prototype.scrollIntoView = Element.prototype.scrollIntoView || function(
 
 const core = require('../../sar-preflight-core.js');
 Object.assign(globalThis, core);
+// The app loads sar-preflight-offline.js first; processArea's error banner uses formatAge.
+globalThis.formatAge = require('../../sar-preflight-offline.js').formatAge;
 
 // Mock Leaflet — comprehensive chainable mock for processArea chain
 function chainMock() {
@@ -25,6 +27,9 @@ globalThis.L = {
     getBounds: () => ({ getNorthEast: () => ({ lat: latlng[0] + 0.02, lng: latlng[1] + 0.02 }), getSouthWest: () => ({ lat: latlng[0] - 0.02, lng: latlng[1] - 0.02 }), getCenter: () => ({ lat: latlng[0], lng: latlng[1] }) }),
     getLatLng: () => ({ lat: latlng[0], lng: latlng[1] }),
     getRadius: () => opts.radius,
+    // processArea → computeOpsData draws the swap-radius ring with L.circle too
+    bindTooltip() { return this; },
+    bindPopup() { return this; },
   })),
   polygon: vi.fn((coords, opts) => ({
     _coords: coords,

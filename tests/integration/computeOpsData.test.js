@@ -30,6 +30,32 @@ describe('computeOpsData()', () => {
     document.body.innerHTML = '';
   });
 
+  describe('wind unavailable', () => {
+    beforeEach(() => {
+      S.wx = { temperature_2m: 70 };
+      S.elev = { center: 1000 };
+    });
+
+    it('plans on the worst wind band, never a calm 5 mph, and says so', () => {
+      for (const w of [{}, { maxWind: null, maxGust: null }, { maxWind: NaN }]) {
+        S.wind = w;
+        computeOpsData();
+        expect(document.getElementById('opsWindFactor').textContent).toBe('UNKNOWN — assumes 65%');
+        expect(document.getElementById('opsWindFactor').classList.contains('amber')).toBe(true);
+        // 38 min × 0.65 = 24.7 → 25: the conservative estimate, labeled
+        expect(document.getElementById('opsFlightTime').textContent).toBe('~25 min (wind unknown — worst case)');
+        expect(document.getElementById('opsCapacity').textContent).toBe('65% of nominal (wind unknown — worst case)');
+      }
+    });
+
+    it('a real 0 mph wind still means full endurance', () => {
+      S.wind = { maxWind: 0, maxGust: 0 };
+      computeOpsData();
+      expect(document.getElementById('opsWindFactor').textContent).toBe('100%');
+      expect(document.getElementById('opsFlightTime').textContent).toBe('~38 min');
+    });
+  });
+
   describe('nominal conditions (warm, low elevation, calm wind)', () => {
     beforeEach(() => {
       S.wx = { temperature_2m: 70 };  // 21.1C -> tempFactor 1.0
@@ -241,19 +267,59 @@ describe('computeOpsData()', () => {
   });
 
   describe('default values when state is empty', () => {
-    it('uses defaults (65F temp, 1500ft elev, 5mph wind)', () => {
+    it('assumes worst-case temp (20 °F), elevation (9,000 ft) and wind — and says so in every affected cell', () => {
       S.wx = {};
       S.elev = {};
       S.wind = {};
 
       computeOpsData();
 
-      // temp 65F -> 18.33C -> tempFactor 1.0
-      // elev 1500 -> altFactor 1.0
-      // wind 5 -> windFactor 1.0
-      expect(document.getElementById('opsTempFactor').textContent).toBe('100%');
-      expect(document.getElementById('opsAltFactor').textContent).toBe('100%');
-      expect(document.getElementById('opsWindFactor').textContent).toBe('100%');
+      // every unknown input takes its WORST battery band: temp 70%, elev 75%, wind 65%
+      const t = id => document.getElementById(id).textContent;
+      expect(t('opsTempFactor')).toBe('Temp missing, assuming 20 °F (worst case) → 70%');
+      expect(t('opsAltFactor')).toBe('Elevation missing, assuming 9,000 ft (worst case) → 75%');
+      expect(t('opsWindFactor')).toBe('UNKNOWN — assumes 65%');
+      expect(document.getElementById('opsTempFactor').classList.contains('amber')).toBe(true);
+      expect(document.getElementById('opsAltFactor').classList.contains('amber')).toBe(true);
+      // 38 × 0.70 × 0.75 × 0.65 = 12.97
+      expect(t('opsFlightTime')).toBe('~13 min (wind unknown — worst case; temp missing, assuming 20 °F (worst case); elevation missing, assuming 9,000 ft (worst case))');
+    });
+
+    it('only temperature missing: the temp cell and the estimates say so, nothing else does', () => {
+      S.wx = {};
+      S.elev = { center: 1000 };
+      S.wind = { maxWind: 5 };
+      computeOpsData();
+      const t = id => document.getElementById(id).textContent;
+      expect(t('opsTempFactor')).toBe('Temp missing, assuming 20 °F (worst case) → 70%');
+      expect(t('opsAltFactor')).toBe('100%');
+      expect(t('opsFlightTime')).toBe('~27 min (temp missing, assuming 20 °F (worst case))');
+      expect(t('opsCapacity')).toBe('70% of nominal (temp missing, assuming 20 °F (worst case))');
+      // an estimate on an assumed input is never green
+      expect(document.getElementById('opsFlightTime').classList.contains('amber')).toBe(true);
+    });
+
+    it('only elevation missing: the elevation cell and the estimates say so', () => {
+      S.wx = { temperature_2m: 70 };
+      S.elev = {};
+      S.wind = { maxWind: 5 };
+      computeOpsData();
+      const t = id => document.getElementById(id).textContent;
+      expect(t('opsTempFactor')).toBe('100%');
+      expect(t('opsAltFactor')).toBe('Elevation missing, assuming 9,000 ft (worst case) → 75%');
+      expect(t('opsFlightTime')).toBe('~29 min (elevation missing, assuming 9,000 ft (worst case))');
+      expect(document.getElementById('opsFlightTime').classList.contains('amber')).toBe(true);
+    });
+
+    it('real readings (0 °F, sea level) are used, not flagged as missing', () => {
+      S.wx = { temperature_2m: 0 };
+      S.elev = { center: 0 };
+      S.wind = { maxWind: 5 };
+      computeOpsData();
+      const t = id => document.getElementById(id).textContent;
+      expect(t('opsTempFactor')).toBe('70%');
+      expect(t('opsAltFactor')).toBe('100%');
+      expect(t('opsFlightTime')).not.toMatch(/missing/);
     });
   });
 

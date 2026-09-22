@@ -118,7 +118,7 @@ async function purgeCartoTiles() {
 
 // --- Fetch: route by URL pattern ---
 self.addEventListener('fetch', event => {
-  // Skip non-GET requests (POST to Overpass, Open-Elevation, etc.)
+  // Skip non-GET requests (POST to Overpass, etc.)
   if (event.request.method !== 'GET') return;
 
   // Navigation requests (PWA cold launch / page load) — cache-first so the
@@ -247,10 +247,17 @@ function routeStrategy(url) {
       url.includes('mapservices.weather.noaa.gov')) // NOHRSC snow WMS
                                                   return 'network-first';
 
-  // API endpoints — network-first with cache fallback
+  // Terrain elevation grid (USGS 3DEP point samples) — network-first, like the
+  // other area APIs. Without this rule it fell through to the cache-first
+  // default and would answer from the first stored copy with no X-SAR-SW-Cache
+  // marker, i.e. unlabeled. (The viewshed's exportImage DEM keeps the default:
+  // it has its own IndexedDB cache.)
+  if (url.includes('/3DEPElevation/ImageServer/getSamples')) return 'network-first';
+
+  // API endpoints — network-first with cache fallback. api.open-meteo.com also
+  // covers the Open-Meteo elevation fallback (/v1/elevation).
   if (url.includes('api.open-meteo.com') ||
       url.includes('air-quality-api.open-meteo.com') ||
-      url.includes('api.open-elevation.com') ||
       url.includes('api.sunrise-sunset.org') ||
       url.includes('services.swpc.noaa.gov') ||
       url.includes('overpass-api.de') ||

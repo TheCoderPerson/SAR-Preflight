@@ -12,11 +12,11 @@ describe('computeAssessment()', () => {
       <span id="assessBadge" class="assessment-badge">--</span>
       <span id="assessText">--</span>
     `;
-    // Reset state — nominal weather (missing visibility is a CAUTION on its
-    // own, so tests about OTHER cautions start from a checkable GO).
+    // Reset state — nominal weather (missing visibility, wind or elevation is a CAUTION
+    // on its own, so tests about OTHER cautions start from a checkable GO).
     S.wx = { visibility: 16000, temperature_2m: 65, precipitation_probability: 0, weather_code: 0 };
-    S.wind = {};
-    S.elev = {};
+    S.wind = { maxWind: 5, maxGust: 8 };
+    S.elev = { center: 2000 };
   });
 
   afterEach(() => {

@@ -24,6 +24,21 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.09.22-a',
+    date: '2026-09-22',
+    changes: [
+      'Data served from the offline cache (weather, air quality, Kp, NWS alerts, sun times, obstacles, protected areas, utility circuits) is now labeled CACHED with its original age instead of LIVE. Failed weather requests (rate limits, server errors) are reported as errors instead of leaving the panel on "Fetching...".',
+      'Drawing a new area while the previous one is still loading can no longer mix the two: late answers for the old area are discarded, and in-flight map-data requests for it are cancelled.',
+      'Missing wind, gust, temperature or launch elevation is now called out instead of being assumed silently. The assessment lists "Wind unavailable", "Temp missing, assuming 20 °F (worst case)" or "Elevation missing, assuming 9,000 ft (worst case)", and the Ops tab shows the same assumption in each affected cell. Unknown wind, temperature or elevation now takes its worst battery band, so flight-time and battery-swap estimates err short, and such an estimate is never shown green.',
+      'One exceeded limit no longer hides other advisories (for example emergency or low traffic), and a failed NOTAM re-check keeps its advisory in the banner.',
+      'A failed dams / wilderness / national park or FAA obstacle lookup is now shown as unverified, with an advisory, instead of "none found".',
+      'Terrain elevation now comes from USGS 3DEP (Open-Meteo elevation outside 3DEP coverage). The previous Open-Elevation service stopped working when its security certificate expired.',
+      'OpenStreetMap lookups (airports, hospitals, trails, wires) now give up on a stalled server after a time limit and try the next one, and an overloaded server reply is no longer read as "none found".',
+      'Wind direction interpolation across north no longer produces false wind shear, and the Kp index reads the current NOAA feed format (it had been showing a fixed value of 2).',
+      'Single-file field build: every feature loads again (a code comment was cutting the script short), and the build now includes the files the update check and the NAIP-CHM canopy lookup need.',
+    ],
+  },
+  {
     version: '2026.09.20-a',
     date: '2026-09-20',
     changes: [
@@ -523,6 +538,16 @@ const CHANGELOG_ENTRIES = [
 
 function lerp(a, b, t) { return a + (b - a) * t; }
 
+// Compass-bearing interpolation along the SHORTER arc, result in [0, 360).
+// Plain lerp(350, 10) swings through south (a 340° turn) and fakes a huge
+// directional shear. Exactly opposite bearings (Δ = 180°) turn counter-clockwise.
+function lerpBearing(a, b, t) {
+  a = ((a % 360) + 360) % 360;
+  b = ((b % 360) + 360) % 360;
+  const delta = ((b - a + 540) % 360) - 180;
+  return (((a + t * delta) % 360) + 360) % 360;
+}
+
 function degToCompass(d) {
   const dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
   return dirs[Math.round(((d%360)+360)%360/22.5)%16];
@@ -854,6 +879,16 @@ function obstacleHazardLevel(summary) {
 
 // --- Default Risk Thresholds ---
 
+// Values assumed when a reading is MISSING, for the Ops battery / swap
+// estimates. Each sits inside the WORST band of calcBatteryDerating (below
+// freezing → 70%; above 8,000 ft → 75%), like OPS_UNKNOWN_WIND_MPH for wind,
+// so an unknown input shortens the flight time and swap radius instead of
+// flattering them (65 °F / 1,500 ft used to give 100%). Anything that falls
+// back to one must SAY so — an Ops cell note plus an assessment advisory. The
+// assessment never runs a cold/heat/elevation gate on an assumed value.
+const ASSUMED_TEMP_F = 20;
+const ASSUMED_ELEV_FT = 9000;
+
 // A profile is one flat object holding BOTH the aircraft specs and the
 // environmental gates, so picking a drone profile sets every threshold at once.
 // Existing keys keep their names/defaults (back-compat with saved profiles & tests);
@@ -1012,8 +1047,12 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
   // maxWindTol arg kept for back-compat; fall back to the profile value when omitted.
   const windTol = (maxWindTol != null) ? maxWindTol : (t.maxWindTol ?? 27);
   const gustMargin = t.gustMargin ?? 5;
-  const maxWind = wind.maxWind ?? 0;
-  const maxGust = wind.maxGust ?? 0;
+  // Wind, like visibility below: only a real number counts. `?? 0` used to
+  // turn missing wind into 0 mph calm, which passes every wind limit.
+  const num = v => (v != null && Number.isFinite(Number(v))) ? Number(v) : null;
+  const maxWind = num(wind && wind.maxWind);
+  const maxGust = num(wind && wind.maxGust);
+  const hasWind = maxWind != null, hasGust = maxGust != null;
   // Visibility (m → statute miles). `wx.visibility ? … : 99` used to treat a
   // reported ZERO as "missing" and substitute 99 mi, so fog dense enough to
   // read 0 m produced "All conditions nominal". Only null/undefined/NaN is
@@ -1021,33 +1060,52 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
   const visRaw = wx.visibility;
   const hasVis = visRaw != null && Number.isFinite(Number(visRaw));
   const vis = hasVis ? Number(visRaw) / 1609.34 : null;
-  const temp = wx.temperature_2m ?? 65;
+  // Temperature: missing falls back to ASSUMED_TEMP_F (which trips no cold or
+  // heat gate), so it is reported below — never assumed silently.
+  const hasTemp = num(wx.temperature_2m) != null;
+  const temp = hasTemp ? num(wx.temperature_2m) : ASSUMED_TEMP_F;
   const precip = wx.precipitation_probability ?? 0;
   const weatherCode = wx.weather_code ?? 0;
-  const centerElev = elev.center ?? 0;
+  // Launch elevation: missing is UNAVAILABLE (it gates the service-ceiling
+  // limit), not 0 ft — `?? 0` used to pass those checks silently.
+  const hasElev = !!elev && num(elev.center) != null;
+  const centerElev = hasElev ? num(elev.center) : 0;
 
   const issues = [];
-  if (maxWind > windTol || maxGust > windTol + gustMargin) { issues.push(`Wind ${maxWind}/${maxGust}g exceeds limits`); }
+  if ((hasWind && maxWind > windTol) || (hasGust && maxGust > windTol + gustMargin)) {
+    issues.push(`Wind ${hasWind ? maxWind : '?'}/${hasGust ? maxGust : '?'}g exceeds limits`);
+  }
   if (hasVis && vis < t.visNoGo) { issues.push(`Visibility ${vis.toFixed(1)} mi`); }
   if (precip > t.precipNoGo) { issues.push(`Precip ${precip}%`); }
   if (weatherCode >= t.weatherCodeNoGo) { issues.push('Thunderstorm activity'); }
-  if (t.tempColdNoGo != null && wx.temperature_2m != null && temp < t.tempColdNoGo) { issues.push(`Temp ${Math.round(temp)}°F below aircraft limit`); }
-  if (t.tempHotNoGo != null && temp > t.tempHotNoGo) { issues.push(`Temp ${Math.round(temp)}°F above aircraft limit`); }
-  if (t.serviceCeiling != null && centerElev > t.serviceCeiling) { issues.push(`Launch elev ${Math.round(centerElev)} ft above aircraft ceiling`); }
+  if (hasTemp && t.tempColdNoGo != null && temp < t.tempColdNoGo) { issues.push(`Temp ${Math.round(temp)}°F below aircraft limit`); }
+  if (hasTemp && t.tempHotNoGo != null && temp > t.tempHotNoGo) { issues.push(`Temp ${Math.round(temp)}°F above aircraft limit`); }
+  if (hasElev && t.serviceCeiling != null && centerElev > t.serviceCeiling) { issues.push(`Launch elev ${Math.round(centerElev)} ft above aircraft ceiling`); }
 
   const cautions = [];
-  if (maxWind > t.windCaution && maxWind <= windTol) { cautions.push('Elevated winds'); }
+  if (hasWind && maxWind > t.windCaution && maxWind <= windTol) { cautions.push('Elevated winds'); }
   if (hasVis && vis >= t.visNoGo && vis < t.visCaution) { cautions.push('Reduced visibility'); }
   // Unavailable weather is not the same as good weather: a Part 107 minimum
   // (3 SM, §107.51) that cannot be checked must not contribute to a GO.
   const unavailable = [];
   if (!hasVis) { unavailable.push('visibility'); cautions.push('Visibility unavailable — verify 3 SM minimum at launch'); }
+  if (!hasWind) { unavailable.push('wind'); cautions.push(`Wind unavailable — verify sustained wind at launch is within ${windTol} mph limit`); }
+  if (!hasGust) { unavailable.push('gust'); cautions.push(`Gust unavailable — verify gusts at launch are within ${windTol + gustMargin} mph limit`); }
+  if (!hasTemp) {
+    unavailable.push('temperature');
+    cautions.push(`Temp missing, assuming ${ASSUMED_TEMP_F} °F (worst case) for flight-time estimates — cold/heat battery and prop-icing checks not verified`);
+  }
+  if (!hasElev) {
+    unavailable.push('elevation');
+    cautions.push(`Elevation missing, assuming ${ASSUMED_ELEV_FT.toLocaleString('en-US')} ft (worst case) for flight-time estimates — verify launch is below the aircraft service ceiling`
+      + (t.serviceCeiling != null ? ` (${t.serviceCeiling.toLocaleString('en-US')} ft)` : ''));
+  }
   if (precip > t.precipCaution && precip <= t.precipNoGo) { cautions.push(`Precip ${precip}%`); }
-  if (temp < t.tempCaution && !(t.tempColdNoGo != null && temp < t.tempColdNoGo)) { cautions.push('Cold — battery impact'); }
-  if (t.tempHotCaution != null && temp > t.tempHotCaution && !(t.tempHotNoGo != null && temp > t.tempHotNoGo)) { cautions.push('Heat — battery/motor stress'); }
-  if (centerElev > t.elevCaution) { cautions.push('High elevation'); }
+  if (hasTemp && temp < t.tempCaution && !(t.tempColdNoGo != null && temp < t.tempColdNoGo)) { cautions.push('Cold — battery impact'); }
+  if (hasTemp && t.tempHotCaution != null && temp > t.tempHotCaution && !(t.tempHotNoGo != null && temp > t.tempHotNoGo)) { cautions.push('Heat — battery/motor stress'); }
+  if (hasElev && centerElev > t.elevCaution) { cautions.push('High elevation'); }
   // Approaching the airframe's max takeoff altitude (e.g. small drones in high terrain)
-  if (t.serviceCeiling != null && t.ceilingMarginFt != null &&
+  if (hasElev && t.serviceCeiling != null && t.ceilingMarginFt != null &&
       centerElev <= t.serviceCeiling && centerElev > t.serviceCeiling - t.ceilingMarginFt) {
     cautions.push('Near aircraft service ceiling');
   }
@@ -1085,8 +1143,9 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
 //   cls   — badge colour class (go / caution / nogo — CSS names, not shown)
 //   text  — full listing; limits and advisories separated by " | Advisory: "
 function assessmentDisplay(result) {
-  const limits = ((result && result.issues) || []).slice();
-  const advisories = ((result && result.cautions) || []).slice();
+  // Deduplicated; an item already listed as a limit is not repeated as an advisory.
+  const limits = [...new Set((result && result.issues) || [])];
+  const advisories = [...new Set((result && result.cautions) || [])].filter(c => !limits.includes(c));
   const n = limits.length, m = advisories.length;
   let label, cls;
   if (n) { label = n + ' LIMIT' + (n > 1 ? 'S' : '') + ' EXCEEDED'; cls = 'nogo'; }
@@ -1270,6 +1329,46 @@ function calcWindShear(windProfile) {
 // ============================================================
 
 // --- Elevation Grid Generation ---
+
+// Client-side time limit for ONE Overpass mirror: the server-side [timeout:N]
+// the query asks for, plus 10 s of transfer grace (N = 30 when the query names
+// none), clamped to 15–90 s. Without it a stuck mirror held a panel on
+// "Fetching..." for 3+ minutes (measured Sept 2026, overloaded mirrors).
+function overpassMirrorTimeoutMs(query) {
+  const m = /\[timeout:(\d+)\]/.exec(String(query || ''));
+  const n = m ? Number(m[1]) : 30;
+  return Math.min(90, Math.max(15, n + 10)) * 1000;
+}
+
+// --- Point elevation service responses → metres, in request order ---
+// Both return null unless EVERY requested point has a finite value: a grid
+// with holes would skew min/max/launch elevation, so it is not a result.
+// null / '' / 'NoData' are missing — Number(null) and Number('') are 0.
+const _elevNum = v => (v == null || (typeof v === 'string' && v.trim() === '')) ? null
+  : (Number.isFinite(Number(v)) ? Number(v) : null);
+
+// USGS 3DEP ImageServer getSamples (returnFirstValueOnly). Values are STRINGS
+// ("382.135131836"), samples come back in any order (match on locationId),
+// and points outside 3DEP coverage (ocean, most non-US land) are simply
+// omitted — or read "NoData" — so a missing id means "no coverage".
+function parse3depSamples(json, n) {
+  if (!json || !Array.isArray(json.samples) || !(n > 0)) return null;
+  const out = new Array(n).fill(null);
+  for (const s of json.samples) {
+    const i = s && Number(s.locationId);
+    if (!Number.isInteger(i) || i < 0 || i >= n) continue;
+    const v = _elevNum(s.value);
+    if (v != null) out[i] = v;
+  }
+  return out.every(v => v != null) ? out : null;
+}
+
+// Open-Meteo elevation API ({ elevation: [m, …] }, Copernicus GLO-90 DEM).
+function parseOpenMeteoElevation(json, n) {
+  if (!json || !Array.isArray(json.elevation) || json.elevation.length !== n || !(n > 0)) return null;
+  const out = json.elevation.map(_elevNum);
+  return out.every(v => v != null) ? out : null;
+}
 
 function generateElevationGrid(centerLat, centerLng, boundsNE, boundsSW, gridSize) {
   const points = [];
@@ -3196,6 +3295,11 @@ function buildSectionMetaLine(meta, nowMs, tz) {
     const text = 'Cached ' + formatStamp(cab, nowMs, tz) + (ageText ? ' ' + ageText : '');
     return { state: 'cached', tone: 'cached', text, ageText, title: meta.error || '', canUpdate: true };
   }
+  if (status === 'cached') {
+    // Served from a cache that carried no timestamp (X-SAR-SW-Cache: unknown):
+    // still cached, never "Not loaded" and never a fresh "Updated".
+    return { state: 'cached', tone: 'cached', text: 'Cached (age unknown)', ageText: '', title: meta.error || '', canUpdate: true };
+  }
   if (upd != null) {
     const age = relAge(upd, nowMs);
     const ageText = age ? '(' + age + ' ago)' : '';
@@ -4798,7 +4902,7 @@ function geojsonLineLatLngs(geometry) {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     assessmentDisplay, assessmentLabelForLog,
-    WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, degToCompass, haversine, wmoCodeToText,
+    WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, lerpBearing, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,
     calcSunPosition, calcMoonPhase, calcMoonPosition, lightVecENU, lightForTime, hillshadeParams,
     wireHazardName, parseHeightToMeters, osmTowerHeightFt,
@@ -4806,14 +4910,14 @@ if (typeof module !== 'undefined' && module.exports) {
     TRAIL_HIGHWAY_TYPES, buildTrailsOverpassQuery, parseOverpassTrails, trailTypeLabel,
     DOF_LIGHTING, obstacleLighting, obstacleMarkerColor, obstacleLabel,
     summarizeObstacles, obstacleHazardLevel,
-    wxAtHour, kpAtTime, calcDensityAltitude, calcBatteryDerating, assessPropIcing, assessRisk,
+    wxAtHour, kpAtTime, calcDensityAltitude, calcBatteryDerating, ASSUMED_TEMP_F, ASSUMED_ELEV_FT, assessPropIcing, assessRisk,
     freezingLevelRisk, metarCeilingFt, flightCategory, assessCloudClearance,
     DEFAULT_THRESHOLDS, DRONE_PROFILES,
     classifyTerrain, estimateVegetation, estimateCellCoverage,
     SMA_NONPUBLIC_CODES, smaAgencyInfo, smaIsPublic, classifyAreaPublicPrivate, cellCoverageAt,
     filterAirportsByDistance, classifyAirspace,
     calcGustFactor, calcWindShear,
-    generateElevationGrid, calcSlopeFromGrid, calcAspect,
+    generateElevationGrid, parse3depSamples, parseOpenMeteoElevation, overpassMirrorTimeoutMs, calcSlopeFromGrid, calcAspect,
     detectTerrainFeatures, scoreLZFitness, findEmergencyLZs,
     assessTerrainTurbulence, analyzeGPSMasking,
     calcSwapRecommendation,

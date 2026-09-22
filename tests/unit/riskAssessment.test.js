@@ -235,28 +235,82 @@ describe('assessRisk(wx, wind, elev, maxWindTol)', () => {
   });
 
   describe('empty/missing data — never a NO-GO, never a silent GO', () => {
-    it('empty objects: no NO-GO issues, but CAUTION because visibility cannot be verified', () => {
+    const UNAVAILABLE_CAUTIONS = [
+      'Visibility unavailable — verify 3 SM minimum at launch',
+      'Wind unavailable — verify sustained wind at launch is within 27 mph limit',
+      'Gust unavailable — verify gusts at launch are within 32 mph limit',
+      'Temp missing, assuming 20 °F (worst case) for flight-time estimates — cold/heat battery and prop-icing checks not verified',
+      'Elevation missing, assuming 9,000 ft (worst case) for flight-time estimates — verify launch is below the aircraft service ceiling (16,404 ft)',
+    ];
+
+    it('empty objects: no NO-GO issues, but CAUTION because visibility, wind, temp and elevation cannot be verified', () => {
       const result = assessRisk({}, {}, {}, 27);
       expect(result.issues).toEqual([]);
       expect(result.level).toBe('CAUTION');
-      expect(result.cautions).toEqual(['Visibility unavailable — verify 3 SM minimum at launch']);
+      expect(result.cautions).toEqual(UNAVAILABLE_CAUTIONS);
+      expect(result.unavailable).toEqual(['visibility', 'wind', 'gust', 'temperature', 'elevation']);
     });
 
-    it('null/undefined fields use safe defaults via ?? (only the visibility caution remains)', () => {
+    it('null/undefined fields: safe defaults for the rest, but missing visibility/wind/temp/elevation are reported unavailable', () => {
       const wx = { visibility: undefined, temperature_2m: null, precipitation_probability: undefined, weather_code: undefined };
       const wind = { maxWind: undefined, maxGust: undefined };
       const elev = { center: undefined };
       const result = assessRisk(wx, wind, elev, 27);
       expect(result.issues).toEqual([]);
       expect(result.level).toBe('CAUTION');
-      expect(result.cautions).toEqual(['Visibility unavailable — verify 3 SM minimum at launch']);
+      expect(result.cautions).toEqual(UNAVAILABLE_CAUTIONS);
+    });
+
+    it('missing wind is "Wind unavailable", never 0 mph calm', () => {
+      for (const w of [{}, { maxWind: null, maxGust: null }, { maxWind: NaN, maxGust: NaN }, undefined]) {
+        const result = assessRisk({ visibility: 16000, temperature_2m: 65 }, w, { center: 2000 }, 27);
+        expect(result.level).toBe('CAUTION');
+        expect(result.unavailable).toEqual(['wind', 'gust']);
+        expect(result.cautions.some(c => c.startsWith('Wind unavailable'))).toBe(true);
+        expect(result.cautions).not.toContain('Elevated winds');
+      }
+    });
+
+    it('a real 0 mph wind is calm, not unavailable', () => {
+      const result = assessRisk({ visibility: 16000, temperature_2m: 65 }, { maxWind: 0, maxGust: 0 }, { center: 2000 }, 27);
+      expect(result.level).toBe('GO');
+      expect(result.unavailable).toEqual([]);
+    });
+
+    it('known gust over the limit is still a limit when sustained wind is missing', () => {
+      const result = assessRisk({ visibility: 16000, temperature_2m: 65 }, { maxWind: null, maxGust: 45 }, { center: 2000 }, 27);
+      expect(result.level).toBe('NO-GO');
+      expect(result.issues).toEqual(['Wind ?/45g exceeds limits']);
+      expect(result.unavailable).toEqual(['wind']);
     });
 
     it('missing visibility is reported unavailable — not a NO-GO and not "Reduced visibility"', () => {
-      const result = assessRisk({}, defaultWind(), defaultElev(), defaultMaxWindTol);
+      const result = assessRisk({ temperature_2m: 65 }, defaultWind(), defaultElev(), defaultMaxWindTol);
       expect(result.issues.some(i => i.includes('Visibility'))).toBe(false);
       expect(result.cautions.some(c => c === 'Reduced visibility')).toBe(false);
       expect(result.unavailable).toEqual(['visibility']);
+    });
+
+    it('missing temperature says "Temp missing, assuming 20 °F (worst case)" and runs no cold/heat gate on the guess', () => {
+      for (const tmp of [undefined, null, NaN]) {
+        const result = assessRisk({ ...defaultWx(), temperature_2m: tmp }, defaultWind(), defaultElev(), defaultMaxWindTol);
+        expect(result.level).toBe('CAUTION');
+        expect(result.unavailable).toEqual(['temperature']);
+        expect(result.cautions).toEqual(['Temp missing, assuming 20 °F (worst case) for flight-time estimates — cold/heat battery and prop-icing checks not verified']);
+      }
+    });
+
+    it('a real 0 °F reading is judged, not treated as missing', () => {
+      const result = assessRisk({ ...defaultWx(), temperature_2m: 0 }, defaultWind(), defaultElev(), defaultMaxWindTol);
+      expect(result.unavailable).toEqual([]);
+      // judged against the real reading: the default profile's cold LIMIT applies
+      expect(result.issues.concat(result.cautions).some(x => /Temp 0°F below|^Cold/.test(x))).toBe(true);
+    });
+
+    it('missing elevation says "Elevation missing, assuming 9,000 ft (worst case)" and runs no elevation gate on the guess', () => {
+      const result = assessRisk(defaultWx(), defaultWind(), {}, defaultMaxWindTol);
+      expect(result.unavailable).toEqual(['elevation']);
+      expect(result.cautions).toEqual([expect.stringMatching(/^Elevation missing, assuming 9,000 ft \(worst case\)/)]);  // no 'High elevation' from the guess
     });
   });
 
