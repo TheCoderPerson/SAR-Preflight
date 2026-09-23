@@ -15,10 +15,12 @@ globalThis.L = {
 const {
   S, fetchCanopyRaster, getCanopySourceSetting, setCanopySource, canopyDatasetLabel,
   _naipIndexForBlock, _fetchNaipChmFromProxy, _naipTileToGrid, runViewshed, NAIP_CHM_PROXY_ROUTE,
+  _rasterGridKey, _rasterGridRef,
 } = require('../../sar-preflight.js');
 
-const aoiKey = b => [b.west, b.south, b.east, b.north].map(v => v.toFixed(3)).join('_');
-const keyFor = (prefix, grid) => prefix + aoiKey(grid.bounds) + '_' + grid.cols + 'x' + grid.rows;
+// Exact-grid raster cache identity; entries carry their own grid reference.
+const keyFor = (prefix, grid) => _rasterGridKey(prefix.replace(/_$/, ''), grid);
+const entry = (grid, data) => Object.assign(data, _rasterGridRef(grid));
 const cellOf = (grid, lat, lng) => { const { col, row } = latLngToCell(grid, lat, lng); return row * grid.cols + col; };
 
 // ---- a synthetic NAIP-CHM COG: one level, NAD83/UTM 10N, 3 m px, uint16 cm ----
@@ -181,7 +183,7 @@ describe('fetchCanopyRaster dispatch', () => {
 
   it('chmv2 setting: structures:false, never consults the NAIP index', async () => {
     globalThis.isOnline = () => false;
-    store.set('canopy|' + keyFor('canopy2_', grid), { canopyArr: new Float32Array(grid.rows * grid.cols).fill(20) });
+    store.set('canopy|' + keyFor('canopy2_', grid), entry(grid, { canopyArr: new Float32Array(grid.rows * grid.cols).fill(20) }));
     const r = await fetchCanopyRaster(grid);
     expect(r.source).toBe('Meta CHMv2 (cached)');
     expect(r.structures).toBe(false);
@@ -204,7 +206,7 @@ describe('fetchCanopyRaster dispatch', () => {
   it('naip setting offline with a cached NAIP grid: "(cached)" label keeps structures:true', async () => {
     setCanopySource('naip');
     globalThis.isOnline = () => false;
-    store.set('canopy|' + keyFor('naipchm_', grid), { canopyArr: new Float32Array(grid.rows * grid.cols).fill(9), structures: true });
+    store.set('canopy|' + keyFor('naipchm_', grid), entry(grid, { canopyArr: new Float32Array(grid.rows * grid.cols).fill(9), structures: true }));
     const r = await fetchCanopyRaster(grid);
     expect(r.source).toBe('NAIP-CHM (cached)');
     expect(r.structures).toBe(true);
@@ -215,7 +217,7 @@ describe('fetchCanopyRaster dispatch', () => {
     setCanopySource('naip');
     installFetch({ indexStatus: 404 }); // no coverage
     globalThis.isOnline = () => false;   // CHMv2 comes from its cache
-    store.set('canopy|' + keyFor('canopy2_', grid), { canopyArr: new Float32Array(grid.rows * grid.cols).fill(20) });
+    store.set('canopy|' + keyFor('canopy2_', grid), entry(grid, { canopyArr: new Float32Array(grid.rows * grid.cols).fill(20) }));
     const r = await fetchCanopyRaster(grid);
     expect(r.canopyFlat[0]).toBe(20);
     expect(r.source).toContain('Meta CHMv2 (NAIP-CHM unavailable)');
@@ -258,7 +260,7 @@ describe('runViewshed building stamping follows the canopy data actually used', 
 
   it('NAIP-CHM canopy → OSM footprints neither fetched nor stamped; record says structures are in the canopy', async () => {
     setCanopySource('naip');
-    store.set('canopy|' + keyFor('naipchm_', vsGrid), { canopyArr: new Float32Array(vsGrid.rows * vsGrid.cols).fill(12), structures: true });
+    store.set('canopy|' + keyFor('naipchm_', vsGrid), entry(vsGrid, { canopyArr: new Float32Array(vsGrid.rows * vsGrid.cols).fill(12), structures: true }));
     globalThis.GeoTIFF.fromUrl = async () => { throw new Error('offline tile'); }; // force the cached NAIP grid
     installFetch({ indexStatus: 404 });
     await runViewshed('v1');
@@ -274,7 +276,7 @@ describe('runViewshed building stamping follows the canopy data actually used', 
   it('NAIP-CHM selected but unavailable → CHMv2 fallback, footprints fetched late and stamped', async () => {
     setCanopySource('naip');
     installFetch({ indexStatus: 404 });
-    store.set('canopy|' + keyFor('canopy2_', vsGrid), { canopyArr: new Float32Array(vsGrid.rows * vsGrid.cols).fill(12) });
+    store.set('canopy|' + keyFor('canopy2_', vsGrid), entry(vsGrid, { canopyArr: new Float32Array(vsGrid.rows * vsGrid.cols).fill(12) }));
     globalThis.GeoTIFF.fromUrl = async () => { throw new Error('offline tile'); };
     await runViewshed('v1');
     const rec = S.viewsheds[0];
@@ -286,7 +288,7 @@ describe('runViewshed building stamping follows the canopy data actually used', 
   });
 
   it('CHMv2 setting → footprints fetched up front and stamped (unchanged behaviour)', async () => {
-    store.set('canopy|' + keyFor('canopy2_', vsGrid), { canopyArr: new Float32Array(vsGrid.rows * vsGrid.cols).fill(12) });
+    store.set('canopy|' + keyFor('canopy2_', vsGrid), entry(vsGrid, { canopyArr: new Float32Array(vsGrid.rows * vsGrid.cols).fill(12) }));
     globalThis.GeoTIFF.fromUrl = async () => { throw new Error('offline tile'); };
     await runViewshed('v1');
     const rec = S.viewsheds[0];

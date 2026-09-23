@@ -627,3 +627,397 @@ describe('ADS-B — the assessment follows live traffic', () => {
     expect(S.adsbAircraft).toEqual([]);
   });
 });
+
+// ------------------------------------------------------------------
+// BUG_REVIEW_2026-09-22-b (B01–B03). B04/B05 are pure: tests/unit/gpsMasking
+// and tests/unit/terrainAnalysis.
+describe('B01 — NWS alerts: a previous area cannot erase this area’s warning', () => {
+  const severe = { features: [{ id: 'w1', geometry: null, properties: { id: 'w1', event: 'Severe Thunderstorm Warning', severity: 'Severe', urgency: 'Immediate', headline: 'SVR TSTM' } }] };
+  const warned = () => S.assessment.limits.some(l => /Severe Thunderstorm Warning/.test(l));
+  function holdA() {
+    const held = {};
+    route({ 'api.weather.gov': (url, opts) => new Promise((r, j) => { held.release = r; held.fail = j; held.signal = opts && opts.signal; }) });
+    held.p = app.fetchNWSAlerts(A.lat, A.lng);
+    return held;
+  }
+  async function switchToBWithWarning() {
+    app.invalidateAreaRequests();
+    S.areaCenter = B; S.areaBounds = bbox(B.lat, B.lng); S.currentArea = areaLayer(B.lat, B.lng);
+    S.faaAirspace = { classAirspace: fc([]), sua: fc([]), tfrs: fc([]), laanc: fc([]), nsRestrictions: fc([]), prohibited: fc([]) };
+    route({ 'api.weather.gov': resp(severe) });
+    await app.fetchNWSAlerts(B.lat, B.lng);
+    computeAssessment();
+    expect(warned()).toBe(true);
+  }
+  const unchanged = () => {
+    expect(S.nwsAlerts.map(a => a.event)).toEqual(['Severe Thunderstorm Warning']);
+    expect(text('alertStatus')).toMatch(/1 ALERT/);
+    expect(S.sectionMeta.alerts.status).toBe('live');
+    computeAssessment();
+    expect(warned()).toBe(true);
+  };
+
+  it('a late EMPTY success for area A is dropped', async () => {
+    const a = holdA();
+    await switchToBWithWarning();
+    a.release(resp({ features: [] }));
+    await a.p;
+    unchanged();
+  });
+
+  it('a late FAILURE for area A (with a cached A copy) is dropped, not applied', async () => {
+    cacheStore['nws_' + areaKey(A.lat, A.lng)] = { data: { features: [] }, timestamp: Date.now() - 60e3, status: 'stale' };
+    const a = holdA();
+    await switchToBWithWarning();
+    a.fail(new Error('network down'));
+    await a.p;
+    unchanged();
+  });
+
+  it('selecting a new area aborts the old request', async () => {
+    const a = holdA();
+    await switchToBWithWarning();
+    expect(a.signal && a.signal.aborted).toBe(true);
+    a.release(resp({ features: [] }));
+    await a.p;
+  });
+
+  it('clearing the area while a request is pending: its answer does not repopulate alerts', async () => {
+    const a = holdA();
+    app.invalidateAreaRequests(); S.nwsAlerts = [];
+    a.release(resp(severe));
+    await a.p;
+    expect(S.nwsAlerts).toEqual([]);
+  });
+});
+
+describe('B02 — fire distance is to the footprint, independent of vertex order', () => {
+  const L0 = { lat: 38, lng: -121 };
+  const ring = [[-120.5, 38.5], [-121.01, 38.5], [-121.01, 37.99], [-120.5, 37.99], [-120.5, 38.5]];
+  const rotated = [[-121.01, 37.99], [-120.5, 37.99], [-120.5, 38.5], [-121.01, 38.5], [-121.01, 37.99]];
+  const fire = coords => fc([{ type: 'Feature', geometry: { type: 'Polygon', coordinates: [coords] },
+    properties: { poly_IncidentName: 'TEST FIRE', poly_GISAcres: 50000, attr_PercentContained: 10 } }]);
+  beforeEach(() => {
+    S.currentArea = areaLayer(L0.lat, L0.lng); S.areaCenter = L0;
+    S.faaAirspace = { classAirspace: fc([]), sua: fc([]), tfrs: fc([]), laanc: fc([]), nsRestrictions: fc([]), prohibited: fc([]) };
+  });
+
+  for (const [name, coords] of [['listed order', ring], ['rotated ring', rotated], ['reversed ring', ring.slice().reverse()]]) {
+    it(`launch inside the perimeter → 0 nm and a limit (${name})`, async () => {
+      route({ WFIGS: resp(fire(coords)), CA_NFDRS: resp(fc([])) });
+      await app.fetchFireDanger(L0.lat, L0.lng, bbox(L0.lat, L0.lng));
+      expect(S.activeFires[0].distNm).toBe(0);
+      computeAssessment();
+      expect(S.assessment.limits.some(l => /Active fire within 10nm: TEST FIRE/.test(l))).toBe(true);
+    });
+  }
+
+  it('a fire beyond the advisory distance adds no "within 30nm" advisory', async () => {
+    const far = [[-120.2, 38.2], [-120.1, 38.2], [-120.1, 38.3], [-120.2, 38.3], [-120.2, 38.2]]; // ~40 nm east
+    route({ WFIGS: resp(fire(far)), CA_NFDRS: resp(fc([])) });
+    await app.fetchFireDanger(L0.lat, L0.lng, bbox(L0.lat, L0.lng));
+    expect(S.activeFires[0].distNm).toBeGreaterThan(30);
+    computeAssessment();
+    expect(S.assessment.advisories.some(a => /Active fire/.test(a))).toBe(false);
+    expect(S.assessment.limits.some(l => /Active fire/.test(l))).toBe(false);
+  });
+
+  it("a late answer for the previous area does not replace this area's fires", async () => {
+    let release;
+    route({ WFIGS: () => new Promise(r => { release = r; }), CA_NFDRS: resp(fc([])) });
+    const p = app.fetchFireDanger(L0.lat, L0.lng, bbox(L0.lat, L0.lng));
+    app.invalidateAreaRequests();
+    route({ WFIGS: resp(fire(ring)), CA_NFDRS: resp(fc([])) });
+    await app.fetchFireDanger(L0.lat, L0.lng, bbox(L0.lat, L0.lng));
+    release(resp(fc([])));
+    await p;
+    expect(S.activeFires.length).toBe(1);
+  });
+});
+
+describe('B03 — disabling ADS-B stops traffic for good', () => {
+  const emergency = { ac: [{ hex: 'abc123', lat: 38.65, lon: -121, alt_baro: 2300, squawk: '7700', flight: 'TESTSAR', gs: 80, track: 20, seen: 0, seen_pos: 0 }] };
+  const trafficAdvisory = () => S.assessment.advisories.some(a => /Emergency aircraft|below 500ft/.test(a));
+  const disable = () => { document.getElementById('cfgAdsbEnabled').value = '0'; app.toggleAdsbPolling(); };
+  beforeEach(() => {
+    S.currentArea = areaLayer(A.lat, A.lng);
+    S.faaAirspace = { classAirspace: fc([]), sua: fc([]), tfrs: fc([]), laanc: fc([]), nsRestrictions: fc([]), prohibited: fc([]) };
+    S.elev = { center: 2000 };
+    S.adsbSearchRadiusNm = 10; S.adsbAircraft = []; S.adsbTrails = {}; S._adsbFailStreak = 0; S._adsbApiIndex = 0;
+    S._adsbHiresCache = new Map(); S._adsbHiresFetching = false; S.adsbDem = null; S._adsbEnabled = true;
+    computeAssessment();
+  });
+
+  for (const outcome of ['success', 'failure']) {
+    it(`a poll in flight when traffic is disabled cannot restore it (${outcome})`, async () => {
+      let release, fail;
+      route({ adsb: () => new Promise((r, j) => { release = r; fail = j; }), 'airplanes.live': () => new Promise(() => {}), getSamples: resp({ samples: [] }) });
+      const p = app.fetchAdsb();
+      await Promise.resolve();
+      disable();
+      if (outcome === 'success') release(resp(emergency)); else fail(new Error('boom'));
+      await p;
+      expect(S.adsbAircraft).toEqual([]);
+      expect(text('adsbStatus')).toBe('DISABLED');
+      expect(text('adsbPollStatus')).toBe('Disabled');
+      computeAssessment();
+      expect(trafficAdvisory()).toBe(false);
+    });
+  }
+
+  it('disabling after an emergency advisory appeared removes it from the banner', async () => {
+    route({ adsb: resp(emergency), 'airplanes.live': resp(emergency), getSamples: resp({ samples: [] }) });
+    await app.fetchAdsb();
+    expect(trafficAdvisory()).toBe(true);
+    disable();
+    expect(S.adsbAircraft).toEqual([]);
+    expect(trafficAdvisory()).toBe(false);
+    expect(text('adsbAircraftList')).toMatch(/disabled/);
+  });
+
+  it('off → on while a poll is in flight leaves ONE polling chain', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let releaseOld;
+      route({ adsb: () => new Promise(r => { releaseOld = r; }), 'airplanes.live': () => new Promise(() => {}), getSamples: resp({ samples: [] }) });
+      S._adsbPolling = false; S.areaBounds = bbox(A.lat, A.lng);
+      app.startAdsbPolling();
+      await Promise.resolve();
+      const oldRelease = releaseOld;
+      disable();
+      document.getElementById('cfgAdsbEnabled').value = '1'; app.toggleAdsbPolling();
+      oldRelease(resp(emergency));                  // the retired chain's fetch lands late
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      expect(vi.getTimerCount()).toBe(0);           // ...and schedules nothing: no second chain
+      releaseOld(resp({ ac: [] }));                 // the live chain's fetch
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      expect(vi.getTimerCount()).toBe(1);
+      expect(S.adsbAircraft).toEqual([]);
+    } finally {
+      app.stopAdsbPolling();
+      vi.useRealTimers();
+    }
+  });
+
+  it('a terrain refinement finishing after disable does not resurrect traffic', async () => {
+    route({ adsb: resp(emergency), 'airplanes.live': resp(emergency), getSamples: resp({ samples: [] }) });
+    await app.fetchAdsb();
+    let release;
+    route({ getSamples: () => new Promise(r => { release = r; }) });
+    S._adsbHiresCache = new Map(); S._adsbHiresFetching = false;
+    const p = app.refineLowCloseAdsbAgl();
+    disable();
+    release(resp({ samples: [{ locationId: 0, value: '600' }] }));
+    await p;
+    expect(S.adsbAircraft).toEqual([]);
+    expect(trafficAdvisory()).toBe(false);
+  });
+});
+
+// ------------------------------------------------------------------
+// Follow-up review of the B01–B05 fixes: pre-existing gaps it reproduced.
+describe('NWS alert outage is UNVERIFIED, never a silent all-clear', () => {
+  const severe = { features: [{ id: 'w1', geometry: null, properties: { id: 'w1', event: 'Severe Thunderstorm Warning', severity: 'Severe' } }] };
+  const unverified = () => S.assessment.advisories.some(a => /NWS weather alerts UNVERIFIED/.test(a));
+  beforeEach(() => {
+    S.currentArea = areaLayer(A.lat, A.lng);
+    S.faaAirspace = { classAirspace: fc([]), sua: fc([]), tfrs: fc([]), laanc: fc([]), nsRestrictions: fc([]), prohibited: fc([]) };
+    S.nwsAlertsUnverified = false;
+    globalThis.getCachedApiResponse = vi.fn(async () => null);   // no IndexedDB copy
+  });
+
+  it("a same-area refresh failure keeps this area's severe warning and flags the check unverified", async () => {
+    route({ 'api.weather.gov': resp(severe) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    route({ 'api.weather.gov': resp({}, { status: 503 }) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    expect(text('alertStatus')).toBe('ERROR');
+    computeAssessment();
+    expect(S.assessment.label).not.toBe('NOMINAL');
+    expect(S.assessment.limits.some(l => /Severe Thunderstorm Warning/.test(l))).toBe(true);
+    expect(unverified()).toBe(true);
+  });
+
+  it("a failure on a NEW area drops the old area's alerts and is unverified, not NOMINAL", async () => {
+    route({ 'api.weather.gov': resp(severe) });
+    await app.fetchNWSAlerts(B.lat, B.lng);
+    route({ 'api.weather.gov': resp({}, { status: 503 }) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    expect(S.nwsAlerts).toEqual([]);
+    computeAssessment();
+    expect(S.assessment.label).not.toBe('NOMINAL');
+    expect(unverified()).toBe(true);
+  });
+
+  it('the next successful check clears the flag', async () => {
+    route({ 'api.weather.gov': resp({}, { status: 503 }) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    route({ 'api.weather.gov': resp({ features: [] }) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    computeAssessment();
+    expect(unverified()).toBe(false);
+  });
+});
+
+describe("fire data never carries over from another area", () => {
+  const Bf = { lat: 39.5, lng: -119.8 };
+  const around = p => fc([{ type: 'Feature', geometry: { type: 'Polygon', coordinates: [[[p.lng - 0.1, p.lat - 0.1], [p.lng + 0.1, p.lat - 0.1], [p.lng + 0.1, p.lat + 0.1], [p.lng - 0.1, p.lat + 0.1], [p.lng - 0.1, p.lat - 0.1]]] },
+    properties: { poly_IncidentName: 'OTHER FIRE', poly_GISAcres: 900 } }]);
+  const unverified = () => S.assessment.advisories.some(a => /Wildfire data UNVERIFIED/.test(a));
+  beforeEach(() => {
+    S.faaAirspace = { classAirspace: fc([]), sua: fc([]), tfrs: fc([]), laanc: fc([]), nsRestrictions: fc([]), prohibited: fc([]) };
+    S.fireDataUnverified = false;
+  });
+
+  it("a failed request for a NEW area drops the previous area's fires → unverified, not 'inside a perimeter'", async () => {
+    S.currentArea = areaLayer(Bf.lat, Bf.lng);
+    route({ WFIGS: resp(around(Bf)), CA_NFDRS: resp(fc([])), fems: resp({}) });
+    await app.fetchFireDanger(Bf.lat, Bf.lng, bbox(Bf.lat, Bf.lng));
+    expect(S.activeFires[0].distNm).toBe(0);
+    S.currentArea = areaLayer(A.lat, A.lng); S.sectionMeta = {};
+    route({ WFIGS: resp({}, { status: 503 }), CA_NFDRS: resp(fc([])) });
+    await app.fetchFireDanger(A.lat, A.lng, bbox(A.lat, A.lng));
+    expect(S.activeFires).toEqual([]);
+    computeAssessment();
+    expect(S.assessment.limits.some(l => /OTHER FIRE/.test(l))).toBe(false);
+    expect(unverified()).toBe(true);
+  });
+
+  it("a same-area refresh failure keeps this area's fires (still a limit) and flags them unverified", async () => {
+    S.currentArea = areaLayer(A.lat, A.lng);
+    route({ WFIGS: resp(around(A)), CA_NFDRS: resp(fc([])) });
+    await app.fetchFireDanger(A.lat, A.lng, bbox(A.lat, A.lng));
+    route({ WFIGS: resp({}, { status: 503 }), CA_NFDRS: resp(fc([])) });
+    await app.fetchFireDanger(A.lat, A.lng, bbox(A.lat, A.lng));
+    computeAssessment();
+    expect(S.assessment.limits.some(l => /OTHER FIRE/.test(l))).toBe(true);
+    expect(unverified()).toBe(true);
+  });
+});
+
+describe('GPS masking refreshes when terrain arrives after Kp', () => {
+  // 25-point grid over ±0.02°: centre 1,000 ft, everything else 4,000 ft →
+  // every direction is > 15° above a 400 ft AGL flight → 0 % sky.
+  const samples = url => {
+    const n = JSON.parse(new URL(url).searchParams.get('geometry')).points.length;
+    return { samples: Array.from({ length: n }, (_, i) => ({ locationId: i, value: String((i === 12 ? 1000 : 4000) / 3.28084) })) };
+  };
+
+  it('live terrain: the Kp-first "100% / None" is replaced', async () => {
+    S.elev = {}; S.kp = 2;
+    app.renderKp(2);
+    route({ getSamples: url => Promise.resolve(resp(samples(url))) });
+    await app.fetchElevation(A, bbox(A.lat, A.lng));
+    expect(text('satSkyVis')).toBe('0%');
+    expect(text('satMasked')).toBe('N, NE, E, SE, S, SW, W, NW');
+    expect(document.getElementById('satTableBody').textContent).toMatch(/0 sats/);
+  });
+
+  it('cached terrain (IndexedDB copy) also drives the masking cells', async () => {
+    route({ getSamples: url => Promise.resolve(resp(samples(url))) });
+    await app.fetchElevation(A, bbox(A.lat, A.lng));
+    S.elev = {};
+    document.getElementById('satSkyVis').textContent = '--';
+    route({ getSamples: resp({}, { status: 503 }), '/v1/elevation': resp({}, { status: 503 }) });
+    await app.fetchElevation(A, bbox(A.lat, A.lng));
+    expect(S.sectionMeta.elevation.status).toBe('cached');
+    expect(text('satSkyVis')).toBe('0%');
+  });
+});
+
+describe('a cached alert copy never verifies alerts or erases a newer warning', () => {
+  const severe = { features: [{ id: 'w1', geometry: null, properties: { id: 'w1', event: 'Severe Thunderstorm Warning', severity: 'Severe' } }] };
+  const unverified = () => S.assessment.advisories.some(a => /NWS weather alerts UNVERIFIED/.test(a));
+  const warned = () => S.assessment.limits.some(l => /Severe Thunderstorm Warning/.test(l));
+  const oldEmpty = () => ({ data: { features: [] }, timestamp: Date.now() - 6 * 3600e3, status: 'expired' });
+  beforeEach(() => {
+    S.currentArea = areaLayer(A.lat, A.lng);
+    S.faaAirspace = { classAirspace: fc([]), sua: fc([]), tfrs: fc([]), laanc: fc([]), nsRestrictions: fc([]), prohibited: fc([]) };
+    S.nwsAlertsUnverified = false; S.nwsAlertsAt = null;
+  });
+
+  it('network down + an OLDER empty IndexedDB copy: the live warning stays, check unverified', async () => {
+    route({ 'api.weather.gov': resp(severe) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    globalThis.getCachedApiResponse = vi.fn(async () => oldEmpty());
+    route({ 'api.weather.gov': () => Promise.reject(new TypeError('Failed to fetch')) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    expect(S.nwsAlerts.map(a => a.event)).toEqual(['Severe Thunderstorm Warning']);
+    computeAssessment();
+    expect(warned()).toBe(true);
+    expect(unverified()).toBe(true);
+  });
+
+  it('network down + an empty IndexedDB copy on a fresh area: shown as cached, but never NOMINAL', async () => {
+    globalThis.getCachedApiResponse = vi.fn(async () => oldEmpty());
+    route({ 'api.weather.gov': () => Promise.reject(new TypeError('Failed to fetch')) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    expect(S.sectionMeta.alerts.status).toBe('cached');
+    computeAssessment();
+    expect(S.assessment.label).not.toBe('NOMINAL');
+    expect(unverified()).toBe(true);
+  });
+
+  it("the SW's offline copy (older than the held warning) cannot erase it", async () => {
+    route({ 'api.weather.gov': resp(severe) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    route({ 'api.weather.gov': resp({ features: [] }, { headers: { 'X-SAR-SW-Cache': String(Date.now() - 3600e3) } }) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    expect(S.nwsAlerts.length).toBe(1);
+    computeAssessment();
+    expect(warned()).toBe(true);
+    expect(unverified()).toBe(true);
+  });
+
+  it("the SW's offline copy on a fresh area is applied, labeled cached, and still unverified", async () => {
+    route({ 'api.weather.gov': resp({ features: [] }, { headers: { 'X-SAR-SW-Cache': String(Date.now() - 3600e3) } }) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    expect(S.sectionMeta.alerts.status).toBe('cached');
+    computeAssessment();
+    expect(unverified()).toBe(true);
+  });
+
+  it('only a live answer clears the flag', async () => {
+    globalThis.getCachedApiResponse = vi.fn(async () => oldEmpty());
+    route({ 'api.weather.gov': () => Promise.reject(new TypeError('Failed to fetch')) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    route({ 'api.weather.gov': resp({ features: [] }) });
+    await app.fetchNWSAlerts(A.lat, A.lng);
+    computeAssessment();
+    expect(unverified()).toBe(false);
+  });
+});
+
+describe('cached terrain keeps the positions it was measured at', () => {
+  // Centre 1,000 ft, every other sample 4,000 ft. Over ±0.2° (~22 km) that is
+  // ~2° of rise → no masking; placed on a ±0.02° grid it would be > 15°.
+  const samples = url => {
+    const n = JSON.parse(new URL(url).searchParams.get('geometry')).points.length;
+    return { samples: Array.from({ length: n }, (_, i) => ({ locationId: i, value: String((i === 12 ? 1000 : 4000) / 3.28084) })) };
+  };
+
+  it('a resized area (same centre) does not re-place the cached samples on its own bounds', async () => {
+    route({ getSamples: url => Promise.resolve(resp(samples(url))) });
+    await app.fetchElevation(A, bbox(A.lat, A.lng, 0.2));
+    expect(text('satSkyVis')).toBe('100%');
+    S.elev = {};
+    route({ getSamples: resp({}, { status: 503 }), '/v1/elevation': resp({}, { status: 503 }) });
+    await app.fetchElevation(A, bbox(A.lat, A.lng, 0.02));   // same centre, 10× smaller
+    expect(S.sectionMeta.elevation.status).toBe('cached');
+    expect(S.elev.points[0].lat).toBeCloseTo(A.lat - 0.2, 6);
+    expect(text('satSkyVis')).toBe('100%');
+  });
+
+  it('an older copy without stored positions gets no masking rather than guessed positions', async () => {
+    cacheStore['elevation_' + areaKey(A.lat, A.lng)] = {
+      timestamp: Date.now() - 3600e3, status: 'stale',
+      data: { centerIndex: 12, results: Array.from({ length: 25 }, (_, i) => ({ elevation: (i === 12 ? 1000 : 4000) / 3.28084 })) },
+    };
+    S.elev = {};
+    route({ getSamples: resp({}, { status: 503 }), '/v1/elevation': resp({}, { status: 503 }) });
+    await app.fetchElevation(A, bbox(A.lat, A.lng, 0.02));
+    expect(S.elev.center).toBe(1000);
+    expect(S.elev.points).toBeUndefined();
+    expect(text('satSkyVis')).not.toBe('0%');
+  });
+});

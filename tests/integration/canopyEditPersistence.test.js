@@ -11,7 +11,7 @@ globalThis.L = {
   Browser: { mobile: false },
 };
 
-const { S, fetchCanopyRaster, _applyCanopyEdits } = require('../../sar-preflight.js');
+const { S, fetchCanopyRaster, _applyCanopyEdits, _rasterGridKey, _rasterGridRef } = require('../../sar-preflight.js');
 
 // Grids mirroring real call sites: view overlay vs observer viewshed.
 const overlayGrid = makeGrid(38.7, -120.99, 500, 10);
@@ -26,9 +26,8 @@ const DEL_OP = { t: 'del', poly: [[TGT.lat + d, TGT.lng - d], [TGT.lat + d, TGT.
 function installCacheMock({ ops }) {
   const store = new Map();
   for (const grid of [overlayGrid, viewshedGrid]) {
-    const b = grid.bounds;
-    const key = 'canopy2_' + [b.west, b.south, b.east, b.north].map(v => v.toFixed(3)).join('_') + '_' + grid.cols + 'x' + grid.rows;
-    store.set('canopy|' + key, { canopyArr: new Float32Array(grid.rows * grid.cols).fill(20) });
+    const key = _rasterGridKey('canopy2', grid);
+    store.set('canopy|' + key, Object.assign({ canopyArr: new Float32Array(grid.rows * grid.cols).fill(20) }, _rasterGridRef(grid)));
   }
   if (ops) store.set('canopyedit|global', { ops });
   globalThis.getCachedRaster = async (kind, key) => {

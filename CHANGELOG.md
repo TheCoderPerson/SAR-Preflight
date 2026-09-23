@@ -4,6 +4,15 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.09.22-c — 2026-09-22
+
+- Nearby-fire distance is now measured to the fire perimeter itself (zero when the launch point is inside it). It had been measured to one arbitrary corner of the outline, which could put a launch inside a large fire more than 30 nm away and miss the nearby-fire limit. The "active fire within 30 nm" advisory now appears only for a fire that is actually within 30 nm.
+- Weather alerts and fire data can no longer cross between areas, and a failed or offline check no longer reads as clear: the banner shows "NWS weather alerts UNVERIFIED" or "Wildfire data UNVERIFIED" until a live check succeeds, and an older cached copy can no longer replace a newer warning.
+- Turning ADS-B traffic off now stops it completely: a poll already in flight can no longer bring aircraft back, traffic advisories leave the banner, and the traffic panel reads "disabled" instead of "No aircraft detected".
+- GPS terrain masking now uses real distances and compass directions (it had compared feet with grid cells and swapped north and south), so distant low terrain no longer reads as 0 % sky visibility. It also refreshes as soon as terrain loads. Slope aspect north/south is corrected too.
+- Magnetic declination now comes from the World Magnetic Model (WMM2025) instead of a rough fit that read California as about 10° W instead of about 13° E.
+- Further data-honesty fixes: every area-bound source now discards late answers for a previous area; partial or truncated results are labeled as incomplete instead of complete; the dedicated prohibited-area layer now reaches the readout and the assessment; an old or failed METAR check no longer removes observed limits; slope uses true north/south spacing; polygon areas are computed correctly; solar times use the local day; briefings state the forecast time they describe.
+
 ## v2026.09.22-b — 2026-09-22
 
 - Launch elevation now comes from the centre of the area. It had been read from the south-west corner of the terrain grid, which in steep terrain could be thousands of feet off and skewed battery estimates, the service-ceiling check and aircraft height-above-ground.

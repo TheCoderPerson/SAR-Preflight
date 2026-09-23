@@ -241,7 +241,8 @@ describe('renderNWSAlertCards()', () => {
   });
 
   it('shows green badge when no alerts', () => {
-    S.nwsAlerts = [];
+    // Green is reserved for a successful LIVE empty check.
+    S.nwsAlerts = []; S.nwsAlertsUnverified = false; S.nwsAlertsSource = 'live'; S.nwsAlertsAt = Date.now();
     renderNWSAlertCards();
     const list = document.getElementById('alertList');
     expect(list.textContent).toContain('NO ACTIVE ALERTS');
