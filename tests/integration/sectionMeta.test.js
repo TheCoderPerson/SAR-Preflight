@@ -26,6 +26,7 @@ describe('fetch -> S.sectionMeta wiring (alerts)', () => {
       <div class="section-meta" id="meta_alerts"></div>
     `;
     S.nwsAlerts = [];
+    S._dataArea = {}; // no alerts held for any area
     S.mapLayers = {};
     S.wireHazardCounts = {};
     S.sectionMeta = {};

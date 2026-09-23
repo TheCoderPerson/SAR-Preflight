@@ -174,50 +174,47 @@ describe('calcSlopeFromGrid(elevationsFt, gridSize, cellSizeKm)', () => {
 // ============================================================
 
 describe('calcAspect(elevationsFt, gridSize)', () => {
+  // Build fixtures through generateElevationGrid and derive each sample's
+  // elevation from its latitude/longitude — never assume a row orientation
+  // (the grid is row-major from the SW corner: row 0 is SOUTH).
+  const NE = { lat: 38.01, lng: -120.99 }, SW = { lat: 37.99, lng: -121.01 };
+  const fromGeo = fn => generateElevationGrid(38, -121, NE, SW, 5).map(p => fn(p.latitude, p.longitude));
+
   describe('cardinal direction slopes', () => {
-    it('returns S for north-facing slope (higher to the south)', () => {
-      // Higher south (bottom), lower north (top) → slope faces north → downhill toward N
-      // But our convention: higher south edge → gradient points north → aspect = N
-      // Actually: the function computes dx, dy as differences of edges.
-      // Higher south = southAvg > northAvg → dy = northAvg - southAvg < 0
-      // Slope faces toward lower side = North = 'N'
-      const grid = [
-        1000, 1000, 1000,
-        2000, 2000, 2000,
-        3000, 3000, 3000,
-      ];
-      const result = calcAspect(grid, 3);
-      expect(result).toBe('N');
+    it('row 0 of the generated grid is the SOUTH edge', () => {
+      const pts = generateElevationGrid(38, -121, NE, SW, 5);
+      expect(pts[0].latitude).toBeCloseTo(37.99, 6);
+      expect(pts[24].latitude).toBeCloseTo(38.01, 6);
     });
 
-    it('returns S for south-facing slope (higher to the north)', () => {
-      const grid = [
-        3000, 3000, 3000,
-        2000, 2000, 2000,
-        1000, 1000, 1000,
-      ];
-      const result = calcAspect(grid, 3);
-      expect(result).toBe('S');
+    it('higher to the south → faces N', () => {
+      expect(calcAspect(fromGeo(lat => 1000 + (38.01 - lat) * 100000), 5)).toBe('N');
     });
 
-    it('returns E for east-facing slope (higher to the west)', () => {
-      const grid = [
-        3000, 2000, 1000,
-        3000, 2000, 1000,
-        3000, 2000, 1000,
-      ];
-      const result = calcAspect(grid, 3);
-      expect(result).toBe('E');
+    it('high southern row only (review fixture) → faces N', () => {
+      expect(calcAspect(fromGeo(lat => lat < 37.995 ? 4000 : 1000), 5)).toBe('N');
     });
 
-    it('returns W for west-facing slope (higher to the east)', () => {
-      const grid = [
-        1000, 2000, 3000,
-        1000, 2000, 3000,
-        1000, 2000, 3000,
-      ];
-      const result = calcAspect(grid, 3);
-      expect(result).toBe('W');
+    it('higher to the north → faces S', () => {
+      expect(calcAspect(fromGeo(lat => 1000 + (lat - 37.99) * 100000), 5)).toBe('S');
+    });
+
+    it('higher to the west → faces E', () => {
+      expect(calcAspect(fromGeo((lat, lng) => 1000 + (-120.99 - lng) * 100000), 5)).toBe('E');
+    });
+
+    it('higher to the east → faces W', () => {
+      expect(calcAspect(fromGeo((lat, lng) => 1000 + (lng + 121.01) * 100000), 5)).toBe('W');
+    });
+
+    it('higher to the SW → faces NE; higher to the NE → faces SW', () => {
+      expect(calcAspect(fromGeo((lat, lng) => 1000 + ((38.01 - lat) + (-120.99 - lng)) * 100000), 5)).toBe('NE');
+      expect(calcAspect(fromGeo((lat, lng) => 1000 + ((lat - 37.99) + (lng + 121.01)) * 100000), 5)).toBe('SW');
+    });
+
+    it('higher to the SE → faces NW; higher to the NW → faces SE', () => {
+      expect(calcAspect(fromGeo((lat, lng) => 1000 + ((38.01 - lat) + (lng + 121.01)) * 100000), 5)).toBe('NW');
+      expect(calcAspect(fromGeo((lat, lng) => 1000 + ((lat - 37.99) + (-120.99 - lng)) * 100000), 5)).toBe('SE');
     });
   });
 

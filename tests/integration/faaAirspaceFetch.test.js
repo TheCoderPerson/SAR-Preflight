@@ -83,17 +83,32 @@ describe('fetchFAAairspace — outage handling', () => {
     document.body.innerHTML = '';
   });
 
-  it('all six fail with no cached copy → ERROR, state untouched, nothing cached, error recorded', async () => {
-    S.faaAirspace = { marker: 'previous' };
+  it('all six fail with no cached copy → ERROR, every layer UNAVAILABLE (never "clear"), nothing cached, error recorded', async () => {
+    S.faaAirspace = { marker: 'previous' };   // state of unknown provenance (e.g. another area)
     mockFetch({ Class_Airspace: http(503), Special_Use_Airspace: http(503), National_Defense_Airspace_TFR_Areas: http(503), FAA_UAS_FacilityMap_Data_V5: http(503), Part_Time_National_Security_UAS_Flight_Restrictions: http(503), Prohibited_Areas: http(503) });
     await fetchFAAairspace(bounds);
     const st = document.getElementById('faaAirspaceStatus');
     expect(st.className).toContain('error');
     expect(st.textContent).toBe('ERROR');
-    expect(S.faaAirspace).toEqual({ marker: 'previous' });   // not replaced with empties
+    // Not another area's data, and not empties that read as "no restrictions":
+    // every layer is explicitly unavailable, which the assessment reports as UNVERIFIED.
+    expect(S.faaAirspace.marker).toBeUndefined();
+    expect(faaAirspaceUnavailableLayers(S.faaAirspace)).toEqual(['classAirspace', 'sua', 'tfrs', 'laanc', 'nsRestrictions', 'prohibited']);
+    Object.values(S.faaAirspace).forEach(layer => expect(layer.features).toEqual([]));
     expect(globalThis.cacheApiResponse).not.toHaveBeenCalled();
     expect(S.dataSourceErrors['FAA Airspace']).toBeTruthy();
     expect(S.dataSourceErrors['FAA Airspace'].message).toMatch(/All 6 FAA airspace requests failed/);
+    expect(S.sectionMeta.airspace.sources.faa.status).toBe('error');
+  });
+
+  it("a refresh of the SAME area that fails completely keeps that area's own data (flagged stale), not unavailable", async () => {
+    mockFetch({ Special_Use_Airspace: ok(fc([suaFeature])) });
+    await fetchFAAairspace(bounds);
+    globalThis.getCachedApiResponse = vi.fn(async () => null);
+    mockFetch({ Class_Airspace: http(503), Special_Use_Airspace: http(503), National_Defense_Airspace_TFR_Areas: http(503), FAA_UAS_FacilityMap_Data_V5: http(503), Part_Time_National_Security_UAS_Flight_Restrictions: http(503), Prohibited_Areas: http(503) });
+    await fetchFAAairspace(bounds);
+    expect(S.faaAirspace.sua.features.length).toBe(1);
+    expect(faaAirspaceUnavailableLayers(S.faaAirspace)).toEqual([]);
     expect(S.sectionMeta.airspace.sources.faa.status).toBe('error');
   });
 

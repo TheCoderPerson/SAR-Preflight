@@ -4,6 +4,34 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.09.22-c — 2026-09-22
+
+- Nearby-fire distance is now measured to the fire perimeter itself (zero when the launch point is inside it). It had been measured to one arbitrary corner of the outline, which could put a launch inside a large fire more than 30 nm away and miss the nearby-fire limit. The "active fire within 30 nm" advisory now appears only for a fire that is actually within 30 nm.
+- Weather alerts and fire data can no longer cross between areas, and a failed or offline check no longer reads as clear: the banner shows "NWS weather alerts UNVERIFIED" or "Wildfire data UNVERIFIED" until a live check succeeds, and an older cached copy can no longer replace a newer warning.
+- Turning ADS-B traffic off now stops it completely: a poll already in flight can no longer bring aircraft back, traffic advisories leave the banner, and the traffic panel reads "disabled" instead of "No aircraft detected".
+- GPS terrain masking now uses real distances and compass directions (it had compared feet with grid cells and swapped north and south), so distant low terrain no longer reads as 0 % sky visibility. It also refreshes as soon as terrain loads. Slope aspect north/south is corrected too.
+- Magnetic declination now comes from the World Magnetic Model (WMM2025) instead of a rough fit that read California as about 10° W instead of about 13° E.
+- Further data-honesty fixes: every area-bound source now discards late answers for a previous area; partial or truncated results are labeled as incomplete instead of complete; the dedicated prohibited-area layer now reaches the readout and the assessment; an old or failed METAR check no longer removes observed limits; slope uses true north/south spacing; polygon areas are computed correctly; solar times use the local day; briefings state the forecast time they describe.
+
+## v2026.09.22-b — 2026-09-22
+
+- Launch elevation now comes from the centre of the area. It had been read from the south-west corner of the terrain grid, which in steep terrain could be thousands of feet off and skewed battery estimates, the service-ceiling check and aircraft height-above-ground.
+- FAA airspace can no longer cross between areas: a late answer for a previously drawn area is discarded instead of replacing the current area (an empty late answer had erased a prohibited area).
+- If no FAA airspace data could be loaded for the area, the assessment now says "FAA airspace UNVERIFIED" instead of reading nominal.
+- Live traffic now updates the assessment as it arrives: an emergency squawk or a low, close aircraft appears in the banner without a manual refresh.
+
+## v2026.09.22-a — 2026-09-22
+
+- Data served from the offline cache (weather, air quality, Kp, NWS alerts, sun times, obstacles, protected areas, utility circuits) is now labeled CACHED with its original age instead of LIVE. Failed weather requests (rate limits, server errors) are reported as errors instead of leaving the panel on "Fetching...".
+- Drawing a new area while the previous one is still loading can no longer mix the two: late answers for the old area are discarded, and in-flight map-data requests for it are cancelled.
+- Missing wind, gust, temperature or launch elevation is now called out instead of being assumed silently. The assessment lists "Wind unavailable", "Temp missing, assuming 20 °F (worst case)" or "Elevation missing, assuming 9,000 ft (worst case)", and the Ops tab shows the same assumption in each affected cell. Unknown wind, temperature or elevation now takes its worst battery band, so flight-time and battery-swap estimates err short, and such an estimate is never shown green.
+- One exceeded limit no longer hides other advisories (for example emergency or low traffic), and a failed NOTAM re-check keeps its advisory in the banner.
+- A failed dams / wilderness / national park or FAA obstacle lookup is now shown as unverified, with an advisory, instead of "none found".
+- Terrain elevation now comes from USGS 3DEP (Open-Meteo elevation outside 3DEP coverage). The previous Open-Elevation service stopped working when its security certificate expired.
+- OpenStreetMap lookups (airports, hospitals, trails, wires) now give up on a stalled server after a time limit and try the next one, and an overloaded server reply is no longer read as "none found".
+- Wind direction interpolation across north no longer produces false wind shear, and the Kp index reads the current NOAA feed format (it had been showing a fixed value of 2).
+- Single-file field build: every feature loads again (a code comment was cutting the script short), and the build now includes the files the update check and the NAIP-CHM canopy lookup need.
+
 ## v2026.09.20-a — 2026-09-20
 
 - New Config option "Canopy / structure height source": keep Meta/WRI CHMv2 (default, vegetation only — the viewshed adds buildings from OSM footprints) or switch to NAIP-CHM, a 0.6 m model of everything standing above ground (trees, buildings, towers, power lines) from 2022–23 NAIP aerial imagery (Univ. of Montana, Morford et al. 2026). With NAIP-CHM the viewshed uses that surface directly and does not stamp OSM buildings on top; the observer line reads "structures in NAIP-CHM" and KML exports say so.

@@ -24,6 +24,43 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.09.22-c',
+    date: '2026-09-22',
+    changes: [
+      'Nearby-fire distance is now measured to the fire perimeter itself (zero when the launch point is inside it). It had been measured to one arbitrary corner of the outline, which could put a launch inside a large fire more than 30 nm away and miss the nearby-fire limit. The "active fire within 30 nm" advisory now appears only for a fire that is actually within 30 nm.',
+      'Weather alerts and fire data can no longer cross between areas, and a failed or offline check no longer reads as clear: the banner shows "NWS weather alerts UNVERIFIED" or "Wildfire data UNVERIFIED" until a live check succeeds, and an older cached copy can no longer replace a newer warning.',
+      'Turning ADS-B traffic off now stops it completely: a poll already in flight can no longer bring aircraft back, traffic advisories leave the banner, and the traffic panel reads "disabled" instead of "No aircraft detected".',
+      'GPS terrain masking now uses real distances and compass directions (it had compared feet with grid cells and swapped north and south), so distant low terrain no longer reads as 0 % sky visibility. It also refreshes as soon as terrain loads. Slope aspect north/south is corrected too.',
+      'Magnetic declination now comes from the World Magnetic Model (WMM2025) instead of a rough fit that read California as about 10° W instead of about 13° E.',
+      'Further data-honesty fixes: every area-bound source now discards late answers for a previous area; partial or truncated results are labeled as incomplete instead of complete; the dedicated prohibited-area layer now reaches the readout and the assessment; an old or failed METAR check no longer removes observed limits; slope uses true north/south spacing; polygon areas are computed correctly; solar times use the local day; briefings state the forecast time they describe.',
+    ],
+  },
+  {
+    version: '2026.09.22-b',
+    date: '2026-09-22',
+    changes: [
+      'Launch elevation now comes from the centre of the area. It had been read from the south-west corner of the terrain grid, which in steep terrain could be thousands of feet off and skewed battery estimates, the service-ceiling check and aircraft height-above-ground.',
+      'FAA airspace can no longer cross between areas: a late answer for a previously drawn area is discarded instead of replacing the current area (an empty late answer had erased a prohibited area).',
+      'If no FAA airspace data could be loaded for the area, the assessment now says "FAA airspace UNVERIFIED" instead of reading nominal.',
+      'Live traffic now updates the assessment as it arrives: an emergency squawk or a low, close aircraft appears in the banner without a manual refresh.',
+    ],
+  },
+  {
+    version: '2026.09.22-a',
+    date: '2026-09-22',
+    changes: [
+      'Data served from the offline cache (weather, air quality, Kp, NWS alerts, sun times, obstacles, protected areas, utility circuits) is now labeled CACHED with its original age instead of LIVE. Failed weather requests (rate limits, server errors) are reported as errors instead of leaving the panel on "Fetching...".',
+      'Drawing a new area while the previous one is still loading can no longer mix the two: late answers for the old area are discarded, and in-flight map-data requests for it are cancelled.',
+      'Missing wind, gust, temperature or launch elevation is now called out instead of being assumed silently. The assessment lists "Wind unavailable", "Temp missing, assuming 20 °F (worst case)" or "Elevation missing, assuming 9,000 ft (worst case)", and the Ops tab shows the same assumption in each affected cell. Unknown wind, temperature or elevation now takes its worst battery band, so flight-time and battery-swap estimates err short, and such an estimate is never shown green.',
+      'One exceeded limit no longer hides other advisories (for example emergency or low traffic), and a failed NOTAM re-check keeps its advisory in the banner.',
+      'A failed dams / wilderness / national park or FAA obstacle lookup is now shown as unverified, with an advisory, instead of "none found".',
+      'Terrain elevation now comes from USGS 3DEP (Open-Meteo elevation outside 3DEP coverage). The previous Open-Elevation service stopped working when its security certificate expired.',
+      'OpenStreetMap lookups (airports, hospitals, trails, wires) now give up on a stalled server after a time limit and try the next one, and an overloaded server reply is no longer read as "none found".',
+      'Wind direction interpolation across north no longer produces false wind shear, and the Kp index reads the current NOAA feed format (it had been showing a fixed value of 2).',
+      'Single-file field build: every feature loads again (a code comment was cutting the script short), and the build now includes the files the update check and the NAIP-CHM canopy lookup need.',
+    ],
+  },
+  {
     version: '2026.09.20-a',
     date: '2026-09-20',
     changes: [
@@ -523,6 +560,16 @@ const CHANGELOG_ENTRIES = [
 
 function lerp(a, b, t) { return a + (b - a) * t; }
 
+// Compass-bearing interpolation along the SHORTER arc, result in [0, 360).
+// Plain lerp(350, 10) swings through south (a 340° turn) and fakes a huge
+// directional shear. Exactly opposite bearings (Δ = 180°) turn counter-clockwise.
+function lerpBearing(a, b, t) {
+  a = ((a % 360) + 360) % 360;
+  b = ((b % 360) + 360) % 360;
+  const delta = ((b - a + 540) % 360) - 180;
+  return (((a + t * delta) % 360) + 360) % 360;
+}
+
 function degToCompass(d) {
   const dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
   return dirs[Math.round(((d%360)+360)%360/22.5)%16];
@@ -854,6 +901,16 @@ function obstacleHazardLevel(summary) {
 
 // --- Default Risk Thresholds ---
 
+// Values assumed when a reading is MISSING, for the Ops battery / swap
+// estimates. Each sits inside the WORST band of calcBatteryDerating (below
+// freezing → 70%; above 8,000 ft → 75%), like OPS_UNKNOWN_WIND_MPH for wind,
+// so an unknown input shortens the flight time and swap radius instead of
+// flattering them (65 °F / 1,500 ft used to give 100%). Anything that falls
+// back to one must SAY so — an Ops cell note plus an assessment advisory. The
+// assessment never runs a cold/heat/elevation gate on an assumed value.
+const ASSUMED_TEMP_F = 20;
+const ASSUMED_ELEV_FT = 9000;
+
 // A profile is one flat object holding BOTH the aircraft specs and the
 // environmental gates, so picking a drone profile sets every threshold at once.
 // Existing keys keep their names/defaults (back-compat with saved profiles & tests);
@@ -1012,8 +1069,12 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
   // maxWindTol arg kept for back-compat; fall back to the profile value when omitted.
   const windTol = (maxWindTol != null) ? maxWindTol : (t.maxWindTol ?? 27);
   const gustMargin = t.gustMargin ?? 5;
-  const maxWind = wind.maxWind ?? 0;
-  const maxGust = wind.maxGust ?? 0;
+  // Wind, like visibility below: only a real number counts. `?? 0` used to
+  // turn missing wind into 0 mph calm, which passes every wind limit.
+  const num = v => (v != null && Number.isFinite(Number(v))) ? Number(v) : null;
+  const maxWind = num(wind && wind.maxWind);
+  const maxGust = num(wind && wind.maxGust);
+  const hasWind = maxWind != null, hasGust = maxGust != null;
   // Visibility (m → statute miles). `wx.visibility ? … : 99` used to treat a
   // reported ZERO as "missing" and substitute 99 mi, so fog dense enough to
   // read 0 m produced "All conditions nominal". Only null/undefined/NaN is
@@ -1021,33 +1082,52 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
   const visRaw = wx.visibility;
   const hasVis = visRaw != null && Number.isFinite(Number(visRaw));
   const vis = hasVis ? Number(visRaw) / 1609.34 : null;
-  const temp = wx.temperature_2m ?? 65;
+  // Temperature: missing falls back to ASSUMED_TEMP_F (which trips no cold or
+  // heat gate), so it is reported below — never assumed silently.
+  const hasTemp = num(wx.temperature_2m) != null;
+  const temp = hasTemp ? num(wx.temperature_2m) : ASSUMED_TEMP_F;
   const precip = wx.precipitation_probability ?? 0;
   const weatherCode = wx.weather_code ?? 0;
-  const centerElev = elev.center ?? 0;
+  // Launch elevation: missing is UNAVAILABLE (it gates the service-ceiling
+  // limit), not 0 ft — `?? 0` used to pass those checks silently.
+  const hasElev = !!elev && num(elev.center) != null;
+  const centerElev = hasElev ? num(elev.center) : 0;
 
   const issues = [];
-  if (maxWind > windTol || maxGust > windTol + gustMargin) { issues.push(`Wind ${maxWind}/${maxGust}g exceeds limits`); }
+  if ((hasWind && maxWind > windTol) || (hasGust && maxGust > windTol + gustMargin)) {
+    issues.push(`Wind ${hasWind ? maxWind : '?'}/${hasGust ? maxGust : '?'}g exceeds limits`);
+  }
   if (hasVis && vis < t.visNoGo) { issues.push(`Visibility ${vis.toFixed(1)} mi`); }
   if (precip > t.precipNoGo) { issues.push(`Precip ${precip}%`); }
   if (weatherCode >= t.weatherCodeNoGo) { issues.push('Thunderstorm activity'); }
-  if (t.tempColdNoGo != null && wx.temperature_2m != null && temp < t.tempColdNoGo) { issues.push(`Temp ${Math.round(temp)}°F below aircraft limit`); }
-  if (t.tempHotNoGo != null && temp > t.tempHotNoGo) { issues.push(`Temp ${Math.round(temp)}°F above aircraft limit`); }
-  if (t.serviceCeiling != null && centerElev > t.serviceCeiling) { issues.push(`Launch elev ${Math.round(centerElev)} ft above aircraft ceiling`); }
+  if (hasTemp && t.tempColdNoGo != null && temp < t.tempColdNoGo) { issues.push(`Temp ${Math.round(temp)}°F below aircraft limit`); }
+  if (hasTemp && t.tempHotNoGo != null && temp > t.tempHotNoGo) { issues.push(`Temp ${Math.round(temp)}°F above aircraft limit`); }
+  if (hasElev && t.serviceCeiling != null && centerElev > t.serviceCeiling) { issues.push(`Launch elev ${Math.round(centerElev)} ft above aircraft ceiling`); }
 
   const cautions = [];
-  if (maxWind > t.windCaution && maxWind <= windTol) { cautions.push('Elevated winds'); }
+  if (hasWind && maxWind > t.windCaution && maxWind <= windTol) { cautions.push('Elevated winds'); }
   if (hasVis && vis >= t.visNoGo && vis < t.visCaution) { cautions.push('Reduced visibility'); }
   // Unavailable weather is not the same as good weather: a Part 107 minimum
   // (3 SM, §107.51) that cannot be checked must not contribute to a GO.
   const unavailable = [];
   if (!hasVis) { unavailable.push('visibility'); cautions.push('Visibility unavailable — verify 3 SM minimum at launch'); }
+  if (!hasWind) { unavailable.push('wind'); cautions.push(`Wind unavailable — verify sustained wind at launch is within ${windTol} mph limit`); }
+  if (!hasGust) { unavailable.push('gust'); cautions.push(`Gust unavailable — verify gusts at launch are within ${windTol + gustMargin} mph limit`); }
+  if (!hasTemp) {
+    unavailable.push('temperature');
+    cautions.push(`Temp missing, assuming ${ASSUMED_TEMP_F} °F (worst case) for flight-time estimates — cold/heat battery and prop-icing checks not verified`);
+  }
+  if (!hasElev) {
+    unavailable.push('elevation');
+    cautions.push(`Elevation missing, assuming ${ASSUMED_ELEV_FT.toLocaleString('en-US')} ft (worst case) for flight-time estimates — verify launch is below the aircraft service ceiling`
+      + (t.serviceCeiling != null ? ` (${t.serviceCeiling.toLocaleString('en-US')} ft)` : ''));
+  }
   if (precip > t.precipCaution && precip <= t.precipNoGo) { cautions.push(`Precip ${precip}%`); }
-  if (temp < t.tempCaution && !(t.tempColdNoGo != null && temp < t.tempColdNoGo)) { cautions.push('Cold — battery impact'); }
-  if (t.tempHotCaution != null && temp > t.tempHotCaution && !(t.tempHotNoGo != null && temp > t.tempHotNoGo)) { cautions.push('Heat — battery/motor stress'); }
-  if (centerElev > t.elevCaution) { cautions.push('High elevation'); }
+  if (hasTemp && temp < t.tempCaution && !(t.tempColdNoGo != null && temp < t.tempColdNoGo)) { cautions.push('Cold — battery impact'); }
+  if (hasTemp && t.tempHotCaution != null && temp > t.tempHotCaution && !(t.tempHotNoGo != null && temp > t.tempHotNoGo)) { cautions.push('Heat — battery/motor stress'); }
+  if (hasElev && centerElev > t.elevCaution) { cautions.push('High elevation'); }
   // Approaching the airframe's max takeoff altitude (e.g. small drones in high terrain)
-  if (t.serviceCeiling != null && t.ceilingMarginFt != null &&
+  if (hasElev && t.serviceCeiling != null && t.ceilingMarginFt != null &&
       centerElev <= t.serviceCeiling && centerElev > t.serviceCeiling - t.ceilingMarginFt) {
     cautions.push('Near aircraft service ceiling');
   }
@@ -1085,8 +1165,9 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
 //   cls   — badge colour class (go / caution / nogo — CSS names, not shown)
 //   text  — full listing; limits and advisories separated by " | Advisory: "
 function assessmentDisplay(result) {
-  const limits = ((result && result.issues) || []).slice();
-  const advisories = ((result && result.cautions) || []).slice();
+  // Deduplicated; an item already listed as a limit is not repeated as an advisory.
+  const limits = [...new Set((result && result.issues) || [])];
+  const advisories = [...new Set((result && result.cautions) || [])].filter(c => !limits.includes(c));
   const n = limits.length, m = advisories.length;
   let label, cls;
   if (n) { label = n + ' LIMIT' + (n > 1 ? 'S' : '') + ' EXCEEDED'; cls = 'nogo'; }
@@ -1188,6 +1269,243 @@ function assessCloudClearance(ceilingFt, visSm, maxAltAGL, thresholds) {
   return { issues, cautions };
 }
 
+// Prohibited airspace comes from TWO FAA layers: SUA features whose TYPE_CODE
+// starts with 'P', and the dedicated Prohibited_Areas layer. Reading only the
+// SUA copy let a P-area returned by the dedicated layer render on the map yet
+// never reach the readout or the assessment. Both are merged here, deduplicated
+// by designator/name, so presence in EITHER is reported. `unknown` is true when
+// either layer could not be checked (missing or `_unavailable`) — an empty
+// merge is then not proof of absence. `cached` flags a contributing layer that
+// was filled from the cached copy (`_cachedAt`).
+function combineProhibitedAreas(sua, prohibited) {
+  const usable = l => !!(l && Array.isArray(l.features) && !l._unavailable);
+  const out = [], seen = new Set();
+  const keyOf = f => {
+    const p = (f && f.properties) || {};
+    const k = p.DESIGNATOR || p.IDENT || p.NAME || p.Name || p.name;
+    return k ? String(k).trim().toUpperCase().replace(/\s+/g, ' ') : null;
+  };
+  const add = f => {
+    const k = keyOf(f);
+    if (k != null) { if (seen.has(k)) return; seen.add(k); }
+    out.push(f);
+  };
+  if (usable(prohibited)) prohibited.features.forEach(add);
+  if (usable(sua)) sua.features.filter(f => String(((f && f.properties) || {}).TYPE_CODE || '').startsWith('P')).forEach(add);
+  return {
+    features: out,
+    unknown: !usable(sua) || !usable(prohibited),
+    cached: [sua, prohibited].some(l => usable(l) && l._cachedAt != null),
+  };
+}
+
+// ArcGIS marks a query result cut off at the server's record limit with
+// `exceededTransferLimit` — top-level for f=json and most f=geojson servers,
+// under `properties` for hosted FeatureServer f=geojson. Either placement
+// means the feature list is INCOMPLETE and must not be treated as an inventory.
+function arcgisExceededLimit(j) {
+  return !!(j && (j.exceededTransferLimit || (j.properties && j.properties.exceededTransferLimit)));
+}
+// The same query URL asking for the page starting at `offset` (ArcGIS
+// `resultOffset`); an existing resultOffset is replaced.
+function arcgisPageUrl(url, offset) {
+  const u = String(url).replace(/([?&])resultOffset=\d*(&|$)/, (m, a, b) => (b ? a : ''));
+  return u + (u.indexOf('?') >= 0 ? '&' : '?') + 'resultOffset=' + offset;
+}
+
+// Geodesic area (km²) of one closed ring of {lat, lng} vertices (closing vertex
+// optional, either winding order) on a spherical Earth — the spherical-excess
+// formula used by geojson-area / Leaflet.GeometryUtil. The drawn-area readout
+// used the polygon's bounding box, overstating a triangle 2× and concave
+// shapes by more.
+function ringAreaKm2(ring) {
+  if (!Array.isArray(ring) || ring.length < 3) return 0;
+  const R = 6371.0088; // mean Earth radius, km
+  const rad = Math.PI / 180;
+  let pts = ring.map(p => [p.lat != null ? p.lat : p[0], p.lng != null ? p.lng : p[1]]);
+  const f = pts[0], l = pts[pts.length - 1];
+  if (f[0] === l[0] && f[1] === l[1]) pts = pts.slice(0, -1);
+  if (pts.length < 3) return 0;
+  let sum = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    sum += (b[1] - a[1]) * rad * (2 + Math.sin(a[0] * rad) + Math.sin(b[0] * rad));
+  }
+  return Math.abs(sum * R * R / 2);
+}
+// Calendar date (YYYY-MM-DD) of instant `ms` in IANA time zone `tz`. Solar
+// events must be requested for the LOCAL day the panel displays —
+// toISOString() gives the UTC date, which in the western US flips to
+// tomorrow every evening (and in the east lags in the early morning).
+function localDateISO(ms, tz) {
+  const d = new Date(ms);
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', { timeZone: tz || undefined, year: 'numeric', month: '2-digit', day: '2-digit' })
+      .formatToParts(d).reduce((o, p) => { o[p.type] = p.value; return o; }, {});
+    if (parts.year && parts.month && parts.day) return `${parts.year}-${parts.month}-${parts.day}`;
+  } catch (_) { /* unknown zone → fall through */ }
+  return d.toISOString().split('T')[0];
+}
+
+// --- Magnetic declination: World Magnetic Model WMM2025 (valid 2025.0–2030.0) ---
+// Official NOAA/NCEI + BGS coefficients (WMM2025.COF, 11/13/2024), degree/order
+// 12, as flat rows [n, m, g, h, gDot, hDot] (nT, nT/yr). The panel used a
+// linear CONUS fit whose sign was backwards for the western US (California read
+// 9.7° W; the model gives ~12.6° E). Verified against NCEI's
+// WMM2025_TestValues (tests/unit/magDeclination.test.js).
+const WMM2025_EPOCH = 2025.0;
+const WMM2025_COEF = [
+  1,0,-29351.8,0.0,12.0,0.0, 1,1,-1410.8,4545.4,9.7,-21.5, 2,0,-2556.6,0.0,-11.6,0.0,
+  2,1,2951.1,-3133.6,-5.2,-27.7, 2,2,1649.3,-815.1,-8.0,-12.1, 3,0,1361.0,0.0,-1.3,0.0,
+  3,1,-2404.1,-56.6,-4.2,4.0, 3,2,1243.8,237.5,0.4,-0.3, 3,3,453.6,-549.5,-15.6,-4.1,
+  4,0,895.0,0.0,-1.6,0.0, 4,1,799.5,278.6,-2.4,-1.1, 4,2,55.7,-133.9,-6.0,4.1,
+  4,3,-281.1,212.0,5.6,1.6, 4,4,12.1,-375.6,-7.0,-4.4, 5,0,-233.2,0.0,0.6,0.0,
+  5,1,368.9,45.4,1.4,-0.5, 5,2,187.2,220.2,0.0,2.2, 5,3,-138.7,-122.9,0.6,0.4,
+  5,4,-142.0,43.0,2.2,1.7, 5,5,20.9,106.1,0.9,1.9, 6,0,64.4,0.0,-0.2,0.0,
+  6,1,63.8,-18.4,-0.4,0.3, 6,2,76.9,16.8,0.9,-1.6, 6,3,-115.7,48.8,1.2,-0.4,
+  6,4,-40.9,-59.8,-0.9,0.9, 6,5,14.9,10.9,0.3,0.7, 6,6,-60.7,72.7,0.9,0.9,
+  7,0,79.5,0.0,-0.0,0.0, 7,1,-77.0,-48.9,-0.1,0.6, 7,2,-8.8,-14.4,-0.1,0.5,
+  7,3,59.3,-1.0,0.5,-0.8, 7,4,15.8,23.4,-0.1,0.0, 7,5,2.5,-7.4,-0.8,-1.0,
+  7,6,-11.1,-25.1,-0.8,0.6, 7,7,14.2,-2.3,0.8,-0.2, 8,0,23.2,0.0,-0.1,0.0,
+  8,1,10.8,7.1,0.2,-0.2, 8,2,-17.5,-12.6,0.0,0.5, 8,3,2.0,11.4,0.5,-0.4,
+  8,4,-21.7,-9.7,-0.1,0.4, 8,5,16.9,12.7,0.3,-0.5, 8,6,15.0,0.7,0.2,-0.6,
+  8,7,-16.8,-5.2,-0.0,0.3, 8,8,0.9,3.9,0.2,0.2, 9,0,4.6,0.0,-0.0,0.0,
+  9,1,7.8,-24.8,-0.1,-0.3, 9,2,3.0,12.2,0.1,0.3, 9,3,-0.2,8.3,0.3,-0.3,
+  9,4,-2.5,-3.3,-0.3,0.3, 9,5,-13.1,-5.2,0.0,0.2, 9,6,2.4,7.2,0.3,-0.1,
+  9,7,8.6,-0.6,-0.1,-0.2, 9,8,-8.7,0.8,0.1,0.4, 9,9,-12.9,10.0,-0.1,0.1,
+  10,0,-1.3,0.0,0.1,0.0, 10,1,-6.4,3.3,0.0,0.0, 10,2,0.2,0.0,0.1,-0.0,
+  10,3,2.0,2.4,0.1,-0.2, 10,4,-1.0,5.3,-0.0,0.1, 10,5,-0.6,-9.1,-0.3,-0.1,
+  10,6,-0.9,0.4,0.0,0.1, 10,7,1.5,-4.2,-0.1,0.0, 10,8,0.9,-3.8,-0.1,-0.1,
+  10,9,-2.7,0.9,-0.0,0.2, 10,10,-3.9,-9.1,-0.0,-0.0, 11,0,2.9,0.0,0.0,0.0,
+  11,1,-1.5,0.0,-0.0,-0.0, 11,2,-2.5,2.9,0.0,0.1, 11,3,2.4,-0.6,0.0,-0.0,
+  11,4,-0.6,0.2,0.0,0.1, 11,5,-0.1,0.5,-0.1,-0.0, 11,6,-0.6,-0.3,0.0,-0.0,
+  11,7,-0.1,-1.2,-0.0,0.1, 11,8,1.1,-1.7,-0.1,-0.0, 11,9,-1.0,-2.9,-0.1,0.0,
+  11,10,-0.2,-1.8,-0.1,0.0, 11,11,2.6,-2.3,-0.1,0.0, 12,0,-2.0,0.0,0.0,0.0,
+  12,1,-0.2,-1.3,0.0,-0.0, 12,2,0.3,0.7,-0.0,0.0, 12,3,1.2,1.0,-0.0,-0.1,
+  12,4,-1.3,-1.4,-0.0,0.1, 12,5,0.6,-0.0,-0.0,-0.0, 12,6,0.6,0.6,0.1,-0.0,
+  12,7,0.5,-0.1,-0.0,-0.0, 12,8,-0.1,0.8,0.0,0.0, 12,9,-0.4,0.1,0.0,-0.0,
+  12,10,-0.2,-1.0,-0.1,-0.0, 12,11,-1.3,0.1,-0.0,0.0, 12,12,-0.7,0.2,-0.1,-0.1,];
+
+// Decimal year of an instant (e.g. 2026-07-02 → ~2026.5).
+function decimalYear(ms) {
+  const d = new Date(ms);
+  const y = d.getUTCFullYear();
+  const start = Date.UTC(y, 0, 1), end = Date.UTC(y + 1, 0, 1);
+  return y + (ms - start) / (end - start);
+}
+
+// Main-field geomagnetic elements at a geodetic position (WGS84 latitude /
+// longitude in degrees, height above the ellipsoid in km) and decimal year.
+// Returns { declination, inclination (deg), X north, Y east, Z down, H, F (nT),
+// outOfRange } — `outOfRange` when the date is outside the model's 5-year span
+// (the result is then an extrapolation and must be labeled as such).
+function wmmMagneticField(latDeg, lonDeg, altKm, decYear) {
+  const A_WGS = 6378.137, F_WGS = 1 / 298.257223563, RE = 6371.2;
+  const E2 = F_WGS * (2 - F_WGS);
+  const rad = Math.PI / 180;
+  const dt = decYear - WMM2025_EPOCH;
+  const phi = latDeg * rad, lam = lonDeg * rad, h = altKm || 0;
+
+  // Geodetic → geocentric spherical (radius r, geocentric latitude phiC).
+  const sinPhi = Math.sin(phi), cosPhi = Math.cos(phi);
+  const Rc = A_WGS / Math.sqrt(1 - E2 * sinPhi * sinPhi);
+  const xp = (Rc + h) * cosPhi, zp = (Rc * (1 - E2) + h) * sinPhi;
+  const r = Math.hypot(xp, zp);
+  const phiC = Math.asin(zp / r);
+
+  // Schmidt semi-normalized associated Legendre functions P[n][m](cos θ) and
+  // dP/dθ, θ = geocentric colatitude (cos θ = sin phiC).
+  const N = 12;
+  const x = Math.sin(phiC), s = Math.cos(phiC);
+  const P = [], dP = [];
+  for (let n = 0; n <= N; n++) { P.push(new Array(N + 1).fill(0)); dP.push(new Array(N + 1).fill(0)); }
+  P[0][0] = 1;
+  for (let n = 1; n <= N; n++) {
+    P[n][n] = (n === 1 ? 1 : Math.sqrt((2 * n - 1) / (2 * n))) * s * P[n - 1][n - 1];
+    for (let m = 0; m < n; m++) {
+      const k = Math.sqrt(n * n - m * m);
+      P[n][m] = ((2 * n - 1) * x * P[n - 1][m] - (n >= 2 ? Math.sqrt((n - 1) * (n - 1) - m * m) * P[n - 2][m] : 0)) / k;
+    }
+  }
+  // sinθ · dP/dθ = n cosθ P(n,m) − sqrt(n²−m²) P(n−1,m)
+  for (let n = 1; n <= N; n++) {
+    for (let m = 0; m <= n; m++) {
+      dP[n][m] = (n * x * P[n][m] - Math.sqrt(n * n - m * m) * (m <= n - 1 ? P[n - 1][m] : 0)) / s;
+    }
+  }
+
+  // Field in geocentric spherical components.
+  let Br = 0, Bt = 0, Bp = 0;
+  for (let i = 0; i < WMM2025_COEF.length; i += 6) {
+    const n = WMM2025_COEF[i], m = WMM2025_COEF[i + 1];
+    const g = WMM2025_COEF[i + 2] + dt * WMM2025_COEF[i + 4];
+    const hh = WMM2025_COEF[i + 3] + dt * WMM2025_COEF[i + 5];
+    const ar = Math.pow(RE / r, n + 2);
+    const cm = Math.cos(m * lam), sm = Math.sin(m * lam);
+    const gh = g * cm + hh * sm;
+    Br += (n + 1) * ar * gh * P[n][m];
+    Bt -= ar * gh * dP[n][m];
+    Bp += ar * m * (g * sm - hh * cm) * P[n][m];
+  }
+  Bp /= s;
+  // Geocentric north / east / down, then rotate into the geodetic frame.
+  const Xc = -Bt, Yc = Bp, Zc = -Br;
+  const psi = phiC - phi;
+  const X = Xc * Math.cos(psi) - Zc * Math.sin(psi);
+  const Z = Xc * Math.sin(psi) + Zc * Math.cos(psi);
+  const Y = Yc;
+  const H = Math.hypot(X, Y);
+  return {
+    declination: Math.atan2(Y, X) / rad,
+    inclination: Math.atan2(Z, H) / rad,
+    X, Y, Z, H, F: Math.hypot(H, Z),
+    outOfRange: decYear < WMM2025_EPOCH || decYear >= WMM2025_EPOCH + 5,
+  };
+}
+
+// Declination (degrees, EAST positive) at the surface for an instant.
+function magneticDeclination(latDeg, lonDeg, ms, altKm) {
+  return wmmMagneticField(latDeg, lonDeg, altKm || 0, decimalYear(ms)).declination;
+}
+
+// "12.6° E" / "3.2° W" readout text.
+function formatDeclination(deg) {
+  if (!Number.isFinite(deg)) return '--';
+  return `${Math.abs(deg).toFixed(1)}° ${deg >= 0 ? 'E' : 'W'}`;
+}
+
+// Open-Meteo hourly timestamp → absolute ISO-8601 UTC ("…Z"). With
+// timezone=auto the API returns MISSION-local wall-clock strings with no
+// offset ("2026-09-22T17:00"); new Date() read those in the DEVICE zone, so a
+// mission three zones away was three hours off everywhere a forecast hour was
+// shown or exported. Handles: unix seconds (timeformat=unixtime — what the app
+// requests, exact across DST changes), strings that already carry a zone, and
+// naive local strings + the response's utc_offset_seconds (legacy bodies).
+// A naive string with no known offset is returned unchanged.
+function openMeteoTimeToIso(t, utcOffsetSeconds) {
+  if (typeof t === 'number' && Number.isFinite(t)) return new Date(t * 1000).toISOString();
+  if (typeof t !== 'string' || !t) return t;
+  if (/(Z|[+-]\d{2}:?\d{2})$/.test(t)) { const ms = Date.parse(t); return Number.isFinite(ms) ? new Date(ms).toISOString() : t; }
+  if (!Number.isFinite(utcOffsetSeconds)) return t;
+  const ms = Date.parse(t + (t.length === 16 ? ':00Z' : 'Z'));
+  return Number.isFinite(ms) ? new Date(ms - utcOffsetSeconds * 1000).toISOString() : t;
+}
+
+// Area (km²) of a Leaflet-style polygon: an array of rings (outer first, then
+// holes) or a single ring; a multi-polygon ([[[…]]]) sums its parts. Holes are
+// subtracted.
+function polygonAreaKm2(latlngs) {
+  if (!Array.isArray(latlngs) || !latlngs.length) return 0;
+  const isPt = p => p && (p.lat != null || (Array.isArray(p) && typeof p[0] === 'number'));
+  if (isPt(latlngs[0])) return ringAreaKm2(latlngs);                 // single ring
+  if (isPt(latlngs[0][0])) {                                         // [outer, ...holes]
+    const outer = ringAreaKm2(latlngs[0]);
+    const holes = latlngs.slice(1).reduce((s, r) => s + ringAreaKm2(r), 0);
+    return Math.max(0, outer - holes);
+  }
+  return latlngs.reduce((s, part) => s + polygonAreaKm2(part), 0);  // multi-polygon
+}
+
 // --- Terrain Classification ---
 
 function classifyTerrain(centerElevFt) {
@@ -1271,6 +1589,46 @@ function calcWindShear(windProfile) {
 
 // --- Elevation Grid Generation ---
 
+// Client-side time limit for ONE Overpass mirror: the server-side [timeout:N]
+// the query asks for, plus 10 s of transfer grace (N = 30 when the query names
+// none), clamped to 15–90 s. Without it a stuck mirror held a panel on
+// "Fetching..." for 3+ minutes (measured Sept 2026, overloaded mirrors).
+function overpassMirrorTimeoutMs(query) {
+  const m = /\[timeout:(\d+)\]/.exec(String(query || ''));
+  const n = m ? Number(m[1]) : 30;
+  return Math.min(90, Math.max(15, n + 10)) * 1000;
+}
+
+// --- Point elevation service responses → metres, in request order ---
+// Both return null unless EVERY requested point has a finite value: a grid
+// with holes would skew min/max/launch elevation, so it is not a result.
+// null / '' / 'NoData' are missing — Number(null) and Number('') are 0.
+const _elevNum = v => (v == null || (typeof v === 'string' && v.trim() === '')) ? null
+  : (Number.isFinite(Number(v)) ? Number(v) : null);
+
+// USGS 3DEP ImageServer getSamples (returnFirstValueOnly). Values are STRINGS
+// ("382.135131836"), samples come back in any order (match on locationId),
+// and points outside 3DEP coverage (ocean, most non-US land) are simply
+// omitted — or read "NoData" — so a missing id means "no coverage".
+function parse3depSamples(json, n) {
+  if (!json || !Array.isArray(json.samples) || !(n > 0)) return null;
+  const out = new Array(n).fill(null);
+  for (const s of json.samples) {
+    const i = s && Number(s.locationId);
+    if (!Number.isInteger(i) || i < 0 || i >= n) continue;
+    const v = _elevNum(s.value);
+    if (v != null) out[i] = v;
+  }
+  return out.every(v => v != null) ? out : null;
+}
+
+// Open-Meteo elevation API ({ elevation: [m, …] }, Copernicus GLO-90 DEM).
+function parseOpenMeteoElevation(json, n) {
+  if (!json || !Array.isArray(json.elevation) || json.elevation.length !== n || !(n > 0)) return null;
+  const out = json.elevation.map(_elevNum);
+  return out.every(v => v != null) ? out : null;
+}
+
 function generateElevationGrid(centerLat, centerLng, boundsNE, boundsSW, gridSize) {
   const points = [];
   for (let row = 0; row < gridSize; row++) {
@@ -1285,10 +1643,45 @@ function generateElevationGrid(centerLat, centerLng, boundsNE, boundsSW, gridSiz
   return points;
 }
 
+// Index of the grid point nearest (lat, lng) — the LAUNCH sample. The grid is
+// row-major from the SW corner, so index 0 is a corner, not the centre (the
+// old 9-point layout listed the centre first; the 25-point grid kept reading
+// [0] and reported the SW corner's elevation as launch elevation).
+function gridCenterIndex(points, lat, lng) {
+  let best = -1, bestD = Infinity;
+  const cosLat = Math.cos(lat * Math.PI / 180);
+  (points || []).forEach((p, i) => {
+    const pLat = p.latitude != null ? p.latitude : p.lat;
+    const pLng = p.longitude != null ? p.longitude : p.lng;
+    const d = (pLat - lat) ** 2 + ((pLng - lng) * cosLat) ** 2;
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  return best;
+}
+
 // --- Slope Calculation from Grid ---
 
+// Physical sample spacing of a row-major grid (generateElevationGrid order):
+// x = east/west between adjacent columns, y = north/south between adjacent
+// rows. A rectangular area has DIFFERENT spacings — using the east/west one for
+// both axes turned a 31° north-facing slope into 3.5° "flat" terrain on a wide,
+// short rectangle. Points are {lat, lng} (or {latitude, longitude}).
+function gridCellSpacingKm(points, gridSize) {
+  if (!Array.isArray(points) || !(gridSize >= 2) || points.length < gridSize * gridSize) return null;
+  const ll = p => [p.lat != null ? p.lat : p.latitude, p.lng != null ? p.lng : p.longitude];
+  const [a0, b0] = ll(points[0]), [a1, b1] = ll(points[1]), [a2, b2] = ll(points[gridSize]);
+  if (![a0, b0, a1, b1, a2, b2].every(Number.isFinite)) return null;
+  const xKm = haversine(a0, b0, a1, b1), yKm = haversine(a0, b0, a2, b2);
+  return (xKm > 0 && yKm > 0) ? { xKm, yKm } : null;
+}
+// Accepts a spacing object {xKm, yKm} or a single number (square cells).
+function _cellSpacingFt(cellSize) {
+  if (cellSize && typeof cellSize === 'object') return { x: cellSize.xKm * 3280.84, y: cellSize.yKm * 3280.84 };
+  return { x: cellSize * 3280.84, y: cellSize * 3280.84 };
+}
+
 function calcSlopeFromGrid(elevationsFt, gridSize, cellSizeKm) {
-  const cellSizeFt = cellSizeKm * 3280.84; // km -> ft
+  const sp = _cellSpacingFt(cellSizeKm); // km -> ft, per axis
   const slopeGrid = [];
 
   for (let r = 0; r < gridSize; r++) {
@@ -1298,8 +1691,8 @@ function calcSlopeFromGrid(elevationsFt, gridSize, cellSizeKm) {
         continue;
       }
       const idx = r * gridSize + c;
-      const dz_dx = (elevationsFt[idx + 1] - elevationsFt[idx - 1]) / (2 * cellSizeFt);
-      const dz_dy = (elevationsFt[(r + 1) * gridSize + c] - elevationsFt[(r - 1) * gridSize + c]) / (2 * cellSizeFt);
+      const dz_dx = (elevationsFt[idx + 1] - elevationsFt[idx - 1]) / (2 * sp.x);
+      const dz_dy = (elevationsFt[(r + 1) * gridSize + c] - elevationsFt[(r - 1) * gridSize + c]) / (2 * sp.y);
       const slopeRad = Math.atan(Math.sqrt(dz_dx * dz_dx + dz_dy * dz_dy));
       slopeGrid.push(slopeRad * 180 / Math.PI);
     }
@@ -1317,11 +1710,12 @@ function calcSlopeFromGrid(elevationsFt, gridSize, cellSizeKm) {
 function calcAspect(elevationsFt, gridSize) {
   if (gridSize < 2) return 'flat';
 
-  // Compute average elevation of each edge
+  // Compute average elevation of each edge. generateElevationGrid is row-major
+  // from the SW corner: row 0 is the SOUTH edge, the last row the NORTH edge.
   let northAvg = 0, southAvg = 0, eastAvg = 0, westAvg = 0;
   for (let c = 0; c < gridSize; c++) {
-    northAvg += elevationsFt[c];                           // top row (north)
-    southAvg += elevationsFt[(gridSize - 1) * gridSize + c]; // bottom row (south)
+    southAvg += elevationsFt[c];                           // row 0 (south)
+    northAvg += elevationsFt[(gridSize - 1) * gridSize + c]; // last row (north)
   }
   for (let r = 0; r < gridSize; r++) {
     westAvg += elevationsFt[r * gridSize];                 // left col (west)
@@ -1332,15 +1726,14 @@ function calcAspect(elevationsFt, gridSize) {
   eastAvg  /= gridSize;
   westAvg  /= gridSize;
 
-  // Gradient vector: points downhill from high to low
-  const dx = eastAvg - westAvg;   // positive = slopes east (higher west, faces east)
-  const dy = northAvg - southAvg; // positive = slopes north (higher south, faces north)
+  // Uphill gradient; the slope faces the opposite (downhill) way.
+  const dx = eastAvg - westAvg;   // positive = rises to the east (faces west)
+  const dy = northAvg - southAvg; // positive = rises to the north (faces south)
 
   const threshold = 5; // ft — below this consider flat
   if (Math.abs(dx) < threshold && Math.abs(dy) < threshold) return 'flat';
 
-  // Aspect angle: direction the slope faces (downhill direction)
-  // atan2 with negated dy because grid north row = index 0 but elevation increase going south means slope faces north
+  // Aspect angle: compass bearing of the downhill direction (-dx east, -dy north)
   const angleDeg = ((Math.atan2(-dx, -dy) * 180 / Math.PI) + 360) % 360;
 
   const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
@@ -1453,7 +1846,7 @@ function scoreLZFitness(elevFt, slopeDeg, vegetationType) {
 function findEmergencyLZs(elevPoints, gridSize, cellSizeKm) {
   if (!elevPoints || elevPoints.length === 0) return [];
 
-  const cellSizeFt = cellSizeKm * 3280.84;
+  const sp = _cellSpacingFt(cellSizeKm); // number (square) or {xKm, yKm}
   const candidates = [];
 
   for (let i = 0; i < elevPoints.length; i++) {
@@ -1464,8 +1857,8 @@ function findEmergencyLZs(elevPoints, gridSize, cellSizeKm) {
     // Only score interior points where we can calculate slope from neighbors
     if (r === 0 || r === gridSize - 1 || c === 0 || c === gridSize - 1) continue;
 
-    const dz_dx = (elevPoints[i + 1].elevFt - elevPoints[i - 1].elevFt) / (2 * cellSizeFt);
-    const dz_dy = (elevPoints[(r + 1) * gridSize + c].elevFt - elevPoints[(r - 1) * gridSize + c].elevFt) / (2 * cellSizeFt);
+    const dz_dx = (elevPoints[i + 1].elevFt - elevPoints[i - 1].elevFt) / (2 * sp.x);
+    const dz_dy = (elevPoints[(r + 1) * gridSize + c].elevFt - elevPoints[(r - 1) * gridSize + c].elevFt) / (2 * sp.y);
     const slopeDeg = Math.atan(Math.sqrt(dz_dx * dz_dx + dz_dy * dz_dy)) * 180 / Math.PI;
 
     // Estimate vegetation from elevation
@@ -1556,78 +1949,50 @@ function assessTerrainTurbulence(elevationsFt, gridSize, rangeFt, windDirDeg, wi
 
 // --- GPS Terrain Masking ---
 
-function analyzeGPSMasking(centerElevFt, elevPoints, gridSize, flightAltAGL) {
+function analyzeGPSMasking(centerElevFt, elevPoints, gridSize, flightAltAGL, observer) {
   if (!elevPoints || elevPoints.length === 0) {
     return { maskedDirections: [], skyVisibilityPct: 100, description: 'No terrain data — assuming clear sky view' };
   }
 
   const GPS_MASK_ANGLE = 15; // degrees — typical GPS mask angle
-  const centerR = Math.floor(gridSize / 2);
-  const centerC = Math.floor(gridSize / 2);
   const flightElevFt = centerElevFt + flightAltAGL;
+  const DIRS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
 
-  // Direction mapping: for each compass direction, which edge cells to check
-  const directions = {
-    'N':  { rows: [0],              cols: null },                     // top row
-    'NE': { rows: [0],              cols: [gridSize - 1] },          // top-right corner
-    'E':  { rows: null,             cols: [gridSize - 1] },          // right col
-    'SE': { rows: [gridSize - 1],   cols: [gridSize - 1] },          // bottom-right corner
-    'S':  { rows: [gridSize - 1],   cols: null },                     // bottom row
-    'SW': { rows: [gridSize - 1],   cols: [0] },                     // bottom-left corner
-    'W':  { rows: null,             cols: [0] },                      // left col
-    'NW': { rows: [0],              cols: [0] },                      // top-left corner
-  };
-
-  const maskedDirections = [];
-
-  for (const [dir, spec] of Object.entries(directions)) {
-    let maxAngle = -Infinity;
-
-    // Collect edge points for this direction
-    const points = [];
-    if (spec.rows !== null && spec.cols !== null) {
-      // Corner: specific cell(s)
-      for (const r of spec.rows) {
-        for (const c of spec.cols) {
-          points.push({ r, c, idx: r * gridSize + c });
-        }
-      }
-    } else if (spec.rows !== null) {
-      // Full row
-      for (const r of spec.rows) {
-        for (let c = 0; c < gridSize; c++) {
-          points.push({ r, c, idx: r * gridSize + c });
-        }
-      }
-    } else if (spec.cols !== null) {
-      // Full column
-      for (const c of spec.cols) {
-        for (let r = 0; r < gridSize; r++) {
-          points.push({ r, c, idx: r * gridSize + c });
-        }
-      }
-    }
-
-    for (const pt of points) {
-      const terrainElev = elevPoints[pt.idx].elevFt !== undefined ? elevPoints[pt.idx].elevFt :
-                          (typeof elevPoints[pt.idx] === 'number' ? elevPoints[pt.idx] : 0);
-      const dRow = pt.r - centerR;
-      const dCol = pt.c - centerC;
-      const cellDist = Math.sqrt(dRow * dRow + dCol * dCol);
-      if (cellDist === 0) continue;
-
-      // Elevation angle from flight altitude to terrain point
-      const rise = terrainElev - flightElevFt;
-      // Use cell distance as proportional measure (actual distance scaling cancels out in angle)
-      const angle = Math.atan2(rise, cellDist) * 180 / Math.PI;
-      maxAngle = Math.max(maxAngle, angle);
-    }
-
-    if (maxAngle > GPS_MASK_ANGLE) {
-      maskedDirections.push(dir);
-    }
+  // Geometry comes from each sample's own lat/lng, never its row/col: the
+  // elevation grid is row-major from the SW corner (row 0 is SOUTH), and an
+  // angle needs rise and run in the SAME unit — a count of grid cells is not a
+  // distance. The observer is the sample nearest `observer` (the launch
+  // point), else nearest the samples' bbox centre.
+  const pts = elevPoints.map(p => (p && isFinite(p.lat) && isFinite(p.lng)) ? p : null);
+  const usable = pts.filter(Boolean);
+  if (!usable.length) {
+    return { maskedDirections: [], skyVisibilityPct: 100, description: 'No terrain geometry — assuming clear sky view' };
   }
+  let oLat, oLng;
+  if (observer && isFinite(observer.lat) && isFinite(observer.lng)) { oLat = observer.lat; oLng = observer.lng; }
+  else {
+    const lats = usable.map(p => p.lat), lngs = usable.map(p => p.lng);
+    oLat = (Math.min(...lats) + Math.max(...lats)) / 2;
+    oLng = (Math.min(...lngs) + Math.max(...lngs)) / 2;
+  }
+  const obsIdx = gridCenterIndex(pts.map(p => p || { lat: NaN, lng: NaN }), oLat, oLng);
+  if (obsIdx >= 0) { oLat = pts[obsIdx].lat; oLng = pts[obsIdx].lng; }
+  const cosLat = Math.cos(oLat * Math.PI / 180);
 
+  const maxAngle = {};
+  pts.forEach((p, i) => {
+    if (!p || i === obsIdx) return;
+    const terrainElev = typeof p.elevFt === 'number' ? p.elevFt : null;
+    if (terrainElev == null || !isFinite(terrainElev)) return;
+    const distFt = haversine(oLat, oLng, p.lat, p.lng) * 3280.84;
+    if (!(distFt > 1)) return; // co-located sample: no defined angle
+    const bearing = (Math.atan2((p.lng - oLng) * cosLat, p.lat - oLat) * 180 / Math.PI + 360) % 360;
+    const dir = DIRS[Math.round(bearing / 45) % 8];
+    const angle = Math.atan2(terrainElev - flightElevFt, distFt) * 180 / Math.PI;
+    if (!(dir in maxAngle) || angle > maxAngle[dir]) maxAngle[dir] = angle;
+  });
+
+  const maskedDirections = DIRS.filter(d => maxAngle[d] > GPS_MASK_ANGLE);
   const skyVisibilityPct = Math.round((8 - maskedDirections.length) / 8 * 100);
 
   let description;
@@ -1905,6 +2270,57 @@ function distPointToSegment(px, py, ax, ay, bx, by) {
   let t = ((px - ax) * dx + (py - ay) * dy) / l2;
   t = Math.max(0, Math.min(1, t));
   return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+// Distance (km) from (lat, lng) to a GeoJSON footprint: 0 when the point is
+// inside it (holes subtract), else the shortest distance to any ring edge.
+// Polygon and MultiPolygon; other geometries measure to their vertices.
+// Returns null for a missing/empty geometry. Edges are measured in a local
+// equirectangular plane centred on the point — ample for the tens of nm a fire
+// query spans, and independent of vertex order (a vertex or "first-point
+// centroid" is not proximity: a launch INSIDE a large perimeter read 38 nm).
+function distanceToGeoJsonKm(lat, lng, geometry) {
+  if (!geometry || !geometry.type) return null;
+  const R = 6371.0088;
+  const kx = Math.cos(lat * Math.PI / 180) * Math.PI / 180 * R;
+  const ky = Math.PI / 180 * R;
+  const proj = c => [(c[0] - lng) * kx, (c[1] - lat) * ky];
+  const polys = geometry.type === 'Polygon' ? [geometry.coordinates]
+    : geometry.type === 'MultiPolygon' ? geometry.coordinates : null;
+  let best = Infinity;
+  if (polys) {
+    for (const poly of polys) {
+      if (!Array.isArray(poly) || !poly.length) continue;
+      const rings = poly.filter(r => Array.isArray(r) && r.length >= 2).map(r => r.map(proj));
+      if (!rings.length) continue;
+      // Even-odd over the outer ring + holes of THIS polygon (origin = the point).
+      let crossings = 0;
+      for (const ring of rings) {
+        let inside = false;
+        for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+          const [xi, yi] = ring[i], [xj, yj] = ring[j];
+          if (((yi > 0) !== (yj > 0)) && (0 < (xj - xi) * (0 - yi) / (yj - yi) + xi)) inside = !inside;
+          const d = distPointToSegment(0, 0, xj, yj, xi, yi);
+          if (d < best) best = d;
+        }
+        if (inside) crossings++;
+      }
+      if (crossings % 2 === 1) return 0;
+    }
+  } else {
+    const walk = c => {
+      if (!Array.isArray(c)) return;
+      if (typeof c[0] === 'number') { const [x, y] = proj(c); best = Math.min(best, Math.hypot(x, y)); }
+      else c.forEach(walk);
+    };
+    if (geometry.type === 'GeometryCollection') {
+      for (const g of geometry.geometries || []) {
+        const d = distanceToGeoJsonKm(lat, lng, g);
+        if (d != null && d < best) best = d;
+      }
+    } else walk(geometry.coordinates);
+  }
+  return isFinite(best) ? best : null;
 }
 
 // ============================================================
@@ -3195,6 +3611,11 @@ function buildSectionMetaLine(meta, nowMs, tz) {
     const ageText = age ? '(' + age + ' ago)' : '';
     const text = 'Cached ' + formatStamp(cab, nowMs, tz) + (ageText ? ' ' + ageText : '');
     return { state: 'cached', tone: 'cached', text, ageText, title: meta.error || '', canUpdate: true };
+  }
+  if (status === 'cached') {
+    // Served from a cache that carried no timestamp (X-SAR-SW-Cache: unknown):
+    // still cached, never "Not loaded" and never a fresh "Updated".
+    return { state: 'cached', tone: 'cached', text: 'Cached (age unknown)', ageText: '', title: meta.error || '', canUpdate: true };
   }
   if (upd != null) {
     const age = relAge(upd, nowMs);
@@ -4798,7 +5219,7 @@ function geojsonLineLatLngs(geometry) {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     assessmentDisplay, assessmentLabelForLog,
-    WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, degToCompass, haversine, wmoCodeToText,
+    WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, lerpBearing, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,
     calcSunPosition, calcMoonPhase, calcMoonPosition, lightVecENU, lightForTime, hillshadeParams,
     wireHazardName, parseHeightToMeters, osmTowerHeightFt,
@@ -4806,20 +5227,22 @@ if (typeof module !== 'undefined' && module.exports) {
     TRAIL_HIGHWAY_TYPES, buildTrailsOverpassQuery, parseOverpassTrails, trailTypeLabel,
     DOF_LIGHTING, obstacleLighting, obstacleMarkerColor, obstacleLabel,
     summarizeObstacles, obstacleHazardLevel,
-    wxAtHour, kpAtTime, calcDensityAltitude, calcBatteryDerating, assessPropIcing, assessRisk,
-    freezingLevelRisk, metarCeilingFt, flightCategory, assessCloudClearance,
+    wxAtHour, kpAtTime, calcDensityAltitude, calcBatteryDerating, ASSUMED_TEMP_F, ASSUMED_ELEV_FT, assessPropIcing, assessRisk,
+    freezingLevelRisk, metarCeilingFt, flightCategory, assessCloudClearance, combineProhibitedAreas,
+    arcgisExceededLimit, arcgisPageUrl, ringAreaKm2, polygonAreaKm2, localDateISO,
+    WMM2025_EPOCH, WMM2025_COEF, decimalYear, wmmMagneticField, magneticDeclination, formatDeclination, openMeteoTimeToIso,
     DEFAULT_THRESHOLDS, DRONE_PROFILES,
     classifyTerrain, estimateVegetation, estimateCellCoverage,
     SMA_NONPUBLIC_CODES, smaAgencyInfo, smaIsPublic, classifyAreaPublicPrivate, cellCoverageAt,
     filterAirportsByDistance, classifyAirspace,
     calcGustFactor, calcWindShear,
-    generateElevationGrid, calcSlopeFromGrid, calcAspect,
+    generateElevationGrid, gridCenterIndex, parse3depSamples, parseOpenMeteoElevation, overpassMirrorTimeoutMs, calcSlopeFromGrid, gridCellSpacingKm, calcAspect,
     detectTerrainFeatures, scoreLZFitness, findEmergencyLZs,
     assessTerrainTurbulence, analyzeGPSMasking,
     calcSwapRecommendation,
     computeAdsbSearchRadius, parseAdsbAircraft, formatAltitudeAgl, resolveAdsbSelection,
     adsbAircraftList, adsbPollDelay,
-    pointInPolygon, pointInRings, distPointToSegment, polygonBBox, bboxesOverlap, segmentsIntersect, polygonsIntersect,
+    pointInPolygon, pointInRings, distPointToSegment, distanceToGeoJsonKm, polygonBBox, bboxesOverlap, segmentsIntersect, polygonsIntersect,
     circleToPolygon, parseFaaCoord, normalizeFaaDate, geoJsonOuterRings,
     utmToLatLng, parseAngleFlexible, parseCoordinateInput,
     GEOCODE_PROVIDER, GEOCODE_MIN_INTERVAL_MS, GEOCODE_LIMIT, GEOCODE_VIEWBOX_DEG,

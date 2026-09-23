@@ -1,0 +1,4 @@
+# Node scripts with a #! line must stay LF. With core.autocrlf=true a CRLF
+# checkout makes Vitest's module transform reject the shebang
+# ("SyntaxError: Invalid or unexpected token") when a test imports the file.
+*.mjs text eol=lf

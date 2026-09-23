@@ -1,144 +1,132 @@
 const {
-  analyzeGPSMasking, assessTerrainTurbulence, calcAspect,
+  analyzeGPSMasking, assessTerrainTurbulence, calcAspect, generateElevationGrid, haversine,
 } = require('../../sar-preflight-core.js');
 
 // ============================================================
 // analyzeGPSMasking
 // ============================================================
 
-describe('analyzeGPSMasking(centerElevFt, elevPoints, gridSize, flightAltAGL)', () => {
-  function makeElevPoints(gridSize, elevFn) {
-    const pts = [];
-    for (let r = 0; r < gridSize; r++) {
-      for (let c = 0; c < gridSize; c++) {
-        pts.push({ elevFt: elevFn(r, c) });
-      }
-    }
-    return pts;
+describe('analyzeGPSMasking(centerElevFt, elevPoints, gridSize, flightAltAGL, observer)', () => {
+  // Fixtures come from generateElevationGrid (row-major from the SW corner:
+  // row 0 is SOUTH) with each sample's elevation derived from its lat/lng, so
+  // neither orientation nor spacing is assumed.
+  const C = { lat: 38, lng: -121 };
+  function geoPoints(halfDeg, elevFn) {
+    const ne = { lat: C.lat + halfDeg, lng: C.lng + halfDeg }, sw = { lat: C.lat - halfDeg, lng: C.lng - halfDeg };
+    return generateElevationGrid(C.lat, C.lng, ne, sw, 5)
+      .map(p => ({ lat: p.latitude, lng: p.longitude, elevFt: elevFn(p.latitude, p.longitude) }));
   }
+  const near = (a, b) => Math.abs(a - b) < 1e-9;
+  const distFt = (lat, lng) => haversine(C.lat, C.lng, lat, lng) * 3280.84;
+  const tanD = d => Math.tan(d * Math.PI / 180);
 
   describe('flat terrain', () => {
     it('reports no masking for flat terrain', () => {
-      const pts = makeElevPoints(5, () => 3000);
-      const result = analyzeGPSMasking(3000, pts, 5, 400);
+      const result = analyzeGPSMasking(3000, geoPoints(0.01, () => 3000), 5, 400, C);
       expect(result.maskedDirections).toHaveLength(0);
       expect(result.skyVisibilityPct).toBe(100);
-    });
-
-    it('description mentions good visibility', () => {
-      const pts = makeElevPoints(5, () => 3000);
-      const result = analyzeGPSMasking(3000, pts, 5, 400);
       expect(result.description.toLowerCase()).toContain('good');
     });
   });
 
-  describe('canyon scenario (center low, edges high)', () => {
-    it('detects masking when surrounding terrain towers above flight altitude', () => {
-      // Center = 2000 ft, flight at 400 AGL = 2400 ft
-      // Edges at 8000 ft — massive terrain angle
-      const pts = makeElevPoints(5, (r, c) => {
-        const isEdge = r === 0 || r === 4 || c === 0 || c === 4;
-        return isEdge ? 8000 : 2000;
-      });
-      const result = analyzeGPSMasking(2000, pts, 5, 400);
-      expect(result.maskedDirections.length).toBeGreaterThan(0);
-      expect(result.skyVisibilityPct).toBeLessThan(100);
+  describe('units: rise and run are both feet (B04)', () => {
+    it('review fixture: 600 ft higher terrain ~5–11 km away is < 1° → nothing masked', () => {
+      const pts = geoPoints(0.1, (lat, lng) => (near(lat, C.lat) && near(lng, C.lng)) ? 1000 : 1600);
+      const result = analyzeGPSMasking(1000, pts, 5, 400, C);
+      expect(result.maskedDirections).toEqual([]);
+      expect(result.skyVisibilityPct).toBe(100);
     });
 
-    it('masks multiple directions in deep canyon', () => {
-      const pts = makeElevPoints(5, (r, c) => {
-        const isEdge = r === 0 || r === 4 || c === 0 || c === 4;
-        return isEdge ? 10000 : 2000;
-      });
-      const result = analyzeGPSMasking(2000, pts, 5, 200);
-      // Most or all directions should be masked
-      expect(result.maskedDirections.length).toBeGreaterThanOrEqual(4);
-      expect(result.skyVisibilityPct).toBeLessThanOrEqual(50);
+    it('a single northern sample just below 15° is clear; just above masks N only', () => {
+      const northLat = C.lat + 0.01;
+      const d = distFt(northLat, C.lng);
+      const flightElev = 3000 + 400;
+      const withPeak = deg => geoPoints(0.01, (lat, lng) => (near(lat, northLat) && near(lng, C.lng)) ? flightElev + tanD(deg) * d : 3000);
+      expect(analyzeGPSMasking(3000, withPeak(14), 5, 400, C).maskedDirections).toEqual([]);
+      expect(analyzeGPSMasking(3000, withPeak(16), 5, 400, C).maskedDirections).toEqual(['N']);
     });
 
-    it('description mentions masking for partially masked scenario', () => {
-      const pts = makeElevPoints(5, (r, c) => {
-        return r === 0 ? 6000 : 3000; // only north edge high
-      });
-      const result = analyzeGPSMasking(3000, pts, 5, 100);
-      // Depending on angle, N direction may be masked
-      if (result.maskedDirections.length > 0) {
-        expect(result.description.toLowerCase()).toContain('mask');
-      }
+    it('rectangular spacing: an eastern sample uses its own (shorter) E-W distance', () => {
+      const eastLng = C.lng + 0.01;              // ~2,880 ft at 38°N, vs ~3,650 ft for 0.01° of latitude
+      const d = distFt(C.lat, eastLng);
+      const withPeak = deg => geoPoints(0.01, (lat, lng) => (near(lat, C.lat) && near(lng, eastLng)) ? 3400 + tanD(deg) * d : 3000);
+      expect(analyzeGPSMasking(3000, withPeak(14), 5, 400, C).maskedDirections).toEqual([]);
+      expect(analyzeGPSMasking(3000, withPeak(16), 5, 400, C).maskedDirections).toEqual(['E']);
+    });
+
+    it('the same elevations mask a tight grid but not one ten times wider', () => {
+      const canyon = (lat, lng) => (near(lat, C.lat) && near(lng, C.lng)) ? 2000 : 4000;
+      expect(analyzeGPSMasking(2000, geoPoints(0.01, canyon), 5, 200, C).maskedDirections).toHaveLength(8);
+      expect(analyzeGPSMasking(2000, geoPoints(0.1, canyon), 5, 200, C).maskedDirections).toEqual([]);
     });
   });
 
-  describe('one-sided masking', () => {
-    it('detects masking only from direction with high terrain', () => {
-      // Only south edge is very high
-      const pts = makeElevPoints(5, (r, c) => {
-        return r === 4 ? 9000 : 3000;
-      });
-      const result = analyzeGPSMasking(3000, pts, 5, 200);
-      // S, SE, SW might be masked
-      const southDirs = result.maskedDirections.filter(d => d.includes('S'));
-      if (result.maskedDirections.length > 0) {
-        expect(southDirs.length).toBeGreaterThan(0);
-      }
+  describe('orientation follows geography (B05)', () => {
+    it('review fixture: a high SOUTHERN row masks the south, never the north', () => {
+      const pts = geoPoints(0.01, lat => lat < C.lat - 0.009 ? 4000 : 1000);
+      expect(analyzeGPSMasking(1000, pts, 5, 100, C).maskedDirections).toEqual(['SE', 'S', 'SW']);
+    });
+
+    it('a high NORTHERN row masks the north', () => {
+      const pts = geoPoints(0.01, lat => lat > C.lat + 0.009 ? 4000 : 1000);
+      expect(analyzeGPSMasking(1000, pts, 5, 100, C).maskedDirections).toEqual(['N', 'NE', 'NW']);
+    });
+
+    it('a high EASTERN column masks the east; a high WESTERN column the west', () => {
+      const east = geoPoints(0.01, (lat, lng) => lng > C.lng + 0.009 ? 4000 : 1000);
+      expect(analyzeGPSMasking(1000, east, 5, 100, C).maskedDirections).toEqual(['NE', 'E', 'SE']);
+      const west = geoPoints(0.01, (lat, lng) => lng < C.lng - 0.009 ? 4000 : 1000);
+      expect(analyzeGPSMasking(1000, west, 5, 100, C).maskedDirections).toEqual(['SW', 'W', 'NW']);
+    });
+
+    it('a high SW corner masks SW only', () => {
+      const pts = geoPoints(0.01, (lat, lng) => (lat < C.lat - 0.009 && lng < C.lng - 0.009) ? 4000 : 1000);
+      expect(analyzeGPSMasking(1000, pts, 5, 100, C).maskedDirections).toEqual(['SW']);
     });
   });
 
   describe('flight altitude effect', () => {
     it('higher flight altitude reduces masking', () => {
-      const pts = makeElevPoints(5, (r, c) => {
-        const isEdge = r === 0 || r === 4 || c === 0 || c === 4;
-        return isEdge ? 5000 : 3000;
-      });
-      const lowFlight = analyzeGPSMasking(3000, pts, 5, 100);
-      const highFlight = analyzeGPSMasking(3000, pts, 5, 2000);
-      expect(highFlight.maskedDirections.length).toBeLessThanOrEqual(lowFlight.maskedDirections.length);
+      const pts = geoPoints(0.01, (lat, lng) => (near(lat, C.lat) && near(lng, C.lng)) ? 3000 : 4200);
+      const lowFlight = analyzeGPSMasking(3000, pts, 5, 100, C);
+      const highFlight = analyzeGPSMasking(3000, pts, 5, 1200, C);
+      expect(lowFlight.maskedDirections.length).toBeGreaterThan(0);
+      expect(highFlight.maskedDirections.length).toBeLessThan(lowFlight.maskedDirections.length);
     });
   });
 
   describe('return structure', () => {
     it('returns correct properties', () => {
-      const pts = makeElevPoints(5, () => 3000);
-      const result = analyzeGPSMasking(3000, pts, 5, 400);
-      expect(result).toHaveProperty('maskedDirections');
-      expect(result).toHaveProperty('skyVisibilityPct');
-      expect(result).toHaveProperty('description');
+      const result = analyzeGPSMasking(3000, geoPoints(0.01, () => 3000), 5, 400, C);
       expect(Array.isArray(result.maskedDirections)).toBe(true);
       expect(typeof result.skyVisibilityPct).toBe('number');
       expect(typeof result.description).toBe('string');
     });
 
-    it('skyVisibilityPct is between 0 and 100', () => {
-      const pts = makeElevPoints(5, () => 3000);
-      const result = analyzeGPSMasking(3000, pts, 5, 400);
-      expect(result.skyVisibilityPct).toBeGreaterThanOrEqual(0);
-      expect(result.skyVisibilityPct).toBeLessThanOrEqual(100);
-    });
-
     it('skyVisibilityPct = (8 - masked) / 8 * 100', () => {
-      const pts = makeElevPoints(5, () => 3000);
-      const result = analyzeGPSMasking(3000, pts, 5, 400);
-      const expected = Math.round((8 - result.maskedDirections.length) / 8 * 100);
-      expect(result.skyVisibilityPct).toBe(expected);
+      const pts = geoPoints(0.01, lat => lat < C.lat - 0.009 ? 4000 : 1000);
+      const result = analyzeGPSMasking(1000, pts, 5, 100, C);
+      expect(result.skyVisibilityPct).toBe(Math.round((8 - 3) / 8 * 100));
+      expect(result.description.toLowerCase()).toContain('mask');
     });
   });
 
   describe('edge cases', () => {
-    it('returns 100% visibility for null elevPoints', () => {
-      const result = analyzeGPSMasking(3000, null, 5, 400);
-      expect(result.skyVisibilityPct).toBe(100);
-      expect(result.maskedDirections).toHaveLength(0);
+    it('returns 100% visibility for null / empty elevPoints', () => {
+      expect(analyzeGPSMasking(3000, null, 5, 400).skyVisibilityPct).toBe(100);
+      expect(analyzeGPSMasking(3000, [], 5, 400).maskedDirections).toHaveLength(0);
     });
 
-    it('returns 100% visibility for empty elevPoints', () => {
-      const result = analyzeGPSMasking(3000, [], 5, 400);
-      expect(result.skyVisibilityPct).toBe(100);
+    it('samples without coordinates cannot be ranged — never treated as grid-cell distances', () => {
+      const pts = Array.from({ length: 25 }, () => ({ elevFt: 9000 }));
+      const result = analyzeGPSMasking(1000, pts, 5, 100);
+      expect(result.maskedDirections).toEqual([]);
+      expect(result.description).toMatch(/No terrain geometry/);
     });
 
-    it('description severity scales with masked direction count', () => {
-      // 0 masked = "good"
-      const pts0 = makeElevPoints(5, () => 3000);
-      const r0 = analyzeGPSMasking(3000, pts0, 5, 400);
-      expect(r0.description.toLowerCase()).toContain('good');
+    it('without an observer the bbox-centre sample is the observer', () => {
+      const pts = geoPoints(0.01, lat => lat < C.lat - 0.009 ? 4000 : 1000);
+      expect(analyzeGPSMasking(1000, pts, 5, 100).maskedDirections).toEqual(['SE', 'S', 'SW']);
     });
   });
 });

@@ -63,7 +63,11 @@ describe('routeStrategy(url)', () => {
   it('routes API endpoints to network-first', () => {
     expect(routeStrategy('https://api.open-meteo.com/v1/forecast?lat=38')).toBe('network-first');
     expect(routeStrategy('https://air-quality-api.open-meteo.com/v1/air-quality?lat=38')).toBe('network-first');
-    expect(routeStrategy('https://api.open-elevation.com/api/v1/lookup')).toBe('network-first');
+    // Terrain grid: USGS 3DEP point samples + the Open-Meteo elevation fallback.
+    expect(routeStrategy('https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/getSamples?geometry=x&f=json')).toBe('network-first');
+    expect(routeStrategy('https://api.open-meteo.com/v1/elevation?latitude=38&longitude=-121')).toBe('network-first');
+    // …while the viewshed DEM export keeps its default (IndexedDB-cached in the app).
+    expect(routeStrategy('https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage?bbox=1')).toBe('cache-first');
     expect(routeStrategy('https://api.sunrise-sunset.org/json?lat=38')).toBe('network-first');
     expect(routeStrategy('https://services.swpc.noaa.gov/products/noaa-planetary-k-index-forecast.json')).toBe('network-first');
     expect(routeStrategy('https://overpass-api.de/api/interpreter')).toBe('network-first');

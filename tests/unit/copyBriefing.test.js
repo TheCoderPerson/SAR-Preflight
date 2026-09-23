@@ -84,8 +84,9 @@ describe('buildBriefingText()', () => {
   it('includes a timestamp', () => {
     const text = buildBriefingText();
     expect(text).toContain('Generated:');
-    // ISO timestamp pattern
-    expect(text).toMatch(/Generated: \d{4}-\d{2}-\d{2}T/);
+    // Local time with an explicit zone, plus the ISO UTC instant.
+    expect(text).toMatch(/Generated: .+ \(\d{4}-\d{2}-\d{2}T[\d:.]+Z\)/);
+    expect(text).toMatch(/Weather valid: NOW/);
   });
 
   it('includes area info', () => {
