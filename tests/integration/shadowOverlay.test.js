@@ -106,7 +106,7 @@ describe('_renderShadowForTime', () => {
     S._overlayWanted = {};
     S.is3D = false;
     // Midday over a flat DEM at the default map center.
-    S.wx = { hourly: { time: ['2026-07-18T12:00'] } };
+    S.wx = { hourly: { time: ['2026-07-18T19:00:00.000Z'] } }; // noon PDT, as openMeteoTimeToIso stores it
     S.timeIdx = 0;
     const grid = makeGrid(38.685, -120.99, 100, 10);
     S.shadow = { grid, demFlat: new Float32Array(grid.rows * grid.cols), source: '3DEP ~10 m' };
@@ -123,7 +123,7 @@ describe('_renderShadowForTime', () => {
   });
 
   it('night hour → full-shade mask and NIGHT status', () => {
-    S.wx.hourly.time = ['2026-07-18T00:30'];
+    S.wx.hourly.time = ['2026-07-18T07:30:00.000Z']; // 00:30 PDT
     _renderShadowForTime();
     expect(S.shadow.sun.elevation).toBeLessThanOrEqual(0);
     expect(Array.from(S.shadow.mask).every(v => v === 255)).toBe(true);
