@@ -31,6 +31,12 @@ A small CORS+Range proxy so the browser-only app can read CORS-blocked sources:
    agents), passes the JSON through, and adds CORS (real-time, uncached). The served
    provider is reported in the `X-Adsb-Source` response header. When all fail, the 502
    body lists each provider's status in `providers: [{ name, status, detail }]`.
+   Provider order: **FlyItalyADSB** (needs a free key from
+   https://flyitalyadsb.com/en/dati/api stored as the Worker variable/secret
+   `FlyItaly`; skipped without it; radius sent in km), then adsb.fi (v3), then adsb.lol.
+   A provider that answers 403/429 is paused for up to 10 min (adsb.fi counts refused
+   requests toward a temporary IP ban), and a 200 without an `ac`/`aircraft` list counts
+   as a failure, never as "no traffic".
    (airplanes.live was dropped in Oct 2026: it answers 403 to unregistered clients.)
 5. **USFS roads/trails/MVUM** — the USFS EDW ArcGIS server (`apps.fs.usda.gov`) is
    self-hosted and blocks browser CORS. Served at the `/usfs/...` route (cached a day;

@@ -52,10 +52,24 @@ const UA = 'Mozilla/5.0 (compatible; SAR-Preflight/1.0)';
 // the /adsb route fetches them server-side (first success wins) and adds CORS.
 // airplanes.live was dropped (Oct 2026): it answers 403 "contact us" to every
 // unregistered client.
+//
+// FlyItalyADSB is keyed: its free key lives in the Worker variable/secret
+// `FlyItaly` (dashboard -> Settings -> Variables & Secrets), sent as X-Api-Key,
+// and the provider is skipped when that is unset. Its `dist` is KILOMETRES
+// (the others take nautical miles). Docs: https://flyitalyadsb.com/en/dati/api
+// (100 requests/min per IP; commercial use allowed within that).
+const NM_TO_KM = 1.852;
 const ADSB_UPSTREAMS = [
+  { name: 'flyitalyadsb', keyEnv: 'FlyItaly',
+    url: (lat, lon, dist) => `https://api.flyitalyadsb.com/v2/lat/${lat}/lon/${lon}/dist/${Math.ceil(dist * NM_TO_KM)}` },
   { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v3/lat/${lat}/lon/${lon}/dist/${dist}` },
   { name: 'adsb.lol',       url: (lat, lon, dist) => `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
 ];
+// A provider that REFUSES us (403/429) is left alone for a while: adsb.fi counts
+// 400/401/403/404/429 answers toward a temporary IP ban, so retrying it on
+// every 5 s poll would only deepen the block. Per isolate, best effort.
+const ADSB_REFUSAL_COOLDOWN_MS = 10 * 60 * 1000;
+const _adsbCooldownUntil = {};
 // adsb.lol rejects generic agents ("User-Agent too generic; include valid
 // contact info"), so the ADS-B requests identify the project by URL.
 const ADSB_UA = 'SAR-Preflight/1.0 (+https://github.com/TheCoderPerson/SAR-Preflight)';
@@ -135,7 +149,7 @@ function resolveTarget(url) {
 }
 
 // Named exports for unit tests (wrangler ignores them; `default` is the Worker).
-export { handleNotam, handleAdsb, dms, resolveTarget };
+export { handleNotam, handleAdsb, _adsbCooldownUntil, dms, resolveTarget };
 
 export default {
   async fetch(req, env) {
@@ -181,7 +195,7 @@ export default {
       return handleNotam(reqUrl, allow);
     }
     if (reqUrl.pathname === '/adsb' || reqUrl.pathname === '/adsb/') {
-      return handleAdsb(reqUrl, allow);
+      return handleAdsb(reqUrl, allow, env);
     }
 
     const route = resolveTarget(reqUrl);
@@ -376,7 +390,7 @@ async function handleNotam(url, allow) {
 }
 
 // ---- ADS-B: first provider that responds wins; pass its JSON through ----
-async function handleAdsb(url, allow) {
+async function handleAdsb(url, allow, env) {
   const lat = url.searchParams.get('lat');
   const lon = url.searchParams.get('lon');
   let dist = parseInt(url.searchParams.get('dist') || '0', 10);
@@ -388,19 +402,41 @@ async function handleAdsb(url, allow) {
   // Why each provider failed, returned with the 502 so a dead route can be
   // diagnosed from the browser (it used to say only "all providers failed").
   const failures = [];
+  const now = Date.now();
   for (const up of ADSB_UPSTREAMS) {
+    const key = up.keyEnv ? env && env[up.keyEnv] : null;
+    if (up.keyEnv && !key) { failures.push({ name: up.name, status: 0, detail: 'no API key configured' }); continue; }
+    if (_adsbCooldownUntil[up.name] > now) {
+      failures.push({ name: up.name, status: 0, detail: 'paused after a refusal, retry in ' + Math.ceil((_adsbCooldownUntil[up.name] - now) / 1000) + ' s' });
+      continue;
+    }
     try {
+      const headers = { 'User-Agent': ADSB_UA, Accept: 'application/json' };
+      if (key) headers['X-Api-Key'] = key;
       const r = await fetch(up.url(lat, lon, dist), {
-        headers: { 'User-Agent': ADSB_UA, Accept: 'application/json' },
+        headers,
         signal: AbortSignal.timeout(ADSB_UPSTREAM_TIMEOUT_MS),
       });
       if (!r.ok) {
         let detail = '';
         try { detail = (await r.text()).replace(/\s+/g, ' ').slice(0, 120); } catch (_) {}
+        if (r.status === 403 || r.status === 429) {
+          const ra = parseInt(r.headers.get('Retry-After') || '', 10);
+          _adsbCooldownUntil[up.name] = now + (ra > 0 ? Math.min(ra * 1000, ADSB_REFUSAL_COOLDOWN_MS) : ADSB_REFUSAL_COOLDOWN_MS);
+        }
         failures.push({ name: up.name, status: r.status, detail });
         continue;
       }
       const body = await r.text();
+      // Only a body that holds an aircraft list is an answer: a 200 in another
+      // shape would otherwise render as "no traffic", the unsafe direction.
+      let parsed = null;
+      try { parsed = JSON.parse(body); } catch (_) {}
+      if (!parsed || !(Array.isArray(parsed.ac) || Array.isArray(parsed.aircraft))) {
+        failures.push({ name: up.name, status: r.status, detail: 'unexpected response shape: ' + body.replace(/\s+/g, ' ').slice(0, 100) });
+        continue;
+      }
+      delete _adsbCooldownUntil[up.name];
       const h = Object.assign(
         { 'Content-Type': 'application/json', 'X-Adsb-Source': up.name },
         corsHeaders(allow),
