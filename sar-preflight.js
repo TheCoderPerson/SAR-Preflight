@@ -816,6 +816,7 @@ const MAX_MAP_ZOOM = _isConstrained() ? 18 : 19;
 function initMap() {
   // Collapsed layer-control sections + PLANS mode, before the first buildLayerControl.
   restoreLayerUiState();
+  restoreAssessCollapsed();
   // preferCanvas: render vector layers (wires, obstacles, towers, airspace,
   // ADS-B, etc.) on one GPU canvas instead of per-feature SVG — much smoother
   // panning at close zoom on high-DPR mobile (the choppiness reported on iPhone).
@@ -8692,8 +8693,62 @@ function computeAssessment(snap) {
   const badge = document.getElementById('assessBadge');
   badge.textContent = display.label;
   badge.className = 'assessment-badge ' + display.cls;
-  document.getElementById('assessText').textContent = display.text;
+  const textEl = document.getElementById('assessText');
+  textEl.textContent = display.text;
+  textEl.title = display.text; // full listing on hover while collapsed to one line
+  renderAssessProfile();
+}
 
+// "Limits from Config profile: <name>" under the advisories: which Config →
+// Aircraft & SOP Profile entry the limits above come from, flagged when a
+// threshold field was edited away from it. Tapping the name opens Config.
+function renderAssessProfile() {
+  const el = document.getElementById('assessProfile');
+  if (!el || typeof limitsProfileInfo !== 'function') return;
+  const info = limitsProfileInfo(S.activeProfile,
+    (typeof DEFAULT_THRESHOLDS !== 'undefined') ? DEFAULT_THRESHOLDS : {},
+    readActiveThresholds(), THRESHOLD_FIELDS.map(f => f[1]));
+  const name = info.isDefault ? 'Default (no aircraft selected)' : info.name;
+  el.innerHTML = 'Limits from Config profile: '
+    + `<button type="button" class="assess-profile-link" onclick="openLimitsProfileConfig()" title="Open Config → Aircraft &amp; SOP Profile">${_esc(name)}</button>`
+    + (info.edited ? ' <span class="assess-profile-edited">(edited values)</span>' : '');
+}
+
+function openLimitsProfileConfig() {
+  switchTab('config');
+  const dd = document.getElementById('cfgSopProfile');
+  if (dd && dd.scrollIntoView) dd.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+// Advisories collapse: the banner shrinks to the badge + first item on one
+// line and the operational-area bar hides, giving the tabs the room (mostly
+// for mobile). The badge (count + colour) always stays visible. Per-viewer,
+// remembered in localStorage.
+const ASSESS_COLLAPSED_KEY = 'sar_assess_collapsed';
+
+function toggleAssessmentCollapsed() {
+  _setAssessCollapsed(!S.assessCollapsed, true);
+}
+
+function _setAssessCollapsed(on, persist) {
+  S.assessCollapsed = !!on;
+  const banner = document.getElementById('assessmentBanner');
+  const panel = document.getElementById('sidePanel');
+  const btn = document.getElementById('assessToggle');
+  if (banner) banner.classList.toggle('collapsed', S.assessCollapsed);
+  if (panel) panel.classList.toggle('assess-collapsed', S.assessCollapsed);
+  if (btn) {
+    btn.innerHTML = S.assessCollapsed ? '&#9660;' : '&#9650;';
+    btn.setAttribute('aria-expanded', String(!S.assessCollapsed));
+    btn.title = S.assessCollapsed ? 'Expand advisories and area info' : 'Collapse advisories and area info';
+  }
+  if (persist) { try { localStorage.setItem(ASSESS_COLLAPSED_KEY, S.assessCollapsed ? '1' : '0'); } catch (_) {} }
+}
+
+function restoreAssessCollapsed() {
+  let on = false;
+  try { on = localStorage.getItem(ASSESS_COLLAPSED_KEY) === '1'; } catch (_) {}
+  _setAssessCollapsed(on, false);
 }
 
 // Colour of the assessment badge for exports — read from the last computed
@@ -16245,7 +16300,7 @@ if (typeof module !== 'undefined' && module.exports) {
     CANOPY_SOURCE_KEY, NAIP_CHM_PROXY_ROUTE, NAIP_CHM_INDEX_BASE, NAIP_CHM_MAX_M, getCanopySourceSetting, setCanopySource,
     canopyDatasetLabel, _updateCanopyCaption, _canopyHasStructures, _fetchChmv2Raster, _fetchNaipChmRaster,
     _naipIndexForBlock, _fetchNaipChmFromProxy, _naipTileToGrid,
-    notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _freshPatch, invalidateAreaRequests, _beginRequest, _requestCurrent, _setDataArea, _dataIsForArea, _readArcgisGeoJson, PROTECTED_LAYER_LABELS, _assessBadgeColor, sendFeedback, openFeedback, closeFeedback,
+    notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _freshPatch, invalidateAreaRequests, _beginRequest, _requestCurrent, _setDataArea, _dataIsForArea, _readArcgisGeoJson, PROTECTED_LAYER_LABELS, _assessBadgeColor, renderAssessProfile, openLimitsProfileConfig, toggleAssessmentCollapsed, _setAssessCollapsed, restoreAssessCollapsed, ASSESS_COLLAPSED_KEY, sendFeedback, openFeedback, closeFeedback,
     fetchFAAairspace, faaAirspaceUnavailableLayers, FAA_AIRSPACE_LAYER_LABELS, fetchFireDanger,
     UNKNOWN_CELL_TEXT, SECTION_CELLS, sectionCellsFor, markCellsUnknown, renderFireDangerUnknown,
     NOTAM_MANUAL_UPDATE_CAUTION, renderNotamManualNotice,

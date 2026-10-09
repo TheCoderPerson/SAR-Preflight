@@ -24,6 +24,14 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.10.09-c',
+    date: '2026-10-09',
+    changes: [
+      'The advisories banner can now be collapsed with the arrow button at its right. Collapsed, it keeps the count badge and the first item on one line and hides the operational-area details (center, area, type, perimeter, max dimension), leaving much more room for the tabs on a phone. The choice is remembered on this device.',
+      'The advisories banner now names the Config aircraft profile its limits come from (for example "Limits from Config profile: DJI Matrice 4T"), says "Default (no aircraft selected)" when none is chosen, and adds "(edited values)" when a threshold field has been changed from that profile. Tap the name to open the profile in Config.',
+    ],
+  },
+  {
     version: '2026.10.09-b',
     date: '2026-10-09',
     changes: [
@@ -1172,6 +1180,24 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
   else if (cautions.length > 0) { level = 'CAUTION'; text = cautions.join(' • '); }
 
   return { level, text, issues, cautions, unavailable };
+}
+
+// Which Config → "Aircraft & SOP Profile" entry the assessment limits come
+// from, for the line under the advisories. profile: the selected profile
+// object (null = no selection, i.e. the generic defaults); defaults:
+// DEFAULT_THRESHOLDS; active: the thresholds actually in force (profile +
+// any hand-edited Config fields); keys: the threshold keys the Config fields
+// set. `edited` is true when any field no longer matches the profile, so the
+// line never names an aircraft whose numbers are not the ones being used.
+function limitsProfileInfo(profile, defaults, active, keys) {
+  const base = Object.assign({}, defaults || {}, profile || {});
+  const name = (profile && (profile.name || profile.model)) || 'Default';
+  const cur = active || {};
+  const edited = (keys || []).some(k => {
+    const a = Number(cur[k]), b = Number(base[k]);
+    return Number.isFinite(a) && (!Number.isFinite(b) || Math.abs(a - b) > 1e-9);
+  });
+  return { name, isDefault: !profile, edited };
 }
 
 // Operator-facing rendering of an assessment WITHOUT a GO / CAUTION / NO-GO
@@ -5400,7 +5426,7 @@ function geojsonLineLatLngs(geometry) {
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    assessmentDisplay, assessmentLabelForLog,
+    assessmentDisplay, assessmentLabelForLog, limitsProfileInfo,
     WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, lerpBearing, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,
     calcSunPosition, calcMoonPhase, calcMoonPosition, lightVecENU, lightForTime, hillshadeParams,

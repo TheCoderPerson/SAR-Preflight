@@ -4,6 +4,11 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.10.09-c — 2026-10-09
+
+- The advisories banner can now be collapsed with the arrow button at its right. Collapsed, it keeps the count badge and the first item on one line and hides the operational-area details (center, area, type, perimeter, max dimension), leaving much more room for the tabs on a phone. The choice is remembered on this device.
+- The advisories banner now names the Config aircraft profile its limits come from (for example "Limits from Config profile: DJI Matrice 4T"), says "Default (no aircraft selected)" when none is chosen, and adds "(edited values)" when a threshold field has been changed from that profile. Tap the name to open the profile in Config.
+
 ## v2026.10.09-b — 2026-10-09
 
 - In the 3D view, live aircraft now show the same plane icon as the 2D map, pointed along their direction of travel and kept a readable size at any zoom, and leave a trail at their altitude while Position Trails is on, colored by height above ground. Aircraft that report no heading keep the X marker.
