@@ -2,6 +2,7 @@ const {
   TERRAIN_DEM_URL, leafletToMaplibreCamera, maplibreToLeafletCamera, build3dStyle,
   leafletStyleTo3d, latlngsToMultiPolygon, latlngsToMultiLine, dashArrayTo3d, vector3dSourceAndLayers,
   cylRadiusForHeightM, aircraft3dRecords, hexToRgb01, collectVerticalSegments,
+  aircraftIconMesh, aircraftIconVerts, AIRCRAFT_ICON_RING, AIRCRAFT_ICON_TRIS, decimateAdsbTrail,
   OBSERVER_PITCH_MIN, OBSERVER_PITCH_MAX, OBSERVER_START_PITCH,
   wrapBearing, clampObserverPitch, applyLookDrag, wheelLook, observerEyeAltitudeM,
 } = require('../../sar-preflight-core.js');
@@ -359,6 +360,118 @@ describe('aircraft3dRecords', () => {
   it('skips aircraft without a usable AGL', () => {
     expect(aircraft3dRecords([{ lat: 1, lng: 1, aglM: null }, { lat: 1, lng: 1, aglM: -50 }, null])).toEqual([]);
     expect(aircraft3dRecords(null)).toEqual([]);
+  });
+});
+
+describe('aircraft3dRecords — heading icon + trail', () => {
+  const trail = [
+    { lat: 38.60, lng: -120.9, aglM: 800, color: '#22c55e' },
+    { lat: 38.65, lng: -120.85, aglM: 850, color: '#22c55e' },
+  ];
+
+  it('emits a heading icon instead of the slab when the track is known', () => {
+    const recs = aircraft3dRecords([{ lat: 38.7, lng: -120.8, aglM: 900, color: '#22c55e', track: -90 }]);
+    expect(recs.map(r => r.kind)).toEqual(['cylinder', 'aircraft3d']);
+    expect(recs[1].trackDeg).toBe(270); // normalized into [0, 360)
+    expect(recs[1].aglM).toBe(900);
+  });
+
+  it('keeps the X slab when the track is unknown (null is not 0°)', () => {
+    const recs = aircraft3dRecords([{ lat: 38.7, lng: -120.8, aglM: 900, track: null }]);
+    expect(recs.map(r => r.radiusM)).toEqual([3, 50]);
+  });
+
+  it('adds a path3d trail record when at least two trail points are usable', () => {
+    const recs = aircraft3dRecords([{ lat: 38.7, lng: -120.8, aglM: 900, track: 45, trail }]);
+    expect(recs[0].kind).toBe('path3d');
+    expect(recs[0].points.length).toBe(2);
+    const one = aircraft3dRecords([{ lat: 38.7, lng: -120.8, aglM: 900, track: 45, trail: [trail[0], { lat: NaN, lng: 1, aglM: 1 }] }]);
+    expect(one.some(r => r.kind === 'path3d')).toBe(false);
+  });
+
+  it('collectVerticalSegments turns them into plane + path segments', () => {
+    const segs = collectVerticalSegments([{ id: 'adsb3d', features: aircraft3dRecords([{ lat: 38.7, lng: -120.8, aglM: 900, color: '#ef4444', track: 90, trail }]) }]);
+    expect(segs.map(s => s.type)).toEqual(['path', 'line', 'plane']);
+    expect(segs[0].points[1]).toEqual({ lat: 38.65, lng: -120.85, atM: 850, color: hexToRgb01('#22c55e') });
+    expect(segs[2]).toMatchObject({ atM: 900, trackDeg: 90, color: hexToRgb01('#ef4444') });
+  });
+});
+
+describe('aircraftIconMesh', () => {
+  const area = ring => ring.reduce((a, p, i) => { const q = ring[(i + 1) % ring.length]; return a + p[0] * q[1] - q[0] * p[1]; }, 0) / 2;
+  const triArea = (a, b, c) => ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) / 2;
+
+  it('triangulates the 2D plane silhouette exactly (no fan fallback overlap)', () => {
+    const sum = AIRCRAFT_ICON_TRIS.reduce((a, t) => a + Math.abs(triArea(AIRCRAFT_ICON_RING[t[0]], AIRCRAFT_ICON_RING[t[1]], AIRCRAFT_ICON_RING[t[2]])), 0);
+    expect(AIRCRAFT_ICON_TRIS.length).toBe(AIRCRAFT_ICON_RING.length - 2);
+    expect(sum).toBeCloseTo(Math.abs(area(AIRCRAFT_ICON_RING)), 9);
+  });
+
+  it('points the nose along the track (clockwise from north)', () => {
+    const n = aircraftIconMesh(0).tris.reduce((a, v) => (v.p[1] > a[1] ? v.p : a), [0, -1, 0]);
+    expect(n[1]).toBeCloseTo(0.5, 6); // nose tip at +0.5 north
+    expect(Math.abs(n[0])).toBeLessThan(1e-9);
+    const e = aircraftIconMesh(90).tris.reduce((a, v) => (v.p[0] > a[0] ? v.p : a), [-1, 0, 0]);
+    expect(e[0]).toBeCloseTo(0.5, 6); // track 090 → nose east
+    expect(e[1]).toBeCloseTo(0, 6);
+    const sw = aircraftIconMesh(225).tris.reduce((a, v) => (v.p[0] + v.p[1] < a[0] + a[1] ? v.p : a), [1, 1, 0]);
+    expect(sw[0]).toBeCloseTo(-0.5 * Math.SQRT1_2, 6); // track 225 → nose south-west
+    expect(sw[1]).toBeCloseTo(-0.5 * Math.SQRT1_2, 6);
+  });
+
+  it('adds an upright tail fin and a closed outline', () => {
+    const m = aircraftIconMesh(0);
+    const fin = m.tris.filter(v => v.fin);
+    expect(fin.length).toBe(3);
+    expect(Math.max(...fin.map(v => v.p[2]))).toBeGreaterThan(0);
+    expect(fin[0].normal).toEqual([1, 0, 0]);
+    expect(m.edges.length).toBe(AIRCRAFT_ICON_RING.length);
+    expect(m.edges[m.edges.length - 1][1]).toEqual(m.edges[0][0]);
+  });
+});
+
+describe('aircraftIconVerts', () => {
+  // Orthographic-ish test matrix: clip = (x, y, z) scaled by s, w = 1.
+  const ortho = s => [s, 0, 0, 0, 0, s, 0, 0, 0, 0, s, 0, 0, 0, 0, 1];
+  const plane = { x: 0, y: 0, z: 0, mpu: 1e-6, color: [1, 0, 0], mesh: aircraftIconMesh(0) };
+
+  it('sizes the icon to targetPx on screen', () => {
+    // 1 mercator unit → 1e7 clip units * halfW(1) px: 1 m = 10 px.
+    const v = aircraftIconVerts([plane], ortho(1e7), 1, 1, 30, 0);
+    const ys = [];
+    for (let i = 1; i < v.tris.length; i += 10) ys.push(v.tris[i]);
+    const lenM = (Math.max(...ys) - Math.min(...ys)) / plane.mpu;
+    expect(lenM).toBeCloseTo(3, 4); // 30 px / 10 px per m (Float32 output)
+    expect(v.tris.length).toBe(plane.mesh.tris.length * 10);
+    expect(v.lines.length).toBe(plane.mesh.edges.length * 12);
+    expect(v.tris[3]).toBe(1); // red
+  });
+
+  it('honors the minimum size in metres and skips planes behind the camera', () => {
+    const v = aircraftIconVerts([plane], ortho(1e7), 1, 1, 30, 40);
+    const ys = [];
+    for (let i = 1; i < v.tris.length; i += 10) ys.push(v.tris[i]);
+    expect((Math.max(...ys) - Math.min(...ys)) / plane.mpu).toBeCloseTo(40, 4); // Float32 output
+    const behind = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1];
+    expect(aircraftIconVerts([plane], behind, 1, 1, 30, 0).tris.length).toBe(0);
+    expect(aircraftIconVerts(null, ortho(1), 1, 1, 30, 0).tris.length).toBe(0);
+  });
+});
+
+describe('decimateAdsbTrail', () => {
+  const pts = Array.from({ length: 13 }, (_, i) => ({ lat: 38 + i * 0.001, lon: -120, time: i * 5000 }));
+
+  it('keeps one point per gap, always including the newest', () => {
+    const d = decimateAdsbTrail(pts, 20000, 0);
+    expect(d.map(p => p.time)).toEqual([0, 20000, 40000, 60000]);
+    expect(d[d.length - 1]).toBe(pts[12]);
+  });
+
+  it('trims the oldest beyond maxPts and passes short trails through', () => {
+    expect(decimateAdsbTrail(pts, 0, 3).map(p => p.time)).toEqual([50000, 55000, 60000]);
+    expect(decimateAdsbTrail(pts.slice(0, 2), 99999, 1).length).toBe(2);
+    expect(decimateAdsbTrail([{ lat: NaN, lon: 1 }, pts[0]], 0, 0)).toEqual([pts[0]]);
+    expect(decimateAdsbTrail(null)).toEqual([]);
   });
 });
 

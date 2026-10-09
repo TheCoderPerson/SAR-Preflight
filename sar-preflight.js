@@ -7552,7 +7552,8 @@ function updateAdsbTrails(aircraft) {
     // Only append if position changed from last entry
     const last = trail[trail.length - 1];
     if (!last || last.lat !== ac.lat || last.lon !== ac.lon) {
-      trail.push({ lat: ac.lat, lon: ac.lon, alt: ac.alt_baro, time: now });
+      // alt: the same MSL altitude parseAdsbAircraft bases AGL on (baro, else geometric)
+      trail.push({ lat: ac.lat, lon: ac.lon, alt: ac.alt_baro != null ? ac.alt_baro : ac.alt_geom, time: now });
     }
     // Prune entries older than 15 min
     while (trail.length > 0 && trail[0].time < cutoff) trail.shift();
@@ -15112,17 +15113,54 @@ function collect3dVectorGroups() {
   return groups;
 }
 
-// Live ADS-B aircraft as 3D cylinders: a slab at true AGL altitude + a thin
-// drop line to the ground, colored by the same AGL scale as the 2D markers.
+// 3D trail thinning: one point per ADSB_TRAIL_3D_GAP_MS, at most
+// ADSB_TRAIL_3D_MAX_PTS (each costs a terrain query on every poll rebuild).
+const ADSB_TRAIL_3D_GAP_MS = 20000;
+const ADSB_TRAIL_3D_MAX_PTS = 45;
+const ADSB_TRAIL_3D_LOST_COLOR = '#556677'; // trail of an aircraft no longer in the feed
+
+// One 2D trail → 3D path points at altitude. AGL is recomputed with the same
+// ground function parseAdsbAircraft uses, so the path meets the plane.
+function _adsbTrail3dPoints(trail, groundFn, lostColor) {
+  const exag = 0.3048 * TERRAIN_EXAGGERATION;
+  return decimateAdsbTrail(trail, ADSB_TRAIL_3D_GAP_MS, ADSB_TRAIL_3D_MAX_PTS)
+    .filter(p => Number.isFinite(p.alt))
+    .map(p => {
+      let g = groundFn(p.lat, p.lon);
+      if (g == null || !isFinite(g)) g = 0;
+      const agl = Math.max(0, p.alt - g);
+      return { lat: p.lat, lng: p.lon, aglM: agl * exag, color: lostColor || adsbAglColor(agl) };
+    });
+}
+
+// Live ADS-B aircraft in 3D: the 2D plane icon at true AGL altitude, nose on
+// the track (an X when the track is unknown), a thin drop line to the ground
+// and — while the 2D trails layer is on — the trail at altitude, all colored
+// by the same AGL scale as the 2D markers.
 function _aircraft3dGroup() {
   if (!S.map || !S.mapLayers.adsb_aircraft || !S.map.hasLayer(S.mapLayers.adsb_aircraft)) return null;
   if (!Array.isArray(S.adsbAircraft) || !S.adsbAircraft.length) return null;
+  const trailsOn = !!(S.mapLayers.adsb_trails && S.map.hasLayer(S.mapLayers.adsb_trails) && S.adsbTrails);
+  const groundFn = trailsOn ? adsbGroundElevFnFt() : null;
   const recs = aircraft3dRecords(S.adsbAircraft.map(ac => ({
     lat: ac.lat, lng: ac.lon,
     aglM: (isFinite(ac.agl) && ac.agl > 0) ? ac.agl * 0.3048 * TERRAIN_EXAGGERATION : null,
     color: adsbAglColor(ac.agl),
     popupHtml: _adsbPopupHtml(ac),
+    track: ac.track,
+    trail: trailsOn && S.adsbTrails[ac.hex] ? _adsbTrail3dPoints(S.adsbTrails[ac.hex], groundFn) : null,
   })));
+  // Trails of aircraft that left the feed linger (as in 2D) in a muted color.
+  if (trailsOn) {
+    const active = new Set(S.adsbAircraft.map(ac => ac.hex));
+    for (const [hex, trail] of Object.entries(S.adsbTrails)) {
+      if (active.has(hex)) continue;
+      const points = _adsbTrail3dPoints(trail, groundFn, ADSB_TRAIL_3D_LOST_COLOR);
+      if (points.length >= 2) {
+        recs.push({ kind: 'path3d', points, style: { stroke: ADSB_TRAIL_3D_LOST_COLOR, fill: ADSB_TRAIL_3D_LOST_COLOR }, label: 'Aircraft', pri: 2, popupHtml: '' });
+      }
+    }
+  }
   // Draped ground dot per aircraft: visual anchor for the drop line + the
   // clickable handle for the popup (custom-layer verticals aren't clickable).
   S.adsbAircraft.forEach(ac => {
@@ -15219,6 +15257,13 @@ const VERT3D_LAYER_ID = 'vert3d';
 
 // Screen-space width of the thick (obstacle/tower/dam) vertical lines.
 const VERT3D_THICK_PX = 4.5;
+// ADS-B in 3D: plane icon nose-to-tail length on screen (CSS px; the 2D
+// marker icon is 28 px), its floor in metres when the camera is close, and
+// the trail line width.
+const AIRCRAFT_3D_ICON_PX = 30;
+const AIRCRAFT_3D_ICON_MIN_M = 40;
+const AIRCRAFT_3D_TRAIL_PX = 2.5;
+const AIRCRAFT_3D_LIGHT = { dir: [0, 0, 1], diffuse: 0.3, ambient: 0.7 };
 
 function _vert3dMakeLayer() {
   return {
@@ -15302,6 +15347,9 @@ function _vert3dMakeLayer() {
       };
       this.lineBuffer = gl.createBuffer();
       this.quadBuffer = gl.createBuffer();
+      this.trailBuffer = gl.createBuffer();
+      this.planeTriBuffer = gl.createBuffer();
+      this.planeLineBuffer = gl.createBuffer();
       this.triOpaqueBuffer = gl.createBuffer();
       this.triCanopyBuffer = gl.createBuffer();
       this.triCanopyIndexBuffer = gl.createBuffer();
@@ -15334,7 +15382,8 @@ function _vert3dMakeLayer() {
       const thin = S._vert3dVerts;
       const thick = S._vert3dThickVerts;
       const light = S._light3d || { dir: [0, 0, 1], diffuse: 0.4, ambient: 0.55 };
-      const drawTris = (buffer, verts, dirty, alpha, indexBuffer, indices, anchor) => {
+      const drawTris = (buffer, verts, dirty, alpha, indexBuffer, indices, anchor, lt) => {
+        const li = lt || light;
         gl.useProgram(this.triProg);
         gl.disable(gl.CULL_FACE);
         gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -15348,9 +15397,9 @@ function _vert3dMakeLayer() {
         gl.vertexAttribPointer(this.triAttrs.normal, 3, gl.FLOAT, false, stride, 28);
         gl.uniformMatrix4fv(this.triAttrs.matrix, false, mFor(anchor));
         gl.uniform1f(this.triAttrs.alpha, alpha);
-        gl.uniform3f(this.triAttrs.light, light.dir[0], light.dir[1], light.dir[2]);
-        gl.uniform1f(this.triAttrs.diffuse, light.diffuse);
-        gl.uniform1f(this.triAttrs.ambient, light.ambient);
+        gl.uniform3f(this.triAttrs.light, li.dir[0], li.dir[1], li.dir[2]);
+        gl.uniform1f(this.triAttrs.diffuse, li.diffuse);
+        gl.uniform1f(this.triAttrs.ambient, li.ambient);
         if (indices && indices.length) {
           gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
           if (dirty) gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.DYNAMIC_DRAW);
@@ -15384,11 +15433,11 @@ function _vert3dMakeLayer() {
         gl.uniformMatrix4fv(this.lineAttrs.matrix, false, mVert);
         gl.drawArrays(gl.LINES, 0, thin.length / 6);
       }
-      if (thick && thick.length && this.quadProg) {
+      const drawQuads = (buffer, verts, dirty, widthPx) => {
         gl.useProgram(this.quadProg);
         gl.disable(gl.CULL_FACE);
-        gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
-        if (S._vert3dDirty) gl.bufferData(gl.ARRAY_BUFFER, thick, gl.DYNAMIC_DRAW);
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        if (dirty) gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
         const stride = 40; // pos(3) + other(3) + side(1) + color(3) floats
         gl.enableVertexAttribArray(this.quadAttrs.pos);
         gl.vertexAttribPointer(this.quadAttrs.pos, 3, gl.FLOAT, false, stride, 0);
@@ -15401,8 +15450,32 @@ function _vert3dMakeLayer() {
         gl.uniformMatrix4fv(this.quadAttrs.matrix, false, mVert);
         const c = gl.canvas;
         gl.uniform2f(this.quadAttrs.halfvp, c.width / 2, c.height / 2);
-        gl.uniform1f(this.quadAttrs.width, VERT3D_THICK_PX * (window.devicePixelRatio || 1));
-        gl.drawArrays(gl.TRIANGLES, 0, thick.length / 10);
+        gl.uniform1f(this.quadAttrs.width, widthPx * (window.devicePixelRatio || 1));
+        gl.drawArrays(gl.TRIANGLES, 0, verts.length / 10);
+      };
+      if (thick && thick.length && this.quadProg) drawQuads(this.quadBuffer, thick, S._vert3dDirty, VERT3D_THICK_PX);
+      const trail = S._vert3dTrailVerts;
+      if (trail && trail.length && this.quadProg) drawQuads(this.trailBuffer, trail, S._vert3dDirty, AIRCRAFT_3D_TRAIL_PX);
+      // Aircraft icons: rebuilt every frame at a constant on-screen size, so
+      // they stay readable at any zoom (the scale depends on the camera).
+      const planes = S._plane3d;
+      if (planes && planes.length && this.triProg && this.lineProg) {
+        const pv = aircraftIconVerts(planes, mVert, gl.canvas.width / 2, gl.canvas.height / 2,
+          AIRCRAFT_3D_ICON_PX * (window.devicePixelRatio || 1), AIRCRAFT_3D_ICON_MIN_M);
+        if (pv.tris.length) {
+          // Fixed overhead light: the silhouette stays at full color day or
+          // night; the tail fin's sideways normal shades it for shape.
+          drawTris(this.planeTriBuffer, pv.tris, true, 1.0, null, null, S._vert3dAnchor, AIRCRAFT_3D_LIGHT);
+          gl.useProgram(this.lineProg);
+          gl.bindBuffer(gl.ARRAY_BUFFER, this.planeLineBuffer);
+          gl.bufferData(gl.ARRAY_BUFFER, pv.lines, gl.DYNAMIC_DRAW);
+          gl.enableVertexAttribArray(this.lineAttrs.pos);
+          gl.vertexAttribPointer(this.lineAttrs.pos, 3, gl.FLOAT, false, 24, 0);
+          gl.enableVertexAttribArray(this.lineAttrs.color);
+          gl.vertexAttribPointer(this.lineAttrs.color, 3, gl.FLOAT, false, 24, 12);
+          gl.uniformMatrix4fv(this.lineAttrs.matrix, false, mVert);
+          gl.drawArrays(gl.LINES, 0, pv.lines.length / 6);
+        }
       }
       S._vert3dDirty = false;
     },
@@ -15441,6 +15514,8 @@ function _updateVert3dVerts() {
   const segs = collectVerticalSegments(collect3dVectorGroups());
   const thin = [];
   const thick = [];
+  const trail = [];
+  const planes = [];
   let missing = false;
   const groundOf = (lat, lng) => {
     try {
@@ -15460,13 +15535,30 @@ function _updateVert3dVerts() {
   const pushThin = (mc, c) => { thin.push(mc.x, mc.y, mc.z, c[0], c[1], c[2]); };
   // One quad (2 triangles) per thick line; each vertex carries its endpoint,
   // the opposite endpoint, and the expansion side for the billboard shader.
-  const pushThickLine = (a, b, c) => {
-    const v = (p, o, side) => { thick.push(p.x, p.y, p.z, o.x, o.y, o.z, side, c[0], c[1], c[2]); };
+  const pushThickLine = (a, b, c, buf) => {
+    const out = buf || thick;
+    const v = (p, o, side) => { out.push(p.x, p.y, p.z, o.x, o.y, o.z, side, c[0], c[1], c[2]); };
     v(a, b, 1); v(a, b, -1); v(b, a, -1);
     v(a, b, -1); v(b, a, 1); v(b, a, -1);
   };
   segs.forEach(sg => {
+    if (sg.type === 'path') {
+      // Trail at altitude; each segment takes its newer end's (AGL) color.
+      let prev = null;
+      sg.points.forEach(p => {
+        const cur = mcOf(p.lng, p.lat, groundOf(p.lat, p.lng) + p.atM);
+        if (prev) pushThickLine(prev, cur, p.color, trail);
+        prev = cur;
+      });
+      return;
+    }
     const g = groundOf(sg.lat, sg.lng);
+    if (sg.type === 'plane') {
+      const mc = maplibregl.MercatorCoordinate.fromLngLat([sg.lng, sg.lat], g + sg.atM);
+      planes.push({ x: mc.x - anchor[0], y: mc.y - anchor[1], z: mc.z, mpu: mc.meterInMercatorCoordinateUnits(),
+        color: sg.color, mesh: aircraftIconMesh(sg.trackDeg) });
+      return;
+    }
     if (sg.type === 'line') {
       const a = mcOf(sg.lng, sg.lat, g + sg.fromM);
       const b = mcOf(sg.lng, sg.lat, g + sg.toM);
@@ -15541,6 +15633,8 @@ function _updateVert3dVerts() {
   }
   S._vert3dVerts = new Float32Array(thin);
   S._vert3dThickVerts = new Float32Array(thick);
+  S._vert3dTrailVerts = new Float32Array(trail);
+  S._plane3d = planes;
   S._vert3dDirty = true;
   S.map3d.triggerRepaint();
   if (missing && (S._vert3dRetry || 0) < 4) {
