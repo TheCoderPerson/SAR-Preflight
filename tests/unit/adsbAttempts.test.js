@@ -33,3 +33,23 @@ describe('_adsbAttemptUrls (ADS-B fetch ordering)', () => {
     expect(list[1].name).toBe(ADSB_APIS[1].name);
   });
 });
+
+describe('ADS-B provider list', () => {
+  it('no longer includes airplanes.live (403 to every unregistered client)', () => {
+    expect(ADSB_APIS.map(a => a.name)).toEqual(['adsb.fi', 'adsb.lol']);
+  });
+});
+
+describe('adsbProxyFailureSummary (proxy /adsb 502 body)', () => {
+  const { adsbProxyFailureSummary } = core;
+  it('names each provider and why it failed', () => {
+    expect(adsbProxyFailureSummary({ error: 'all ADS-B providers failed', providers: [
+      { name: 'adsb.fi', status: 403, detail: 'Forbidden' },
+      { name: 'adsb.lol', status: 0, detail: 'timeout' },
+    ] })).toBe('adsb.fi HTTP 403, adsb.lol timeout');
+  });
+  it('is empty for an older Worker body without providers, or no body', () => {
+    expect(adsbProxyFailureSummary({ error: 'all ADS-B providers failed', ac: [] })).toBe('');
+    expect(adsbProxyFailureSummary(null)).toBe('');
+  });
+});

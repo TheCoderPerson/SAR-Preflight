@@ -24,6 +24,16 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.10.09-a',
+    date: '2026-10-09',
+    changes: [
+      'The FAA sectional chart edition check works again. The FAA changed how its chart service writes the edition date, so the check had failed every time: the Config tab wrongly said "cached edition 2026-05-13 (offline)" and the map could keep showing chart tiles from that older edition.',
+      'Live ADS-B traffic: the data proxy no longer asks airplanes.live (it now refuses unregistered apps), identifies itself to adsb.lol as that service now requires, and gives up on a stalled provider after 8 seconds. When every provider fails, the traffic error now names each one and why. Self-hosted proxies need the updated Worker code.',
+      'OpenStreetMap lookups (wires, cell towers, hospitals, trails, buildings) now send at most two queries at a time. The main OpenStreetMap server had been refusing the extra requests from a single area load, which pushed them onto slower backup servers and could drop buildings from the viewshed. When every server answers "busy", the app now tries them once more after a short pause. The viewshed\'s building lookup now waits up to 25 seconds instead of 12 (a busy server often needs longer, and without buildings the viewshed overstates visibility) and frees its place when it gives up.',
+      'Water, roads and trails, land status, smoke and parcel lookups now give up after 40 seconds and report the source as unavailable (or show the cached copy) instead of staying on "Fetching..." when a government server stalls.',
+    ],
+  },
+  {
     version: '2026.09.22-c',
     date: '2026-09-22',
     changes: [
@@ -2108,7 +2118,7 @@ function parseAdsbAircraft(acArray, centerLat, centerLng, groundElev) {
 
 /**
  * Extract the aircraft array from an ADS-B API response. Providers disagree
- * on the field name: readsb-style APIs (airplanes.live, adsb.lol) use `ac`,
+ * on the field name: readsb-style APIs (adsb.lol, formerly airplanes.live) use `ac`,
  * adsb.fi has been observed serving `aircraft` — and the data proxy passes
  * whichever body through untouched, so both must be accepted or a successful
  * fetch can silently render zero traffic.
@@ -2118,6 +2128,19 @@ function adsbAircraftList(json) {
   if (Array.isArray(json.ac)) return json.ac;
   if (Array.isArray(json.aircraft)) return json.aircraft;
   return [];
+}
+
+/**
+ * One-line reason from the data proxy's /adsb 502 body
+ * ({ error, providers: [{ name, status, detail }] }), e.g.
+ * "adsb.fi HTTP 403, adsb.lol timeout". '' when the body names no providers
+ * (an older Worker that only says "all ADS-B providers failed").
+ */
+function adsbProxyFailureSummary(body) {
+  const list = body && Array.isArray(body.providers) ? body.providers : [];
+  return list.filter(p => p && p.name)
+    .map(p => p.status ? `${p.name} HTTP ${p.status}` : `${p.name} ${p.detail || 'unreachable'}`)
+    .join(', ');
 }
 
 /**
@@ -2869,14 +2892,23 @@ function artccsForArea(areaPoly) {
 
 // --- FAA VFR Sectional chart edition helpers ---
 // The FAA VFR Sectional tile service publishes a new edition every 56 days.
-// parseSectionalEdition() extracts the YYYY-MM-DD edition stamp from the
-// ArcGIS MapServer `description` field, e.g.:
+// parseSectionalEdition() extracts the edition stamp from the ArcGIS MapServer
+// metadata text and normalizes it to YYYY-MM-DD. The service has used both
+// formats (documentInfo.subject switched to US order by Oct 2026):
 //   "Updated with the latest charts on 2026-05-13 16:18:39.073216"
-// Returns the date string, or null if none is present.
+//   "Updated with the latest charts on 07-09-2026."
+// Returns the first valid date in the text, or null if none is present.
 function parseSectionalEdition(description) {
   if (typeof description !== 'string') return null;
-  const m = description.match(/(\d{4}-\d{2}-\d{2})/);
-  return m ? m[1] : null;
+  const re = /(\d{4})-(\d{2})-(\d{2})|\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b/g;
+  let m;
+  while ((m = re.exec(description)) !== null) {
+    const y = +(m[1] || m[6]), mo = +(m[2] || m[4]), d = +(m[3] || m[5]);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    }
+  }
+  return null;
 }
 
 // Deterministic 56-day cycle used ONLY as a cold-start fallback edition when
@@ -5241,7 +5273,7 @@ if (typeof module !== 'undefined' && module.exports) {
     assessTerrainTurbulence, analyzeGPSMasking,
     calcSwapRecommendation,
     computeAdsbSearchRadius, parseAdsbAircraft, formatAltitudeAgl, resolveAdsbSelection,
-    adsbAircraftList, adsbPollDelay,
+    adsbAircraftList, adsbProxyFailureSummary, adsbPollDelay,
     pointInPolygon, pointInRings, distPointToSegment, distanceToGeoJsonKm, polygonBBox, bboxesOverlap, segmentsIntersect, polygonsIntersect,
     circleToPolygon, parseFaaCoord, normalizeFaaDate, geoJsonOuterRings,
     utmToLatLng, parseAngleFlexible, parseCoordinateInput,

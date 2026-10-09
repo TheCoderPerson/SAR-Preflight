@@ -50,11 +50,17 @@ const UA = 'Mozilla/5.0 (compatible; SAR-Preflight/1.0)';
 
 // Live ADS-B traffic — the public providers increasingly block browser CORS, so
 // the /adsb route fetches them server-side (first success wins) and adds CORS.
+// airplanes.live was dropped (Oct 2026): it answers 403 "contact us" to every
+// unregistered client.
 const ADSB_UPSTREAMS = [
   { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
-  { name: 'airplanes.live', url: (lat, lon, dist) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${dist}` },
   { name: 'adsb.lol',       url: (lat, lon, dist) => `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
 ];
+// adsb.lol rejects generic agents ("User-Agent too generic; include valid
+// contact info"), so the ADS-B requests identify the project by URL.
+const ADSB_UA = 'SAR-Preflight/1.0 (+https://github.com/TheCoderPerson/SAR-Preflight)';
+// Per-provider limit, so one stalled provider cannot use up the request.
+const ADSB_UPSTREAM_TIMEOUT_MS = 8000;
 
 // Path-prefix routes (checked before the canopy default). TFR is safety-critical
 // and time-sensitive, so it is cached for only a few seconds.
@@ -129,7 +135,7 @@ function resolveTarget(url) {
 }
 
 // Named exports for unit tests (wrangler ignores them; `default` is the Worker).
-export { handleNotam, dms, resolveTarget };
+export { handleNotam, handleAdsb, dms, resolveTarget };
 
 export default {
   async fetch(req, env) {
@@ -379,10 +385,21 @@ async function handleAdsb(url, allow) {
   }
   if (dist > 250) dist = 250; // provider cap
 
+  // Why each provider failed, returned with the 502 so a dead route can be
+  // diagnosed from the browser (it used to say only "all providers failed").
+  const failures = [];
   for (const up of ADSB_UPSTREAMS) {
     try {
-      const r = await fetch(up.url(lat, lon, dist), { headers: { 'User-Agent': UA } });
-      if (!r.ok) continue;
+      const r = await fetch(up.url(lat, lon, dist), {
+        headers: { 'User-Agent': ADSB_UA, Accept: 'application/json' },
+        signal: AbortSignal.timeout(ADSB_UPSTREAM_TIMEOUT_MS),
+      });
+      if (!r.ok) {
+        let detail = '';
+        try { detail = (await r.text()).replace(/\s+/g, ' ').slice(0, 120); } catch (_) {}
+        failures.push({ name: up.name, status: r.status, detail });
+        continue;
+      }
       const body = await r.text();
       const h = Object.assign(
         { 'Content-Type': 'application/json', 'X-Adsb-Source': up.name },
@@ -390,9 +407,11 @@ async function handleAdsb(url, allow) {
       );
       h['Access-Control-Expose-Headers'] = 'X-Adsb-Source'; // let the app read which provider served
       return new Response(body, { status: 200, headers: h }); // real-time data: no edge cache
-    } catch (_) { /* try next provider */ }
+    } catch (e) {
+      failures.push({ name: up.name, status: 0, detail: String((e && e.name === 'TimeoutError') ? 'timeout' : (e && e.message) || e).slice(0, 120) });
+    }
   }
-  return jsonResponse({ error: 'all ADS-B providers failed', ac: [] }, 502, allow);
+  return jsonResponse({ error: 'all ADS-B providers failed', providers: failures, ac: [] }, 502, allow);
 }
 
 // ---- Feedback: forward in-app feedback to a Discord webhook ----

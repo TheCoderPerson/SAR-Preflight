@@ -427,9 +427,10 @@ try { if (typeof window !== 'undefined') window.SARDiag = Diag; } catch (_) {}
 // Open the diagnostics panel on demand (wired to the Config → App Version button).
 function showDiagnostics() { try { Diag.showPanel(); } catch (_) {} }
 
+// Direct fallbacks behind the proxy /adsb route. airplanes.live was dropped
+// (Oct 2026): it answers 403 "contact us" to every unregistered client.
 const ADSB_APIS = [
   { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
-  { name: 'airplanes.live', url: (lat, lon, dist) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${dist}` },
   { name: 'adsb.lol',       url: (lat, lon, dist) => `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
 ];
 
@@ -688,7 +689,8 @@ async function resolveSectionalEdition() {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const meta = await res.json();
     // The edition stamp lives in documentInfo.subject for this service
-    // (e.g. "Updated with the latest charts on 2026-05-13 ..."); fall back
+    // (e.g. "Updated with the latest charts on 07-09-2026."; older builds of
+    // the service used "2026-05-13 ..." — parseSectionalEdition takes both); fall back
     // across the other text fields in case the service layout changes.
     const di = (meta && meta.documentInfo) || {};
     const candidate = [di.subject, di.comments, meta && meta.serviceDescription, meta && meta.description]
@@ -5700,10 +5702,15 @@ async function _arcgisFetchRemainingPages(url, firstCount, fetchJson) {
 //  - a network failure answered from IndexedDB carries `fetchError`.
 // opts.signal: AbortController signal — an aborted fetch returns error:'aborted'
 // WITHOUT consulting the cache (a superseded pan-fetch must not repaint stale data).
+// opts.timeoutMs: per-request limit (default GEOJSON_FETCH_TIMEOUT_MS) covering
+// the response AND its body. A request that exceeds it fails like any other
+// error (cached copy, else the error) — without it a stalled server held a
+// section on "Fetching..." indefinitely (USGS NHD, Oct 2026).
+const GEOJSON_FETCH_TIMEOUT_MS = 40000;
 async function _fetchGeoJsonLayer(endpoint, cacheKey, url, opts) {
   opts = opts || {};
   const online = (typeof isOnline !== 'function') || isOnline();
-  const init = opts.signal ? { signal: opts.signal } : undefined;
+  const limitMs = opts.timeoutMs || GEOJSON_FETCH_TIMEOUT_MS;
   const readJson = async res => {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const gj = await res.json();
@@ -5712,10 +5719,36 @@ async function _fetchGeoJsonLayer(endpoint, cacheKey, url, opts) {
     if (gj && gj.error) throw new Error('ArcGIS ' + (gj.error.code || 'error') + ': ' + (gj.error.message || 'query failed'));
     return gj;
   };
+  // One request (first or continuation page) under the time limit and the
+  // caller's signal. The race also settles a fetch that ignores its signal.
+  const fetchJson = async u => {
+    const ctl = new AbortController();
+    let timedOut = false;
+    const parent = opts.signal;
+    const onParentAbort = () => ctl.abort();
+    if (parent) { if (parent.aborted) ctl.abort(); else parent.addEventListener('abort', onParentAbort, { once: true }); }
+    const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, limitMs);
+    const stopped = new Promise((_, rej) => {
+      const fail = () => rej(timedOut ? new Error(`no answer within ${Math.round(limitMs / 1000)} s`) : _abortError());
+      if (ctl.signal.aborted) fail(); else ctl.signal.addEventListener('abort', fail, { once: true });
+    });
+    stopped.catch(() => {});
+    try {
+      return await Promise.race([
+        (async () => { const res = await _proxyFetch(u, { signal: ctl.signal }); return { res, gj: await readJson(res) }; })(),
+        stopped,
+      ]);
+    } catch (e) {
+      if (timedOut && !(parent && parent.aborted)) throw new Error(`no answer within ${Math.round(limitMs / 1000)} s`);
+      throw e;
+    } finally {
+      clearTimeout(timer);
+      if (parent) parent.removeEventListener('abort', onParentAbort);
+    }
+  };
   if (url && online) {
     try {
-      const res = await _proxyFetch(url, init);
-      const gj = await readJson(res);
+      const { res, gj } = await fetchJson(url);
       // A continuation page can come from the SW's offline fallback even when
       // the first did not: then the merged result is a cached copy too.
       let sw = _swCacheStamp(res);
@@ -5723,8 +5756,7 @@ async function _fetchGeoJsonLayer(endpoint, cacheKey, url, opts) {
       let truncated = arcgisExceededLimit(gj), truncErr = null;
       if (truncated && opts.paginate !== false && !sw) {
         const more = await _arcgisFetchRemainingPages(url, features.length, async u => {
-          const r = await _proxyFetch(u, init);
-          const j = await readJson(r);
+          const { res: r, gj: j } = await fetchJson(u);
           sw = _mergeSwStamps(sw, _swCacheStamp(r));
           return j;
         });
@@ -6542,46 +6574,115 @@ function cellCoverageReadout(lat, lng, centerElevFt) {
 //                    the whole call is also capped at twice that, so a run
 //                    of slow mirrors fails in bounded time instead of minutes.
 function _abortError() { const e = new Error('cancelled'); e.name = 'AbortError'; return e; }
-async function _overpassFetch(query, opts) {
+
+// At most OVERPASS_MAX_CONCURRENT queries in flight. One area load starts ~5
+// (wires, towers, hospitals, trails, buildings); overpass-api.de grants each
+// client only a few slots and refuses the rest WITHOUT CORS headers, so the
+// browser saw "Failed to fetch" and the request spilled onto the slower
+// mirrors (measured Oct 2026 — the viewshed's buildings query then failed on
+// all three). Time spent queued does not count against the mirror time limits;
+// an abort while queued leaves the queue.
+const OVERPASS_MAX_CONCURRENT = 2;
+let _overpassActive = 0;
+const _overpassWaiters = [];
+function _overpassWait(signal) {
+  if (signal && signal.aborted) return Promise.reject(_abortError());
+  return new Promise((resolve, reject) => {
+    const w = { resolve, reject, signal, onAbort: null };
+    if (signal) {
+      w.onAbort = () => {
+        const i = _overpassWaiters.indexOf(w);
+        if (i >= 0) _overpassWaiters.splice(i, 1);
+        reject(_abortError());
+      };
+      signal.addEventListener('abort', w.onAbort, { once: true });
+    }
+    _overpassWaiters.push(w);
+  });
+}
+function _overpassRelease() {
+  const w = _overpassWaiters.shift();
+  if (!w) { _overpassActive = Math.max(0, _overpassActive - 1); return; }
+  if (w.signal && w.onAbort) w.signal.removeEventListener('abort', w.onAbort);
+  w.resolve(); // the slot passes straight to the next waiter
+}
+
+function _overpassFetch(query, opts) {
+  const run = () => _overpassFetchMirrors(query, opts).finally(_overpassRelease);
+  // A free slot starts the request synchronously (no extra tick of latency).
+  if (_overpassActive < OVERPASS_MAX_CONCURRENT) { _overpassActive++; return run(); }
+  return _overpassWait(opts && opts.signal).then(run);
+}
+
+// When every mirror fails FAST with an overload answer (429/502/503/504) or a
+// network/CORS refusal, wait this long and walk the mirrors once more, inside
+// the same overall deadline. overpass-api.de answers 504 to roughly every
+// other request while busy and the next one usually succeeds (measured Oct
+// 2026), while a time-out or a "runtime error" remark is not retried.
+const OVERPASS_RETRY_DELAY_MS = 4000;
+const _overpassRetryableStatus = st => st === 429 || st === 502 || st === 503 || st === 504;
+function _overpassSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) { reject(_abortError()); return; }
+    const onAbort = () => { clearTimeout(t); reject(_abortError()); };
+    const t = setTimeout(() => { if (signal) signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function _overpassFetchMirrors(query, opts) {
   const signal = opts && opts.signal;
   const perMirrorMs = (opts && opts.timeoutMs) || overpassMirrorTimeoutMs(query);
+  const retryDelayMs = (opts && opts.retryDelayMs != null) ? opts.retryDelayMs : OVERPASS_RETRY_DELAY_MS;
   const deadline = Date.now() + 2 * perMirrorMs;
   let lastErr = null;
-  for (const server of OVERPASS_MIRRORS) {
-    if (signal && signal.aborted) throw _abortError();
-    const left = deadline - Date.now();
-    if (left <= 0) { lastErr = new Error(`no answer within ${Math.round(2 * perMirrorMs / 1000)} s overall`); break; }
-    const limit = Math.min(perMirrorMs, left);
-    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
-    let timedOut = false;
-    const timer = ctl ? setTimeout(() => { timedOut = true; ctl.abort(); }, limit) : null;
-    const onCancel = () => { if (ctl) ctl.abort(); };
-    if (signal) signal.addEventListener('abort', onCancel, { once: true });
-    try {
-      const res = await fetch(server, {
-        method: 'POST',
-        body: 'data=' + encodeURIComponent(query),
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        signal: ctl ? ctl.signal : undefined,
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      let data;
-      try { data = await res.json(); } catch (_) { throw new Error('response is not valid JSON'); }
-      if (!data || !Array.isArray(data.elements)) throw new Error('response has no elements list');
-      // A timed-out / out-of-memory query answers HTTP 200 with an EMPTY
-      // elements list and a "runtime error" remark — a failure (try the next
-      // mirror), never "nothing here".
-      if (data.remark && /error/i.test(data.remark)) throw new Error(String(data.remark).slice(0, 160));
-      return data;
-    } catch (e) {
-      if (signal && signal.aborted) throw _abortError(); // superseded: no further mirrors
-      const err = timedOut ? new Error(`no answer within ${Math.round(limit / 1000)} s`) : e;
-      console.warn(`Overpass mirror ${server} failed:`, err.message);
-      lastErr = err;
-    } finally {
-      if (timer) clearTimeout(timer);
-      if (signal) signal.removeEventListener('abort', onCancel);
+  for (let pass = 0; pass < 2; pass++) {
+    let retryable = true;   // every failure this pass was a fast overload / refusal
+    if (pass === 1) {
+      if (signal && signal.aborted) throw _abortError();
+      console.info(`Overpass: all mirrors busy, retrying in ${Math.round(retryDelayMs / 1000)} s`);
+      await _overpassSleep(retryDelayMs, signal);
     }
+    for (const server of OVERPASS_MIRRORS) {
+      if (signal && signal.aborted) throw _abortError();
+      const left = deadline - Date.now();
+      if (left <= 0) { lastErr = new Error(`no answer within ${Math.round(2 * perMirrorMs / 1000)} s overall`); retryable = false; break; }
+      const limit = Math.min(perMirrorMs, left);
+      const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+      let timedOut = false;
+      const timer = ctl ? setTimeout(() => { timedOut = true; ctl.abort(); }, limit) : null;
+      const onCancel = () => { if (ctl) ctl.abort(); };
+      if (signal) signal.addEventListener('abort', onCancel, { once: true });
+      try {
+        const res = await fetch(server, {
+          method: 'POST',
+          body: 'data=' + encodeURIComponent(query),
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          signal: ctl ? ctl.signal : undefined,
+        });
+        if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { overpassRetryable: _overpassRetryableStatus(res.status) });
+        let data;
+        try { data = await res.json(); } catch (_) { throw new Error('response is not valid JSON'); }
+        if (!data || !Array.isArray(data.elements)) throw new Error('response has no elements list');
+        // A timed-out / out-of-memory query answers HTTP 200 with an EMPTY
+        // elements list and a "runtime error" remark — a failure (try the next
+        // mirror), never "nothing here".
+        if (data.remark && /error/i.test(data.remark)) throw new Error(String(data.remark).slice(0, 160));
+        return data;
+      } catch (e) {
+        if (signal && signal.aborted) throw _abortError(); // superseded: no further mirrors
+        const err = timedOut ? new Error(`no answer within ${Math.round(limit / 1000)} s`) : e;
+        // A refused request (an overloaded server answers without CORS headers,
+        // so the browser reports only a TypeError) counts as a fast overload.
+        if (timedOut || !(e && (e.overpassRetryable || e instanceof TypeError))) retryable = false;
+        console.warn(`Overpass mirror ${server} failed:`, err.message);
+        lastErr = err;
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onCancel);
+      }
+    }
+    if (!retryable || deadline - Date.now() < retryDelayMs + 5000) break;
   }
   throw new Error('Overpass: all mirrors failed (' + (lastErr ? lastErr.message : 'unknown') + ')');
 }
@@ -7349,7 +7450,12 @@ async function fetchAdsb() {
     for (const a of _adsbAttemptUrls(lat, lon, dist)) {
       try {
         const res = await _proxyFetch(a.url, { signal: tok.signal });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+          // The proxy's 502 names each upstream's failure; keep it in the reason.
+          let why = '';
+          if (a.proxy) { try { why = adsbProxyFailureSummary(await res.json()); } catch (_) {} }
+          throw new Error(`HTTP ${res.status}` + (why ? ` (${why})` : ''));
+        }
         json = await res.json();
         if (!_requestCurrent(tok)) return;
         if (a.idx != null) S._adsbApiIndex = a.idx;
@@ -14694,21 +14800,30 @@ async function restoreViewsheds() {
 // the wait is hard-capped: _overpassFetch walks 3 mirrors with no client
 // timeout and must never stall the viewshed. Resolves null when OSM can't
 // answer in time and nothing is cached — the compute then runs terrain +
-// canopy only.
-const BUILDINGS_FETCH_TIMEOUT_MS = 12000;
+// canopy only. 25 s (was 12): a busy overpass-api.de took 4–17 s to answer
+// (Oct 2026), so 12 s dropped buildings — and with them occlusion — on most
+// runs. It runs alongside the canopy and DEM fetches, so the cap only adds
+// time when OSM is the slowest leg.
+const BUILDINGS_FETCH_TIMEOUT_MS = 25000;
 async function fetchBuildingsForGrid(grid) {
   const gb = grid.bounds;
   const bboxKey = `${gb.south.toFixed(3)}_${gb.west.toFixed(3)}_${gb.north.toFixed(3)}_${gb.east.toFixed(3)}`;
   // Short server-side timeout too — a busy mirror should fail fast, not queue.
   const query = `[out:json][timeout:10];way["building"](${gb.south},${gb.west},${gb.north},${gb.east});out body ${_buildingsCap()};>;out skel qt;`;
+  // Abort (not just abandon) at the cap, so the request also gives up its
+  // Overpass slot instead of holding it while it walks the remaining mirrors.
+  const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+  let timer = null;
   try {
     const data = await Promise.race([
-      _overpassFetch(query),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('buildings fetch timed out')), BUILDINGS_FETCH_TIMEOUT_MS)),
+      _overpassFetch(query, ctl ? { signal: ctl.signal } : undefined),
+      new Promise((_, rej) => { timer = setTimeout(() => { if (ctl) ctl.abort(); rej(new Error('buildings fetch timed out')); }, BUILDINGS_FETCH_TIMEOUT_MS); }),
     ]);
+    clearTimeout(timer);
     if (typeof cacheApiResponse === 'function') cacheApiResponse('osm_buildings', bboxKey, data);
     return parseOverpassBuildings(data, _buildingsCap());
   } catch (err) {
+    clearTimeout(timer);
     try {
       const cached = (typeof getCachedApiResponse === 'function') ? await getCachedApiResponse('osm_buildings', bboxKey) : null;
       if (cached && cached.data) return parseOverpassBuildings(cached.data, _buildingsCap());
@@ -16081,7 +16196,7 @@ if (typeof module !== 'undefined' && module.exports) {
     enterObserverView, exitObserverView, _on3dClick, _observer3dFeatureAt, _lockObserverCamera, _applyObserverLook,
     _aircraft3dGroup, _refresh3dAircraft, _adsbPopupHtml,
     _adsbPanelHtml, openAdsbPanel, closeAdsbPanel, refreshAdsbPanel, focusAdsbAircraft, ADSB_PANEL_LOST_MS,
-    _overpassFetch, fetchBuildings, renderBuildingsLayer, _buildingsCap,
+    _overpassFetch, OVERPASS_MAX_CONCURRENT, GEOJSON_FETCH_TIMEOUT_MS, fetchBuildings, renderBuildingsLayer, _buildingsCap,
     getBuildings3dSetting, setBuildings3dMode, _buildings3dMode,
     _buildBuildingTriVerts, _vert3dMakeLayer, _updateVert3dVerts,
     _buildCanopy3dMeshChunked, _startCanopy3dBuild, cancelCanopy3dBuild, CANOPY_3D_COLOR,

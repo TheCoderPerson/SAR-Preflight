@@ -4,6 +4,13 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.10.09-a — 2026-10-09
+
+- The FAA sectional chart edition check works again. The FAA changed how its chart service writes the edition date, so the check had failed every time: the Config tab wrongly said "cached edition 2026-05-13 (offline)" and the map could keep showing chart tiles from that older edition.
+- Live ADS-B traffic: the data proxy no longer asks airplanes.live (it now refuses unregistered apps), identifies itself to adsb.lol as that service now requires, and gives up on a stalled provider after 8 seconds. When every provider fails, the traffic error now names each one and why. Self-hosted proxies need the updated Worker code.
+- OpenStreetMap lookups (wires, cell towers, hospitals, trails, buildings) now send at most two queries at a time. The main OpenStreetMap server had been refusing the extra requests from a single area load, which pushed them onto slower backup servers and could drop buildings from the viewshed. When every server answers "busy", the app now tries them once more after a short pause. The viewshed's building lookup now waits up to 25 seconds instead of 12 (a busy server often needs longer, and without buildings the viewshed overstates visibility) and frees its place when it gives up.
+- Water, roads and trails, land status, smoke and parcel lookups now give up after 40 seconds and report the source as unavailable (or show the cached copy) instead of staying on "Fetching..." when a government server stalls.
+
 ## v2026.09.22-c — 2026-09-22
 
 - Nearby-fire distance is now measured to the fire perimeter itself (zero when the launch point is inside it). It had been measured to one arbitrary corner of the outline, which could put a launch inside a large fire more than 30 nm away and miss the nearby-fire limit. The "active fire within 30 nm" advisory now appears only for a fire that is actually within 30 nm.

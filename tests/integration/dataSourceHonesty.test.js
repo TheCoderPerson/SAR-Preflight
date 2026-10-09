@@ -386,6 +386,88 @@ describe('Overpass sources (airports, hospitals, trails, wires)', () => {
     expect(seen.length).toBeLessThanOrEqual(3);
   });
 
+  it('concurrency: at most OVERPASS_MAX_CONCURRENT queries in flight; the rest queue and run as slots free', async () => {
+    const pending = [];
+    route({ overpass: () => new Promise(r => pending.push(r)) });
+    const runs = [1, 2, 3, 4].map(() => app._overpassFetch('q'));
+    await Promise.resolve();
+    expect(pending.length).toBe(app.OVERPASS_MAX_CONCURRENT);   // 2 sent, 2 queued
+    pending.shift()(resp(hospital));
+    await runs[0];
+    await new Promise(r => setTimeout(r, 0));
+    expect(pending.length).toBe(app.OVERPASS_MAX_CONCURRENT);   // a queued one took the freed slot
+    while (pending.length) { pending.shift()(resp(hospital)); await new Promise(r => setTimeout(r, 0)); }
+    const all = await Promise.all(runs);
+    expect(all.every(d => d.elements.length === 1)).toBe(true);
+  });
+
+  it('concurrency: a full area load (wires, hospitals, trails, airports) all finish through the queue', async () => {
+    const empty = { elements: [] };
+    let inFlight = 0, peak = 0;
+    route({ overpass: () => { inFlight++; peak = Math.max(peak, inFlight);
+      return new Promise(r => setTimeout(() => { inFlight--; r(resp(empty)); }, 5)); } });
+    await Promise.all([
+      app.fetchWireHazards(bbox(A.lat, A.lng)),
+      app.fetchHospitals(bbox(A.lat, A.lng)),
+      app.fetchTrails(bbox(A.lat, A.lng)),
+      app.fetchNearbyAirports(A, bbox(A.lat, A.lng)),
+    ]);
+    expect(peak).toBeLessThanOrEqual(app.OVERPASS_MAX_CONCURRENT);
+    expect(document.getElementById('wireStatus').textContent).not.toMatch(/Fetching/);
+    expect(text('terrHospitals')).toBe('None found in area');
+    expect(S._activeFetches['Wire Hazards']).toBeUndefined();
+    expect(S._activeFetches.Hospitals).toBeUndefined();
+  });
+
+  it('concurrency: a query aborted while queued leaves the queue without being sent', async () => {
+    const pending = [];
+    route({ overpass: () => new Promise(r => pending.push(r)) });
+    const a = app._overpassFetch('q'), b = app._overpassFetch('q');
+    const ctl = new AbortController();
+    const c = app._overpassFetch('q', { signal: ctl.signal });
+    ctl.abort();
+    await expect(c).rejects.toThrow(/cancelled/);
+    pending.splice(0).forEach(r => r(resp(hospital)));
+    await Promise.all([a, b]);
+    await new Promise(r => setTimeout(r, 0));
+    expect(pending.length).toBe(0);                             // c never reached the network
+    // the slots are free again: a new query is sent immediately
+    const d = app._overpassFetch('q');
+    await Promise.resolve();
+    expect(pending.length).toBe(1);
+    pending.shift()(resp(hospital));
+    await d;
+  });
+
+  it('retry: every mirror answering 504 / refusing → one more pass after a pause, which can succeed', async () => {
+    let n = 0;
+    route({
+      'overpass-api.de': () => (++n <= 1 ? Promise.resolve(resp({}, { status: 504 })) : Promise.resolve(resp(hospital))),
+      'kumi.systems': () => Promise.reject(new TypeError('Failed to fetch')),   // CORS-less overload answer
+      'mail.ru': resp({}, { status: 504 }),
+    });
+    const data = await app._overpassFetch('q', { retryDelayMs: 0 });
+    expect(data.elements.length).toBe(1);
+    expect(n).toBe(2);
+  });
+
+  it('retry: at most one extra pass, then it rejects', async () => {
+    const seen = [];
+    route({ 'mail.ru': u => { seen.push(u); return Promise.resolve(resp({}, { status: 503 })); },
+            overpass: u => { seen.push(u); return Promise.resolve(resp({}, { status: 429 })); } });
+    await expect(app._overpassFetch('q', { retryDelayMs: 0 })).rejects.toThrow(/HTTP 503/);
+    expect(seen.length).toBe(6);                                // 3 mirrors × 2 passes
+  });
+
+  it('retry: a non-overload failure (404, runtime-error remark) is not retried', async () => {
+    const seen = [];
+    route({ 'overpass-api.de': u => { seen.push(u); return Promise.resolve(resp({}, { status: 504 })); },
+            'kumi.systems': u => { seen.push(u); return Promise.resolve(resp({}, { status: 404 })); },
+            'mail.ru': u => { seen.push(u); return Promise.resolve(resp(timeout)); } });
+    await expect(app._overpassFetch('q', { retryDelayMs: 0 })).rejects.toThrow(/timed out/);
+    expect(seen.length).toBe(3);
+  });
+
   it('the per-mirror limit follows the query [timeout:N] + 10 s, clamped 15–90 s', () => {
     expect(overpassMirrorTimeoutMs('[out:json][timeout:30];')).toBe(40000);
     expect(overpassMirrorTimeoutMs('[out:json][timeout:60];')).toBe(70000);

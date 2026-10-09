@@ -25,10 +25,13 @@ A small CORS+Range proxy so the browser-only app can read CORS-blocked sources:
    session, network fault, a page that never arrived) answers **502** with `{ error, partial,
    notamList }` — never a 200 with an empty list, which the app would show as "0 NOTAMs · LIVE".
    A search capped by the page backstop is a 200 flagged `truncated: true`.
-4. **Live ADS-B traffic** — the public providers (adsb.fi / airplanes.live / adsb.lol)
-   increasingly block browser CORS. The `/adsb?lat=&lon=&dist=` route fetches them
-   server-side (first success wins), passes the JSON through, and adds CORS (real-time,
-   uncached). The served provider is reported in the `X-Adsb-Source` response header.
+4. **Live ADS-B traffic** — the public providers (adsb.fi / adsb.lol) block browser
+   CORS. The `/adsb?lat=&lon=&dist=` route fetches them server-side (first success wins,
+   8 s limit each, with a User-Agent carrying the project URL — adsb.lol rejects generic
+   agents), passes the JSON through, and adds CORS (real-time, uncached). The served
+   provider is reported in the `X-Adsb-Source` response header. When all fail, the 502
+   body lists each provider's status in `providers: [{ name, status, detail }]`.
+   (airplanes.live was dropped in Oct 2026: it answers 403 to unregistered clients.)
 5. **USFS roads/trails/MVUM** — the USFS EDW ArcGIS server (`apps.fs.usda.gov`) is
    self-hosted and blocks browser CORS. Served at the `/usfs/...` route (cached a day;
    forest roads change slowly). The app appends the full ArcGIS query path after `/usfs/`.
