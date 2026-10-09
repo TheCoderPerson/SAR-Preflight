@@ -4,13 +4,16 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.10.09-b — 2026-10-09
+
+- In the 3D view, live aircraft now show the same plane icon as the 2D map, pointed along their direction of travel and kept a readable size at any zoom, and leave a trail at their altitude while Position Trails is on, colored by height above ground. Aircraft that report no heading keep the X marker.
+
 ## v2026.10.09-a — 2026-10-09
 
 - The FAA sectional chart edition check works again. The FAA changed how its chart service writes the edition date, so the check had failed every time: the Config tab wrongly said "cached edition 2026-05-13 (offline)" and the map could keep showing chart tiles from that older edition.
 - Live ADS-B traffic: the data proxy now asks FlyItalyADSB first (a free keyed service), no longer asks airplanes.live (it now refuses unregistered apps), identifies itself to adsb.lol as that service now requires, pauses a provider that refuses it instead of asking again every few seconds, and gives up on a stalled provider after 8 seconds. An answer without an aircraft list now counts as a failure, never as "no traffic". When every provider fails, the traffic error now names each one and why. Self-hosted proxies need the updated Worker code.
 - OpenStreetMap lookups (wires, cell towers, hospitals, trails, buildings) now send at most two queries at a time. The main OpenStreetMap server had been refusing the extra requests from a single area load, which pushed them onto slower backup servers and could drop buildings from the viewshed. When every server answers "busy", the app now tries them once more after a short pause. The viewshed's building lookup now waits up to 25 seconds instead of 12 (a busy server often needs longer, and without buildings the viewshed overstates visibility) and frees its place when it gives up.
 - OpenStreetMap answers built on out-of-date map data are no longer shown as live. One backup server was serving map data three months old, so recently mapped power lines, towers or helipads could be missing. The app now asks the other servers for current data, and if none has it, labels the section in amber "OSM data from <date>".
-- In the 3D view, live aircraft now show the same plane icon as the 2D map, pointed along their direction of travel and kept a readable size at any zoom, and leave a trail at their altitude while Position Trails is on, colored by height above ground. Aircraft that report no heading keep the X marker.
 - Water, roads and trails, land status, smoke and parcel lookups now give up after 40 seconds and report the source as unavailable (or show the cached copy) instead of staying on "Fetching..." when a government server stalls.
 
 ## v2026.09.22-c — 2026-09-22
