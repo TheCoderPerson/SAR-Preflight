@@ -468,6 +468,42 @@ describe('Overpass sources (airports, hospitals, trails, wires)', () => {
     expect(seen.length).toBe(3);
   });
 
+  // Overpass answers name the age of the server's map copy (osm3s.timestamp_osm_base).
+  const withBase = (body, iso) => Object.assign({}, body, { osm3s: { timestamp_osm_base: iso } });
+  const recent = () => new Date(Date.now() - 60000).toISOString();
+
+  it('stale map data: a mirror with old OSM data is skipped for one with current data', async () => {
+    route({ 'overpass-api.de': resp({}, { status: 504 }),
+            'kumi.systems': resp(withBase(hospital, '2026-07-15T15:22:01Z')),
+            'mail.ru': () => Promise.resolve(resp(withBase(hospital, recent()))) });
+    const data = await app._overpassFetch('q', { retryDelayMs: 0 });
+    expect(data._osmStale).toBeUndefined();
+    expect(Date.now() - overpassDataTimestamp(data)).toBeLessThan(120000);
+  });
+
+  it('stale map data: with nothing current, the freshest old answer is used and flagged', async () => {
+    route({ 'overpass-api.de': resp(withBase(hospital, '2026-08-01T00:00:00Z')),
+            'kumi.systems': resp(withBase(hospital, '2026-07-15T15:22:01Z')),
+            'mail.ru': resp({}, { status: 404 }) });
+    const data = await app._overpassFetch('q', { retryDelayMs: 0 });
+    expect(data._osmStale).toBe(true);
+    expect(data.osm3s.timestamp_osm_base).toBe('2026-08-01T00:00:00Z');
+  });
+
+  it('stale map data: hospitals read "OSM data from <date>" (amber), never LIVE', async () => {
+    route({ overpass: resp(withBase(hospital, '2026-07-15T15:22:01Z')), 'mail.ru': resp(withBase(hospital, '2026-07-15T15:22:01Z')) });
+    await app.fetchHospitals(bbox(A.lat, A.lng));
+    expect(S.sectionMeta.hospitals.status).toBe('cached');
+    expect(S.sectionMeta.hospitals.cachedAt).toBe(Date.parse('2026-07-15T15:22:01Z'));
+    expect(S.sectionMeta.hospitals.error).toMatch(/out-of-date map data/);
+    expect(text('hospitalsStatus')).not.toMatch(/LIVE/);
+    // a later current answer is LIVE again and drops the label
+    route({ overpass: resp(withBase(hospital, recent())), 'mail.ru': resp(withBase(hospital, recent())) });
+    await app.fetchHospitals(bbox(A.lat, A.lng));
+    expect(S.sectionMeta.hospitals.status).toBe('live');
+    expect(S.sectionMeta.hospitals.cachedLabel).toBeUndefined();
+  });
+
   it('the per-mirror limit follows the query [timeout:N] + 10 s, clamped 15–90 s', () => {
     expect(overpassMirrorTimeoutMs('[out:json][timeout:30];')).toBe(40000);
     expect(overpassMirrorTimeoutMs('[out:json][timeout:60];')).toBe(70000);

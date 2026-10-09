@@ -430,7 +430,7 @@ function showDiagnostics() { try { Diag.showPanel(); } catch (_) {} }
 // Direct fallbacks behind the proxy /adsb route. airplanes.live was dropped
 // (Oct 2026): it answers 403 "contact us" to every unregistered client.
 const ADSB_APIS = [
-  { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
+  { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v3/lat/${lat}/lon/${lon}/dist/${dist}` },
   { name: 'adsb.lol',       url: (lat, lon, dist) => `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
 ];
 
@@ -1855,6 +1855,8 @@ function _sectionUpdatable(def) {
 function markSection(key, patch) {
   patch = patch || {};
   if (patch.status === 'error' && patch.errorAt == null) patch.errorAt = Date.now();
+  // A cachedLabel describes only the status that set it; any new status clears it.
+  if (patch.status && !('cachedLabel' in patch)) patch.cachedLabel = undefined;
   const cur = S.sectionMeta[key] || { status: 'never', updatedAt: null, cachedAt: null, error: null, errorAt: null };
   let prior;
   if (patch.source) {
@@ -4549,7 +4551,7 @@ async function fetchNearbyAirports(center, bounds) {
     // Cache results
     if (typeof cacheApiResponse === 'function') cacheApiResponse('airports', cacheKey, data);
     clearDataSourceError('Airports');
-    markSection('airspace', { source: 'airports', status: 'live', updatedAt: Date.now(), error: null });
+    markSection('airspace', Object.assign({ source: 'airports' }, _overpassMetaPatch(data)));
   } catch (err) {
     if (!_requestCurrent(tok)) return;
     console.warn('Airport fetch failed:', err);
@@ -6400,7 +6402,7 @@ async function fetchHospitals(bounds) {
       setText('terrHospitals', 'Unavailable (no data or cache)');
     }
     if (typeof markSection === 'function') {
-      if (data && !fromCache) markSection('hospitals', { status: 'live', updatedAt: Date.now(), error: null });
+      if (data && !fromCache) markSection('hospitals', _overpassMetaPatch(data));
       else if (data && fromCache) markSection('hospitals', { status: 'cached', cachedAt: cachedAt || Date.now(), error: errMsg });
       else markSection('hospitals', { status: 'error', error: errMsg || 'No data' });
     }
@@ -6466,7 +6468,7 @@ async function fetchTrails(bounds) {
       setText('terrTrails', 'Unavailable (no data or cache)');
     }
     if (typeof markSection === 'function') {
-      if (data && !fromCache) markSection('trails', { status: 'live', updatedAt: Date.now(), error: null });
+      if (data && !fromCache) markSection('trails', _overpassMetaPatch(data));
       else if (data && fromCache) markSection('trails', { status: 'cached', cachedAt: cachedAt || Date.now(), error: errMsg });
       else markSection('trails', { status: 'error', error: errMsg || 'No data' });
     }
@@ -6630,14 +6632,31 @@ function _overpassSleep(ms, signal) {
   });
 }
 
+// Section-meta patch for a fresh Overpass answer: LIVE, or — when every
+// reachable mirror held out-of-date map data — amber "OSM data from <date>".
+function _overpassMetaPatch(data) {
+  if (data && data._osmStale) {
+    const t = overpassDataTimestamp(data);
+    return { status: 'cached', cachedAt: t, cachedLabel: 'OSM data from',
+      error: 'Every reachable OpenStreetMap server had out-of-date map data; this reflects OSM as of '
+        + new Date(t).toISOString().slice(0, 10) + '. Recently mapped features may be missing.' };
+  }
+  return { status: 'live', updatedAt: Date.now(), error: null };
+}
+
 async function _overpassFetchMirrors(query, opts) {
   const signal = opts && opts.signal;
   const perMirrorMs = (opts && opts.timeoutMs) || overpassMirrorTimeoutMs(query);
   const retryDelayMs = (opts && opts.retryDelayMs != null) ? opts.retryDelayMs : OVERPASS_RETRY_DELAY_MS;
   const deadline = Date.now() + 2 * perMirrorMs;
   let lastErr = null;
+  // The freshest answer built on OUT-OF-DATE map data (overpassDataIsStale):
+  // kept only as a last resort while the other mirrors are asked for current
+  // data, and returned flagged `_osmStale` so callers label it with its date.
+  let staleBest = null;
   for (let pass = 0; pass < 2; pass++) {
     let retryable = true;   // every failure this pass was a fast overload / refusal
+    let sawOverload = false; // ...and there was at least one (old-data answers are not failures)
     if (pass === 1) {
       if (signal && signal.aborted) throw _abortError();
       console.info(`Overpass: all mirrors busy, retrying in ${Math.round(retryDelayMs / 1000)} s`);
@@ -6668,6 +6687,12 @@ async function _overpassFetchMirrors(query, opts) {
         // elements list and a "runtime error" remark — a failure (try the next
         // mirror), never "nothing here".
         if (data.remark && /error/i.test(data.remark)) throw new Error(String(data.remark).slice(0, 160));
+        if (overpassDataIsStale(data, Date.now())) {
+          const base = data.osm3s.timestamp_osm_base;
+          console.warn(`Overpass mirror ${server} serves OpenStreetMap data from ${base}; trying the next mirror for current data`);
+          if (!staleBest || overpassDataTimestamp(data) > overpassDataTimestamp(staleBest)) staleBest = data;
+          continue;
+        }
         return data;
       } catch (e) {
         if (signal && signal.aborted) throw _abortError(); // superseded: no further mirrors
@@ -6675,6 +6700,7 @@ async function _overpassFetchMirrors(query, opts) {
         // A refused request (an overloaded server answers without CORS headers,
         // so the browser reports only a TypeError) counts as a fast overload.
         if (timedOut || !(e && (e.overpassRetryable || e instanceof TypeError))) retryable = false;
+        else sawOverload = true;
         console.warn(`Overpass mirror ${server} failed:`, err.message);
         lastErr = err;
       } finally {
@@ -6682,8 +6708,9 @@ async function _overpassFetchMirrors(query, opts) {
         if (signal) signal.removeEventListener('abort', onCancel);
       }
     }
-    if (!retryable || deadline - Date.now() < retryDelayMs + 5000) break;
+    if (!retryable || !sawOverload || deadline - Date.now() < retryDelayMs + 5000) break;
   }
+  if (staleBest) { staleBest._osmStale = true; return staleBest; }
   throw new Error('Overpass: all mirrors failed (' + (lastErr ? lastErr.message : 'unknown') + ')');
 }
 
@@ -6829,9 +6856,14 @@ async function fetchWireHazards(bounds) {
     }
     if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
 
-    setStatus('wireStatus', 'live', `${total + towerCount} FEATURES`);
+    if (data._osmStale) {
+      const asOf = new Date(overpassDataTimestamp(data)).toISOString().slice(0, 10);
+      setStatus('wireStatus', 'cached', `${total + towerCount} FEAT · OSM ${asOf}`);
+    } else {
+      setStatus('wireStatus', 'live', `${total + towerCount} FEATURES`);
+    }
     clearDataSourceError('Wire Hazards');
-    markSection('obstacles', { source: 'wire', status: 'live', updatedAt: Date.now(), error: null });
+    markSection('obstacles', Object.assign({ source: 'wire' }, _overpassMetaPatch(data)));
   } catch (err) {
     if (!_requestCurrent(tok)) return;
     console.error('Wire hazard fetch error:', err);

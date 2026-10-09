@@ -30,6 +30,7 @@ const CHANGELOG_ENTRIES = [
       'The FAA sectional chart edition check works again. The FAA changed how its chart service writes the edition date, so the check had failed every time: the Config tab wrongly said "cached edition 2026-05-13 (offline)" and the map could keep showing chart tiles from that older edition.',
       'Live ADS-B traffic: the data proxy no longer asks airplanes.live (it now refuses unregistered apps), identifies itself to adsb.lol as that service now requires, and gives up on a stalled provider after 8 seconds. When every provider fails, the traffic error now names each one and why. Self-hosted proxies need the updated Worker code.',
       'OpenStreetMap lookups (wires, cell towers, hospitals, trails, buildings) now send at most two queries at a time. The main OpenStreetMap server had been refusing the extra requests from a single area load, which pushed them onto slower backup servers and could drop buildings from the viewshed. When every server answers "busy", the app now tries them once more after a short pause. The viewshed\'s building lookup now waits up to 25 seconds instead of 12 (a busy server often needs longer, and without buildings the viewshed overstates visibility) and frees its place when it gives up.',
+      'OpenStreetMap answers built on out-of-date map data are no longer shown as live. One backup server was serving map data three months old, so recently mapped power lines, towers or helipads could be missing. The app now asks the other servers for current data, and if none has it, labels the section in amber "OSM data from <date>".',
       'Water, roads and trails, land status, smoke and parcel lookups now give up after 40 seconds and report the source as unavailable (or show the cached copy) instead of staying on "Fetching..." when a government server stalls.',
     ],
   },
@@ -1603,6 +1604,23 @@ function calcWindShear(windProfile) {
 // the query asks for, plus 10 s of transfer grace (N = 30 when the query names
 // none), clamped to 15–90 s. Without it a stuck mirror held a panel on
 // "Fetching..." for 3+ minutes (measured Sept 2026, overloaded mirrors).
+// Overpass answers carry osm3s.timestamp_osm_base — the moment the server's
+// copy of OpenStreetMap was last updated. Mirrors normally lag minutes; one
+// was found serving data three months old (kumi.systems, Oct 2026), so a
+// newly mapped power line or helipad could silently be missing. An answer
+// older than OVERPASS_STALE_MAX_MS is "stale".
+const OVERPASS_STALE_MAX_MS = 3 * 86400000;
+function overpassDataTimestamp(data) {
+  const s = data && data.osm3s && data.osm3s.timestamp_osm_base;
+  const t = typeof s === 'string' ? Date.parse(s) : NaN;
+  return isFinite(t) ? t : null;
+}
+// Unknown age (no timestamp) is not called stale: there is nothing to judge.
+function overpassDataIsStale(data, nowMs, maxMs) {
+  const t = overpassDataTimestamp(data);
+  return t != null && (nowMs - t) > (maxMs || OVERPASS_STALE_MAX_MS);
+}
+
 function overpassMirrorTimeoutMs(query) {
   const m = /\[timeout:(\d+)\]/.exec(String(query || ''));
   const n = m ? Number(m[1]) : 30;
@@ -3641,7 +3659,9 @@ function buildSectionMetaLine(meta, nowMs, tz) {
   if (status === 'cached' && cab != null) {
     const age = relAge(cab, nowMs);
     const ageText = age ? '(' + age + ' ago)' : '';
-    const text = 'Cached ' + formatStamp(cab, nowMs, tz) + (ageText ? ' ' + ageText : '');
+    // cachedLabel names what the date is when it is not a cache copy, e.g.
+    // "OSM data from" for an Overpass answer built on old map data.
+    const text = (meta.cachedLabel || 'Cached') + ' ' + formatStamp(cab, nowMs, tz) + (ageText ? ' ' + ageText : '');
     return { state: 'cached', tone: 'cached', text, ageText, title: meta.error || '', canUpdate: true };
   }
   if (status === 'cached') {
@@ -3667,6 +3687,7 @@ function rollupSources(sources, nowMs) {
   if (!names.length) return { status: 'never' };
   let anyError = false, anyCached = false, allLive = true;
   let oldestUpdated = null, oldestCached = null, latestError = null, errMsg = null;
+  let cachedLabel, cachedNote = null;
   const detail = [];
   for (const name of names) {
     const s = sources[name] || {};
@@ -3677,7 +3698,11 @@ function rollupSources(sources, nowMs) {
       errMsg = errMsg || s.error;
     } else if (st === 'cached') {
       anyCached = true; allLive = false;
-      if (s.cachedAt != null && (oldestCached == null || s.cachedAt < oldestCached)) oldestCached = s.cachedAt;
+      if (s.cachedAt != null && (oldestCached == null || s.cachedAt < oldestCached)) {
+        oldestCached = s.cachedAt;
+        cachedLabel = s.cachedLabel;   // the header shows the oldest piece, so its label
+        cachedNote = s.error || null;
+      }
     } else if (st === 'live') {
       if (s.updatedAt != null && (oldestUpdated == null || s.updatedAt < oldestUpdated)) oldestUpdated = s.updatedAt;
     } else {
@@ -3693,7 +3718,8 @@ function rollupSources(sources, nowMs) {
     status,
     updatedAt: oldestUpdated,
     cachedAt: oldestCached,
-    error: errMsg,
+    cachedLabel: status === 'cached' ? cachedLabel : undefined,
+    error: status === 'cached' ? (errMsg || cachedNote) : errMsg,
     errorAt: latestError,
     detail: detail.join(' · '),
   };
@@ -5268,7 +5294,7 @@ if (typeof module !== 'undefined' && module.exports) {
     SMA_NONPUBLIC_CODES, smaAgencyInfo, smaIsPublic, classifyAreaPublicPrivate, cellCoverageAt,
     filterAirportsByDistance, classifyAirspace,
     calcGustFactor, calcWindShear,
-    generateElevationGrid, gridCenterIndex, parse3depSamples, parseOpenMeteoElevation, overpassMirrorTimeoutMs, calcSlopeFromGrid, gridCellSpacingKm, calcAspect,
+    generateElevationGrid, gridCenterIndex, parse3depSamples, parseOpenMeteoElevation, overpassMirrorTimeoutMs, OVERPASS_STALE_MAX_MS, overpassDataTimestamp, overpassDataIsStale, calcSlopeFromGrid, gridCellSpacingKm, calcAspect,
     detectTerrainFeatures, scoreLZFitness, findEmergencyLZs,
     assessTerrainTurbulence, analyzeGPSMasking,
     calcSwapRecommendation,

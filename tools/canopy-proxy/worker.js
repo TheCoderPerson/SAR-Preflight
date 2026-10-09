@@ -53,7 +53,7 @@ const UA = 'Mozilla/5.0 (compatible; SAR-Preflight/1.0)';
 // airplanes.live was dropped (Oct 2026): it answers 403 "contact us" to every
 // unregistered client.
 const ADSB_UPSTREAMS = [
-  { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
+  { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v3/lat/${lat}/lon/${lon}/dist/${dist}` },
   { name: 'adsb.lol',       url: (lat, lon, dist) => `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
 ];
 // adsb.lol rejects generic agents ("User-Agent too generic; include valid
