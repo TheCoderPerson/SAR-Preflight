@@ -427,9 +427,10 @@ try { if (typeof window !== 'undefined') window.SARDiag = Diag; } catch (_) {}
 // Open the diagnostics panel on demand (wired to the Config → App Version button).
 function showDiagnostics() { try { Diag.showPanel(); } catch (_) {} }
 
+// Direct fallbacks behind the proxy /adsb route. airplanes.live was dropped
+// (Oct 2026): it answers 403 "contact us" to every unregistered client.
 const ADSB_APIS = [
-  { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
-  { name: 'airplanes.live', url: (lat, lon, dist) => `https://api.airplanes.live/v2/point/${lat}/${lon}/${dist}` },
+  { name: 'adsb.fi',        url: (lat, lon, dist) => `https://opendata.adsb.fi/api/v3/lat/${lat}/lon/${lon}/dist/${dist}` },
   { name: 'adsb.lol',       url: (lat, lon, dist) => `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${dist}` },
 ];
 
@@ -688,7 +689,8 @@ async function resolveSectionalEdition() {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const meta = await res.json();
     // The edition stamp lives in documentInfo.subject for this service
-    // (e.g. "Updated with the latest charts on 2026-05-13 ..."); fall back
+    // (e.g. "Updated with the latest charts on 07-09-2026."; older builds of
+    // the service used "2026-05-13 ..." — parseSectionalEdition takes both); fall back
     // across the other text fields in case the service layout changes.
     const di = (meta && meta.documentInfo) || {};
     const candidate = [di.subject, di.comments, meta && meta.serviceDescription, meta && meta.description]
@@ -814,6 +816,7 @@ const MAX_MAP_ZOOM = _isConstrained() ? 18 : 19;
 function initMap() {
   // Collapsed layer-control sections + PLANS mode, before the first buildLayerControl.
   restoreLayerUiState();
+  restoreAssessCollapsed();
   // preferCanvas: render vector layers (wires, obstacles, towers, airspace,
   // ADS-B, etc.) on one GPU canvas instead of per-feature SVG — much smoother
   // panning at close zoom on high-DPR mobile (the choppiness reported on iPhone).
@@ -1853,6 +1856,8 @@ function _sectionUpdatable(def) {
 function markSection(key, patch) {
   patch = patch || {};
   if (patch.status === 'error' && patch.errorAt == null) patch.errorAt = Date.now();
+  // A cachedLabel describes only the status that set it; any new status clears it.
+  if (patch.status && !('cachedLabel' in patch)) patch.cachedLabel = undefined;
   const cur = S.sectionMeta[key] || { status: 'never', updatedAt: null, cachedAt: null, error: null, errorAt: null };
   let prior;
   if (patch.source) {
@@ -4547,7 +4552,7 @@ async function fetchNearbyAirports(center, bounds) {
     // Cache results
     if (typeof cacheApiResponse === 'function') cacheApiResponse('airports', cacheKey, data);
     clearDataSourceError('Airports');
-    markSection('airspace', { source: 'airports', status: 'live', updatedAt: Date.now(), error: null });
+    markSection('airspace', Object.assign({ source: 'airports' }, _overpassMetaPatch(data)));
   } catch (err) {
     if (!_requestCurrent(tok)) return;
     console.warn('Airport fetch failed:', err);
@@ -5700,10 +5705,15 @@ async function _arcgisFetchRemainingPages(url, firstCount, fetchJson) {
 //  - a network failure answered from IndexedDB carries `fetchError`.
 // opts.signal: AbortController signal — an aborted fetch returns error:'aborted'
 // WITHOUT consulting the cache (a superseded pan-fetch must not repaint stale data).
+// opts.timeoutMs: per-request limit (default GEOJSON_FETCH_TIMEOUT_MS) covering
+// the response AND its body. A request that exceeds it fails like any other
+// error (cached copy, else the error) — without it a stalled server held a
+// section on "Fetching..." indefinitely (USGS NHD, Oct 2026).
+const GEOJSON_FETCH_TIMEOUT_MS = 40000;
 async function _fetchGeoJsonLayer(endpoint, cacheKey, url, opts) {
   opts = opts || {};
   const online = (typeof isOnline !== 'function') || isOnline();
-  const init = opts.signal ? { signal: opts.signal } : undefined;
+  const limitMs = opts.timeoutMs || GEOJSON_FETCH_TIMEOUT_MS;
   const readJson = async res => {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const gj = await res.json();
@@ -5712,10 +5722,36 @@ async function _fetchGeoJsonLayer(endpoint, cacheKey, url, opts) {
     if (gj && gj.error) throw new Error('ArcGIS ' + (gj.error.code || 'error') + ': ' + (gj.error.message || 'query failed'));
     return gj;
   };
+  // One request (first or continuation page) under the time limit and the
+  // caller's signal. The race also settles a fetch that ignores its signal.
+  const fetchJson = async u => {
+    const ctl = new AbortController();
+    let timedOut = false;
+    const parent = opts.signal;
+    const onParentAbort = () => ctl.abort();
+    if (parent) { if (parent.aborted) ctl.abort(); else parent.addEventListener('abort', onParentAbort, { once: true }); }
+    const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, limitMs);
+    const stopped = new Promise((_, rej) => {
+      const fail = () => rej(timedOut ? new Error(`no answer within ${Math.round(limitMs / 1000)} s`) : _abortError());
+      if (ctl.signal.aborted) fail(); else ctl.signal.addEventListener('abort', fail, { once: true });
+    });
+    stopped.catch(() => {});
+    try {
+      return await Promise.race([
+        (async () => { const res = await _proxyFetch(u, { signal: ctl.signal }); return { res, gj: await readJson(res) }; })(),
+        stopped,
+      ]);
+    } catch (e) {
+      if (timedOut && !(parent && parent.aborted)) throw new Error(`no answer within ${Math.round(limitMs / 1000)} s`);
+      throw e;
+    } finally {
+      clearTimeout(timer);
+      if (parent) parent.removeEventListener('abort', onParentAbort);
+    }
+  };
   if (url && online) {
     try {
-      const res = await _proxyFetch(url, init);
-      const gj = await readJson(res);
+      const { res, gj } = await fetchJson(url);
       // A continuation page can come from the SW's offline fallback even when
       // the first did not: then the merged result is a cached copy too.
       let sw = _swCacheStamp(res);
@@ -5723,8 +5759,7 @@ async function _fetchGeoJsonLayer(endpoint, cacheKey, url, opts) {
       let truncated = arcgisExceededLimit(gj), truncErr = null;
       if (truncated && opts.paginate !== false && !sw) {
         const more = await _arcgisFetchRemainingPages(url, features.length, async u => {
-          const r = await _proxyFetch(u, init);
-          const j = await readJson(r);
+          const { res: r, gj: j } = await fetchJson(u);
           sw = _mergeSwStamps(sw, _swCacheStamp(r));
           return j;
         });
@@ -6368,7 +6403,7 @@ async function fetchHospitals(bounds) {
       setText('terrHospitals', 'Unavailable (no data or cache)');
     }
     if (typeof markSection === 'function') {
-      if (data && !fromCache) markSection('hospitals', { status: 'live', updatedAt: Date.now(), error: null });
+      if (data && !fromCache) markSection('hospitals', _overpassMetaPatch(data));
       else if (data && fromCache) markSection('hospitals', { status: 'cached', cachedAt: cachedAt || Date.now(), error: errMsg });
       else markSection('hospitals', { status: 'error', error: errMsg || 'No data' });
     }
@@ -6434,7 +6469,7 @@ async function fetchTrails(bounds) {
       setText('terrTrails', 'Unavailable (no data or cache)');
     }
     if (typeof markSection === 'function') {
-      if (data && !fromCache) markSection('trails', { status: 'live', updatedAt: Date.now(), error: null });
+      if (data && !fromCache) markSection('trails', _overpassMetaPatch(data));
       else if (data && fromCache) markSection('trails', { status: 'cached', cachedAt: cachedAt || Date.now(), error: errMsg });
       else markSection('trails', { status: 'error', error: errMsg || 'No data' });
     }
@@ -6542,47 +6577,141 @@ function cellCoverageReadout(lat, lng, centerElevFt) {
 //                    the whole call is also capped at twice that, so a run
 //                    of slow mirrors fails in bounded time instead of minutes.
 function _abortError() { const e = new Error('cancelled'); e.name = 'AbortError'; return e; }
-async function _overpassFetch(query, opts) {
+
+// At most OVERPASS_MAX_CONCURRENT queries in flight. One area load starts ~5
+// (wires, towers, hospitals, trails, buildings); overpass-api.de grants each
+// client only a few slots and refuses the rest WITHOUT CORS headers, so the
+// browser saw "Failed to fetch" and the request spilled onto the slower
+// mirrors (measured Oct 2026 — the viewshed's buildings query then failed on
+// all three). Time spent queued does not count against the mirror time limits;
+// an abort while queued leaves the queue.
+const OVERPASS_MAX_CONCURRENT = 2;
+let _overpassActive = 0;
+const _overpassWaiters = [];
+function _overpassWait(signal) {
+  if (signal && signal.aborted) return Promise.reject(_abortError());
+  return new Promise((resolve, reject) => {
+    const w = { resolve, reject, signal, onAbort: null };
+    if (signal) {
+      w.onAbort = () => {
+        const i = _overpassWaiters.indexOf(w);
+        if (i >= 0) _overpassWaiters.splice(i, 1);
+        reject(_abortError());
+      };
+      signal.addEventListener('abort', w.onAbort, { once: true });
+    }
+    _overpassWaiters.push(w);
+  });
+}
+function _overpassRelease() {
+  const w = _overpassWaiters.shift();
+  if (!w) { _overpassActive = Math.max(0, _overpassActive - 1); return; }
+  if (w.signal && w.onAbort) w.signal.removeEventListener('abort', w.onAbort);
+  w.resolve(); // the slot passes straight to the next waiter
+}
+
+function _overpassFetch(query, opts) {
+  const run = () => _overpassFetchMirrors(query, opts).finally(_overpassRelease);
+  // A free slot starts the request synchronously (no extra tick of latency).
+  if (_overpassActive < OVERPASS_MAX_CONCURRENT) { _overpassActive++; return run(); }
+  return _overpassWait(opts && opts.signal).then(run);
+}
+
+// When every mirror fails FAST with an overload answer (429/502/503/504) or a
+// network/CORS refusal, wait this long and walk the mirrors once more, inside
+// the same overall deadline. overpass-api.de answers 504 to roughly every
+// other request while busy and the next one usually succeeds (measured Oct
+// 2026), while a time-out or a "runtime error" remark is not retried.
+const OVERPASS_RETRY_DELAY_MS = 4000;
+const _overpassRetryableStatus = st => st === 429 || st === 502 || st === 503 || st === 504;
+function _overpassSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) { reject(_abortError()); return; }
+    const onAbort = () => { clearTimeout(t); reject(_abortError()); };
+    const t = setTimeout(() => { if (signal) signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+// Section-meta patch for a fresh Overpass answer: LIVE, or — when every
+// reachable mirror held out-of-date map data — amber "OSM data from <date>".
+function _overpassMetaPatch(data) {
+  if (data && data._osmStale) {
+    const t = overpassDataTimestamp(data);
+    return { status: 'cached', cachedAt: t, cachedLabel: 'OSM data from',
+      error: 'Every reachable OpenStreetMap server had out-of-date map data; this reflects OSM as of '
+        + new Date(t).toISOString().slice(0, 10) + '. Recently mapped features may be missing.' };
+  }
+  return { status: 'live', updatedAt: Date.now(), error: null };
+}
+
+async function _overpassFetchMirrors(query, opts) {
   const signal = opts && opts.signal;
   const perMirrorMs = (opts && opts.timeoutMs) || overpassMirrorTimeoutMs(query);
+  const retryDelayMs = (opts && opts.retryDelayMs != null) ? opts.retryDelayMs : OVERPASS_RETRY_DELAY_MS;
   const deadline = Date.now() + 2 * perMirrorMs;
   let lastErr = null;
-  for (const server of OVERPASS_MIRRORS) {
-    if (signal && signal.aborted) throw _abortError();
-    const left = deadline - Date.now();
-    if (left <= 0) { lastErr = new Error(`no answer within ${Math.round(2 * perMirrorMs / 1000)} s overall`); break; }
-    const limit = Math.min(perMirrorMs, left);
-    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
-    let timedOut = false;
-    const timer = ctl ? setTimeout(() => { timedOut = true; ctl.abort(); }, limit) : null;
-    const onCancel = () => { if (ctl) ctl.abort(); };
-    if (signal) signal.addEventListener('abort', onCancel, { once: true });
-    try {
-      const res = await fetch(server, {
-        method: 'POST',
-        body: 'data=' + encodeURIComponent(query),
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        signal: ctl ? ctl.signal : undefined,
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      let data;
-      try { data = await res.json(); } catch (_) { throw new Error('response is not valid JSON'); }
-      if (!data || !Array.isArray(data.elements)) throw new Error('response has no elements list');
-      // A timed-out / out-of-memory query answers HTTP 200 with an EMPTY
-      // elements list and a "runtime error" remark — a failure (try the next
-      // mirror), never "nothing here".
-      if (data.remark && /error/i.test(data.remark)) throw new Error(String(data.remark).slice(0, 160));
-      return data;
-    } catch (e) {
-      if (signal && signal.aborted) throw _abortError(); // superseded: no further mirrors
-      const err = timedOut ? new Error(`no answer within ${Math.round(limit / 1000)} s`) : e;
-      console.warn(`Overpass mirror ${server} failed:`, err.message);
-      lastErr = err;
-    } finally {
-      if (timer) clearTimeout(timer);
-      if (signal) signal.removeEventListener('abort', onCancel);
+  // The freshest answer built on OUT-OF-DATE map data (overpassDataIsStale):
+  // kept only as a last resort while the other mirrors are asked for current
+  // data, and returned flagged `_osmStale` so callers label it with its date.
+  let staleBest = null;
+  for (let pass = 0; pass < 2; pass++) {
+    let retryable = true;   // every failure this pass was a fast overload / refusal
+    let sawOverload = false; // ...and there was at least one (old-data answers are not failures)
+    if (pass === 1) {
+      if (signal && signal.aborted) throw _abortError();
+      console.info(`Overpass: all mirrors busy, retrying in ${Math.round(retryDelayMs / 1000)} s`);
+      await _overpassSleep(retryDelayMs, signal);
     }
+    for (const server of OVERPASS_MIRRORS) {
+      if (signal && signal.aborted) throw _abortError();
+      const left = deadline - Date.now();
+      if (left <= 0) { lastErr = new Error(`no answer within ${Math.round(2 * perMirrorMs / 1000)} s overall`); retryable = false; break; }
+      const limit = Math.min(perMirrorMs, left);
+      const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+      let timedOut = false;
+      const timer = ctl ? setTimeout(() => { timedOut = true; ctl.abort(); }, limit) : null;
+      const onCancel = () => { if (ctl) ctl.abort(); };
+      if (signal) signal.addEventListener('abort', onCancel, { once: true });
+      try {
+        const res = await fetch(server, {
+          method: 'POST',
+          body: 'data=' + encodeURIComponent(query),
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          signal: ctl ? ctl.signal : undefined,
+        });
+        if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { overpassRetryable: _overpassRetryableStatus(res.status) });
+        let data;
+        try { data = await res.json(); } catch (_) { throw new Error('response is not valid JSON'); }
+        if (!data || !Array.isArray(data.elements)) throw new Error('response has no elements list');
+        // A timed-out / out-of-memory query answers HTTP 200 with an EMPTY
+        // elements list and a "runtime error" remark — a failure (try the next
+        // mirror), never "nothing here".
+        if (data.remark && /error/i.test(data.remark)) throw new Error(String(data.remark).slice(0, 160));
+        if (overpassDataIsStale(data, Date.now())) {
+          const base = data.osm3s.timestamp_osm_base;
+          console.warn(`Overpass mirror ${server} serves OpenStreetMap data from ${base}; trying the next mirror for current data`);
+          if (!staleBest || overpassDataTimestamp(data) > overpassDataTimestamp(staleBest)) staleBest = data;
+          continue;
+        }
+        return data;
+      } catch (e) {
+        if (signal && signal.aborted) throw _abortError(); // superseded: no further mirrors
+        const err = timedOut ? new Error(`no answer within ${Math.round(limit / 1000)} s`) : e;
+        // A refused request (an overloaded server answers without CORS headers,
+        // so the browser reports only a TypeError) counts as a fast overload.
+        if (timedOut || !(e && (e.overpassRetryable || e instanceof TypeError))) retryable = false;
+        else sawOverload = true;
+        console.warn(`Overpass mirror ${server} failed:`, err.message);
+        lastErr = err;
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onCancel);
+      }
+    }
+    if (!retryable || !sawOverload || deadline - Date.now() < retryDelayMs + 5000) break;
   }
+  if (staleBest) { staleBest._osmStale = true; return staleBest; }
   throw new Error('Overpass: all mirrors failed (' + (lastErr ? lastErr.message : 'unknown') + ')');
 }
 
@@ -6728,9 +6857,14 @@ async function fetchWireHazards(bounds) {
     }
     if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
 
-    setStatus('wireStatus', 'live', `${total + towerCount} FEATURES`);
+    if (data._osmStale) {
+      const asOf = new Date(overpassDataTimestamp(data)).toISOString().slice(0, 10);
+      setStatus('wireStatus', 'cached', `${total + towerCount} FEAT · OSM ${asOf}`);
+    } else {
+      setStatus('wireStatus', 'live', `${total + towerCount} FEATURES`);
+    }
     clearDataSourceError('Wire Hazards');
-    markSection('obstacles', { source: 'wire', status: 'live', updatedAt: Date.now(), error: null });
+    markSection('obstacles', Object.assign({ source: 'wire' }, _overpassMetaPatch(data)));
   } catch (err) {
     if (!_requestCurrent(tok)) return;
     console.error('Wire hazard fetch error:', err);
@@ -7349,7 +7483,12 @@ async function fetchAdsb() {
     for (const a of _adsbAttemptUrls(lat, lon, dist)) {
       try {
         const res = await _proxyFetch(a.url, { signal: tok.signal });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+          // The proxy's 502 names each upstream's failure; keep it in the reason.
+          let why = '';
+          if (a.proxy) { try { why = adsbProxyFailureSummary(await res.json()); } catch (_) {} }
+          throw new Error(`HTTP ${res.status}` + (why ? ` (${why})` : ''));
+        }
         json = await res.json();
         if (!_requestCurrent(tok)) return;
         if (a.idx != null) S._adsbApiIndex = a.idx;
@@ -7414,7 +7553,8 @@ function updateAdsbTrails(aircraft) {
     // Only append if position changed from last entry
     const last = trail[trail.length - 1];
     if (!last || last.lat !== ac.lat || last.lon !== ac.lon) {
-      trail.push({ lat: ac.lat, lon: ac.lon, alt: ac.alt_baro, time: now });
+      // alt: the same MSL altitude parseAdsbAircraft bases AGL on (baro, else geometric)
+      trail.push({ lat: ac.lat, lon: ac.lon, alt: ac.alt_baro != null ? ac.alt_baro : ac.alt_geom, time: now });
     }
     // Prune entries older than 15 min
     while (trail.length > 0 && trail[0].time < cutoff) trail.shift();
@@ -8553,8 +8693,62 @@ function computeAssessment(snap) {
   const badge = document.getElementById('assessBadge');
   badge.textContent = display.label;
   badge.className = 'assessment-badge ' + display.cls;
-  document.getElementById('assessText').textContent = display.text;
+  const textEl = document.getElementById('assessText');
+  textEl.textContent = display.text;
+  textEl.title = display.text; // full listing on hover while collapsed to one line
+  renderAssessProfile();
+}
 
+// "Limits from Config profile: <name>" under the advisories: which Config →
+// Aircraft & SOP Profile entry the limits above come from, flagged when a
+// threshold field was edited away from it. Tapping the name opens Config.
+function renderAssessProfile() {
+  const el = document.getElementById('assessProfile');
+  if (!el || typeof limitsProfileInfo !== 'function') return;
+  const info = limitsProfileInfo(S.activeProfile,
+    (typeof DEFAULT_THRESHOLDS !== 'undefined') ? DEFAULT_THRESHOLDS : {},
+    readActiveThresholds(), THRESHOLD_FIELDS.map(f => f[1]));
+  const name = info.isDefault ? 'Default (no aircraft selected)' : info.name;
+  el.innerHTML = 'Limits from Config profile: '
+    + `<button type="button" class="assess-profile-link" onclick="openLimitsProfileConfig()" title="Open Config → Aircraft &amp; SOP Profile">${_esc(name)}</button>`
+    + (info.edited ? ' <span class="assess-profile-edited">(edited values)</span>' : '');
+}
+
+function openLimitsProfileConfig() {
+  switchTab('config');
+  const dd = document.getElementById('cfgSopProfile');
+  if (dd && dd.scrollIntoView) dd.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+// Advisories collapse: the banner shrinks to the badge + first item on one
+// line and the operational-area bar hides, giving the tabs the room (mostly
+// for mobile). The badge (count + colour) always stays visible. Per-viewer,
+// remembered in localStorage.
+const ASSESS_COLLAPSED_KEY = 'sar_assess_collapsed';
+
+function toggleAssessmentCollapsed() {
+  _setAssessCollapsed(!S.assessCollapsed, true);
+}
+
+function _setAssessCollapsed(on, persist) {
+  S.assessCollapsed = !!on;
+  const banner = document.getElementById('assessmentBanner');
+  const panel = document.getElementById('sidePanel');
+  const btn = document.getElementById('assessToggle');
+  if (banner) banner.classList.toggle('collapsed', S.assessCollapsed);
+  if (panel) panel.classList.toggle('assess-collapsed', S.assessCollapsed);
+  if (btn) {
+    btn.innerHTML = S.assessCollapsed ? '&#9660;' : '&#9650;';
+    btn.setAttribute('aria-expanded', String(!S.assessCollapsed));
+    btn.title = S.assessCollapsed ? 'Expand advisories and area info' : 'Collapse advisories and area info';
+  }
+  if (persist) { try { localStorage.setItem(ASSESS_COLLAPSED_KEY, S.assessCollapsed ? '1' : '0'); } catch (_) {} }
+}
+
+function restoreAssessCollapsed() {
+  let on = false;
+  try { on = localStorage.getItem(ASSESS_COLLAPSED_KEY) === '1'; } catch (_) {}
+  _setAssessCollapsed(on, false);
 }
 
 // Colour of the assessment badge for exports — read from the last computed
@@ -14694,21 +14888,30 @@ async function restoreViewsheds() {
 // the wait is hard-capped: _overpassFetch walks 3 mirrors with no client
 // timeout and must never stall the viewshed. Resolves null when OSM can't
 // answer in time and nothing is cached — the compute then runs terrain +
-// canopy only.
-const BUILDINGS_FETCH_TIMEOUT_MS = 12000;
+// canopy only. 25 s (was 12): a busy overpass-api.de took 4–17 s to answer
+// (Oct 2026), so 12 s dropped buildings — and with them occlusion — on most
+// runs. It runs alongside the canopy and DEM fetches, so the cap only adds
+// time when OSM is the slowest leg.
+const BUILDINGS_FETCH_TIMEOUT_MS = 25000;
 async function fetchBuildingsForGrid(grid) {
   const gb = grid.bounds;
   const bboxKey = `${gb.south.toFixed(3)}_${gb.west.toFixed(3)}_${gb.north.toFixed(3)}_${gb.east.toFixed(3)}`;
   // Short server-side timeout too — a busy mirror should fail fast, not queue.
   const query = `[out:json][timeout:10];way["building"](${gb.south},${gb.west},${gb.north},${gb.east});out body ${_buildingsCap()};>;out skel qt;`;
+  // Abort (not just abandon) at the cap, so the request also gives up its
+  // Overpass slot instead of holding it while it walks the remaining mirrors.
+  const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+  let timer = null;
   try {
     const data = await Promise.race([
-      _overpassFetch(query),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('buildings fetch timed out')), BUILDINGS_FETCH_TIMEOUT_MS)),
+      _overpassFetch(query, ctl ? { signal: ctl.signal } : undefined),
+      new Promise((_, rej) => { timer = setTimeout(() => { if (ctl) ctl.abort(); rej(new Error('buildings fetch timed out')); }, BUILDINGS_FETCH_TIMEOUT_MS); }),
     ]);
+    clearTimeout(timer);
     if (typeof cacheApiResponse === 'function') cacheApiResponse('osm_buildings', bboxKey, data);
     return parseOverpassBuildings(data, _buildingsCap());
   } catch (err) {
+    clearTimeout(timer);
     try {
       const cached = (typeof getCachedApiResponse === 'function') ? await getCachedApiResponse('osm_buildings', bboxKey) : null;
       if (cached && cached.data) return parseOverpassBuildings(cached.data, _buildingsCap());
@@ -14965,17 +15168,54 @@ function collect3dVectorGroups() {
   return groups;
 }
 
-// Live ADS-B aircraft as 3D cylinders: a slab at true AGL altitude + a thin
-// drop line to the ground, colored by the same AGL scale as the 2D markers.
+// 3D trail thinning: one point per ADSB_TRAIL_3D_GAP_MS, at most
+// ADSB_TRAIL_3D_MAX_PTS (each costs a terrain query on every poll rebuild).
+const ADSB_TRAIL_3D_GAP_MS = 20000;
+const ADSB_TRAIL_3D_MAX_PTS = 45;
+const ADSB_TRAIL_3D_LOST_COLOR = '#556677'; // trail of an aircraft no longer in the feed
+
+// One 2D trail → 3D path points at altitude. AGL is recomputed with the same
+// ground function parseAdsbAircraft uses, so the path meets the plane.
+function _adsbTrail3dPoints(trail, groundFn, lostColor) {
+  const exag = 0.3048 * TERRAIN_EXAGGERATION;
+  return decimateAdsbTrail(trail, ADSB_TRAIL_3D_GAP_MS, ADSB_TRAIL_3D_MAX_PTS)
+    .filter(p => Number.isFinite(p.alt))
+    .map(p => {
+      let g = groundFn(p.lat, p.lon);
+      if (g == null || !isFinite(g)) g = 0;
+      const agl = Math.max(0, p.alt - g);
+      return { lat: p.lat, lng: p.lon, aglM: agl * exag, color: lostColor || adsbAglColor(agl) };
+    });
+}
+
+// Live ADS-B aircraft in 3D: the 2D plane icon at true AGL altitude, nose on
+// the track (an X when the track is unknown), a thin drop line to the ground
+// and — while the 2D trails layer is on — the trail at altitude, all colored
+// by the same AGL scale as the 2D markers.
 function _aircraft3dGroup() {
   if (!S.map || !S.mapLayers.adsb_aircraft || !S.map.hasLayer(S.mapLayers.adsb_aircraft)) return null;
   if (!Array.isArray(S.adsbAircraft) || !S.adsbAircraft.length) return null;
+  const trailsOn = !!(S.mapLayers.adsb_trails && S.map.hasLayer(S.mapLayers.adsb_trails) && S.adsbTrails);
+  const groundFn = trailsOn ? adsbGroundElevFnFt() : null;
   const recs = aircraft3dRecords(S.adsbAircraft.map(ac => ({
     lat: ac.lat, lng: ac.lon,
     aglM: (isFinite(ac.agl) && ac.agl > 0) ? ac.agl * 0.3048 * TERRAIN_EXAGGERATION : null,
     color: adsbAglColor(ac.agl),
     popupHtml: _adsbPopupHtml(ac),
+    track: ac.track,
+    trail: trailsOn && S.adsbTrails[ac.hex] ? _adsbTrail3dPoints(S.adsbTrails[ac.hex], groundFn) : null,
   })));
+  // Trails of aircraft that left the feed linger (as in 2D) in a muted color.
+  if (trailsOn) {
+    const active = new Set(S.adsbAircraft.map(ac => ac.hex));
+    for (const [hex, trail] of Object.entries(S.adsbTrails)) {
+      if (active.has(hex)) continue;
+      const points = _adsbTrail3dPoints(trail, groundFn, ADSB_TRAIL_3D_LOST_COLOR);
+      if (points.length >= 2) {
+        recs.push({ kind: 'path3d', points, style: { stroke: ADSB_TRAIL_3D_LOST_COLOR, fill: ADSB_TRAIL_3D_LOST_COLOR }, label: 'Aircraft', pri: 2, popupHtml: '' });
+      }
+    }
+  }
   // Draped ground dot per aircraft: visual anchor for the drop line + the
   // clickable handle for the popup (custom-layer verticals aren't clickable).
   S.adsbAircraft.forEach(ac => {
@@ -15072,6 +15312,13 @@ const VERT3D_LAYER_ID = 'vert3d';
 
 // Screen-space width of the thick (obstacle/tower/dam) vertical lines.
 const VERT3D_THICK_PX = 4.5;
+// ADS-B in 3D: plane icon nose-to-tail length on screen (CSS px; the 2D
+// marker icon is 28 px), its floor in metres when the camera is close, and
+// the trail line width.
+const AIRCRAFT_3D_ICON_PX = 30;
+const AIRCRAFT_3D_ICON_MIN_M = 40;
+const AIRCRAFT_3D_TRAIL_PX = 2.5;
+const AIRCRAFT_3D_LIGHT = { dir: [0, 0, 1], diffuse: 0.3, ambient: 0.7 };
 
 function _vert3dMakeLayer() {
   return {
@@ -15155,6 +15402,9 @@ function _vert3dMakeLayer() {
       };
       this.lineBuffer = gl.createBuffer();
       this.quadBuffer = gl.createBuffer();
+      this.trailBuffer = gl.createBuffer();
+      this.planeTriBuffer = gl.createBuffer();
+      this.planeLineBuffer = gl.createBuffer();
       this.triOpaqueBuffer = gl.createBuffer();
       this.triCanopyBuffer = gl.createBuffer();
       this.triCanopyIndexBuffer = gl.createBuffer();
@@ -15187,7 +15437,8 @@ function _vert3dMakeLayer() {
       const thin = S._vert3dVerts;
       const thick = S._vert3dThickVerts;
       const light = S._light3d || { dir: [0, 0, 1], diffuse: 0.4, ambient: 0.55 };
-      const drawTris = (buffer, verts, dirty, alpha, indexBuffer, indices, anchor) => {
+      const drawTris = (buffer, verts, dirty, alpha, indexBuffer, indices, anchor, lt) => {
+        const li = lt || light;
         gl.useProgram(this.triProg);
         gl.disable(gl.CULL_FACE);
         gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -15201,9 +15452,9 @@ function _vert3dMakeLayer() {
         gl.vertexAttribPointer(this.triAttrs.normal, 3, gl.FLOAT, false, stride, 28);
         gl.uniformMatrix4fv(this.triAttrs.matrix, false, mFor(anchor));
         gl.uniform1f(this.triAttrs.alpha, alpha);
-        gl.uniform3f(this.triAttrs.light, light.dir[0], light.dir[1], light.dir[2]);
-        gl.uniform1f(this.triAttrs.diffuse, light.diffuse);
-        gl.uniform1f(this.triAttrs.ambient, light.ambient);
+        gl.uniform3f(this.triAttrs.light, li.dir[0], li.dir[1], li.dir[2]);
+        gl.uniform1f(this.triAttrs.diffuse, li.diffuse);
+        gl.uniform1f(this.triAttrs.ambient, li.ambient);
         if (indices && indices.length) {
           gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
           if (dirty) gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.DYNAMIC_DRAW);
@@ -15237,11 +15488,11 @@ function _vert3dMakeLayer() {
         gl.uniformMatrix4fv(this.lineAttrs.matrix, false, mVert);
         gl.drawArrays(gl.LINES, 0, thin.length / 6);
       }
-      if (thick && thick.length && this.quadProg) {
+      const drawQuads = (buffer, verts, dirty, widthPx) => {
         gl.useProgram(this.quadProg);
         gl.disable(gl.CULL_FACE);
-        gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
-        if (S._vert3dDirty) gl.bufferData(gl.ARRAY_BUFFER, thick, gl.DYNAMIC_DRAW);
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        if (dirty) gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
         const stride = 40; // pos(3) + other(3) + side(1) + color(3) floats
         gl.enableVertexAttribArray(this.quadAttrs.pos);
         gl.vertexAttribPointer(this.quadAttrs.pos, 3, gl.FLOAT, false, stride, 0);
@@ -15254,8 +15505,32 @@ function _vert3dMakeLayer() {
         gl.uniformMatrix4fv(this.quadAttrs.matrix, false, mVert);
         const c = gl.canvas;
         gl.uniform2f(this.quadAttrs.halfvp, c.width / 2, c.height / 2);
-        gl.uniform1f(this.quadAttrs.width, VERT3D_THICK_PX * (window.devicePixelRatio || 1));
-        gl.drawArrays(gl.TRIANGLES, 0, thick.length / 10);
+        gl.uniform1f(this.quadAttrs.width, widthPx * (window.devicePixelRatio || 1));
+        gl.drawArrays(gl.TRIANGLES, 0, verts.length / 10);
+      };
+      if (thick && thick.length && this.quadProg) drawQuads(this.quadBuffer, thick, S._vert3dDirty, VERT3D_THICK_PX);
+      const trail = S._vert3dTrailVerts;
+      if (trail && trail.length && this.quadProg) drawQuads(this.trailBuffer, trail, S._vert3dDirty, AIRCRAFT_3D_TRAIL_PX);
+      // Aircraft icons: rebuilt every frame at a constant on-screen size, so
+      // they stay readable at any zoom (the scale depends on the camera).
+      const planes = S._plane3d;
+      if (planes && planes.length && this.triProg && this.lineProg) {
+        const pv = aircraftIconVerts(planes, mVert, gl.canvas.width / 2, gl.canvas.height / 2,
+          AIRCRAFT_3D_ICON_PX * (window.devicePixelRatio || 1), AIRCRAFT_3D_ICON_MIN_M);
+        if (pv.tris.length) {
+          // Fixed overhead light: the silhouette stays at full color day or
+          // night; the tail fin's sideways normal shades it for shape.
+          drawTris(this.planeTriBuffer, pv.tris, true, 1.0, null, null, S._vert3dAnchor, AIRCRAFT_3D_LIGHT);
+          gl.useProgram(this.lineProg);
+          gl.bindBuffer(gl.ARRAY_BUFFER, this.planeLineBuffer);
+          gl.bufferData(gl.ARRAY_BUFFER, pv.lines, gl.DYNAMIC_DRAW);
+          gl.enableVertexAttribArray(this.lineAttrs.pos);
+          gl.vertexAttribPointer(this.lineAttrs.pos, 3, gl.FLOAT, false, 24, 0);
+          gl.enableVertexAttribArray(this.lineAttrs.color);
+          gl.vertexAttribPointer(this.lineAttrs.color, 3, gl.FLOAT, false, 24, 12);
+          gl.uniformMatrix4fv(this.lineAttrs.matrix, false, mVert);
+          gl.drawArrays(gl.LINES, 0, pv.lines.length / 6);
+        }
       }
       S._vert3dDirty = false;
     },
@@ -15294,6 +15569,8 @@ function _updateVert3dVerts() {
   const segs = collectVerticalSegments(collect3dVectorGroups());
   const thin = [];
   const thick = [];
+  const trail = [];
+  const planes = [];
   let missing = false;
   const groundOf = (lat, lng) => {
     try {
@@ -15313,13 +15590,30 @@ function _updateVert3dVerts() {
   const pushThin = (mc, c) => { thin.push(mc.x, mc.y, mc.z, c[0], c[1], c[2]); };
   // One quad (2 triangles) per thick line; each vertex carries its endpoint,
   // the opposite endpoint, and the expansion side for the billboard shader.
-  const pushThickLine = (a, b, c) => {
-    const v = (p, o, side) => { thick.push(p.x, p.y, p.z, o.x, o.y, o.z, side, c[0], c[1], c[2]); };
+  const pushThickLine = (a, b, c, buf) => {
+    const out = buf || thick;
+    const v = (p, o, side) => { out.push(p.x, p.y, p.z, o.x, o.y, o.z, side, c[0], c[1], c[2]); };
     v(a, b, 1); v(a, b, -1); v(b, a, -1);
     v(a, b, -1); v(b, a, 1); v(b, a, -1);
   };
   segs.forEach(sg => {
+    if (sg.type === 'path') {
+      // Trail at altitude; each segment takes its newer end's (AGL) color.
+      let prev = null;
+      sg.points.forEach(p => {
+        const cur = mcOf(p.lng, p.lat, groundOf(p.lat, p.lng) + p.atM);
+        if (prev) pushThickLine(prev, cur, p.color, trail);
+        prev = cur;
+      });
+      return;
+    }
     const g = groundOf(sg.lat, sg.lng);
+    if (sg.type === 'plane') {
+      const mc = maplibregl.MercatorCoordinate.fromLngLat([sg.lng, sg.lat], g + sg.atM);
+      planes.push({ x: mc.x - anchor[0], y: mc.y - anchor[1], z: mc.z, mpu: mc.meterInMercatorCoordinateUnits(),
+        color: sg.color, mesh: aircraftIconMesh(sg.trackDeg) });
+      return;
+    }
     if (sg.type === 'line') {
       const a = mcOf(sg.lng, sg.lat, g + sg.fromM);
       const b = mcOf(sg.lng, sg.lat, g + sg.toM);
@@ -15394,6 +15688,8 @@ function _updateVert3dVerts() {
   }
   S._vert3dVerts = new Float32Array(thin);
   S._vert3dThickVerts = new Float32Array(thick);
+  S._vert3dTrailVerts = new Float32Array(trail);
+  S._plane3d = planes;
   S._vert3dDirty = true;
   S.map3d.triggerRepaint();
   if (missing && (S._vert3dRetry || 0) < 4) {
@@ -16004,7 +16300,7 @@ if (typeof module !== 'undefined' && module.exports) {
     CANOPY_SOURCE_KEY, NAIP_CHM_PROXY_ROUTE, NAIP_CHM_INDEX_BASE, NAIP_CHM_MAX_M, getCanopySourceSetting, setCanopySource,
     canopyDatasetLabel, _updateCanopyCaption, _canopyHasStructures, _fetchChmv2Raster, _fetchNaipChmRaster,
     _naipIndexForBlock, _fetchNaipChmFromProxy, _naipTileToGrid,
-    notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _freshPatch, invalidateAreaRequests, _beginRequest, _requestCurrent, _setDataArea, _dataIsForArea, _readArcgisGeoJson, PROTECTED_LAYER_LABELS, _assessBadgeColor, sendFeedback, openFeedback, closeFeedback,
+    notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _freshPatch, invalidateAreaRequests, _beginRequest, _requestCurrent, _setDataArea, _dataIsForArea, _readArcgisGeoJson, PROTECTED_LAYER_LABELS, _assessBadgeColor, renderAssessProfile, openLimitsProfileConfig, toggleAssessmentCollapsed, _setAssessCollapsed, restoreAssessCollapsed, ASSESS_COLLAPSED_KEY, sendFeedback, openFeedback, closeFeedback,
     fetchFAAairspace, faaAirspaceUnavailableLayers, FAA_AIRSPACE_LAYER_LABELS, fetchFireDanger,
     UNKNOWN_CELL_TEXT, SECTION_CELLS, sectionCellsFor, markCellsUnknown, renderFireDangerUnknown,
     NOTAM_MANUAL_UPDATE_CAUTION, renderNotamManualNotice,
@@ -16081,7 +16377,7 @@ if (typeof module !== 'undefined' && module.exports) {
     enterObserverView, exitObserverView, _on3dClick, _observer3dFeatureAt, _lockObserverCamera, _applyObserverLook,
     _aircraft3dGroup, _refresh3dAircraft, _adsbPopupHtml,
     _adsbPanelHtml, openAdsbPanel, closeAdsbPanel, refreshAdsbPanel, focusAdsbAircraft, ADSB_PANEL_LOST_MS,
-    _overpassFetch, fetchBuildings, renderBuildingsLayer, _buildingsCap,
+    _overpassFetch, OVERPASS_MAX_CONCURRENT, GEOJSON_FETCH_TIMEOUT_MS, fetchBuildings, renderBuildingsLayer, _buildingsCap,
     getBuildings3dSetting, setBuildings3dMode, _buildings3dMode,
     _buildBuildingTriVerts, _vert3dMakeLayer, _updateVert3dVerts,
     _buildCanopy3dMeshChunked, _startCanopy3dBuild, cancelCanopy3dBuild, CANOPY_3D_COLOR,

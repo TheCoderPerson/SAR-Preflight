@@ -14,6 +14,15 @@ describe('parseSectionalEdition(description)', () => {
     expect(parseSectionalEdition('effective 2026-05-13, next 2026-07-08')).toBe('2026-05-13');
   });
 
+  it('normalizes the US-order MM-DD-YYYY stamp the service switched to', () => {
+    expect(parseSectionalEdition('Updated with the latest charts on 07-09-2026.')).toBe('2026-07-09');
+    expect(parseSectionalEdition('charts on 7/9/2026')).toBe('2026-07-09');
+  });
+
+  it('skips an out-of-range date and takes the next valid one', () => {
+    expect(parseSectionalEdition('build 2026-13-40, charts on 09-03-2026')).toBe('2026-09-03');
+  });
+
   it('returns null when no date is present', () => {
     expect(parseSectionalEdition('VFR Sectional')).toBeNull();
   });

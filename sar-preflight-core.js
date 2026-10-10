@@ -24,6 +24,32 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.10.09-c',
+    date: '2026-10-09',
+    changes: [
+      'The advisories banner can now be collapsed with the arrow button at its right. Collapsed, it keeps the count badge and the first item on one line and hides the operational-area details (center, area, type, perimeter, max dimension), leaving much more room for the tabs on a phone. The choice is remembered on this device.',
+      'The advisories banner now names the Config aircraft profile its limits come from (for example "Limits from Config profile: DJI Matrice 4T"), says "Default (no aircraft selected)" when none is chosen, and adds "(edited values)" when a threshold field has been changed from that profile. Tap the name to open the profile in Config.',
+    ],
+  },
+  {
+    version: '2026.10.09-b',
+    date: '2026-10-09',
+    changes: [
+      'In the 3D view, live aircraft now show the same plane icon as the 2D map, pointed along their direction of travel and kept a readable size at any zoom, and leave a trail at their altitude while Position Trails is on, colored by height above ground. Aircraft that report no heading keep the X marker.',
+    ],
+  },
+  {
+    version: '2026.10.09-a',
+    date: '2026-10-09',
+    changes: [
+      'The FAA sectional chart edition check works again. The FAA changed how its chart service writes the edition date, so the check had failed every time: the Config tab wrongly said "cached edition 2026-05-13 (offline)" and the map could keep showing chart tiles from that older edition.',
+      'Live ADS-B traffic: the data proxy now asks FlyItalyADSB first (a free keyed service), no longer asks airplanes.live (it now refuses unregistered apps), identifies itself to adsb.lol as that service now requires, pauses a provider that refuses it instead of asking again every few seconds, and gives up on a stalled provider after 8 seconds. An answer without an aircraft list now counts as a failure, never as "no traffic". When every provider fails, the traffic error now names each one and why. Self-hosted proxies need the updated Worker code.',
+      'OpenStreetMap lookups (wires, cell towers, hospitals, trails, buildings) now send at most two queries at a time. The main OpenStreetMap server had been refusing the extra requests from a single area load, which pushed them onto slower backup servers and could drop buildings from the viewshed. When every server answers "busy", the app now tries them once more after a short pause. The viewshed\'s building lookup now waits up to 25 seconds instead of 12 (a busy server often needs longer, and without buildings the viewshed overstates visibility) and frees its place when it gives up.',
+      'OpenStreetMap answers built on out-of-date map data are no longer shown as live. One backup server was serving map data three months old, so recently mapped power lines, towers or helipads could be missing. The app now asks the other servers for current data, and if none has it, labels the section in amber "OSM data from <date>".',
+      'Water, roads and trails, land status, smoke and parcel lookups now give up after 40 seconds and report the source as unavailable (or show the cached copy) instead of staying on "Fetching..." when a government server stalls.',
+    ],
+  },
+  {
     version: '2026.09.22-c',
     date: '2026-09-22',
     changes: [
@@ -1156,6 +1182,24 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
   return { level, text, issues, cautions, unavailable };
 }
 
+// Which Config → "Aircraft & SOP Profile" entry the assessment limits come
+// from, for the line under the advisories. profile: the selected profile
+// object (null = no selection, i.e. the generic defaults); defaults:
+// DEFAULT_THRESHOLDS; active: the thresholds actually in force (profile +
+// any hand-edited Config fields); keys: the threshold keys the Config fields
+// set. `edited` is true when any field no longer matches the profile, so the
+// line never names an aircraft whose numbers are not the ones being used.
+function limitsProfileInfo(profile, defaults, active, keys) {
+  const base = Object.assign({}, defaults || {}, profile || {});
+  const name = (profile && (profile.name || profile.model)) || 'Default';
+  const cur = active || {};
+  const edited = (keys || []).some(k => {
+    const a = Number(cur[k]), b = Number(base[k]);
+    return Number.isFinite(a) && (!Number.isFinite(b) || Math.abs(a - b) > 1e-9);
+  });
+  return { name, isDefault: !profile, edited };
+}
+
 // Operator-facing rendering of an assessment WITHOUT a GO / CAUTION / NO-GO
 // verdict. The banner names what was found and lists EVERY item — limits
 // exceeded first, then advisories — and the Remote Pilot makes the call.
@@ -1593,6 +1637,23 @@ function calcWindShear(windProfile) {
 // the query asks for, plus 10 s of transfer grace (N = 30 when the query names
 // none), clamped to 15–90 s. Without it a stuck mirror held a panel on
 // "Fetching..." for 3+ minutes (measured Sept 2026, overloaded mirrors).
+// Overpass answers carry osm3s.timestamp_osm_base — the moment the server's
+// copy of OpenStreetMap was last updated. Mirrors normally lag minutes; one
+// was found serving data three months old (kumi.systems, Oct 2026), so a
+// newly mapped power line or helipad could silently be missing. An answer
+// older than OVERPASS_STALE_MAX_MS is "stale".
+const OVERPASS_STALE_MAX_MS = 3 * 86400000;
+function overpassDataTimestamp(data) {
+  const s = data && data.osm3s && data.osm3s.timestamp_osm_base;
+  const t = typeof s === 'string' ? Date.parse(s) : NaN;
+  return isFinite(t) ? t : null;
+}
+// Unknown age (no timestamp) is not called stale: there is nothing to judge.
+function overpassDataIsStale(data, nowMs, maxMs) {
+  const t = overpassDataTimestamp(data);
+  return t != null && (nowMs - t) > (maxMs || OVERPASS_STALE_MAX_MS);
+}
+
 function overpassMirrorTimeoutMs(query) {
   const m = /\[timeout:(\d+)\]/.exec(String(query || ''));
   const n = m ? Number(m[1]) : 30;
@@ -2108,7 +2169,7 @@ function parseAdsbAircraft(acArray, centerLat, centerLng, groundElev) {
 
 /**
  * Extract the aircraft array from an ADS-B API response. Providers disagree
- * on the field name: readsb-style APIs (airplanes.live, adsb.lol) use `ac`,
+ * on the field name: readsb-style APIs (adsb.lol, formerly airplanes.live) use `ac`,
  * adsb.fi has been observed serving `aircraft` — and the data proxy passes
  * whichever body through untouched, so both must be accepted or a successful
  * fetch can silently render zero traffic.
@@ -2118,6 +2179,19 @@ function adsbAircraftList(json) {
   if (Array.isArray(json.ac)) return json.ac;
   if (Array.isArray(json.aircraft)) return json.aircraft;
   return [];
+}
+
+/**
+ * One-line reason from the data proxy's /adsb 502 body
+ * ({ error, providers: [{ name, status, detail }] }), e.g.
+ * "adsb.fi HTTP 403, adsb.lol timeout". '' when the body names no providers
+ * (an older Worker that only says "all ADS-B providers failed").
+ */
+function adsbProxyFailureSummary(body) {
+  const list = body && Array.isArray(body.providers) ? body.providers : [];
+  return list.filter(p => p && p.name)
+    .map(p => p.status ? `${p.name} HTTP ${p.status}` : `${p.name} ${p.detail || 'unreachable'}`)
+    .join(', ');
 }
 
 /**
@@ -2869,14 +2943,23 @@ function artccsForArea(areaPoly) {
 
 // --- FAA VFR Sectional chart edition helpers ---
 // The FAA VFR Sectional tile service publishes a new edition every 56 days.
-// parseSectionalEdition() extracts the YYYY-MM-DD edition stamp from the
-// ArcGIS MapServer `description` field, e.g.:
+// parseSectionalEdition() extracts the edition stamp from the ArcGIS MapServer
+// metadata text and normalizes it to YYYY-MM-DD. The service has used both
+// formats (documentInfo.subject switched to US order by Oct 2026):
 //   "Updated with the latest charts on 2026-05-13 16:18:39.073216"
-// Returns the date string, or null if none is present.
+//   "Updated with the latest charts on 07-09-2026."
+// Returns the first valid date in the text, or null if none is present.
 function parseSectionalEdition(description) {
   if (typeof description !== 'string') return null;
-  const m = description.match(/(\d{4}-\d{2}-\d{2})/);
-  return m ? m[1] : null;
+  const re = /(\d{4})-(\d{2})-(\d{2})|\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b/g;
+  let m;
+  while ((m = re.exec(description)) !== null) {
+    const y = +(m[1] || m[6]), mo = +(m[2] || m[4]), d = +(m[3] || m[5]);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    }
+  }
+  return null;
 }
 
 // Deterministic 56-day cycle used ONLY as a cold-start fallback edition when
@@ -3609,7 +3692,9 @@ function buildSectionMetaLine(meta, nowMs, tz) {
   if (status === 'cached' && cab != null) {
     const age = relAge(cab, nowMs);
     const ageText = age ? '(' + age + ' ago)' : '';
-    const text = 'Cached ' + formatStamp(cab, nowMs, tz) + (ageText ? ' ' + ageText : '');
+    // cachedLabel names what the date is when it is not a cache copy, e.g.
+    // "OSM data from" for an Overpass answer built on old map data.
+    const text = (meta.cachedLabel || 'Cached') + ' ' + formatStamp(cab, nowMs, tz) + (ageText ? ' ' + ageText : '');
     return { state: 'cached', tone: 'cached', text, ageText, title: meta.error || '', canUpdate: true };
   }
   if (status === 'cached') {
@@ -3635,6 +3720,7 @@ function rollupSources(sources, nowMs) {
   if (!names.length) return { status: 'never' };
   let anyError = false, anyCached = false, allLive = true;
   let oldestUpdated = null, oldestCached = null, latestError = null, errMsg = null;
+  let cachedLabel, cachedNote = null;
   const detail = [];
   for (const name of names) {
     const s = sources[name] || {};
@@ -3645,7 +3731,11 @@ function rollupSources(sources, nowMs) {
       errMsg = errMsg || s.error;
     } else if (st === 'cached') {
       anyCached = true; allLive = false;
-      if (s.cachedAt != null && (oldestCached == null || s.cachedAt < oldestCached)) oldestCached = s.cachedAt;
+      if (s.cachedAt != null && (oldestCached == null || s.cachedAt < oldestCached)) {
+        oldestCached = s.cachedAt;
+        cachedLabel = s.cachedLabel;   // the header shows the oldest piece, so its label
+        cachedNote = s.error || null;
+      }
     } else if (st === 'live') {
       if (s.updatedAt != null && (oldestUpdated == null || s.updatedAt < oldestUpdated)) oldestUpdated = s.updatedAt;
     } else {
@@ -3661,7 +3751,8 @@ function rollupSources(sources, nowMs) {
     status,
     updatedAt: oldestUpdated,
     cachedAt: oldestCached,
-    error: errMsg,
+    cachedLabel: status === 'cached' ? cachedLabel : undefined,
+    error: status === 'cached' ? (errMsg || cachedNote) : errMsg,
     errorAt: latestError,
     detail: detail.join(' · '),
   };
@@ -4042,13 +4133,26 @@ function hexToRgb01(hex) {
 // Pull the vertical (cylinder) records out of harvested vector groups into
 // renderable segments for the custom 3D layer: narrow records (obstacle/tower
 // heights, aircraft drop lines) become vertical lines; wide records (the
-// aircraft position slab) become an X marker at that altitude. Heights are
-// metres above the terrain surface at the feature.
+// heading-less aircraft slab) become an X marker at that altitude.
+// 'aircraft3d' records become a 'plane' (heading icon) and 'path3d' records
+// a 'path' (trail polyline at altitude, per-point color). Heights are metres
+// above the terrain surface at the feature.
 function collectVerticalSegments(groups) {
   const out = [];
   (groups || []).forEach(g => ((g && g.features) || []).forEach(f => {
-    if (!f || f.kind !== 'cylinder' || !(f.topM > 0)) return;
-    const color = hexToRgb01(f.style && (f.style.fill || f.style.stroke));
+    if (!f) return;
+    const styleColor = f.style && (f.style.fill || f.style.stroke);
+    if (f.kind === 'aircraft3d') {
+      if (f.aglM > 0) out.push({ type: 'plane', lat: f.lat, lng: f.lng, atM: f.aglM, trackDeg: f.trackDeg, color: hexToRgb01(styleColor) });
+      return;
+    }
+    if (f.kind === 'path3d') {
+      const pts = (f.points || []).map(p => ({ lat: p.lat, lng: p.lng, atM: Math.max(0, p.aglM), color: hexToRgb01(p.color || styleColor) }));
+      if (pts.length >= 2) out.push({ type: 'path', points: pts });
+      return;
+    }
+    if (f.kind !== 'cylinder' || !(f.topM > 0)) return;
+    const color = hexToRgb01(styleColor);
     if (f.radiusM >= 20) {
       out.push({ type: 'cross', lat: f.lat, lng: f.lng, atM: Math.max(0, f.baseM || 0), armM: f.radiusM, color, thin: !!f.thin });
     } else {
@@ -4226,12 +4330,16 @@ function buildingMeshLocal(footprint, heightM) {
   return verts;
 }
 
-// ADS-B aircraft → cylinder records for the 3D view: a floating slab at the
-// aircraft's AGL altitude plus a thin full-height "how high is it" drop line.
+// ADS-B aircraft → records for the 3D view: a thin full-height "how high is
+// it" drop line plus a marker at the aircraft's AGL altitude. With a known
+// track the marker is an 'aircraft3d' record (the 2D plane silhouette, nose
+// on the track — see aircraftIconMesh); without one it stays the heading-less
+// slab that renders as an X. An optional trail (oldest first,
+// [{ lat, lng, aglM, color }]) becomes a 'path3d' record drawn at altitude.
 // MapLibre renders fill-extrusions relative to the terrain surface when
 // terrain is enabled, so base 0 = the ground beneath the aircraft; aglM
 // should already carry the terrain exaggeration for a matched vertical scale.
-// aircraft: [{ lat, lng, aglM, color, popupHtml }]
+// aircraft: [{ lat, lng, aglM, color, popupHtml, track?, trail? }]
 function aircraft3dRecords(aircraft) {
   const out = [];
   (aircraft || []).forEach(ac => {
@@ -4240,11 +4348,111 @@ function aircraft3dRecords(aircraft) {
     if (!Number.isFinite(aglM) || aglM <= 0) return;
     const style = { stroke: ac.color || '#06b6d4', fill: ac.color || '#06b6d4' };
     const common = { popupHtml: ac.popupHtml || '', label: 'Aircraft', pri: 2, style };
+    const trail = (ac.trail || []).filter(p => p && Number.isFinite(p.lat) && Number.isFinite(p.lng) && Number.isFinite(p.aglM));
+    if (trail.length >= 2) out.push(Object.assign({ kind: 'path3d', points: trail }, common));
     // thin: aircraft verticals stay 1px; obstacle/tower lines render as thick quads
     out.push(Object.assign({ kind: 'cylinder', lat: ac.lat, lng: ac.lng, radiusM: 3, baseM: 0, topM: aglM, thin: true }, common));
-    out.push(Object.assign({ kind: 'cylinder', lat: ac.lat, lng: ac.lng, radiusM: 50, baseM: aglM, topM: aglM + 25, thin: true }, common));
+    const track = ac.track == null ? NaN : Number(ac.track);
+    if (Number.isFinite(track)) {
+      out.push(Object.assign({ kind: 'aircraft3d', lat: ac.lat, lng: ac.lng, aglM, trackDeg: ((track % 360) + 360) % 360 }, common));
+    } else {
+      out.push(Object.assign({ kind: 'cylinder', lat: ac.lat, lng: ac.lng, radiusM: 50, baseM: aglM, topM: aglM + 25, thin: true }, common));
+    }
   });
   return out;
+}
+
+// The 2D ADS-B marker's plane silhouette (the 24-unit SVG path in
+// renderAdsbMap, nose arc approximated) as an open ring in a unit frame:
+// x = right wing, y = nose, origin mid-fuselage, nose-to-tail length 1.
+const AIRCRAFT_ICON_RING = [
+  [21, 16], [21, 14], [13, 9], [13, 3.5], [12.56, 2.44], [11.5, 2], [10.44, 2.44], [10, 3.5],
+  [10, 9], [2, 14], [2, 16], [10, 13.5], [10, 19], [8, 20.5], [8, 22], [11.5, 21],
+  [15, 22], [15, 20.5], [13, 19], [13, 13.5],
+].map(p => [(p[0] - 11.5) / 20, (12 - p[1]) / 20]);
+const AIRCRAFT_ICON_TRIS = earClipTriangulate(AIRCRAFT_ICON_RING);
+// Vertical tail fin (unit frame, z up) so the plane still reads edge-on.
+const AIRCRAFT_ICON_FIN = [[0, -0.3, 0], [0, -0.5, 0], [0, -0.5, 0.2]];
+
+// Plane icon for one aircraft rotated to its track (degrees clockwise from
+// true north), as local ENU unit offsets (x east, y north, z up; nose-to-tail
+// length 1 — the caller scales). Returns triangle vertices (silhouette with
+// an up normal, tail fin with a sideways one) and the silhouette outline as
+// edge pairs for a contrasting stroke.
+function aircraftIconMesh(trackDeg) {
+  const t = (Number(trackDeg) || 0) * Math.PI / 180;
+  const c = Math.cos(t), s = Math.sin(t);
+  const rot = p => [p[0] * c + p[1] * s, -p[0] * s + p[1] * c, p[2] || 0];
+  const tris = [];
+  AIRCRAFT_ICON_TRIS.forEach(tri => tri.forEach(i => tris.push({ p: rot(AIRCRAFT_ICON_RING[i]), normal: [0, 0, 1] })));
+  const finNormal = rot([1, 0, 0]);
+  AIRCRAFT_ICON_FIN.forEach(p => tris.push({ p: rot(p), normal: finNormal, fin: true }));
+  const edges = [];
+  const n = AIRCRAFT_ICON_RING.length;
+  for (let i = 0; i < n; i++) edges.push([rot(AIRCRAFT_ICON_RING[i]), rot(AIRCRAFT_ICON_RING[(i + 1) % n])]);
+  return { tris, edges };
+}
+
+// Per-frame vertex buffers for the 3D aircraft icons at a constant on-screen
+// size. planes: [{ x, y, z (mercator, relative to the matrix's anchor), mpu
+// (mercator units per metre there), color: [r,g,b], mesh: aircraftIconMesh }];
+// matrix: column-major 4×4 (the custom layer's anchor-folded matrix);
+// halfW/halfH: half the drawing buffer in pixels. The icon's nose-to-tail
+// length is targetPx on screen — measured along whichever axis projects
+// largest, so a plane seen edge-on is not blown up — but never under minM
+// metres, so a close-up plane keeps a plausible size. Planes behind the
+// camera are skipped. Returns { tris: pos3+rgba4+normal3 per vertex,
+// lines: pos3+rgb3 per vertex (black outline) } as Float32Arrays.
+function aircraftIconVerts(planes, matrix, halfW, halfH, targetPx, minM) {
+  const m = matrix;
+  const proj = (x, y, z) => {
+    const w = m[3] * x + m[7] * y + m[11] * z + m[15];
+    return [(m[0] * x + m[4] * y + m[8] * z + m[12]) / w * halfW, (m[1] * x + m[5] * y + m[9] * z + m[13]) / w * halfH, w];
+  };
+  const tris = [], lines = [];
+  (planes || []).forEach(pl => {
+    if (!pl || !pl.mesh || !(pl.mpu > 0)) return;
+    const a = proj(pl.x, pl.y, pl.z);
+    if (!(a[2] > 0)) return;
+    const d = 10 * pl.mpu; // probe 10 m along each axis
+    let pxPerM = 0;
+    [[d, 0, 0], [0, d, 0], [0, 0, d]].forEach(o => {
+      const b = proj(pl.x + o[0], pl.y + o[1], pl.z + o[2]);
+      if (b[2] > 0) pxPerM = Math.max(pxPerM, Math.hypot(b[0] - a[0], b[1] - a[1]) / 10);
+    });
+    if (!(pxPerM > 0)) return;
+    const k = Math.max(targetPx / pxPerM, minM || 0) * pl.mpu;
+    // ENU → mercator offset: mercator y grows southward.
+    const pos = p => [pl.x + p[0] * k, pl.y - p[1] * k, pl.z + p[2] * k];
+    const col = pl.color || [0.24, 0.55, 0.99];
+    pl.mesh.tris.forEach(v => {
+      const q = pos(v.p);
+      tris.push(q[0], q[1], q[2], col[0], col[1], col[2], 1, v.normal[0], v.normal[1], v.normal[2]);
+    });
+    pl.mesh.edges.forEach(e => {
+      const q0 = pos(e[0]), q1 = pos(e[1]);
+      lines.push(q0[0], q0[1], q0[2], 0, 0, 0, q1[0], q1[1], q1[2], 0, 0, 0);
+    });
+  });
+  return { tris: new Float32Array(tris), lines: new Float32Array(lines) };
+}
+
+// ADS-B trail ([{ lat, lon, time, ... }], oldest first) thinned for the 3D
+// view: a point closer than minGapMs to the next kept (newer) one is dropped,
+// then the oldest are trimmed to maxPts. The newest point is always kept so
+// the path reaches the aircraft's current position.
+function decimateAdsbTrail(trail, minGapMs, maxPts) {
+  const pts = (trail || []).filter(p => p && Number.isFinite(p.lat) && Number.isFinite(p.lon));
+  if (pts.length <= 2) return pts;
+  const gap = minGapMs > 0 ? minGapMs : 0;
+  const kept = [pts[pts.length - 1]];
+  for (let i = pts.length - 2; i >= 0; i--) {
+    const last = kept[kept.length - 1];
+    const timed = Number.isFinite(pts[i].time) && Number.isFinite(last.time);
+    if (!timed || last.time - pts[i].time >= gap) kept.push(pts[i]);
+  }
+  kept.reverse();
+  return (maxPts > 1 && kept.length > maxPts) ? kept.slice(kept.length - maxPts) : kept;
 }
 
 // One harvested overlay group → a MapLibre geojson source + fill/line/circle
@@ -5218,7 +5426,7 @@ function geojsonLineLatLngs(geometry) {
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    assessmentDisplay, assessmentLabelForLog,
+    assessmentDisplay, assessmentLabelForLog, limitsProfileInfo,
     WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, lerpBearing, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,
     calcSunPosition, calcMoonPhase, calcMoonPosition, lightVecENU, lightForTime, hillshadeParams,
@@ -5236,12 +5444,12 @@ if (typeof module !== 'undefined' && module.exports) {
     SMA_NONPUBLIC_CODES, smaAgencyInfo, smaIsPublic, classifyAreaPublicPrivate, cellCoverageAt,
     filterAirportsByDistance, classifyAirspace,
     calcGustFactor, calcWindShear,
-    generateElevationGrid, gridCenterIndex, parse3depSamples, parseOpenMeteoElevation, overpassMirrorTimeoutMs, calcSlopeFromGrid, gridCellSpacingKm, calcAspect,
+    generateElevationGrid, gridCenterIndex, parse3depSamples, parseOpenMeteoElevation, overpassMirrorTimeoutMs, OVERPASS_STALE_MAX_MS, overpassDataTimestamp, overpassDataIsStale, calcSlopeFromGrid, gridCellSpacingKm, calcAspect,
     detectTerrainFeatures, scoreLZFitness, findEmergencyLZs,
     assessTerrainTurbulence, analyzeGPSMasking,
     calcSwapRecommendation,
     computeAdsbSearchRadius, parseAdsbAircraft, formatAltitudeAgl, resolveAdsbSelection,
-    adsbAircraftList, adsbPollDelay,
+    adsbAircraftList, adsbProxyFailureSummary, adsbPollDelay,
     pointInPolygon, pointInRings, distPointToSegment, distanceToGeoJsonKm, polygonBBox, bboxesOverlap, segmentsIntersect, polygonsIntersect,
     circleToPolygon, parseFaaCoord, normalizeFaaDate, geoJsonOuterRings,
     utmToLatLng, parseAngleFlexible, parseCoordinateInput,
@@ -5272,7 +5480,8 @@ if (typeof module !== 'undefined' && module.exports) {
     OBSERVER_PITCH_MIN, OBSERVER_PITCH_MAX, OBSERVER_MAX_PITCH, OBSERVER_START_PITCH,
     wrapBearing, clampObserverPitch, applyLookDrag, wheelLook, observerEyeAltitudeM,
     leafletStyleTo3d, latlngsToMultiPolygon, latlngsToMultiLine, dashArrayTo3d, vector3dSourceAndLayers,
-    cylRadiusForHeightM, aircraft3dRecords, hexToRgb01, collectVerticalSegments,
+    cylRadiusForHeightM, aircraft3dRecords, aircraftIconMesh, aircraftIconVerts, AIRCRAFT_ICON_RING, AIRCRAFT_ICON_TRIS, decimateAdsbTrail,
+    hexToRgb01, collectVerticalSegments,
     AIRSPACE_CLASS_COLORS, SUA_COLORS, LAANC_COLORS, laancCeilingColor,
     buildingHeightM, parseOverpassBuildings, earClipTriangulate, buildingMeshLocal, clampBBoxSpan,
     resolveBuildings3dMode,

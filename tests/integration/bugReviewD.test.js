@@ -262,6 +262,24 @@ describe('D02 — a partial multi-source outage is never a complete LIVE result'
     expect(text('terrWater')).toMatch(/INCOMPLETE — Streams \(NHD flowline\) unavailable/);
   });
 
+  it('a stalled stream request times out → PARTIAL, never stuck on "Fetching..."', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      // Never answers and ignores its signal, like a hung upstream (USGS NHD, Oct 2026).
+      route({ [FLOW]: () => new Promise(() => {}), [WB]: resp(fc([])) });
+      const p = app.fetchWaterFeatures(bbox(A.lat, A.lng));
+      await vi.advanceTimersByTimeAsync(app.GEOJSON_FETCH_TIMEOUT_MS - 1000);
+      expect(text('waterStatus')).toBe('Fetching...');
+      await vi.advanceTimersByTimeAsync(2000);
+      await p;
+      expect(text('waterStatus')).toBe('PARTIAL');
+      expect(S.sectionMeta.water.error).toMatch(/no answer within 40 s/);
+      expect(text('terrWater')).toMatch(/INCOMPLETE — Streams \(NHD flowline\) unavailable/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('lakes fail while streams return features → the count is qualified', async () => {
     route({ [FLOW]: resp(fc([line(A.lat, A.lng), line(A.lat + 0.001, A.lng)])), [WB]: resp({}, { status: 500 }) });
     await app.fetchWaterFeatures(bbox(A.lat, A.lng));
