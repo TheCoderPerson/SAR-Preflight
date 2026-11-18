@@ -92,6 +92,11 @@ const ROUTES = [
   // so cache for a day. Closed-proxy model is preserved: fixed upstream, `..` rejected.
   { prefix: '/usfs/', upstream: 'https://apps.fs.usda.gov/', cacheTtl: 86400 },
   { prefix: '/blm/',  upstream: 'https://gis.blm.gov/',      cacheTtl: 86400 },
+  // Caltrans QuickMap KML — active chain controls + full closures (v2_cc) and
+  // highway-information points such as pass closures (v2_chin), statewide. The
+  // origin sends no CORS header. Only those two files may pass (pathRe), and
+  // the feed changes by the minute, so the edge copy is kept for 60 s.
+  { prefix: '/caltrans/', upstream: 'https://quickmap.dot.ca.gov/data/', cacheTtl: 60, pathRe: /^v2_(cc|chin)\.kml$/ },
 ];
 
 // Only these origins may use the proxy. Add your production origin here if it

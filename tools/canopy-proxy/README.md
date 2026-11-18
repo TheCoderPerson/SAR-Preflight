@@ -44,7 +44,13 @@ A small CORS+Range proxy so the browser-only app can read CORS-blocked sources:
 6. **BLM transport + public-land ownership** — the BLM ArcGIS server (`gis.blm.gov`),
    also CORS-restricted, for BLM GTLF roads/trails and the National Surface Management
    Agency (public vs private land) layer. Served at the `/blm/...` route (cached a day).
-7. **User feedback** — `POST /feedback` forwards in-app feedback (Config tab →
+7. **Caltrans chain controls + closures** — the Caltrans QuickMap KML feeds
+   (`quickmap.dot.ca.gov/data/`), which send no CORS header. Served at the
+   `/caltrans/...` route for the app's Response Time Estimate. Only the two files the
+   app reads may pass — `v2_cc.kml` (active chain controls and full closures) and
+   `v2_chin.kml` (highway information, e.g. pass closures) — and the edge copy is kept
+   for 60 seconds, because the feed changes by the minute.
+8. **User feedback** — `POST /feedback` forwards in-app feedback (Config tab →
    Feedback) to a **Discord webhook**, so users can reach the maintainer without any
    email address appearing anywhere. See [Feedback → Discord](#feedback--discord).
 

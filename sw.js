@@ -220,9 +220,12 @@ function routeStrategy(url) {
   // and the /naipchm/ NAIP-CHM COGs are unaffected (range requests are skipped
   // before routing; the app's data/naipchm/*.json lookup files are same-origin
   // static assets on the version-keyed cache-first path) and /feedback is POST
-  // (never routed here).
+  // (never routed here). /caltrans/ (QuickMap chain controls + closures for the
+  // response-time estimate) is the same hazard class: a pinned copy would keep
+  // reporting yesterday's "no chain controls" as a live check. The app keeps no
+  // cache of it at all — a failed fetch reads UNVERIFIED.
   const path = urlPathname(url);
-  if (path.startsWith('/tfr/') || path === '/notam' || path === '/adsb') return 'network-only';
+  if (path.startsWith('/tfr/') || path === '/notam' || path === '/adsb' || path.startsWith('/caltrans/')) return 'network-only';
 
   // Direct ADS-B providers (the browser's fallback when the proxy /adsb route
   // fails) — network-only, same reason as /adsb above: a pinned response

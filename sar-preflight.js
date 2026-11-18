@@ -85,6 +85,12 @@ const S = {
   // Per-section data freshness, keyed by SECTION_DEFS key:
   // { status:'never'|'live'|'cached'|'error', updatedAt, cachedAt, error, errorAt, loading, sources? }
   sectionMeta: {},
+  // Response Time Estimate (see fetchResponseEstimate)
+  response: null,           // { areaKey, sig, start, staging, dests[], drives{}, wx, caltrans, alerts, mvum, computedAt }
+  _responseStaging: null,   // { areaKey, lat, lng } — where the vehicle parks, set by one map tap
+  _responsePicking: false,  // armed: the next map tap sets the staging point
+  _responseTimer: null,     // debounce for observer changes
+  _responseMemo: null,      // Map<routeKey, leg> — session-scoped, bounded
 };
 
 // ============================================================
@@ -925,6 +931,7 @@ function initMap() {
   // land between features but still inside a polygon.
   S.map.on('click', e => {
     if (S._canopyEditing) return; // no aggregate popups while editing canopy
+    if (S._responsePicking) { onResponseStagingClick(e.latlng); return; }
     if (S._viewshedPicking) { onViewshedMapClick(e.latlng); return; }
     openAggregatePopup(e.latlng, e);
   });
@@ -1032,6 +1039,7 @@ function clearArea() {
     Diag.note('area.clear', { vsFreedKb: Math.round(freed / 1024) });
   } catch (_) {}
   S.viewsheds = []; S.activeViewshedId = null;
+  if (typeof _resetResponse === 'function') _resetResponse(); // routes + staging point belong to the cleared area
   if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
   if (S.mapLayers.canopy && S.map && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
   // Shadow too: leaving it draped while clearing _overlayWanted.shadow stranded
@@ -1502,7 +1510,13 @@ async function processArea(layer, type) {
   document.getElementById('areaCenter').textContent = `${center.lat.toFixed(4)}, ${center.lng.toFixed(4)}`;
   document.getElementById('areaType').textContent = S.areaType;
   // Re-hydrate this area's saved observer viewsheds (markers + active overlay) from IndexedDB.
-  if (typeof restoreViewsheds === 'function') restoreViewsheds();
+  const _vsRestored = (typeof restoreViewsheds === 'function') ? restoreViewsheds() : null;
+  // The response-time estimate routes to the observers, so it starts only once
+  // they are restored — and outside the Promise.allSettled below, so routing
+  // never delays the assessment.
+  Promise.resolve(_vsRestored).catch(() => {}).then(() => {
+    if (S._areaGen === areaGen && typeof autoResponseEstimate === 'function') return autoResponseEstimate();
+  }).catch(e => console.error('Response estimate error:', e));
 
   document.getElementById('areaPerimeter').textContent = `${perimKm.toFixed(2)} km`;
   document.getElementById('areaMaxDim').textContent = `${maxDimKm.toFixed(2)} km`;
@@ -1690,6 +1704,9 @@ const SECTION_CELLS = {
   water: ['terrWater'],
   hospitals: ['terrHospitals'],
   trails: ['terrTrails'],
+  // Static cells only (they show the selected destination); the per-destination
+  // rows are dynamic and render their own UNKNOWN. respLoad is a setting.
+  response: ['respTotal', 'respStart', 'respRoad', 'respForest', 'respHike', 'respChains', 'respWx', 'respAccess'],
 };
 
 function sectionCellsFor(key, source) {
@@ -1821,6 +1838,13 @@ const SECTION_DEFS = {
     label: 'Named Trails', computes: null,
     fetch: (c, b) => fetchTrails(b),
     lines: [{ id: 'meta_trails', button: true }],
+  },
+  // Logistics only — never feeds the assessment. UPDATE is a user gesture, so
+  // it may ask for the device location and always re-resolves the start.
+  response: {
+    label: 'Response Time', computes: null,
+    fetch: () => fetchResponseEstimate({ userGesture: true }),
+    lines: [{ id: 'meta_response', button: true }],
   },
   // The combined live check is the unit of truth for both: refreshing one
   // source alone would leave S.autoCheck lying about the other, so both
@@ -2113,6 +2137,8 @@ function refreshPanelForHour() {
     const kp = kpAtTime(S.kpForecast, new Date(snap._time).getTime());
     if (kp != null) { S.kp = kp; renderKp(kp); }
   }
+  // Response time: departure follows the selected hour (stored route data, no request).
+  if (typeof recomputeResponseForHour === 'function') recomputeResponseForHour();
   reapplyStaleCells();
   if (S.currentArea) { computeOpsData(snap); computeAssessment(snap); }
   updateTimeContextBanner();
@@ -4697,13 +4723,10 @@ function renderAirportMarkers(lat, lng) {
 // ============================================================
 // API: NWS SEVERE WEATHER ALERTS (FREE, no key, CORS-friendly)
 // ============================================================
-async function fetchNWSAlerts(lat, lng) {
-  // A response for a previous (or cleared) area must not overwrite this
-  // area's alerts: a late empty answer used to erase a current Severe warning.
-  const tok = _beginRequest('nwsAlerts');
-  trackFetchStart('NWS Alerts');
-  setStatus('alertStatus', 'loading', 'Checking...');
-  const mapAlerts = features => features.map(f => ({
+// NWS alert GeoJSON features → the app's alert records. Shared by the area
+// check (fetchNWSAlerts) and the route check (Response Time Estimate).
+function _mapNwsAlertFeatures(features) {
+  return (features || []).map(f => ({
     id: f.properties.id || f.id,
     event: f.properties.event,
     severity: f.properties.severity,
@@ -4716,6 +4739,41 @@ async function fetchNWSAlerts(lat, lng) {
     senderName: f.properties.senderName,
     geometry: f.geometry,
   }));
+}
+
+// One alert as a .notam-card. `metaExtra` (plain text) is appended to the
+// meta line — the route check uses it to say where on the route it applies.
+function _nwsAlertCardHtml(a, metaExtra) {
+  const sevColor = a.severity === 'Extreme' || a.severity === 'Severe'
+    ? 'var(--accent-red)' : a.severity === 'Moderate'
+    ? 'var(--accent-amber)' : 'var(--accent-cyan)';
+  const sevBg = a.severity === 'Extreme' || a.severity === 'Severe'
+    ? 'rgba(239,68,68,0.15)' : a.severity === 'Moderate'
+    ? 'rgba(245,158,11,0.15)' : 'rgba(6,182,212,0.15)';
+  const onset = a.onset ? new Date(a.onset).toLocaleString('en-US', { timeZone: _localTZ(), month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+  const expires = a.expires ? new Date(a.expires).toLocaleString('en-US', { timeZone: _localTZ(), month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+  // Show the full hazard detail (HAZARD/SOURCE/IMPACT block), not just the headline —
+  // for e.g. a Special Weather Statement the headline alone says nothing about wind/hail/flood.
+  const desc = ((a.description || '').substring(0, 600) + ((a.description || '').length > 600 ? '...' : '')).replace(/\n{2,}/g, '<br><br>').replace(/\n/g, ' ');
+  const instr = ((a.instruction || '').substring(0, 300) + ((a.instruction || '').length > 300 ? '...' : '')).replace(/\n+/g, ' ');
+
+  return `<div class="notam-card" style="border-left:3px solid ${sevColor};">
+      <div class="notam-header">
+        <span class="notam-id" style="color:${sevColor};">${a.event}</span>
+        <span class="notam-type" style="background:${sevBg};color:${sevColor};">${a.severity}</span>
+      </div>
+      <div class="notam-body">${a.headline ? `<b>${a.headline}</b>` : ''}${a.headline && desc ? '<br>' : ''}${desc}${instr ? `<div style="margin-top:4px;font-style:italic;opacity:0.85;">⚠ ${instr}</div>` : ''}</div>
+      <div class="notam-meta">${onset ? `Onset: ${onset}` : ''}${expires ? ` • Expires: ${expires}` : ''}${a.senderName ? ` • ${a.senderName}` : ''}${metaExtra ? ` • ${metaExtra}` : ''}</div>
+    </div>`;
+}
+
+async function fetchNWSAlerts(lat, lng) {
+  // A response for a previous (or cleared) area must not overwrite this
+  // area's alerts: a late empty answer used to erase a current Severe warning.
+  const tok = _beginRequest('nwsAlerts');
+  trackFetchStart('NWS Alerts');
+  setStatus('alertStatus', 'loading', 'Checking...');
+  const mapAlerts = _mapNwsAlertFeatures;
   const k = typeof areaKey === 'function' ? areaKey(lat, lng) : `${lat.toFixed(3)}_${lng.toFixed(3)}`;
   // The check failed and no usable copy exists. This area's earlier alerts
   // stay (flagged stale by markSection) — dropping them turned a failed
@@ -4866,29 +4924,7 @@ function renderNWSAlertCards() {
   const staleHeader = unverified
     ? `<div class="notam-card" style="border-left:3px solid var(--accent-amber);"><div class="notam-body" style="color:var(--accent-amber);">⚠ ${staleNote}</div></div>`
     : '';
-  list.innerHTML = staleHeader + S.nwsAlerts.map(a => {
-    const sevColor = a.severity === 'Extreme' || a.severity === 'Severe'
-      ? 'var(--accent-red)' : a.severity === 'Moderate'
-      ? 'var(--accent-amber)' : 'var(--accent-cyan)';
-    const sevBg = a.severity === 'Extreme' || a.severity === 'Severe'
-      ? 'rgba(239,68,68,0.15)' : a.severity === 'Moderate'
-      ? 'rgba(245,158,11,0.15)' : 'rgba(6,182,212,0.15)';
-    const onset = a.onset ? new Date(a.onset).toLocaleString('en-US', { timeZone: _localTZ(), month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
-    const expires = a.expires ? new Date(a.expires).toLocaleString('en-US', { timeZone: _localTZ(), month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
-    // Show the full hazard detail (HAZARD/SOURCE/IMPACT block), not just the headline —
-    // for e.g. a Special Weather Statement the headline alone says nothing about wind/hail/flood.
-    const desc = ((a.description || '').substring(0, 600) + ((a.description || '').length > 600 ? '...' : '')).replace(/\n{2,}/g, '<br><br>').replace(/\n/g, ' ');
-    const instr = ((a.instruction || '').substring(0, 300) + ((a.instruction || '').length > 300 ? '...' : '')).replace(/\n+/g, ' ');
-
-    return `<div class="notam-card" style="border-left:3px solid ${sevColor};">
-      <div class="notam-header">
-        <span class="notam-id" style="color:${sevColor};">${a.event}</span>
-        <span class="notam-type" style="background:${sevBg};color:${sevColor};">${a.severity}</span>
-      </div>
-      <div class="notam-body">${a.headline ? `<b>${a.headline}</b>` : ''}${a.headline && desc ? '<br>' : ''}${desc}${instr ? `<div style="margin-top:4px;font-style:italic;opacity:0.85;">\u26a0 ${instr}</div>` : ''}</div>
-      <div class="notam-meta">${onset ? `Onset: ${onset}` : ''}${expires ? ` \u2022 Expires: ${expires}` : ''}${a.senderName ? ` \u2022 ${a.senderName}` : ''}</div>
-    </div>`;
-  }).join('');
+  list.innerHTML = staleHeader + S.nwsAlerts.map(a => _nwsAlertCardHtml(a)).join('');
 }
 
 function renderNWSAlertPolygons() {
@@ -7632,6 +7668,7 @@ function renderAdsbMap() {
     // marker on the next rebuild; aggregation skips this layer for the same
     // reason). Pick-mode routing matches _aggFeatureClick.
     marker.on('click', e => {
+      if (S._responsePicking) { onResponseStagingClick(e.latlng); return; }
       if (S._viewshedPicking) { onViewshedMapClick(e.latlng); return; }
       openAdsbPanel(ac);
     });
@@ -9312,6 +9349,9 @@ function populateExportModal() {
   _setExportRasterRow('expViewshedVec', 'expViewshedVecRow', nViewsheds > 0, true);
   const vv = document.getElementById('expViewshedVecLabel');
   if (vv) vv.textContent = `Viewsheds (${nViewsheds}) → vector polygons (in the KML / GeoJSON file)`;
+  // Response route: offered only when one is computed, and OFF by default —
+  // the line starts at the responder's own location.
+  _setExportRasterRow('expResponse', 'expResponseRow', _exportResponseRecords().length > 0, false);
 }
 
 function doExport() {
@@ -9344,6 +9384,12 @@ function doExport() {
     const vrecs = _exportViewshedPolygonRecords();
     if (vrecs.length) folders += kmlFolder('Viewshed Polygons', vrecs.map(recordToKml).join(''),
       { description: 'Simplified vector outlines of each observer viewshed. Low-poly by design — the GeoTIFF/KMZ raster export is authoritative.' });
+  }
+
+  // 3c. Response route(s) — only when ticked (the line starts at the responder's location)
+  if (document.getElementById('expResponse')?.checked) {
+    const rrecs = _exportResponseRecords();
+    if (rrecs.length) folders += kmlFolder('Response Route', rrecs.map(recordToKml).join(''), { description: RESPONSE_CAVEAT });
   }
 
   // 4. Hourly sun + wind bearing lines
@@ -9403,6 +9449,16 @@ function doExportGeoJson() {
       const fid = _uuid();
       features.push(geojsonFolderFeature(fid, 'Viewshed Polygons'));
       vrecs.forEach(r => { const f = recordToGeoJsonFeature(r, fid, _uuid()); if (f) features.push(f); });
+    }
+  }
+
+  // 3c. Response route(s) — only when ticked (the line starts at the responder's location).
+  if (document.getElementById('expResponse')?.checked) {
+    const rrecs = _exportResponseRecords();
+    if (rrecs.length) {
+      const fid = _uuid();
+      features.push(geojsonFolderFeature(fid, 'Response Route'));
+      rrecs.forEach(r => { const f = recordToGeoJsonFeature(r, fid, _uuid()); if (f) features.push(f); });
     }
   }
 
@@ -9801,8 +9857,15 @@ function buildLayerControl() {
     html += _sectionClose();
   }
   // Ground Access section: forest roads/trails, MVUM, BLM routes
-  if (_layerHasFeatures('usfs_roads') || _layerHasFeatures('usfs_trails') || _layerHasFeatures('mvum_roads') || _layerHasFeatures('mvum_trails') || _layerHasFeatures('blm_gtlf') || _layerHasFeatures('trails')) {
+  if (_layerHasFeatures('usfs_roads') || _layerHasFeatures('usfs_trails') || _layerHasFeatures('mvum_roads') || _layerHasFeatures('mvum_trails') || _layerHasFeatures('blm_gtlf') || _layerHasFeatures('trails') || _layerHasFeatures('response_route')) {
     html += _sectionOpen('ground_access', 'Ground Access');
+    if (_layerHasFeatures('response_route')) {
+      const rrOn = S.map.hasLayer(S.mapLayers.response_route);
+      // Raw row (not _layerRow): the group holds line pieces + markers, so its count means nothing.
+      html += `<div class="layer-item${rrOn ? ' active' : ''}" data-layer="response_route" onclick="toggleLayer('response_route',this)">
+      <div class="layer-check"></div><div class="layer-color" style="background:${RESPONSE_ROUTE_COLORS.road}"></div><span>Response Route</span>
+    </div>`;
+    }
     if (_layerHasFeatures('usfs_roads')) html += _layerRow('usfs_roads', '#c98a3a', 'NFS Roads');
     if (_layerHasFeatures('usfs_trails')) html += _layerRow('usfs_trails', '#8b5a2b', 'NFS Trails');
     if (_layerHasFeatures('mvum_roads')) html += _layerRow('mvum_roads', '#e0a458', 'MVUM Roads');
@@ -10001,7 +10064,7 @@ function setLayerVisible(id, on) {
       if (S._parcelAbort) { try { S._parcelAbort.abort(); } catch (_) {} }
       _setParcelChip(null);
     }
-  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'viewshed' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'slope' || id === 'streets' || id === 'trails' || id === 'hms_smoke' || id === 'avalanche' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
+  } else if ((id === 'airports' || id === 'nws_alerts' || id === 'cell_towers' || id === 'fire_perimeters' || id === 'emergency_lz' || id === 'swap_radius' || id === 'dams' || id === 'wilderness' || id === 'national_parks' || id === 'adsb_aircraft' || id === 'adsb_trails' || id === 'viewshed' || id === 'observers' || id === 'public_lands' || id === 'nhd_water' || id === 'hospitals' || id === 'slope' || id === 'streets' || id === 'trails' || id === 'hms_smoke' || id === 'avalanche' || id === 'response_route' || id.startsWith('wire_') || id.startsWith('faa_') || id.startsWith('chart_') || id.startsWith('tfr_') || id.startsWith('notam_') || id.startsWith('usfs_') || id.startsWith('mvum_') || id.startsWith('blm_') || id.startsWith('cell_')) && S.mapLayers[id]) {
     if (id === 'viewshed') {
       // Keep the zoom-cap's "wanted" flag in sync — otherwise _applyOverlayZoomCap
       // re-adds the overlay on the next zoomend after it was unchecked here.
@@ -10140,6 +10203,7 @@ const EXPORT_SKIP_LAYERS = new Set([
   'public_lands',                              // land ownership
   'cell_towers', 'dams',                       // user-requested additions
   'parcels',                                   // view-driven advisory data — huge, stays out of exports
+  'response_route',                            // reveals the start location — exports only via its own checkbox (#expResponse)
 ]);
 // Layers that may be exported even when hidden on the map, provided they are built
 // and populated (e.g. LAANC is built unconditionally but off by default).
@@ -10163,6 +10227,7 @@ const AGG_LAYER_META = {
   hospitals: { label: 'Hospital/LZ', pri: 4 }, emergency_lz: { label: 'Emergency LZ', pri: 4 },
   usfs_roads: { label: 'NFS Road', pri: 7 }, usfs_trails: { label: 'NFS Trail', pri: 7 },
   trails: { label: 'Named Trail (OSM)', pri: 7 },
+  response_route: { label: 'Response Route', pri: 5 },
   mvum_roads: { label: 'MVUM Road', pri: 7 }, mvum_trails: { label: 'MVUM Trail', pri: 7 },
   blm_gtlf: { label: 'BLM Route', pri: 7 },
   cell_att: { label: 'AT&T LTE', pri: 8 }, cell_tmobile: { label: 'T-Mobile LTE', pri: 8 },
@@ -10356,6 +10421,8 @@ function _aggFeatureClick(e) {
   // While picking a viewshed observer, a click that lands on an interactive
   // feature (TFR/NOTAM polygon) must still place the observer — the feature
   // handler stops propagation, so the map-level click handler never sees it.
+  // The response-time staging pick is routed the same way.
+  if (S._responsePicking) { onResponseStagingClick(e.latlng); return; }
   if (S._viewshedPicking) { onViewshedMapClick(e.latlng); return; }
   // An observer-marker tap toggles its viewshed (the marker's own click
   // handler) — anchor the popup at the pin and lift it above the icon so the
@@ -11096,6 +11163,9 @@ function enableNotifications() {
 }
 
 async function restoreConfig() {
+  // Response-time settings live in localStorage — fill their inputs first, so
+  // they show even when IndexedDB is unavailable.
+  if (typeof _syncResponseConfigInputs === 'function') _syncResponseConfigInputs();
   if (typeof getAppState !== 'function') return;
   const rpic = await getAppState('cfgRPIC');
   if (rpic) {
@@ -11388,6 +11458,15 @@ function buildBriefingText() {
   if (obsLines.length) {
     lines.push('--- OBSERVERS ---');
     obsLines.forEach(l => lines.push(l));
+    lines.push('');
+  }
+
+  // Response time — only when an estimate exists. No blank lines inside the
+  // block: the PDF splits sections on them.
+  const respLines = _briefingResponseLines();
+  if (respLines.length) {
+    lines.push('--- RESPONSE TIME ---');
+    respLines.forEach(l => lines.push(l));
     lines.push('');
   }
 
@@ -14465,9 +14544,10 @@ const VLOS_RING_STYLE = { color: '#5ec522', weight: 1.5, dashArray: '5,7', fillC
 function startViewshedPick() {
   if (S._canopyEditing) return; // observer pick is disabled in canopy edit mode
   if (S.is3D && typeof _exit3D === 'function') _exit3D(); // observer pick is a 2D map tap
-  // Mutually exclusive with the draw tools.
+  // Mutually exclusive with the draw tools and the staging-point pick.
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
   clearDrawBtns();
+  if (S._responsePicking && typeof cancelResponseStagingPick === 'function') cancelResponseStagingPick();
   S._viewshedPicking = true;
   document.getElementById('vsPickBtnMap')?.classList.add('active');
   document.getElementById('vsPickBtn')?.classList.add('active');
@@ -14635,6 +14715,7 @@ function _addObserverMarker(rec) {
     _renderObserverRings(); // ring follows the marker immediately, before the recompute
     setActiveViewshed(r.id);
     runViewshed(r.id);
+    if (typeof _scheduleResponseEstimate === 'function') _scheduleResponseEstimate(); // new destination
   });
   if (m.on) m.on('click', () => {
     if (S._viewshedPicking) return; // pick-mode click places a NEW observer
@@ -14681,6 +14762,7 @@ function onViewshedMapClick(latlng) {
   renderObserverList();
   buildLayerControl(); // the Observers row appears with the first observer, even if the compute fails
   runViewshed(rec.id);
+  if (typeof _scheduleResponseEstimate === 'function') _scheduleResponseEstimate(); // route to the new observer
 }
 
 function _vsProgress(frac) {
@@ -14796,6 +14878,7 @@ function removeViewshed(id) {
   _renderVisibleViewsheds(); // repaint the composite without the removed mask
   renderObserverList();
   buildLayerControl();
+  if (typeof _scheduleResponseEstimate === 'function') _scheduleResponseEstimate();
 }
 
 function clearAllViewsheds() {
@@ -14813,6 +14896,7 @@ function clearAllViewsheds() {
   const pb = document.getElementById('vsProgressBar'); if (pb) pb.style.width = '0';
   renderObserverList();
   buildLayerControl();
+  if (typeof _scheduleResponseEstimate === 'function') _scheduleResponseEstimate();
 }
 
 // Render the observer list UI (one row per record).
@@ -15099,7 +15183,7 @@ function _loadMaplibre() {
 
 // Vector layers mirrored into 3D: everything the popup aggregation covers,
 // minus live ADS-B (Phase 3 — needs per-poll updates + altitude placement).
-const VEC3D_SKIP = new Set([...AGG_SKIP_LAYERS, 'adsb_aircraft', 'parcels']); // parcels: thousands of view-driven polygons — not mirrored into 3D
+const VEC3D_SKIP = new Set([...AGG_SKIP_LAYERS, 'adsb_aircraft', 'parcels', 'response_route']); // parcels: thousands of view-driven polygons — not mirrored into 3D
 
 // Walk a Leaflet layer tree and emit neutral geometry records for the 3D
 // mirror. A popup bound on a group (L.geoJSON wrapper) is inherited by its
@@ -16288,9 +16372,1206 @@ function _exit3D() {
   try { Diag.note('3d.exit', {}); } catch (_) {}
 }
 
+// ============================================================
+// RESPONSE TIME ESTIMATE
+// How long it takes to reach each observer: equipment loading + road drive +
+// forest/OHV-road drive + chain-control delay + hike-in (pure model in
+// sar-preflight-core.js). A logistics estimate — it never feeds the
+// advisories banner (no computeAssessment, no recordDataSourceError).
+//
+// Sources: FOSSGIS Valhalla (routing, POST — the service worker ignores
+// non-GET), Open-Meteo (weather at points along the route), Caltrans QuickMap
+// through the data proxy's /caltrans/ route (chain controls + closures), NWS
+// alerts at points along the route, USFS MVUM (access flags), 3DEP (hike
+// ascent). Every await is followed by _requestCurrent(tok).
+//
+// Privacy: the start point (device location or saved base) and the
+// destinations are sent to the routing service, so nothing is sent until the
+// user has agreed once (settings.consent).
+// ============================================================
+const RESPONSE_CFG_KEY = 'sar_response_cfg';
+const RESPONSE_REQ_TIMEOUT_MS = 25000;
+const RESPONSE_DEBOUNCE_MS = 1500;
+const RESPONSE_ROUTE_COLORS = { road: '#22d3ee', forest: '#f59e0b', hike: '#e879f9' };
+const RESPONSE_QUICKMAP_URL = 'https://quickmap.dot.ca.gov/';
+const RESPONSE_CAVEAT = 'Estimate only: free-flow routing with no live traffic; construction and county-road closures are not covered; MVUM is a legal designation, not road condition.';
+const VALHALLA_TRACE_ATTRS = ['edge.names', 'edge.length', 'edge.speed', 'edge.road_class', 'edge.surface',
+  'edge.unpaved', 'edge.use', 'edge.begin_shape_index', 'edge.end_shape_index', 'shape'];
+const RESPONSE_CFG_INPUTS = {
+  loadMin: 'cfgRespLoad', rainPct: 'cfgRespRain', snowMaxMph: 'cfgRespSnow', chainDelayMin: 'cfgRespChain',
+  forestMph: 'cfgRespForest', trailMph: 'cfgRespTrail', offTrailMph: 'cfgRespOffTrail', driveAdjustPct: 'cfgRespAdjust',
+};
+
+// --- Settings (one localStorage blob; never read from the inputs) ---
+
+function getResponseSettings() {
+  let raw = null;
+  try { raw = JSON.parse(localStorage.getItem(RESPONSE_CFG_KEY) || 'null'); } catch (_) { raw = null; }
+  return normalizeResponseSettings(raw);
+}
+
+function _saveResponseSettings(s) {
+  try { localStorage.setItem(RESPONSE_CFG_KEY, JSON.stringify(normalizeResponseSettings(s))); } catch (_) { /* private mode */ }
+}
+
+function _syncResponseConfigInputs(s) {
+  if (typeof document === 'undefined') return;
+  s = s || getResponseSettings();
+  Object.keys(RESPONSE_CFG_INPUTS).forEach(k => {
+    const el = document.getElementById(RESPONSE_CFG_INPUTS[k]);
+    if (el) el.value = s[k];
+  });
+  const auto = document.getElementById('cfgRespAuto');
+  if (auto) auto.checked = !!s.auto;
+  const baseEl = document.getElementById('cfgRespBase');
+  if (baseEl && !baseEl.matches(':focus')) baseEl.value = s.base ? s.base.label : '';
+  const hint = document.getElementById('cfgRespBaseHint');
+  if (hint) {
+    hint.style.color = '';
+    hint.textContent = s.base
+      ? `Saved: ${s.base.label} (${s.base.lat.toFixed(5)}, ${s.base.lng.toFixed(5)})`
+      : 'No base saved — the estimate needs this device\'s location.';
+  }
+}
+
+// Config-tab handler for one numeric / boolean setting. Re-evaluates the
+// estimate from stored route data — no request.
+function saveResponseSetting(key, value) {
+  const s = getResponseSettings();
+  s[key] = value;
+  const n = normalizeResponseSettings(s);
+  _saveResponseSettings(n);
+  _syncResponseConfigInputs(n);
+  recomputeResponseForHour();
+  return n;
+}
+
+// Resolve the saved base ONCE, on Save: coordinates synchronously, otherwise
+// one geocoder lookup (submit-only — never per keystroke).
+async function saveResponseBase(raw) {
+  const hint = typeof document !== 'undefined' ? document.getElementById('cfgRespBaseHint') : null;
+  const text = String(raw == null ? '' : raw).trim();
+  const s = getResponseSettings();
+  if (!text) {
+    s.base = null;
+    _saveResponseSettings(s); _syncResponseConfigInputs(s);
+    return null;
+  }
+  let base = null;
+  const p = parseCoordinateInput(text);
+  if (p) base = { label: text, lat: p.lat, lng: p.lng };
+  else {
+    if (hint) { hint.style.color = ''; hint.textContent = 'Looking up…'; }
+    const anchor = searchAnchor();
+    const r = await _fetchGeocode(text, anchor, null);
+    const recs = (r && r.data) ? rankGeocodeResults(normalizeGeocodeResults(r.data), anchor) : [];
+    if (!recs.length) {
+      if (hint) {
+        hint.style.color = 'var(--accent-red)';
+        hint.textContent = (r && r.error) ? `Could not look that up (${r.error}). Base not changed.` : 'No match for that place. Base not changed.';
+      }
+      return null;
+    }
+    base = { label: recs[0].displayName, lat: recs[0].lat, lng: recs[0].lng };
+  }
+  s.base = base;
+  _saveResponseSettings(s); _syncResponseConfigInputs(getResponseSettings());
+  renderResponse();
+  return base;
+}
+
+// --- Routing client: one module-level queue, at most 1 request per second ---
+// (A superseded run starts its successor at once, so the limiter cannot live
+// on the request token.)
+let _valhallaChain = Promise.resolve();
+let _valhallaLastAt = 0;
+let _valhallaMinIntervalMs = VALHALLA_MIN_INTERVAL_MS;
+function _setValhallaInterval(ms) { _valhallaMinIntervalMs = ms; _valhallaLastAt = 0; } // tests
+
+function _valhallaPost(path, body, signal) {
+  const run = async () => {
+    if (signal && signal.aborted) throw _abortError();
+    const wait = _valhallaLastAt + _valhallaMinIntervalMs - Date.now();
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    if (signal && signal.aborted) throw _abortError();
+    _valhallaLastAt = Date.now();
+    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    let timedOut = false;
+    const onAbort = () => { if (ctl) ctl.abort(); };
+    if (signal && ctl) signal.addEventListener('abort', onAbort, { once: true });
+    const timer = ctl ? setTimeout(() => { timedOut = true; ctl.abort(); }, RESPONSE_REQ_TIMEOUT_MS) : null;
+    try {
+      const res = await fetch(VALHALLA_BASE_URL + path, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), signal: ctl ? ctl.signal : signal,
+      });
+      let j = null;
+      try { j = await res.json(); } catch (_) { j = null; }
+      if (!res.ok) {
+        const info = valhallaError(j, res.status);
+        const e = new Error(info.message); e.valhalla = info;
+        throw e;
+      }
+      if (!j) throw new Error('routing answer is not valid JSON');
+      return j;
+    } catch (e) {
+      if (timedOut && !(signal && signal.aborted)) {
+        throw new Error(`no answer from the routing service within ${Math.round(RESPONSE_REQ_TIMEOUT_MS / 1000)} s`);
+      }
+      throw e;
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (signal && ctl) signal.removeEventListener('abort', onAbort);
+    }
+  };
+  const p = _valhallaChain.then(run, run);
+  _valhallaChain = p.then(() => {}, () => {});
+  return p;
+}
+
+// Session memo of routed legs (bounded). IndexedDB holds routes only as a
+// LABELLED fallback for when routing fails.
+function _responseMemo() { if (!S._responseMemo) S._responseMemo = new Map(); return S._responseMemo; }
+function _responseMemoSet(key, v) {
+  const m = _responseMemo();
+  m.set(key, v);
+  if (m.size > 40) m.delete(m.keys().next().value);
+}
+
+function _driveUsable(d) { return !!(d && (d.status === 'ok' || d.status === 'cached') && d.coords && d.coords.length > 1); }
+
+function _finishDrive(d, target) {
+  d.cum = polylineCumKm(d.coords);
+  const end = d.coords[d.coords.length - 1];
+  d.roadEnd = { lat: end[0], lng: end[1] };
+  d.snapM = haversine(end[0], end[1], target.lat, target.lng) * 1000;
+  d.stretches = routeHighwayStretches(d.segments);
+  d.inCA = routeTouchesCalifornia(d.coords);
+  return d;
+}
+
+// One drive leg: /route, then /trace_attributes on that route's own shape for
+// per-edge surface + road class. A failed or oversized trace is a normal
+// path: the route's maneuver-level unpaved flag is used instead (slower,
+// never faster) and the drive is marked surfaceDetail:false.
+async function _routeDrive(start, target, signal) {
+  const key = responseRouteKey('auto', start, target);
+  const memo = _responseMemo().get(key);
+  if (memo) return memo;
+  try {
+    const rj = await _valhallaPost('/route', {
+      locations: [{ lat: start.lat, lon: start.lng }, { lat: target.lat, lon: target.lng }],
+      costing: 'auto', units: 'kilometers',
+    }, signal);
+    const leg = valhallaRouteLeg(rj);
+    if (!leg) throw new Error('routing answer was not a route');
+    let coords = leg.coords, segments = null, surfaceDetail = false;
+    try {
+      const tj = await _valhallaPost('/trace_attributes', {
+        encoded_polyline: leg.shape, shape_match: 'map_snap', costing: 'auto',
+        filters: { attributes: VALHALLA_TRACE_ATTRS, action: 'include' },
+      }, signal);
+      const t = valhallaEdgesToSegments(tj);
+      if (t && Math.abs(t.km - leg.km) <= Math.max(0.5, leg.km * 0.05)) { coords = t.coords; segments = t.segments; surfaceDetail = true; }
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+    }
+    if (!segments) segments = valhallaManeuversToSegments(leg);
+    const drive = _finishDrive({ key, status: 'ok', coords, km: leg.km, sec: leg.sec, segments, surfaceDetail, at: Date.now() }, target);
+    _responseMemoSet(key, drive);
+    if (typeof cacheApiResponse === 'function') {
+      cacheApiResponse('response_route', key, { coords, km: leg.km, sec: leg.sec, segments, surfaceDetail, at: drive.at });
+    }
+    return drive;
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw e;
+    const info = e && e.valhalla;
+    if (info && (info.noRoad || info.noRoute)) {
+      return { key, status: 'noroad', error: info.noRoad ? 'no road found near this point' : 'no drivable route found' };
+    }
+    const msg = (e && e.message) || String(e);
+    let c = null;
+    if (typeof getCachedApiResponse === 'function') {
+      try { c = await getCachedApiResponse('response_route', key); } catch (_) { c = null; }
+    }
+    if (c && c.data && Array.isArray(c.data.coords) && c.data.coords.length > 1 && Array.isArray(c.data.segments)) {
+      return _finishDrive(Object.assign({}, c.data, { key, status: 'cached', cachedAt: c.timestamp, error: msg }), target);
+    }
+    return { key, status: 'error', error: msg };
+  }
+}
+
+// Hike leg from the road end to the observer: a pedestrian route (trails),
+// then the straight-line gap from where that route ends. No trail near the
+// observer, or a routing failure, leaves a straight off-trail line.
+async function _routeHike(drive, dest, settings, signal) {
+  const from = drive.roadEnd;
+  const gapKm = haversine(from.lat, from.lng, dest.lat, dest.lng);
+  if (gapKm * 1000 <= RESPONSE_AT_ROAD_M) return { status: 'atroad', gapM: gapKm * 1000 };
+  const key = `ped|${from.lat.toFixed(5)},${from.lng.toFixed(5)}|${dest.lat.toFixed(5)},${dest.lng.toFixed(5)}`;
+  let routed = _responseMemo().get(key) || null, routeError = null;
+  if (!routed) {
+    try {
+      const pj = await _valhallaPost('/route', {
+        locations: [{ lat: from.lat, lon: from.lng }, { lat: dest.lat, lon: dest.lng }],
+        costing: 'pedestrian', units: 'kilometers',
+      }, signal);
+      const leg = valhallaRouteLeg(pj);
+      if (leg) {
+        const end = leg.coords[leg.coords.length - 1];
+        routed = { trailKm: leg.km, offTrailKm: haversine(end[0], end[1], dest.lat, dest.lng), coords: leg.coords };
+        _responseMemoSet(key, routed);
+      } else routeError = 'trail routing answer was not a route';
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      // "No path / no edge nearby" is an answer (there is no trail), not a failure.
+      if (!(e && e.valhalla && (e.valhalla.noRoad || e.valhalla.noRoute))) routeError = (e && e.message) || String(e);
+    }
+  }
+  const plan = chooseHikePlan(gapKm, routed, settings);
+  const line = plan.mode === 'trail' ? routed.coords.concat([[dest.lat, dest.lng]]) : [[from.lat, from.lng], [dest.lat, dest.lng]];
+  return { status: 'ok', gapM: gapKm * 1000, routed, routeError, line, ascentM: null };
+}
+
+// --- Start + destinations ---
+
+function _geoPermissionState() {
+  try {
+    if (typeof navigator === 'undefined' || !navigator.permissions || !navigator.permissions.query) return Promise.resolve('unknown');
+    return navigator.permissions.query({ name: 'geolocation' }).then(p => p.state, () => 'unknown');
+  } catch (_) { return Promise.resolve('unknown'); }
+}
+
+function _getPositionOnce(timeoutMs) {
+  return new Promise(resolve => {
+    if (typeof navigator === 'undefined' || !navigator.geolocation) return resolve(null);
+    let done = false;
+    const fin = v => { if (!done) { done = true; clearTimeout(guard); resolve(v); } };
+    const guard = setTimeout(() => fin(null), timeoutMs + 1000);
+    try {
+      navigator.geolocation.getCurrentPosition(pos => fin(pos), () => fin(null),
+        { enableHighAccuracy: true, timeout: timeoutMs, maximumAge: 30000 });
+    } catch (_) { fin(null); }
+  });
+}
+
+// Device fix under 5 min old → a silent position request (only when the
+// permission is already granted, or the caller is a user gesture) → an older
+// fix (≤ 30 min) → the saved base → null.
+async function _resolveResponseStart(settings, allowPrompt) {
+  const now = Date.now();
+  const gps = f => ({ kind: 'gps', lat: f.lat, lng: f.lng, at: f.at, accM: f.accM, label: 'GPS location' });
+  const fix = S.deviceFix;
+  if (fix && now - fix.at <= RESPONSE_FIX_FRESH_MS) return gps(fix);
+  const perm = await _geoPermissionState();
+  if (perm !== 'denied' && (allowPrompt || perm === 'granted')) {
+    const pos = await _getPositionOnce(8000);
+    if (pos) { _noteDeviceFix(pos); if (S.deviceFix) return gps(S.deviceFix); }
+  }
+  if (fix && now - fix.at <= DEVICE_FIX_MAX_AGE_MS) return gps(fix);
+  if (settings.base) return { kind: 'base', lat: settings.base.lat, lng: settings.base.lng, at: null, accM: null, label: settings.base.label };
+  return null;
+}
+
+function _responseStaging() {
+  const st = S._responseStaging;
+  return (st && st.areaKey === _currentAreaKey()) ? st : null;
+}
+
+// Every observer of the current area (active first, capped). With a staging
+// point the vehicle parks there and each observer gets a hike leg from it;
+// with no observers the estimate is drive-only (staging point, else the road
+// nearest the area centre).
+function _responsePlan() {
+  const st = _responseStaging();
+  const obs = (S.viewsheds || []).filter(r => r && !r._deleted && r.observer
+    && Number.isFinite(+r.observer.lat) && Number.isFinite(+r.observer.lng));
+  obs.sort((a, b) => (b.id === S.activeViewshedId ? 1 : 0) - (a.id === S.activeViewshedId ? 1 : 0));
+  const dests = [];
+  if (!obs.length) {
+    if (st) dests.push({ id: 'staging', name: 'Staging point', kind: 'staging', lat: st.lat, lng: st.lng, target: { lat: st.lat, lng: st.lng }, hike: false });
+    else if (S.areaCenter) dests.push({ id: 'auto', name: 'Road nearest area centre', kind: 'auto', lat: S.areaCenter.lat, lng: S.areaCenter.lng,
+      target: { lat: S.areaCenter.lat, lng: S.areaCenter.lng }, hike: false });
+  } else {
+    obs.forEach((r, i) => {
+      const lat = +r.observer.lat, lng = +r.observer.lng;
+      dests.push({ id: r.id, name: r.name || 'Observer', kind: 'observer', lat, lng,
+        target: st ? { lat: st.lat, lng: st.lng } : { lat, lng }, hike: true, skipped: i >= RESPONSE_MAX_DESTS });
+    });
+  }
+  return { dests, staging: st };
+}
+
+function _responseHasData(r) {
+  return !!(r && r.dests && r.dests.some(d => d.sum && d.sum.ok));
+}
+
+// --- Conditions along the route(s) ---
+
+async function _loadRouteWeather(resp, drives, signal) {
+  if (!drives.length) return;
+  const lists = drives.map(d => samplePolyline(d.coords, RESPONSE_WX_STEP_KM, RESPONSE_WX_MAX_POINTS));
+  const merged = mergeSamplePoints(lists, RESPONSE_WX_MERGE_KM, RESPONSE_WX_MAX_TOTAL);
+  try {
+    const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + merged.points.map(p => p.lat.toFixed(4)).join(',')
+      + '&longitude=' + merged.points.map(p => p.lng.toFixed(4)).join(',')
+      + '&hourly=rain,showers,snowfall,snow_depth,weather_code'
+      + `&forecast_hours=${RESPONSE_WX_HOURS}&timeformat=unixtime&timezone=GMT`;
+    const res = await fetch(url, { signal });
+    if (!res.ok) {
+      let reason = '';
+      try { const b = await res.json(); if (b && b.reason) reason = ': ' + b.reason; } catch (_) { /* non-JSON */ }
+      throw new Error('HTTP ' + res.status + reason);
+    }
+    let j;
+    try { j = await res.json(); } catch (_) { throw new Error('response is not valid JSON'); }
+    if (j && !Array.isArray(j) && j.error) throw new Error(j.reason || 'API error');
+    const parsed = parseRouteWeather(j, merged.points.length);
+    if (!parsed) throw new Error('response malformed');
+    // The SW answers Open-Meteo network-first: an offline-fallback body is a
+    // dated forecast, labelled cached — never stamped "now".
+    const sw = _swCacheStamp(res);
+    const byDrive = {};
+    drives.forEach((d, i) => {
+      byDrive[d.key] = lists[i].map((s, k) => Object.assign({ alongKm: s.alongKm }, parsed[merged.maps[i][k]]));
+    });
+    resp.wx = { status: sw ? 'cached' : 'ok', cachedAt: sw ? sw.cachedAt : null, at: Date.now(), byDrive, error: null, points: merged.points.length };
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    resp.wx = { status: 'error', error: (e && e.message) || String(e), byDrive: {} };
+  }
+}
+
+// Caltrans QuickMap through the data proxy. Zero placemarks only means "none
+// active" when the body really is a KML document: an undeployed /caltrans/
+// route falls through to another upstream and answers something else.
+async function _loadRouteCaltrans(resp, drives, signal) {
+  drives.forEach(d => { d.haz = null; });
+  if (!drives.some(d => d.inCA)) { resp.caltrans = { status: 'na' }; return; }
+  try {
+    const base = getCanopyProxyBase();
+    if (!base) throw new Error('no data proxy configured');
+    const get = async file => {
+      const res = await _proxyFetch(base + '/caltrans/' + file, { signal });
+      // A Worker without the /caltrans/ route sends the path to its default
+      // upstream, which answers 403 / 404.
+      if (res.status === 403 || res.status === 404) throw new Error(`HTTP ${res.status} — the data proxy has no /caltrans/ route yet`);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const recs = parseQuickmapKml(await res.text());
+      if (!recs) throw new Error('answer was not a Caltrans KML (data proxy needs the /caltrans/ route)');
+      return recs;
+    };
+    const [cc, chin] = await Promise.allSettled([get('v2_cc.kml'), get('v2_chin.kml')]);
+    if (cc.status !== 'fulfilled') throw cc.reason;
+    const records = cc.value.concat(chin.status === 'fulfilled' ? chin.value : []);
+    const newest = quickmapNewestUpdateMs(records);
+    resp.caltrans = {
+      status: 'ok', records, at: Date.now(), updatedMs: newest,
+      chinOk: chin.status === 'fulfilled',
+      stale: newest != null && (Date.now() - newest) > RESPONSE_CALTRANS_STALE_MS,
+    };
+    drives.forEach(d => { d.haz = d.inCA ? summarizeRouteHazards(matchRouteHazards(records, d.coords, d.cum, d.stretches)) : null; });
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    resp.caltrans = { status: 'error', error: (e && e.message) || String(e) };
+  }
+}
+
+// NWS alerts at points along the longest route (+ the other routes' ends).
+// Results live ONLY on the response record: the area's own alert state and
+// the banner are untouched.
+async function _loadRouteAlerts(resp, drives, signal) {
+  if (!drives.length) return;
+  const main = drives.slice().sort((a, b) => b.km - a.km)[0];
+  const step = Math.min(RESPONSE_ALERT_STEP_KM, Math.max(0.5, main.km / 2));
+  const lists = [samplePolyline(main.coords, step, RESPONSE_ALERT_MAX_POINTS)]
+    .concat(drives.filter(d => d !== main).map(d => [{ lat: d.roadEnd.lat, lng: d.roadEnd.lng }]));
+  const pts = mergeSamplePoints(lists, 5, RESPONSE_ALERT_MAX_POINTS + 2).points;
+  const nMain = lists[0].length;
+  const results = await Promise.allSettled(pts.map(async p => {
+    const res = await fetch(`https://api.weather.gov/alerts/active?point=${p.lat.toFixed(4)},${p.lng.toFixed(4)}`, { signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const sw = _swCacheStamp(res);
+    const data = await res.json();
+    if (!data || !Array.isArray(data.features)) throw new Error('malformed');
+    return { alerts: _mapNwsAlertFeatures(data.features), sw };
+  }));
+  if (signal && signal.aborted) return;
+  const byId = new Map();
+  let live = 0, cached = 0;
+  results.forEach((r, i) => {
+    if (r.status !== 'fulfilled') return;
+    if (r.value.sw) cached++; else live++;
+    r.value.alerts.forEach(a => {
+      const e = byId.get(a.id) || Object.assign({}, a, { points: [] });
+      e.points.push(i);
+      byId.set(a.id, e);
+    });
+  });
+  const where = a => {
+    const set = new Set(a.points);
+    if (set.size >= pts.length) return 'entire route';
+    const parts = [];
+    if (set.has(0)) parts.push('at start');
+    if ([...set].some(i => i > 0 && i < nMain - 1)) parts.push('en route');
+    if ([...set].some(i => i >= nMain - 1)) parts.push('at destination');
+    return parts.join(', ');
+  };
+  const alerts = [...byId.values()].map(a => Object.assign(a, { where: where(a) }));
+  resp.alerts = { alerts, pointsLive: live, pointsCached: cached, pointsTotal: pts.length, at: Date.now() };
+}
+
+// MVUM roads for the bbox of the forest pieces → access flags per drive.
+// Flags only: MVUM never changes a segment's kind or speed.
+async function _loadRouteMvum(resp, drives, signal) {
+  drives.forEach(d => { d.mvum = null; });
+  const withForest = drives.filter(d => d.segments.some(s => s.kind === 'forest'));
+  if (!withForest.length) { resp.mvum = { status: 'none' }; return; }
+  let s = 90, w = 180, n = -90, e = -180;
+  withForest.forEach(d => d.segments.forEach(sg => {
+    if (sg.kind !== 'forest') return;
+    for (let i = Math.max(0, sg.i0 | 0); i <= Math.min(d.coords.length - 1, sg.i1 | 0); i++) {
+      const p = d.coords[i];
+      if (p[0] < s) s = p[0]; if (p[0] > n) n = p[0]; if (p[1] < w) w = p[1]; if (p[1] > e) e = p[1];
+    }
+  }));
+  if (n < s || n - s > 0.6 || e - w > 0.8) { resp.mvum = { status: 'skipped', error: 'forest-road section too long to check' }; return; }
+  try {
+    const b = { getSouthWest: () => ({ lat: s, lng: w }), getNorthEast: () => ({ lat: n, lng: e }) };
+    const qopts = { pad: 0.003, maxAllowableOffset: 0.00005, geometryPrecision: 5 };
+    const svc = 'arcx/rest/services/EDW/EDW_MVUM_01/MapServer';
+    const key = 'resp_' + _bboxCacheKey(b);
+    // Layer 1 = MVUM roads, layer 2 = MVUM motorized trails (jeep / OHV routes
+    // — e.g. the Barrett Lake trail is only in this one).
+    const [roads, trails] = await Promise.all([
+      _fetchGeoJsonLayer('mvum_roads', key, _govArcgisUrl('/usfs/', svc, '1', b, '*', qopts), { signal }),
+      _fetchGeoJsonLayer('mvum_trails', key, _govArcgisUrl('/usfs/', svc, '2', b, '*', qopts), { signal }),
+    ]);
+    if ((roads && roads.error === 'aborted') || (trails && trails.error === 'aborted')) return;
+    const okR = !!(roads && roads.features), okT = !!(trails && trails.features);
+    if (!okR && !okT) {
+      resp.mvum = { status: 'error', error: (roads && roads.error) || (trails && trails.error) || 'unavailable' };
+      return;
+    }
+    const feats = (okR ? roads.features : [])
+      .concat(okT ? trails.features.map(f => Object.assign({}, f, { __mvumTrail: true })) : []);
+    const now = new Date();
+    withForest.forEach(d => { d.mvum = matchMvumRoads(feats, d.coords, d.segments, now); });
+    const cached = (okR && roads.fromCache) || (okT && trails.fromCache);
+    resp.mvum = { status: cached ? 'cached' : 'ok', at: Date.now(),
+      // One layer missing, or a capped answer: the list may be short.
+      incomplete: !okR || !okT || !!(okR && roads.truncated) || !!(okT && trails.truncated) };
+  } catch (err) {
+    if (err && err.name === 'AbortError') return;
+    resp.mvum = { status: 'error', error: (err && err.message) || String(err) };
+  }
+}
+
+// Ascent of every hike line in ONE elevation request (it builds a GET URL, so
+// the total is kept under ~50 points).
+async function _loadHikeAscents(resp, dests, signal) {
+  const hikes = dests.filter(d => d.hikeRec && d.hikeRec.status === 'ok');
+  if (!hikes.length) return;
+  const per = Math.max(3, Math.min(16, Math.floor(48 / hikes.length)));
+  const lists = hikes.map(d => samplePolyline(d.hikeRec.line, 0.1, per));
+  const pts = [].concat(...lists).map(p => ({ latitude: p.lat, longitude: p.lng }));
+  try {
+    const r = await _fetchElevationGrid(pts, signal);
+    let o = 0;
+    hikes.forEach((d, i) => {
+      const k = lists[i].length;
+      d.hikeRec.ascentM = ascentFromElevations(r.elevationsM.slice(o, o + k));
+      o += k;
+    });
+  } catch (e) {
+    hikes.forEach(d => { d.hikeRec.ascentM = null; }); // flat estimate, labelled
+  }
+}
+
+// --- Orchestration ---
+
+// opts.userGesture: the caller is a tap (UPDATE / the consent button), so a
+// location prompt is allowed and the start is resolved afresh. Auto runs
+// (area drawn, observer changed) keep a recent start and never prompt.
+async function fetchResponseEstimate(opts) {
+  opts = opts || {};
+  if (!S.areaCenter) return;
+  const settings = getResponseSettings();
+  if (!settings.consent) { renderResponse(); return; }
+  const ak = _currentAreaKey();
+  if (S._responseTimer) { clearTimeout(S._responseTimer); S._responseTimer = null; }
+  const tok = _beginRequest('response');
+  trackFetchStart('Response Time');
+  setStatus('responseStatus', 'loading', 'Locating…');
+  try {
+    const prev = (S.response && S.response.areaKey === ak) ? S.response : null;
+    const ps = prev && prev.start;
+    let start;
+    if (!opts.userGesture && ps && ps.kind === 'gps' && (Date.now() - ps.at) <= DEVICE_FIX_MAX_AGE_MS) start = ps;
+    else start = await _resolveResponseStart(settings, !!opts.userGesture);
+    if (!_requestCurrent(tok)) return;
+
+    const plan = _responsePlan();
+    if (!start || !plan.dests.length) {
+      S.response = { areaKey: ak, sig: null, start: null, needStart: !start, staging: plan.staging, dests: [], drives: {} };
+      delete S.sectionMeta.response;
+      setStatus('responseStatus', '', '');
+      renderResponse(); renderResponseRouteLayer(); renderSectionMeta('response');
+      return;
+    }
+    // A failure must never label ANOTHER start/destination set's numbers
+    // "stale": prior data only counts for the same signature.
+    const sig = [responseRouteKey('s', start, start), plan.staging ? `${plan.staging.lat},${plan.staging.lng}` : '-']
+      .concat(plan.dests.map(d => `${d.id}:${d.lat.toFixed(5)},${d.lng.toFixed(5)}`)).join('|');
+    if (!prev || prev.sig !== sig) delete S.sectionMeta.response;
+
+    const resp = { areaKey: ak, sig, start, staging: plan.staging, dests: plan.dests, drives: {},
+      wx: null, caltrans: null, alerts: null, mvum: null, computedAt: null };
+    const active = plan.dests.filter(d => !d.skipped);
+    const targets = [];
+    active.forEach(d => {
+      d.driveKey = responseRouteKey('auto', start, d.target);
+      if (!targets.some(t => t.key === d.driveKey)) targets.push({ key: d.driveKey, target: d.target });
+    });
+    for (let i = 0; i < targets.length; i++) {
+      setStatus('responseStatus', 'loading', targets.length > 1 ? `Routing ${i + 1}/${targets.length}…` : 'Routing…');
+      const drive = await _routeDrive(start, targets[i].target, tok.signal);
+      if (!_requestCurrent(tok)) return;
+      resp.drives[targets[i].key] = drive;
+    }
+    for (const d of active) {
+      const drive = resp.drives[d.driveKey];
+      d.hikeRec = null;
+      if (!d.hike || !_driveUsable(drive)) continue;
+      setStatus('responseStatus', 'loading', 'Routing hike…');
+      d.hikeRec = await _routeHike(drive, d, settings, tok.signal);
+      if (!_requestCurrent(tok)) return;
+    }
+
+    setStatus('responseStatus', 'loading', 'Checking conditions…');
+    const used = Object.keys(resp.drives).map(k => resp.drives[k]);
+    const usable = used.filter(_driveUsable);
+    await Promise.all([
+      _loadRouteWeather(resp, usable, tok.signal),
+      _loadRouteCaltrans(resp, usable, tok.signal),
+      _loadRouteAlerts(resp, usable, tok.signal),
+      _loadRouteMvum(resp, usable, tok.signal),
+      _loadHikeAscents(resp, active, tok.signal),
+    ]);
+    if (!_requestCurrent(tok)) return;
+
+    // Routing failed outright on top of this same start/destinations' earlier
+    // answer: keep that answer on screen, flagged stale by markSection.
+    const failed = used.filter(d => d.status === 'error');
+    if (used.length && failed.length === used.length && prev && prev.sig === sig && _responseHasData(prev)) {
+      markSection('response', { status: 'error', error: failed[0].error });
+      _syncStatusFromMeta('responseStatus', 'response');
+      return;
+    }
+    resp.computedAt = Date.now();
+    S.response = resp;
+    recomputeResponseForHour();
+    renderResponseRouteLayer();
+    _markResponseSection(resp);
+  } catch (e) {
+    if (!_requestCurrent(tok)) return;
+    console.error('Response estimate error:', e);
+    markSection('response', { status: 'error', error: (e && e.message) || String(e) });
+    _syncStatusFromMeta('responseStatus', 'response');
+  } finally {
+    trackFetchEnd('Response Time');
+  }
+}
+
+// Section freshness from the routed legs. "No road found" is an ANSWER, not a
+// failure. Some legs failed → partial (the rows say which); all failed →
+// error, and the cells read UNKNOWN (or stale, via markSection).
+function _markResponseSection(resp) {
+  const used = Object.keys(resp.drives).map(k => resp.drives[k]);
+  if (!used.length) return;
+  const failed = used.filter(d => d.status === 'error');
+  const cached = used.filter(d => d.status === 'cached');
+  if (failed.length === used.length) {
+    markSection('response', { status: 'error', error: failed[0].error });
+  } else if (failed.length) {
+    markSection('response', { status: 'error', partial: true, error: `${failed.length} of ${used.length} routes failed — ${failed[0].error}` });
+  } else if (cached.length) {
+    markSection('response', { status: 'cached', updatedAt: null, error: cached[0].error || null,
+      cachedAt: cached.reduce((m, d) => (d.cachedAt != null && (m == null || d.cachedAt < m)) ? d.cachedAt : m, null) });
+  } else {
+    markSection('response', { status: 'live', updatedAt: Date.now(), error: null });
+  }
+  _syncStatusFromMeta('responseStatus', 'response');
+}
+
+// The consent button: the one place that agrees to send the start point and
+// destinations to the routing service.
+function startResponseEstimate() {
+  const s = getResponseSettings();
+  s.consent = true;
+  _saveResponseSettings(s);
+  return fetchResponseEstimate({ userGesture: true });
+}
+
+// Area drawn / refreshed. Called after restoreViewsheds() resolves so the
+// observer list is in place. Runs only after consent, and only when the
+// Config switch is on.
+async function autoResponseEstimate() {
+  if (!S.areaCenter) return;
+  const ak = _currentAreaKey();
+  if (S.response && S.response.areaKey !== ak) { S.response = null; renderResponseRouteLayer(); }
+  if (!(S._responseStaging && S._responseStaging.areaKey === ak)) {
+    S._responseStaging = null;
+    if (typeof getAppState === 'function') {
+      try {
+        const st = await getAppState('responseStaging');
+        if (st && st.areaKey === ak && _currentAreaKey() === ak && Number.isFinite(st.lat) && Number.isFinite(st.lng)) S._responseStaging = st;
+      } catch (_) { /* optional */ }
+    }
+  }
+  const settings = getResponseSettings();
+  if (!settings.consent || !settings.auto) { renderResponse(); return; }
+  return fetchResponseEstimate({});
+}
+
+// Observer added / moved / removed: one debounced re-run. Unchanged legs come
+// from the session memo, so only the new one is routed.
+function _scheduleResponseEstimate() {
+  if (typeof window === 'undefined' || !S.areaCenter) return;
+  const s = getResponseSettings();
+  if (!s.consent || !s.auto) return;
+  if (S._responseTimer) clearTimeout(S._responseTimer);
+  S._responseTimer = setTimeout(() => { S._responseTimer = null; fetchResponseEstimate({}); }, RESPONSE_DEBOUNCE_MS);
+}
+
+function _resetResponse() {
+  if (S._responseTimer) { clearTimeout(S._responseTimer); S._responseTimer = null; }
+  S.response = null;
+  S._responseStaging = null;
+  cancelResponseStagingPick();
+  if (S.mapLayers && S.mapLayers.response_route) S.mapLayers.response_route.clearLayers();
+  renderResponse();
+}
+
+// --- Staging point (one map tap) ---
+
+function startResponseStagingPick() {
+  if (S._canopyEditing || !S.areaCenter) return;
+  if (S.is3D && typeof _exit3D === 'function') _exit3D();
+  if (S._viewshedPicking) cancelViewshedPick();
+  if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
+  clearDrawBtns();
+  S._responsePicking = true;
+  if (S.map) S.map.getContainer().style.cursor = 'crosshair';
+  document.getElementById('respStagingBtn')?.classList.add('active');
+  setStatus('responseStatus', 'loading', 'TAP MAP · STAGING POINT');
+}
+
+function cancelResponseStagingPick() {
+  if (!S._responsePicking) return;
+  S._responsePicking = false;
+  if (S.map && S.map.getContainer) S.map.getContainer().style.cursor = '';
+  if (typeof document !== 'undefined') document.getElementById('respStagingBtn')?.classList.remove('active');
+  // Put the status pill back: the section's own state, or blank when it has none yet.
+  if (S.sectionMeta && S.sectionMeta.response) _syncStatusFromMeta('responseStatus', 'response');
+  else setStatus('responseStatus', '', '');
+}
+
+function onResponseStagingClick(latlng) {
+  cancelResponseStagingPick();
+  if (!latlng || !S.areaCenter) return;
+  S._responseStaging = { areaKey: _currentAreaKey(), lat: latlng.lat, lng: latlng.lng };
+  if (typeof saveAppState === 'function') saveAppState('responseStaging', S._responseStaging);
+  renderResponse();
+  fetchResponseEstimate({});
+}
+
+function clearResponseStaging() {
+  S._responseStaging = null;
+  if (typeof saveAppState === 'function') saveAppState('responseStaging', null);
+  renderResponse();
+  fetchResponseEstimate({});
+}
+
+// --- Evaluation for the selected hour (no request) ---
+
+// Departure = the time bar's selected hour (NOW at index 0).
+function _responseDepartMs() {
+  const idx = S.timeIdx || 0;
+  const t = (idx && S.wx && S.wx.hourly && S.wx.hourly.time) ? Date.parse(S.wx.hourly.time[idx]) : NaN;
+  return Number.isFinite(t) ? t : Date.now();
+}
+
+function recomputeResponseForHour() {
+  const r = S.response;
+  if (!r || !r.dests || r.areaKey !== _currentAreaKey()) { renderResponse(); return; }
+  const settings = getResponseSettings();
+  const departMs = _responseDepartMs();
+  r.departMs = departMs;
+  r.forecastHour = !!(S.timeIdx || 0);
+  r.dests.forEach(d => {
+    const drive = d.driveKey ? r.drives[d.driveKey] : null;
+    d.est = null; d.hikePlan = null; d.hikeMin = null;
+    if (d.skipped) { d.sum = null; return; }
+    if (!_driveUsable(drive)) {
+      d.sum = summarizeResponseDest({ routeStatus: drive ? drive.status : 'error', est: null }, settings);
+      return;
+    }
+    const samples = (r.wx && r.wx.byDrive) ? r.wx.byDrive[d.driveKey] : null;
+    d.est = computeDriveEstimate(drive.segments, samples, departMs + settings.loadMin * 60000, settings);
+    const h = d.hikeRec;
+    let hikeDegraded = false;
+    if (h && h.status === 'ok') {
+      d.hikePlan = chooseHikePlan(h.gapM / 1000, h.routed, settings);
+      d.hikeMin = hikeTimeMin({ trailKm: d.hikePlan.trailKm, offTrailKm: d.hikePlan.offTrailKm, ascentM: h.ascentM }, settings);
+      hikeDegraded = h.ascentM == null || !!h.routeError;
+    } else if (h && h.status === 'atroad') d.hikeMin = 0;
+    const haz = drive.haz;
+    const chain = {
+      status: !drive.inCA ? 'na' : ((r.caltrans && r.caltrans.status === 'ok') ? 'ok' : 'unverified'),
+      on: haz ? haz.chainOn.length : 0, may: haz ? haz.chainMay.length : 0,
+      closedOn: haz ? haz.closedOn.length : 0, closedMay: haz ? haz.closedMay.length : 0,
+    };
+    const accessClosed = !!(drive.mvum && drive.mvum.roads.some(x => x.flags.closedNow));
+    d.sum = summarizeResponseDest({
+      routeStatus: drive.status, est: d.est, hikeMin: d.hike ? d.hikeMin : null, hikeDegraded,
+      chain, surfaceDetail: drive.surfaceDetail, accessClosed,
+    }, settings);
+    d.chainStatus = chain.status;
+  });
+  renderResponse();
+}
+
+// --- Rendering ---
+
+function _respClock(ms) {
+  return new Date(ms).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: _localTZ() });
+}
+
+function _responsePrimary(r) {
+  if (!r || !r.dests || !r.dests.length) return null;
+  return r.dests.find(d => d.id === r.primaryId && !d.skipped)
+    || r.dests.find(d => d.id === S.activeViewshedId && !d.skipped)
+    || r.dests.find(d => d.sum && d.sum.ok) || r.dests[0];
+}
+
+function selectResponseDest(id) {
+  if (!S.response) return;
+  S.response.primaryId = id;
+  renderResponse();
+  reapplyStaleCells();
+}
+
+// One line per Caltrans match: "R-2 · Eastbound US 50 at Fred's Place".
+function _respHazardLabel(m) {
+  const head = m.kind === 'chain' ? m.level : (m.kind === 'closure' ? 'CLOSED' : (m.kind === 'truck' ? 'Trucks ' + m.level : 'Info'));
+  return `${head} · ${m.title || 'highway'}${m.location ? ' at ' + m.location : ''}`;
+}
+
+function _respChainText(r, d, drive, settings) {
+  if (!drive.inCA) return { text: 'n/a — route is outside California (Caltrans data only)', level: null };
+  const c = r.caltrans;
+  if (!c || c.status !== 'ok') {
+    return { text: `UNVERIFIED — check QuickMap${c && c.error ? ' (' + c.error + ')' : ''}`, level: 'amber' };
+  }
+  const haz = drive.haz || { chainOn: [], chainMay: [], closedOn: [], closedMay: [], info: [], truck: [] };
+  const list = (arr, n) => arr.slice(0, n).map(_respHazardLabel).join('; ') + (arr.length > n ? ` (+${arr.length - n} more)` : '');
+  const parts = [];
+  let level = 'green';
+  if (haz.closedOn.length) { parts.push(`CLOSED on route — verify: ${list(haz.closedOn, 2)}`); level = 'red'; }
+  if (haz.chainOn.length) { parts.push(`Chain control on route (+${Math.round(settings.chainDelayMin)} min): ${list(haz.chainOn, 2)}`); if (level !== 'red') level = 'amber'; }
+  if (haz.closedMay.length) { parts.push(`Possible closure near route — verify: ${list(haz.closedMay, 2)}`); if (level !== 'red') level = 'amber'; }
+  if (haz.chainMay.length && !haz.chainOn.length) { parts.push(`May apply (+${Math.round(settings.chainDelayMin)} min if so): ${list(haz.chainMay, 2)}`); if (level !== 'red') level = 'amber'; }
+  if (!parts.length) parts.push('None on route');
+  const asOf = `Caltrans QuickMap, checked ${_respClock(c.at)}`;
+  const notes = [asOf];
+  if (c.stale) { notes.push('feed may be stale — last updated ' + new Date(c.updatedMs).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: _localTZ() })); if (level === 'green') level = 'amber'; }
+  if (!c.chinOk) { notes.push('highway-information feed unavailable'); if (level === 'green') level = 'amber'; }
+  if (r.forecastHour) notes.push('current status, not a forecast');
+  return { text: `${parts.join(' · ')} (${notes.join('; ')})`, level };
+}
+
+function _respWxText(r, d, settings) {
+  const e = d.est;
+  const w = r.wx;
+  if (!w || w.status === 'error' || !e.wxKnown) {
+    const why = (!w || w.status === 'error')
+      ? (w && w.error ? ` (${w.error})` : '')
+      : ' (departure is beyond the 48 h forecast)';
+    return { text: `UNKNOWN — drive time not adjusted for weather${why}`, level: 'amber' };
+  }
+  const mi = v => (v < 10 ? v.toFixed(1) : String(Math.round(v))) + ' mi';
+  const parts = [];
+  if (e.rainMi > 0.05) parts.push(`rain on ${mi(e.rainMi)} (−${Math.round(settings.rainPct)} % speed)`);
+  if (e.snowMi > 0.05) parts.push(`snow falling on ${mi(e.snowMi)} (≤ ${Math.round(settings.snowMaxMph)} mph)`);
+  if (e.groundSnowMi > 0.05) parts.push(`snow on the ground on ${mi(e.groundSnowMi)} off-highway (≤ ${Math.round(settings.snowMaxMph)} mph)`);
+  let level = parts.length ? 'amber' : 'green';
+  let text = parts.length ? parts.join(' · ') : 'No rain or snow forecast along the route';
+  text += ` · departing ${_respClock(r.departMs)}`;
+  if (w.status === 'cached') { text += ` (cached forecast${w.cachedAt ? ' from ' + _respClock(w.cachedAt) : ', age unknown'})`; level = 'amber'; }
+  if (e.depthUnknown) text += ' · snow depth unavailable';
+  return { text, level };
+}
+
+function _respAccessText(r, drive) {
+  const forestKm = drive.segments.reduce((a, s) => a + (s.kind === 'forest' ? s.km : 0), 0);
+  if (!(forestKm > 0.05)) return { text: 'No forest roads on route', level: null };
+  const m = r.mvum;
+  if (!m || m.status === 'error' || m.status === 'skipped') {
+    return { text: `MVUM status unverified${m && m.error ? ' (' + m.error + ')' : ''}`, level: 'amber' };
+  }
+  const mv = drive.mvum;
+  if (!mv || !mv.roads.length) {
+    if (m.incomplete) return { text: 'MVUM status unverified (part of the MVUM data is unavailable)', level: 'amber' };
+    return { text: 'Unpaved road, not on the MVUM (county, private or outside a National Forest)', level: 'amber' };
+  }
+  let level = null;
+  const rows = mv.roads.slice(0, 3).map(x => {
+    const f = x.flags, bits = [];
+    if (f.trail) bits.push('motorized trail (4WD / high clearance)');
+    else if (f.highClearance) bits.push('high clearance');
+    if (f.closedNow) { bits.push(`seasonal — open ${f.datesOpen || 'dates unknown'}, CLOSED now`); level = 'red'; }
+    else if (f.partlyRestricted) bits.push(`seasonal limits for some vehicles (open ${f.datesOpen || 'dates unknown'}) — verify`);
+    else if (f.seasonal) bits.push(`seasonal — open ${f.datesOpen || 'dates unknown'}`);
+    if (!bits.length) bits.push('open to passenger vehicles');
+    if ((f.highClearance || f.partlyRestricted) && level !== 'red') level = 'amber';
+    return `${f.label}: ${bits.join(', ')}`;
+  });
+  let text = rows.join(' · ') + (mv.roads.length > 3 ? ` (+${mv.roads.length - 3} more)` : '');
+  if (mv.matched < mv.sampled * 0.8) { text += ' · part of the unpaved section is not an MVUM route'; if (!level) level = 'amber'; }
+  if (m.status === 'cached') text += ' (cached MVUM data)';
+  if (m.incomplete) { text += ' (MVUM list incomplete)'; if (!level) level = 'amber'; }
+  return { text, level };
+}
+
+function _respHikeText(d) {
+  if (!d.hike) return { text: 'n/a — no observer placed (drive only)', level: null };
+  const h = d.hikeRec;
+  if (!h) return { text: '--', level: null };
+  if (h.status === 'atroad') return { text: 'At road — no hike', level: 'green' };
+  const p = d.hikePlan || { trailKm: 0, offTrailKm: h.gapM / 1000 };
+  const bits = [];
+  if (p.trailKm > 0.01) bits.push(`${formatMilesKm(p.trailKm)} trail`);
+  if (p.offTrailKm > 0.01) bits.push(`${formatMilesKm(p.offTrailKm)} off-trail`);
+  let text = `${formatDurationMin(d.hikeMin)} · ${bits.join(' + ')}`;
+  let level = null;
+  if (h.ascentM != null) text += ` · +${Math.round(h.ascentM * 3.28084).toLocaleString()} ft`;
+  else { text += ' · climb unknown (flat estimate)'; level = 'amber'; }
+  if (h.routeError) { text += ' · trail routing unavailable (straight-line estimate)'; level = 'amber'; }
+  return { text, level };
+}
+
+function _respStartText(r) {
+  const s = r.start;
+  if (!s) return { text: '--', level: null };
+  if (s.kind === 'base') return { text: `Saved base: ${s.label}`, level: null };
+  const ageMin = Math.max(0, Math.round((Date.now() - s.at) / 60000));
+  const acc = s.accM != null ? `, ±${Math.round(s.accM)} m` : '';
+  return { text: `GPS fix ${_respClock(s.at)} (${ageMin < 1 ? 'just now' : ageMin + ' min ago'}${acc})`, level: ageMin > 5 ? 'amber' : null };
+}
+
+function _respTotalText(d, r) {
+  const s = d.sum;
+  let text = `${formatDurationMin(s.totalMin)} to ${d.name}`;
+  if (r.departMs) text += ` · ETA ${_respClock(r.departMs + s.totalMin * 60000)}`;
+  if (s.closed) text = 'CLOSED — verify · if open: ' + text;
+  else if (s.closedMay) text += ' · possible closure, verify';
+  if (s.chainMayMin > 0) text += ` (+${Math.round(s.chainMayMin)} min if a chain control applies)`;
+  return text;
+}
+
+function _renderResponsePrompt(settings, r) {
+  const el = document.getElementById('respPrompt');
+  if (!el) return;
+  if (!S.areaCenter) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  if (!settings.consent) {
+    el.style.display = '';
+    el.innerHTML = `<div style="font-size:11px;color:var(--text-secondary);line-height:1.5;">Estimating sends your <b>start point</b> (this device's location, or the base saved in Config) and the destination points to a public routing service (FOSSGIS Valhalla, openstreetmap.de). Nothing is sent until you tap the button; after that it runs when an area is drawn (switch off in Config → Response Time).</div>`
+      + `<button class="btn btn-primary" onclick="startResponseEstimate()" style="padding:5px 12px;font-size:11px;margin-top:8px;">Estimate Response Time</button>`;
+    return;
+  }
+  if (r && r.needStart) {
+    el.style.display = '';
+    el.innerHTML = `<div style="font-size:11px;color:var(--accent-amber);line-height:1.5;">No start location. Tap UPDATE to use this device's location, or save a base location in Config → Response Time.</div>`;
+    return;
+  }
+  el.style.display = 'none'; el.innerHTML = '';
+}
+
+function renderResponse() {
+  if (typeof document === 'undefined' || !document.getElementById('respTotal')) return;
+  const settings = getResponseSettings();
+  const cur = S.response && S.response.areaKey === _currentAreaKey() ? S.response : null;
+  setText('respLoad', formatDurationMin(settings.loadMin));
+  _renderResponsePrompt(settings, cur);
+
+  const stBtn = document.getElementById('respStagingClear');
+  if (stBtn) stBtn.style.display = _responseStaging() ? '' : 'none';
+  const stNote = document.getElementById('respStagingNote');
+  if (stNote) {
+    const st = _responseStaging();
+    stNote.textContent = st ? `Staging point set (${st.lat.toFixed(5)}, ${st.lng.toFixed(5)}) — the vehicle parks here.` : '';
+  }
+
+  const list = document.getElementById('respDestList');
+  const alertsEl = document.getElementById('respAlertList');
+  const cellIds = sectionCellsFor('response');
+  if (!cur || !cur.dests.length) {
+    cellIds.forEach(id => { setText(id, '--'); setColor(id, null); });
+    if (list) list.innerHTML = '';
+    if (alertsEl) alertsEl.innerHTML = '';
+    return;
+  }
+  const r = cur;
+  const p = _responsePrimary(r);
+  const drive = p && p.driveKey ? r.drives[p.driveKey] : null;
+  const st = _respStartText(r);
+  setText('respStart', st.text); setColor('respStart', st.level);
+
+  const put = (id, v) => { setText(id, v.text); setColor(id, v.level); };
+  if (p && p.sum && p.sum.ok && _driveUsable(drive)) {
+    setText('respTotal', _respTotalText(p, r)); setColor('respTotal', p.sum.level);
+    const e = p.est;
+    let road = `${formatDurationMin(e.roadMin)} · ${formatMilesKm(e.roadMi * RESPONSE_KM_PER_MI)}`;
+    if (e.roadMin - e.baseRoadMin > 0.5) road += ` (dry: ${formatDurationMin(e.baseRoadMin)})`;
+    if (drive.status === 'cached') road += ' (cached route)';
+    setText('respRoad', road); setColor('respRoad', drive.status === 'cached' ? 'amber' : null);
+    let forest = e.forestMi > 0.03
+      ? `${formatDurationMin(e.forestMin)} · ${formatMilesKm(e.forestMi * RESPONSE_KM_PER_MI)} at ${Math.round(settings.forestMph)} mph`
+        + (e.forestMin - e.baseForestMin > 0.5 ? ` (dry: ${formatDurationMin(e.baseForestMin)})` : '')
+      : 'None on route';
+    if (!drive.surfaceDetail) forest += ' · surface detail unavailable (estimated conservatively)';
+    setText('respForest', forest); setColor('respForest', drive.surfaceDetail ? null : 'amber');
+    put('respHike', _respHikeText(p));
+    put('respChains', _respChainText(r, p, drive, settings));
+    put('respWx', _respWxText(r, p, settings));
+    put('respAccess', _respAccessText(r, drive));
+  } else if (drive && drive.status === 'noroad') {
+    setText('respTotal', `NO ROAD FOUND for ${p.name} — ${drive.error}`); setColor('respTotal', 'red');
+    ['respRoad', 'respForest', 'respHike', 'respChains', 'respWx', 'respAccess'].forEach(id => { setText(id, '--'); setColor(id, null); });
+  } else if (S.sectionMeta.response && S.sectionMeta.response.partial) {
+    // This destination's route failed while others answered: its cells are
+    // unknown here (a section-wide failure is handled by markSection).
+    markCellsUnknown(cellIds.filter(id => id !== 'respStart'));
+  }
+
+  if (list) {
+    list.innerHTML = r.dests.map(d => {
+      const dv = d.driveKey ? r.drives[d.driveKey] : null;
+      const isP = p && d.id === p.id;
+      let total, sub, cls;
+      if (d.skipped) { total = 'not estimated'; sub = `limit ${RESPONSE_MAX_DESTS} destinations per run`; cls = ''; }
+      else if (d.sum && d.sum.ok) {
+        total = (d.sum.closed ? 'CLOSED · ' : '') + formatDurationMin(d.sum.totalMin);
+        sub = responseBreakdownText(d.sum) + ` · ${formatMilesKm(d.est.totalMi * RESPONSE_KM_PER_MI)} drive`
+          + (d.sum.chainMayMin > 0 ? ` · +${Math.round(d.sum.chainMayMin)} min if a chain control applies` : '');
+        cls = d.sum.level;
+      } else if (dv && dv.status === 'noroad') { total = 'NO ROAD FOUND'; sub = dv.error; cls = 'red'; }
+      else { total = 'UNKNOWN'; sub = (dv && dv.error) ? 'routing failed — ' + dv.error : 'routing failed'; cls = 'red'; }
+      return `<div class="resp-dest-row${isP ? ' active' : ''}" onclick="selectResponseDest('${_esc(d.id)}')">`
+        + `<div class="resp-dest-head"><span class="resp-dest-name">${_esc(d.name)}</span><span class="resp-dest-total ${cls}">${_esc(total)}</span></div>`
+        + `<div class="resp-dest-sub">${_esc(sub)}</div></div>`;
+    }).join('');
+  }
+  _renderResponseAlerts(r, alertsEl);
+}
+
+function _renderResponseAlerts(r, el) {
+  if (!el) return;
+  const a = r.alerts;
+  const card = (color, title, tag, body) => `<div class="notam-card" style="border-left:3px solid var(--accent-${color});">
+      <div class="notam-header"><span class="notam-id" style="color:var(--accent-${color});">${title}</span>
+      <span class="notam-type" style="color:var(--accent-${color});">${tag}</span></div>
+      <div class="notam-body">${body}</div></div>`;
+  if (!a) { el.innerHTML = ''; return; }
+  const answered = a.pointsLive + a.pointsCached;
+  if (!answered) {
+    el.innerHTML = card('red', 'ROUTE WARNINGS UNKNOWN', 'Unverified', 'The NWS alert check failed at every point along the route. Check weather.gov before leaving.');
+    return;
+  }
+  let head = '';
+  if (a.pointsLive < a.pointsTotal) {
+    head = card('amber', `INCOMPLETE — ${a.pointsLive} of ${a.pointsTotal} points checked live`, 'Unverified',
+      'Warnings elsewhere on the route may be missing' + (a.pointsCached ? ` (${a.pointsCached} point${a.pointsCached > 1 ? 's' : ''} answered from an offline copy)` : '') + '. Check weather.gov before leaving.');
+  }
+  const note = r.forecastHour ? ' Warnings are current status, not a forecast for the selected hour.' : '';
+  if (!a.alerts.length) {
+    el.innerHTML = head + (head ? '' : card('green', 'NO ACTIVE WARNINGS ALONG ROUTE', 'Clear',
+      `No NWS weather alerts at ${a.pointsTotal} points along the route (checked ${_respClock(a.at)}).${note}`));
+    return;
+  }
+  el.innerHTML = head + a.alerts.map(x => _nwsAlertCardHtml(x, x.where)).join('');
+}
+
+// --- Map layer ---
+
+// One group, S.mapLayers.response_route: road solid, forest road dashed, hike
+// dotted, plus the start, road-end and Caltrans markers. Skipped by the
+// generic export harvest and the 3D mirror (EXPORT_SKIP_LAYERS / VEC3D_SKIP):
+// the route reveals the start location, so export goes through its own
+// checkbox (_exportResponseRecords).
+function renderResponseRouteLayer() {
+  if (typeof L === 'undefined' || !L.layerGroup || !L.polyline) return;
+  if (!S.mapLayers.response_route) { S.mapLayers.response_route = L.layerGroup(); S._responseLayerShown = false; }
+  const g = S.mapLayers.response_route;
+  g.clearLayers();
+  const r = S.response && S.response.areaKey === _currentAreaKey() ? S.response : null;
+  const add = l => { g.addLayer(l); return l; };
+  if (r) {
+    const drawn = {};
+    r.dests.forEach(d => {
+      const drive = d.driveKey ? r.drives[d.driveKey] : null;
+      if (!_driveUsable(drive)) return;
+      const title = `Route to ${_esc(d.name)}`;
+      const total = d.sum && d.sum.ok ? `<br><b>${_esc(formatDurationMin(d.sum.totalMin))}</b> — ${_esc(responseBreakdownText(d.sum))}` : '';
+      if (!drawn[drive.key]) {
+        drawn[drive.key] = true;
+        drive.segments.forEach(sg => {
+          const pts = drive.coords.slice(Math.max(0, sg.i0 | 0), Math.min(drive.coords.length, (sg.i1 | 0) + 1));
+          if (pts.length < 2) return;
+          const forest = sg.kind === 'forest';
+          add(L.polyline(pts, forest
+            ? { color: RESPONSE_ROUTE_COLORS.forest, weight: 4, opacity: 0.95, dashArray: '8,7' }
+            : { color: RESPONSE_ROUTE_COLORS.road, weight: 4, opacity: 0.9 }))
+            .bindPopup(`<b style="color:${forest ? RESPONSE_ROUTE_COLORS.forest : RESPONSE_ROUTE_COLORS.road}">${title}</b><br>`
+              + `${forest ? 'Forest / unpaved road' : 'Road'}${sg.name ? ': ' + _esc(sg.name) : ''} · ${_esc(formatMilesKm(sg.km))}${total}`
+              + `<br><span style="font-size:10px;opacity:0.6">Routing © OpenStreetMap contributors (FOSSGIS Valhalla) — estimate only</span>`);
+        });
+        if (L.circleMarker) {
+          add(L.circleMarker([drive.roadEnd.lat, drive.roadEnd.lng], { radius: 6, color: '#0b1220', weight: 2, fillColor: RESPONSE_ROUTE_COLORS.road, fillOpacity: 1 }))
+            .bindPopup(`<b style="color:${RESPONSE_ROUTE_COLORS.road}">Road end</b><br>Vehicle stops here for ${_esc(d.name)}${total}`);
+          const haz = drive.haz;
+          if (haz) {
+            haz.closedOn.concat(haz.closedMay).forEach(m => add(L.circleMarker([m.lat, m.lng], { radius: 7, color: '#fff', weight: 2, fillColor: '#ef4444', fillOpacity: 1 }))
+              .bindPopup(`<b style="color:#ef4444">${_esc(_respHazardLabel(m))}</b><br>${_esc(m.text || '')}${m.rel === 'mayApply' ? '<br><i>Near the route — verify</i>' : ''}<br><span style="font-size:10px;opacity:0.6">Caltrans QuickMap — verify before leaving</span>`));
+            haz.chainOn.concat(haz.chainMay).forEach(m => add(L.circleMarker([m.lat, m.lng], { radius: 6, color: '#fff', weight: 2, fillColor: '#f59e0b', fillOpacity: 1 }))
+              .bindPopup(`<b style="color:#f59e0b">${_esc(_respHazardLabel(m))}</b><br>${_esc(m.text || '')}${m.effective ? '<br>Effective from ' + _esc(m.effective) : ''}${m.rel === 'mayApply' ? '<br><i>May apply to this route — verify</i>' : ''}<br><span style="font-size:10px;opacity:0.6">Caltrans QuickMap — verify before leaving</span>`));
+          }
+        }
+      }
+      const h = d.hikeRec;
+      if (h && h.status === 'ok' && h.line && h.line.length > 1) {
+        const plan = d.hikePlan || { trailKm: 0, offTrailKm: h.gapM / 1000 };
+        const line = (plan.trailKm > 0 && h.routed) ? h.routed.coords.concat([[d.lat, d.lng]]) : [[drive.roadEnd.lat, drive.roadEnd.lng], [d.lat, d.lng]];
+        add(L.polyline(line, { color: RESPONSE_ROUTE_COLORS.hike, weight: 3, opacity: 0.95, dashArray: '2,7' }))
+          .bindPopup(`<b style="color:${RESPONSE_ROUTE_COLORS.hike}">Hike to ${_esc(d.name)}</b><br>${_esc(_respHikeText(d).text)}`);
+      }
+    });
+    if (r.start && L.circleMarker && Object.keys(drawn).length) {
+      add(L.circleMarker([r.start.lat, r.start.lng], { radius: 6, color: '#0b1220', weight: 2, fillColor: '#fff', fillOpacity: 1 }))
+        .bindPopup(`<b>Response start</b><br>${_esc(_respStartText(r).text)}`);
+    }
+    const st = _responseStaging();
+    if (st && L.circleMarker) {
+      add(L.circleMarker([st.lat, st.lng], { radius: 7, color: RESPONSE_ROUTE_COLORS.road, weight: 3, fillColor: '#0b1220', fillOpacity: 1 }))
+        .bindPopup('<b>Staging point</b><br>The vehicle parks here; hike legs start from the nearest road point.');
+    }
+  }
+  // Shown the first time it has something to draw (the group can be created
+  // empty, e.g. while waiting for a start location); afterwards the layer
+  // control owns its visibility.
+  if (!S._responseLayerShown && g.getLayers().length && S.map && S.map.addLayer) {
+    S.map.addLayer(g);
+    S._responseLayerShown = true;
+  }
+  if (typeof buildLayerControl === 'function' && S.map && document.getElementById('layerList')) buildLayerControl();
+}
+
+// --- Briefing + export ---
+
+function _briefingResponseLines() {
+  const r = S.response && S.response.areaKey === _currentAreaKey() ? S.response : null;
+  if (!r || !r.dests || !r.dests.some(d => d.sum)) return [];
+  const settings = getResponseSettings();
+  const out = [];
+  const tzName = ms => new Date(ms).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: _localTZ(), timeZoneName: 'short' });
+  // The start is never identified: no coordinates, and not the saved base's
+  // label either — a geocoded label is a street address, and briefings get shared.
+  const start = r.start.kind === 'base' ? 'saved base location' : `GPS location (fix ${tzName(r.start.at)})`;
+  out.push(`  Start: ${start} | Departure: ${tzName(r.departMs || Date.now())}${r.forecastHour ? ' (selected forecast hour)' : ' (now)'} | Equipment loading: ${Math.round(settings.loadMin)} min`);
+  r.dests.forEach(d => {
+    const drive = d.driveKey ? r.drives[d.driveKey] : null;
+    if (d.skipped) { out.push(`  ${d.name}: not estimated (limit ${RESPONSE_MAX_DESTS} destinations)`); return; }
+    if (!d.sum || !d.sum.ok || !_driveUsable(drive)) {
+      out.push(`  ${d.name}: ${drive && drive.status === 'noroad' ? 'NO ROAD FOUND — ' + drive.error : 'UNKNOWN — routing failed' + (drive && drive.error ? ' (' + drive.error + ')' : '')}`);
+      return;
+    }
+    const e = d.est;
+    out.push(`  ${d.name}: ${d.sum.closed ? 'CLOSED — verify; if open: ' : ''}${formatDurationMin(d.sum.totalMin)} total, ETA ${tzName((r.departMs || Date.now()) + d.sum.totalMin * 60000)}`
+      + ` — ${responseBreakdownText(d.sum)} | ${formatMilesKm(e.roadMi * RESPONSE_KM_PER_MI)} road`
+      + (e.forestMi > 0.03 ? `, ${formatMilesKm(e.forestMi * RESPONSE_KM_PER_MI)} forest road at ${Math.round(settings.forestMph)} mph` : '')
+      + (d.sum.chainMayMin > 0 ? ` | +${Math.round(d.sum.chainMayMin)} min if a chain control applies` : ''));
+    out.push(`    Chain controls / closures: ${_respChainText(r, d, drive, settings).text}`);
+    out.push(`    Route weather: ${_respWxText(r, d, settings).text}`);
+    if (d.hike) out.push(`    Hike-in: ${_respHikeText(d).text}`);
+    const acc = _respAccessText(r, drive);
+    if (acc.text !== 'No forest roads on route') out.push(`    Forest road access: ${acc.text}`);
+    if (drive.status === 'cached') out.push('    Route is a cached copy — routing service unavailable.');
+    if (!drive.surfaceDetail) out.push('    Road surface detail unavailable — unpaved sections estimated conservatively.');
+  });
+  const a = r.alerts;
+  if (!a || !(a.pointsLive + a.pointsCached)) out.push('  Warnings along route: UNKNOWN — NWS alert check failed');
+  else {
+    const inc = a.pointsLive < a.pointsTotal ? ` (INCOMPLETE — ${a.pointsLive} of ${a.pointsTotal} points checked live)` : '';
+    if (!a.alerts.length) out.push(`  Warnings along route: none active${inc}`);
+    else a.alerts.forEach(x => out.push(`  Warning along route${inc}: ${x.event} (${x.severity})${x.where ? ' — ' + x.where : ''}${x.headline ? ' — ' + x.headline : ''}`));
+  }
+  out.push(`  ${RESPONSE_CAVEAT} Routing © OpenStreetMap contributors.`);
+  return out;
+}
+
+// Route geometry for the KML / GeoJSON export — only behind its own checkbox
+// (#expResponse, off by default): the line starts at the responder's location.
+function _exportResponseRecords() {
+  const r = S.response && S.response.areaKey === _currentAreaKey() ? S.response : null;
+  const recs = [];
+  if (!r || !r.dests) return recs;
+  const settings = getResponseSettings();
+  const drawn = {};
+  r.dests.forEach(d => {
+    const drive = d.driveKey ? r.drives[d.driveKey] : null;
+    if (!_driveUsable(drive) || !d.sum || !d.sum.ok) return;
+    const desc = [
+      `${formatDurationMin(d.sum.totalMin)} total — ${responseBreakdownText(d.sum)}`,
+      `Chain controls / closures: ${_respChainText(r, d, drive, settings).text}`,
+      `Route weather: ${_respWxText(r, d, settings).text}`,
+      d.hike ? `Hike-in: ${_respHikeText(d).text}` : '',
+      RESPONSE_CAVEAT, 'Routing © OpenStreetMap contributors (FOSSGIS Valhalla).',
+    ].filter(Boolean).join('\n');
+    if (!drawn[drive.key]) {
+      drawn[drive.key] = true;
+      // Consecutive segments of one kind become one line.
+      let run = null;
+      const flush = () => { if (run && run.coords.length > 1) recs.push({ kind: 'line', styleId: run.forest ? 'responseForest' : 'responseRoad',
+        name: `Route to ${d.name} — ${run.forest ? 'forest road' : 'road'}`, description: desc, coords: run.coords }); run = null; };
+      drive.segments.forEach(sg => {
+        const forest = sg.kind === 'forest';
+        const pts = drive.coords.slice(Math.max(0, sg.i0 | 0), Math.min(drive.coords.length, (sg.i1 | 0) + 1));
+        if (!run || run.forest !== forest) { flush(); run = { forest, coords: [] }; }
+        pts.forEach(p => run.coords.push(p));
+      });
+      flush();
+      recs.push({ kind: 'point', styleId: 'responseRoad', name: `Road end — ${d.name}`, description: desc, lat: drive.roadEnd.lat, lng: drive.roadEnd.lng });
+    }
+    const h = d.hikeRec;
+    if (h && h.status === 'ok') {
+      const plan = d.hikePlan || { trailKm: 0 };
+      const line = (plan.trailKm > 0 && h.routed) ? h.routed.coords.concat([[d.lat, d.lng]]) : [[drive.roadEnd.lat, drive.roadEnd.lng], [d.lat, d.lng]];
+      recs.push({ kind: 'line', styleId: 'responseHike', name: `Hike to ${d.name}`, description: `Hike-in: ${_respHikeText(d).text}`, coords: line });
+    }
+  });
+  return recs;
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    RESPONSE_CFG_KEY, RESPONSE_CAVEAT, getResponseSettings, saveResponseSetting, saveResponseBase, _syncResponseConfigInputs,
+    _valhallaPost, _setValhallaInterval, _routeDrive, _routeHike, _resolveResponseStart, _responsePlan,
+    fetchResponseEstimate, startResponseEstimate, autoResponseEstimate, _scheduleResponseEstimate, _resetResponse,
+    recomputeResponseForHour, renderResponse, renderResponseRouteLayer, selectResponseDest, _responseDepartMs,
+    startResponseStagingPick, cancelResponseStagingPick, onResponseStagingClick, clearResponseStaging,
+    _briefingResponseLines, _exportResponseRecords, _mapNwsAlertFeatures, _nwsAlertCardHtml,
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer,
     checkDisclaimer, showDisclaimer, DISCLAIMER_VERSION, BRIEFING_DISCLAIMER,

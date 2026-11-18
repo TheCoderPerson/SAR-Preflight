@@ -24,6 +24,17 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.11.18-a',
+    date: '2026-11-18',
+    changes: [
+      'New Response Time Estimate at the top of the Ops tab: how long it takes to reach each observer, shown as equipment loading + road drive + forest-road drive + chain-control delay + hike-in, with an ETA. It routes from this device\'s location (or a base location saved in Config) to every observer placed for the area, or to the road nearest the area centre when none is placed. Nothing is sent until you press "Estimate Response Time" once: the start point and the destinations go to a public routing service (FOSSGIS Valhalla, built on OpenStreetMap).',
+      'Drive times follow the weather along the route at the hour you would reach each part of it: rain cuts speed by 25 %, falling snow caps it at 15 mph everywhere, and snow on the ground caps forest and minor roads at 15 mph. Unpaved roads and tracks are driven at 15 mph; paved Forest Service roads keep their normal speed. A Caltrans chain control on the route adds 45 minutes, a control that only may apply is shown beside the total instead of in it, and a full closure reads "CLOSED — verify" with the time as "if open". Equipment loading adds 30 minutes. Every one of these numbers is a setting in Config → Response Time, with hiking speeds and a drive-time adjustment for calibrating against a drive you know. Scrub the time bar to see the estimate for a later departure.',
+      'Where an observer is away from the road, a hike-in leg is added from the road end: along trails, then off trail, plus 30 minutes for every 1,000 ft climbed. "Set Staging Point" lets you choose where the vehicle parks; the drive then goes there and each observer gets a hike leg from it.',
+      'The section also lists NWS weather warnings in force along the route, flags forest roads that need high clearance or are closed for the season (USFS Motor Vehicle Use Map), draws the route on the map (Map Layers → Ground Access → Response Route) and is added to the copied briefing. The route can be included in the KML / GeoJSON export with its own checkbox, which is off by default because the line shows your start location.',
+      'When a source fails the section says so instead of guessing: "Chain controls UNVERIFIED", "route weather UNKNOWN — drive time not adjusted", warnings "INCOMPLETE", or UNKNOWN when routing itself fails. Chain controls and closures come from Caltrans QuickMap through the data proxy; self-hosted proxies need the updated Worker code (new /caltrans/ route). The estimate assumes free-flowing traffic and does not cover construction or county-road closures, and it never changes the advisories banner.',
+    ],
+  },
+  {
     version: '2026.10.09-c',
     date: '2026-10-09',
     changes: [
@@ -3449,6 +3460,9 @@ const KML_STYLE_DEFS = {
   observer:  { color: 'ff5ec522', width: 2, icon: 'placemark_circle.png' }, // green — viewshed observer
   viewshed:  { color: 'ff5ec522', fill: '305ec522', width: 2 }, // green — viewshed visibility polygon (matches observer)
   trail:     { color: 'ffb672f4', width: 2 },                   // pink — OSM named trails
+  responseRoad:   { color: 'ffeed322', width: 4, icon: 'placemark_circle.png' }, // cyan — response route on road (+ road-end point)
+  responseForest: { color: 'ff0b9ef5', width: 4 },              // amber — response route on forest / unpaved road
+  responseHike:   { color: 'fff979e8', width: 3 },              // magenta — hike-in leg
   generic:   { color: 'ffffffff', fill: '20ffffff', width: 2 }, // white — fallback
   sunArrow:  { color: 'ff00ccff', width: 3 },                   // gold — sun
   windArrow: { color: 'ffd4b606', width: 3 },                   // cyan — wind
@@ -5423,9 +5437,819 @@ function geojsonLineLatLngs(geometry) {
   return null;
 }
 
+// ============================================================
+// RESPONSE TIME ESTIMATE — pure helpers
+// ============================================================
+// How long it takes to reach each observer: equipment loading + road drive +
+// forest/OHV-road drive + chain-control delay + hike-in. A logistics estimate
+// only: it never feeds assessRisk / the advisories banner.
+//
+// Route geometry and per-edge surface come from Valhalla (/route +
+// /trace_attributes); the road is cut into SEGMENTS of one KIND:
+//   highway — motorway/trunk/primary/secondary (plowed, chain-controlled)
+//   local   — every other paved road
+//   forest  — unpaved, or a track
+// The kind comes from the routing engine's surface + road class ONLY. MVUM
+// membership never changes it (it only adds access flags), so a failed MVUM
+// fetch cannot make the estimate faster and a paved Forest Service road is
+// not slowed.
+
+const RESPONSE_KM_PER_MI = 1.609344;
+const RESPONSE_MAX_DESTS = 6;            // observers routed per run (1 request/s policy)
+const RESPONSE_AT_ROAD_M = 100;          // observer this close to the road end: no hike leg
+const RESPONSE_HAZARD_ON_ROUTE_M = 300;  // Caltrans point this close to the route is ON it
+const RESPONSE_HAZARD_NEAR_KM = 15;      // same highway + this close: "may apply"
+const RESPONSE_RAIN_MIN_MM_H = 0.2;
+const RESPONSE_SNOWFALL_MIN_CM_H = 0.1;
+const RESPONSE_SNOW_DEPTH_MIN_M = 0.05;
+const RESPONSE_ASCENT_MIN_PER_1000FT = 30;
+const RESPONSE_WX_STEP_KM = 10;          // route-weather sample spacing
+const RESPONSE_WX_MAX_POINTS = 12;       // per route
+const RESPONSE_WX_MAX_TOTAL = 30;        // per request, all routes together
+const RESPONSE_WX_MERGE_KM = 3;          // sample points closer than this share one forecast
+const RESPONSE_WX_HOURS = 48;
+const RESPONSE_ALERT_STEP_KM = 15;
+const RESPONSE_ALERT_MAX_POINTS = 8;
+const RESPONSE_FIX_FRESH_MS = 5 * 60 * 1000;         // a device fix this recent is used as-is
+const RESPONSE_CALTRANS_STALE_MS = 24 * 3600 * 1000; // newest "Last updated" older than this: feed may be stale
+const RESPONSE_MVUM_TOL_M = 40;
+const VALHALLA_BASE_URL = 'https://valhalla1.openstreetmap.de';
+const VALHALLA_MIN_INTERVAL_MS = 1100;   // FOSSGIS policy: at most 1 request per second
+
+const DEFAULT_RESPONSE_SETTINGS = {
+  loadMin: 30,          // equipment loading, minutes
+  rainPct: 25,          // rain: speed reduced by this percent
+  snowMaxMph: 15,       // snow: speed capped at this
+  chainDelayMin: 45,    // chain control on route: fixed delay
+  forestMph: 15,        // forest / OHV road speed
+  trailMph: 2,          // hiking on a trail
+  offTrailMph: 1,       // hiking off trail
+  driveAdjustPct: 0,    // calibration of the routing engine's road times
+  auto: true,           // estimate automatically when an area is drawn
+  consent: false,       // user agreed to send start + destinations to the router
+  base: null,           // { label, lat, lng } saved start, used when there is no device fix
+};
+const RESPONSE_SETTING_LIMITS = {
+  loadMin: [0, 480], rainPct: [0, 90], snowMaxMph: [1, 70], chainDelayMin: [0, 480],
+  forestMph: [1, 45], trailMph: [0.5, 6], offTrailMph: [0.25, 4], driveAdjustPct: [-50, 200],
+};
+
+// Clamp + default every setting. Anything unreadable falls back to the default.
+function normalizeResponseSettings(raw) {
+  const r = (raw && typeof raw === 'object') ? raw : {};
+  const out = {};
+  Object.keys(RESPONSE_SETTING_LIMITS).forEach(k => {
+    const lim = RESPONSE_SETTING_LIMITS[k];
+    const v = (r[k] === '' || r[k] == null) ? NaN : Number(r[k]);
+    out[k] = Number.isFinite(v) ? Math.min(lim[1], Math.max(lim[0], v)) : DEFAULT_RESPONSE_SETTINGS[k];
+  });
+  out.auto = r.auto == null ? DEFAULT_RESPONSE_SETTINGS.auto : !!r.auto;
+  out.consent = !!r.consent;
+  const b = r.base;
+  const blat = b ? Number(b.lat) : NaN, blng = b ? Number(b.lng) : NaN;
+  out.base = (b && Number.isFinite(blat) && Number.isFinite(blng) && Math.abs(blat) <= 90 && Math.abs(blng) <= 180)
+    ? { label: String(b.label || '').trim() || 'Saved base', lat: blat, lng: blng } : null;
+  return out;
+}
+
+// --- Polyline geometry ([lat, lng] pairs) ---
+
+// Google encoded polyline, precision 6 (Valhalla's shape format).
+function decodePolyline6(str) {
+  const out = [];
+  if (typeof str !== 'string') return out;
+  let i = 0, lat = 0, lng = 0;
+  const next = () => {
+    let b, shift = 0, result = 0;
+    do {
+      if (i >= str.length) return null;
+      b = str.charCodeAt(i++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    return (result & 1) ? ~(result >> 1) : (result >> 1);
+  };
+  while (i < str.length) {
+    const dLat = next(); if (dLat === null) break;
+    const dLng = next(); if (dLng === null) break;
+    lat += dLat; lng += dLng;
+    out.push([lat / 1e6, lng / 1e6]);
+  }
+  return out;
+}
+
+// Cumulative distance (km) at every vertex; [0] for a single point, [] for none.
+function polylineCumKm(coords) {
+  const cum = [];
+  (coords || []).forEach((p, i) => {
+    cum.push(i === 0 ? 0 : cum[i - 1] + haversine(coords[i - 1][0], coords[i - 1][1], p[0], p[1]));
+  });
+  return cum;
+}
+
+function polylineLengthKm(coords) {
+  const cum = polylineCumKm(coords);
+  return cum.length ? cum[cum.length - 1] : 0;
+}
+
+// [lat, lng] at a distance along the line (clamped to its ends).
+function pointAtKm(coords, cum, km) {
+  if (!coords || !coords.length) return null;
+  cum = cum || polylineCumKm(coords);
+  if (km <= 0) return coords[0];
+  const total = cum[cum.length - 1];
+  if (km >= total) return coords[coords.length - 1];
+  let lo = 0, hi = cum.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (cum[mid] <= km) lo = mid; else hi = mid; }
+  const span = cum[hi] - cum[lo];
+  const t = span > 0 ? (km - cum[lo]) / span : 0;
+  return [coords[lo][0] + t * (coords[hi][0] - coords[lo][0]), coords[lo][1] + t * (coords[hi][1] - coords[lo][1])];
+}
+
+// Evenly spaced points along the line, always including both ends:
+// [{ lat, lng, alongKm }]. Spacing widens when maxPts would be exceeded.
+function samplePolyline(coords, stepKm, maxPts) {
+  if (!coords || !coords.length) return [];
+  const cum = polylineCumKm(coords);
+  const total = cum[cum.length - 1];
+  const mk = km => { const p = pointAtKm(coords, cum, km); return { lat: p[0], lng: p[1], alongKm: km }; };
+  maxPts = Math.max(2, maxPts || 2);
+  if (!(total > 0)) return [mk(0)];
+  const n = Math.max(2, Math.min(maxPts, Math.ceil(total / Math.max(0.01, stepKm || total)) + 1));
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(mk(total * i / (n - 1)));
+  return out;
+}
+
+// Closest point of the line to (lat, lng): { distM, alongKm, index }.
+function nearestOnPolyline(coords, lat, lng, cum) {
+  if (!coords || !coords.length) return null;
+  cum = cum || polylineCumKm(coords);
+  const kx = 111.32 * Math.cos(lat * Math.PI / 180), ky = 110.574;
+  const X = p => (p[1] - lng) * kx, Y = p => (p[0] - lat) * ky;
+  let best = { distM: Infinity, alongKm: 0, index: 0 };
+  if (coords.length === 1) return { distM: Math.hypot(X(coords[0]), Y(coords[0])) * 1000, alongKm: 0, index: 0 };
+  for (let i = 0; i + 1 < coords.length; i++) {
+    const ax = X(coords[i]), ay = Y(coords[i]), bx = X(coords[i + 1]), by = Y(coords[i + 1]);
+    const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+    let t = l2 > 0 ? (-(ax * dx) - (ay * dy)) / l2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    const d = Math.hypot(ax + t * dx, ay + t * dy);
+    if (d * 1000 < best.distM) best = { distM: d * 1000, alongKm: cum[i] + t * (cum[i + 1] - cum[i]), index: i };
+  }
+  return best;
+}
+
+function _respBearingDeg(a, b) {
+  const y = (b[1] - a[1]) * Math.cos((a[0] + b[0]) / 2 * Math.PI / 180), x = b[0] - a[0];
+  return ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+}
+
+// Fold several sample lists into one set of request points: a point within
+// mergeKm of an earlier one reuses it (routes to neighbouring observers share
+// most of their length). Returns { points:[{lat,lng}], maps:[[pointIndex…]…] }.
+// At maxTotal the nearest existing point is reused instead of adding one.
+function mergeSamplePoints(lists, mergeKm, maxTotal) {
+  const points = [], maps = [];
+  (lists || []).forEach(list => {
+    const map = [];
+    (list || []).forEach(s => {
+      let bi = -1, bd = Infinity;
+      points.forEach((p, i) => { const d = haversine(p.lat, p.lng, s.lat, s.lng); if (d < bd) { bd = d; bi = i; } });
+      if (bi >= 0 && (bd <= mergeKm || points.length >= maxTotal)) map.push(bi);
+      else { points.push({ lat: s.lat, lng: s.lng }); map.push(points.length - 1); }
+    });
+    maps.push(map);
+  });
+  return { points, maps };
+}
+
+// --- Valhalla adapters ---
+
+const VALHALLA_UNPAVED_SURFACES = ['compacted', 'dirt', 'gravel', 'path', 'impassable'];
+
+function classifyRoadKind(e) {
+  e = e || {};
+  const surface = String(e.surface || '').toLowerCase();
+  if (e.unpaved === true || String(e.use || '').toLowerCase() === 'track' || VALHALLA_UNPAVED_SURFACES.indexOf(surface) >= 0) return 'forest';
+  const rc = String(e.road_class || e.roadClass || '').toLowerCase();
+  if (rc === 'motorway' || rc === 'trunk' || rc === 'primary' || rc === 'secondary') return 'highway';
+  return 'local';
+}
+
+// Numbered-highway numbers named by a street-name list: "US 50", "CA 89",
+// "I 80", "Highway 180", "Route 50", "SR-49" → [50, 89, 80, 180, 49]. Forest
+// and county routes ("Forest Route 3", "County Road 12") do not match.
+function highwayNumbersFromNames(names) {
+  const out = [];
+  (Array.isArray(names) ? names : [names]).forEach(n => {
+    const m = String(n == null ? '' : n).trim().match(/^(?:I|US|CA|SR|State Route|State Highway|Highway|Hwy|Route|Interstate)[\s-]*(\d{1,3})\b/i);
+    if (m && out.indexOf(Number(m[1])) < 0) out.push(Number(m[1]));
+  });
+  return out;
+}
+
+// A Valhalla error body ({ error_code, error }) → { code, message, noRoad, noRoute }.
+function valhallaError(json, status) {
+  const code = json && json.error_code != null ? Number(json.error_code) : null;
+  const text = (json && (json.error || json.status_message)) || '';
+  return {
+    code,
+    noRoad: code === 171,                          // no suitable edges near location
+    noRoute: code === 170 || code === 442,         // unreachable / no path found
+    message: text ? String(text) : ('routing HTTP ' + (status || 'error')),
+  };
+}
+
+// First leg of a /route answer → { shape, coords, km, sec, maneuvers[] }, or
+// null when the body is not a usable route.
+function valhallaRouteLeg(json) {
+  const trip = json && json.trip;
+  if (!trip || (trip.status != null && trip.status !== 0) || !Array.isArray(trip.legs) || !trip.legs.length) return null;
+  const leg = trip.legs[0];
+  if (!leg || typeof leg.shape !== 'string') return null;
+  const coords = decodePolyline6(leg.shape);
+  if (coords.length < 2) return null;
+  const toKm = String(trip.units || '').toLowerCase().indexOf('mi') === 0 ? RESPONSE_KM_PER_MI : 1;
+  const maneuvers = (leg.maneuvers || []).map(m => ({
+    names: Array.isArray(m.street_names) ? m.street_names : [],
+    km: (Number(m.length) || 0) * toKm, sec: Number(m.time) || 0,
+    rough: m.rough === true, highway: m.highway === true,
+    i0: Number(m.begin_shape_index) || 0, i1: Number(m.end_shape_index) || 0,
+  })).filter(m => m.km > 0);
+  const sum = leg.summary || trip.summary || {};
+  const km = Number(sum.length) * toKm, sec = Number(sum.time);
+  return {
+    shape: leg.shape, coords,
+    km: Number.isFinite(km) && km > 0 ? km : polylineLengthKm(coords),
+    sec: Number.isFinite(sec) && sec > 0 ? sec : maneuvers.reduce((a, m) => a + m.sec, 0),
+    maneuvers,
+  };
+}
+
+// /trace_attributes answer → { coords, segments, km }. Consecutive edges of
+// the same kind and name are merged. Free-flow time is length / edge speed
+// (the sum is within seconds of the route's own time). Null when any edge
+// cannot be timed — the caller then falls back to the maneuver list.
+function valhallaEdgesToSegments(traceJson) {
+  const edges = traceJson && Array.isArray(traceJson.edges) ? traceJson.edges : null;
+  if (!edges || !edges.length || typeof traceJson.shape !== 'string') return null;
+  const coords = decodePolyline6(traceJson.shape);
+  if (coords.length < 2) return null;
+  const toKm = String(traceJson.units || '').toLowerCase().indexOf('mi') === 0 ? RESPONSE_KM_PER_MI : 1;
+  const segments = [];
+  let km = 0;
+  for (const e of edges) {
+    const len = Number(e.length) * toKm, spd = Number(e.speed) * toKm;
+    if (!Number.isFinite(len) || len < 0) return null;
+    if (len === 0) continue;
+    if (!(spd > 0)) return null;
+    const kind = classifyRoadKind(e);
+    const names = Array.isArray(e.names) ? e.names : [];
+    const name = names[0] || '';
+    const sec = len / spd * 3600;
+    const last = segments[segments.length - 1];
+    if (last && last.kind === kind && last.name === name) {
+      last.km += len; last.baseSec += sec; last.i1 = Number(e.end_shape_index) || last.i1;
+      names.forEach(n => { if (last.names.indexOf(n) < 0) last.names.push(n); });
+    } else {
+      segments.push({ kind, km: len, baseSec: sec, name, names: names.slice(),
+        i0: Number(e.begin_shape_index) || 0, i1: Number(e.end_shape_index) || 0,
+        roadClass: e.road_class || null, surface: e.surface || null });
+    }
+    km += len;
+  }
+  return segments.length ? { coords, segments, km } : null;
+}
+
+// Fallback when per-edge surface is unavailable: one segment per maneuver.
+// Valhalla flags a maneuver `rough` when ANY of its edges is unpaved, so the
+// whole maneuver is treated as forest road — slower, never faster.
+function valhallaManeuversToSegments(leg) {
+  return ((leg && leg.maneuvers) || []).map(m => ({
+    kind: m.rough ? 'forest' : ((m.highway || highwayNumbersFromNames(m.names).length) ? 'highway' : 'local'),
+    km: m.km, baseSec: m.sec, name: m.names[0] || '', names: m.names.slice(),
+    i0: m.i0, i1: m.i1, roadClass: null, surface: null,
+  }));
+}
+
+function routeHighwayNumbers(segments) {
+  const out = [];
+  (segments || []).forEach(s => highwayNumbersFromNames(s.names || [s.name]).forEach(n => { if (out.indexOf(n) < 0) out.push(n); }));
+  return out;
+}
+
+// --- Route weather ---
+
+// Open-Meteo answers one location with an object and several with an array.
+// → [{ timesMs, rain, showers, snowfall, snowDepth, code }] (n entries) or null.
+function parseRouteWeather(json, n) {
+  const arr = Array.isArray(json) ? json : ((json && typeof json === 'object' && !json.error) ? [json] : null);
+  if (!arr || arr.length !== n) return null;
+  const out = [];
+  for (const o of arr) {
+    const h = o && o.hourly;
+    if (!h || !Array.isArray(h.time) || !h.time.length) return null;
+    const timesMs = h.time.map(t => typeof t === 'number' ? t * 1000
+      : Date.parse(/(Z|[+-]\d\d:?\d\d)$/.test(String(t)) ? t : t + 'Z'));
+    if (timesMs.some(t => !Number.isFinite(t))) return null;
+    out.push({ timesMs, rain: h.rain || [], showers: h.showers || [], snowfall: h.snowfall || [],
+      snowDepth: h.snow_depth || [], code: h.weather_code || [] });
+  }
+  return out;
+}
+
+const _RESP_FREEZING_CODES = [56, 57, 66, 67];
+const _RESP_SNOW_CODES = [71, 73, 75, 77, 85, 86];
+
+// Conditions at one sample point at a time. { known:false } when the time is
+// outside the forecast or the hour has no values — never assumed dry.
+function routeConditionsAt(sample, atMs) {
+  const t = sample && sample.timesMs;
+  if (!t || !t.length || !Number.isFinite(atMs)) return { known: false };
+  let bi = -1, bd = Infinity;
+  for (let i = 0; i < t.length; i++) { const d = Math.abs(t[i] - atMs); if (d < bd) { bd = d; bi = i; } }
+  if (bd > 90 * 60000) return { known: false };
+  const num = a => { const v = a ? a[bi] : null; return (v == null || !Number.isFinite(Number(v))) ? null : Number(v); };
+  const rain = num(sample.rain), showers = num(sample.showers), snowfall = num(sample.snowfall);
+  const depth = num(sample.snowDepth), code = num(sample.code);
+  if (rain == null && showers == null && snowfall == null && code == null) return { known: false };
+  const snowing = (snowfall != null && snowfall >= RESPONSE_SNOWFALL_MIN_CM_H)
+    || (code != null && (_RESP_FREEZING_CODES.indexOf(code) >= 0 || _RESP_SNOW_CODES.indexOf(code) >= 0));
+  return {
+    known: true,
+    rain: ((rain || 0) + (showers || 0)) >= RESPONSE_RAIN_MIN_MM_H,
+    snowing,
+    snowOnGround: depth != null && depth >= RESPONSE_SNOW_DEPTH_MIN_M,
+    depthKnown: depth != null,
+  };
+}
+
+// Rain cuts the speed by a percent; falling snow caps it everywhere; snow on
+// the ground caps it off the numbered highways. Rain first, then the cap.
+function adjustSegmentMph(baseMph, cond, kind, settings) {
+  let v = baseMph;
+  if (!cond || !cond.known) return v;
+  if (cond.rain) v *= (1 - settings.rainPct / 100);
+  if (cond.snowing || (cond.snowOnGround && kind !== 'highway')) v = Math.min(v, settings.snowMaxMph);
+  return Math.max(v, 0.5);
+}
+
+// Walk the segments in order from startMs (departure + loading), splitting
+// each at the weather-sample boundaries and timing every piece at the speed
+// its conditions allow AT THE HOUR THE VEHICLE REACHES IT.
+function computeDriveEstimate(segments, wxSamples, startMs, settings) {
+  const s = settings;
+  const out = { roadMin: 0, forestMin: 0, roadMi: 0, forestMi: 0, baseRoadMin: 0, baseForestMin: 0,
+    rainMi: 0, snowMi: 0, groundSnowMi: 0, unknownMi: 0, totalMi: 0, driveMin: 0,
+    depthUnknown: false, wxKnown: false, endMs: startMs };
+  const samples = (wxSamples || []).filter(x => x && Number.isFinite(x.alongKm)).slice().sort((a, b) => a.alongKm - b.alongKm);
+  const bounds = [];
+  for (let i = 0; i + 1 < samples.length; i++) bounds.push((samples[i].alongKm + samples[i + 1].alongKm) / 2);
+  const zoneAt = km => { let z = 0; while (z < bounds.length && km >= bounds[z]) z++; return samples[z] || null; };
+  const adj = 1 + (s.driveAdjustPct || 0) / 100;
+  let along = 0, t = startMs;
+  (segments || []).forEach(seg => {
+    if (!seg || !(seg.km > 0)) return;
+    const forest = seg.kind === 'forest';
+    const engineMph = seg.baseSec > 0 ? (seg.km / RESPONSE_KM_PER_MI) / (seg.baseSec / 3600) : 25;
+    const baseMph = forest ? s.forestMph : Math.max(1, engineMph / adj);
+    const end = along + seg.km;
+    const cuts = bounds.filter(b => b > along && b < end).concat([end]);
+    let a = along;
+    cuts.forEach(c => {
+      const pieceKm = c - a;
+      if (pieceKm <= 0) { a = c; return; }
+      const cond = samples.length ? routeConditionsAt(zoneAt(a + pieceKm / 2), t) : { known: false };
+      const mph = adjustSegmentMph(baseMph, cond, seg.kind, s);
+      const mi = pieceKm / RESPONSE_KM_PER_MI;
+      const min = mi / mph * 60, baseMin = mi / baseMph * 60;
+      if (forest) { out.forestMin += min; out.forestMi += mi; out.baseForestMin += baseMin; }
+      else { out.roadMin += min; out.roadMi += mi; out.baseRoadMin += baseMin; }
+      if (!cond.known) out.unknownMi += mi;
+      else {
+        if (cond.rain) out.rainMi += mi;
+        if (cond.snowing) out.snowMi += mi;
+        else if (cond.snowOnGround && seg.kind !== 'highway') out.groundSnowMi += mi;
+        if (cond.depthKnown === false) out.depthUnknown = true;
+      }
+      t += min * 60000;
+      a = c;
+    });
+    along = end;
+  });
+  out.totalMi = out.roadMi + out.forestMi;
+  out.driveMin = out.roadMin + out.forestMin;
+  out.wxKnown = out.totalMi > 0 && out.unknownMi < 0.05;
+  out.endMs = t;
+  return out;
+}
+
+// --- Caltrans QuickMap (chain controls + closures) ---
+
+function _qmText(s) {
+  return String(s == null ? '' : s).replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"').replace(/&#0*39;|&apos;/gi, "'").replace(/\s+/g, ' ').trim();
+}
+
+// "11/18/2026 2:09pm" or "11/16/2026 17:06" → ms, read as Pacific Standard
+// Time (the feed carries no zone; an hour of DST error is irrelevant to the
+// day-scale staleness check this feeds).
+function _qmTimeMs(s) {
+  const m = String(s || '').match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})\s*([ap]m)?/i);
+  if (!m) return null;
+  let h = Number(m[4]);
+  if (m[6]) { const pm = /p/i.test(m[6]); h = (h % 12) + (pm ? 12 : 0); }
+  const ms = Date.UTC(Number(m[3]), Number(m[1]) - 1, Number(m[2]), h + 8, Number(m[5]));
+  return Number.isFinite(ms) ? ms : null;
+}
+
+// QuickMap v2_cc.kml / v2_chin.kml → records, or NULL when the text is not a
+// KML document at all (an undeployed proxy route answers with something else,
+// and "zero placemarks" must only ever mean "none active").
+//   kind: 'chain'   — R-1 / R-2 / R-3 chain control (passenger vehicles)
+//         'truck'   — truck-only requirement (MIN / MAX / TTA …): listed, no delay
+//         'closure' — full closure
+//         'info'    — Caltrans highway information (closureLikely when its
+//                     wording says a road or pass is closed)
+function parseQuickmapKml(text) {
+  if (typeof text !== 'string' || !/<kml[\s>]/i.test(text)) return null;
+  const out = [];
+  const re = /<Placemark[\s>][\s\S]*?<\/Placemark>/gi;
+  let m;
+  while ((m = re.exec(text))) {
+    const pm = m[0];
+    const cm = pm.match(/<coordinates>\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)/i);
+    if (!cm) continue;
+    const lng = Number(cm[1]), lat = Number(cm[2]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) continue;
+    const style = ((pm.match(/<styleUrl>\s*#?([^<\s]+)/i) || [])[1] || '').toLowerCase();
+    const title = _qmText((pm.match(/class="iw-title"[^>]*>([\s\S]*?)<\/h2>/i) || [])[1]);
+    const rawLevel = ((pm.match(/Chain Control level\s*([A-Za-z0-9-]+)/i) || [])[1] || '').toUpperCase();
+    const location = _qmText((pm.match(/<strong>\s*Location:\s*<\/strong>([^<]*)/i) || [])[1]);
+    const effective = _qmText((pm.match(/<strong>\s*Effective from:\s*<\/strong>([^<]*)/i) || [])[1]);
+    const up = pm.match(/Last updated:\s*<strong>([^<]*)<\/strong>\s*([^<]*)/i);
+    const updated = up ? _qmText(up[1] + ' ' + up[2]) : '';
+    const paras = [];
+    const pre = /<p class="iw-text">([\s\S]*?)<\/p>/gi;
+    let p;
+    while ((p = pre.exec(pm))) { if (/<strong>/i.test(p[1])) continue; const t = _qmText(p[1]); if (t) paras.push(t); }
+    const body = paras.join(' ');
+    const isChain = /^R-?[123]\b/.test(rawLevel);
+    let kind;
+    if (style === 'full-closure') kind = 'closure';
+    else if (style === 'chin') kind = 'info';
+    else if (isChain) kind = 'chain';
+    else if (rawLevel) kind = 'truck';
+    else kind = 'info';
+    const dir = (title.match(/^(North|South|East|West)bound\b/i) || [])[1] || null;
+    const hn = title.match(/\b(?:Highway|Interstate|US|SR|State Route|Route|Hwy)\s*-?\s*(\d{1,3})\b/i);
+    const closureWord = /\bclos(?:ed|ure)\b/i.test(title + ' ' + body);
+    out.push({
+      kind,
+      level: isChain ? rawLevel.replace(/^R-?(\d).*/, 'R-$1') : (rawLevel || null),
+      title, direction: dir ? dir.charAt(0).toUpperCase() : null,
+      hwyNum: hn ? Number(hn[1]) : null,
+      location, text: body, effective, updated, updatedMs: _qmTimeMs(updated),
+      closureLikely: kind === 'info' && closureWord && !/\bramps?\b|rest areas?|\btrucks?\b|big rigs?/i.test(body),
+      lat, lng,
+    });
+  }
+  return out;
+}
+
+const _RESP_DIR_BEARING = { N: 0, E: 90, S: 180, W: 270 };
+
+// The stretches of a route that run on a numbered highway:
+// [{ num, fromKm, toKm }] in route order (consecutive segments of one number
+// are one stretch; a highway with two numbers yields one stretch per number).
+function routeHighwayStretches(segments) {
+  const out = [];
+  let along = 0;
+  (segments || []).forEach(s => {
+    const km = (s && s.km) || 0;
+    highwayNumbersFromNames((s && (s.names || [s.name])) || []).forEach(num => {
+      const last = out.filter(x => x.num === num).pop();
+      if (last && Math.abs(last.toKm - along) < 0.05) last.toKm = along + km;
+      else out.push({ num, fromKm: along, toKm: along + km });
+    });
+    along += km;
+  });
+  return out;
+}
+
+function _angleDiff(a, b) { let d = Math.abs(a - b) % 360; if (d > 180) d = 360 - d; return d; }
+
+// Which Caltrans records concern a route. rel:
+//   'onRoute'  — within RESPONSE_HAZARD_ON_ROUTE_M of the line (a directional
+//                control facing the other way is dropped);
+//   'mayApply' — on a highway the route uses, within RESPONSE_HAZARD_NEAR_KM,
+//                and not beyond the point where the route LEAVES that highway.
+//                A control point marks where the control STARTS, so a route
+//                that joins the highway inside the controlled stretch is never
+//                within 300 m of the point; one that has already turned off
+//                before reaching it is not affected by it at all.
+// `stretches` comes from routeHighwayStretches(segments).
+function matchRouteHazards(records, coords, cum, stretches) {
+  const out = [];
+  if (!coords || coords.length < 2) return out;
+  cum = cum || polylineCumKm(coords);
+  const total = cum[cum.length - 1];
+  const sts = stretches || [];
+  const EDGE_KM = 0.3;
+  // 'mayApply' test for a record whose nearest route point is at `along`.
+  const mayApply = (r, along) => {
+    if (r.hwyNum == null) return false;
+    const mine = sts.filter(s => s.num === r.hwyNum);
+    if (!mine.length) return false;
+    // The stretch the nearest point belongs to (or the closest one).
+    let st = mine[0], bd = Infinity;
+    mine.forEach(s => { const d = along < s.fromKm ? s.fromKm - along : (along > s.toKm ? along - s.toKm : 0); if (d < bd) { bd = d; st = s; } });
+    // Nearest point is where the route EXITS the highway: the record lies
+    // beyond the exit, on a part of the highway this route never drives.
+    if (along >= st.toKm - EDGE_KM && along > st.fromKm + EDGE_KM) return false;
+    if (r.direction && (r.kind === 'chain' || r.kind === 'truck')) {
+      const a = pointAtKm(coords, cum, st.fromKm), b = pointAtKm(coords, cum, st.toKm);
+      if (_angleDiff(_respBearingDeg(a, b), _RESP_DIR_BEARING[r.direction]) > 120) return false;
+    }
+    return true;
+  };
+  let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+  coords.forEach(p => { if (p[0] < minLat) minLat = p[0]; if (p[0] > maxLat) maxLat = p[0]; if (p[1] < minLng) minLng = p[1]; if (p[1] > maxLng) maxLng = p[1]; });
+  const padLat = RESPONSE_HAZARD_NEAR_KM / 110.574;
+  const padLng = RESPONSE_HAZARD_NEAR_KM / (111.32 * Math.max(0.2, Math.cos((minLat + maxLat) / 2 * Math.PI / 180)));
+  (records || []).forEach(r => {
+    if (!r || r.lat < minLat - padLat || r.lat > maxLat + padLat || r.lng < minLng - padLng || r.lng > maxLng + padLng) return;
+    const n = nearestOnPolyline(coords, r.lat, r.lng, cum);
+    if (!n) return;
+    let rel = null;
+    if (n.distM <= RESPONSE_HAZARD_ON_ROUTE_M) rel = 'onRoute';
+    else if (n.distM <= RESPONSE_HAZARD_NEAR_KM * 1000 && mayApply(r, n.alongKm)) rel = 'mayApply';
+    if (!rel) return;
+    if (rel === 'onRoute' && r.direction && (r.kind === 'chain' || r.kind === 'truck')) {
+      const a = pointAtKm(coords, cum, Math.max(0, n.alongKm - 0.5)), b = pointAtKm(coords, cum, Math.min(total, n.alongKm + 0.5));
+      if (_angleDiff(_respBearingDeg(a, b), _RESP_DIR_BEARING[r.direction]) > 120) return; // faces the opposite direction of travel
+    }
+    out.push(Object.assign({}, r, { rel, distM: n.distM, alongKm: n.alongKm }));
+  });
+  out.sort((x, y) => x.alongKm - y.alongKm);
+  return out;
+}
+
+// Group matches for the readout and the time model.
+function summarizeRouteHazards(matches) {
+  const pick = (test, rel) => (matches || []).filter(m => test(m) && m.rel === rel);
+  const isClosure = m => m.kind === 'closure' || (m.kind === 'info' && m.closureLikely);
+  const isChain = m => m.kind === 'chain';
+  return {
+    chainOn: pick(isChain, 'onRoute'), chainMay: pick(isChain, 'mayApply'),
+    closedOn: pick(isClosure, 'onRoute'), closedMay: pick(isClosure, 'mayApply'),
+    info: (matches || []).filter(m => m.kind === 'info' && !m.closureLikely),
+    truck: (matches || []).filter(m => m.kind === 'truck'),
+  };
+}
+
+// Newest "Last updated" stamp in a record set (null when none carries one).
+function quickmapNewestUpdateMs(records) {
+  let best = null;
+  (records || []).forEach(r => { if (r && r.updatedMs != null && (best == null || r.updatedMs > best)) best = r.updatedMs; });
+  return best;
+}
+
+// Coarse California outline ([lat, lng], generous offshore) — only to decide
+// whether Caltrans data is applicable to a route at all.
+const CA_OUTLINE_COARSE = [
+  [42.01, -124.7], [42.01, -119.99], [38.99, -119.99], [34.95, -114.55], [34.2, -114.05], [32.6, -114.4],
+  [32.45, -117.4], [33.3, -118.8], [34.3, -120.9], [36.2, -122.3], [37.9, -123.4], [40.3, -124.8],
+];
+function routeTouchesCalifornia(coords) {
+  if (!coords || !coords.length) return false;
+  const step = Math.max(1, Math.floor(coords.length / 200));
+  for (let i = 0; i < coords.length; i += step) if (pointInPolygon(coords[i][0], coords[i][1], CA_OUTLINE_COARSE)) return true;
+  const last = coords[coords.length - 1];
+  return pointInPolygon(last[0], last[1], CA_OUTLINE_COARSE);
+}
+
+// --- USFS MVUM access flags ---
+
+// "04/01-12/31" (one or several ranges; a range may wrap the new year) →
+// 'open' | 'closed' on the given date, 'unknown' when nothing is parseable.
+function mvumSeasonState(datesOpen, date) {
+  const s = String(datesOpen == null ? '' : datesOpen).trim();
+  const d = date instanceof Date ? date : new Date(date);
+  if (!s || isNaN(d.getTime())) return 'unknown';
+  const md = (d.getMonth() + 1) * 100 + d.getDate();
+  const re = /(\d{1,2})\/(\d{1,2})\s*-\s*(\d{1,2})\/(\d{1,2})/g;
+  let m, any = false, open = false;
+  while ((m = re.exec(s))) {
+    any = true;
+    const a = Number(m[1]) * 100 + Number(m[2]), b = Number(m[3]) * 100 + Number(m[4]);
+    if (a <= b ? (md >= a && md <= b) : (md >= a || md <= b)) open = true;
+  }
+  return any ? (open ? 'open' : 'closed') : 'unknown';
+}
+
+// MVUM road / motorized-trail attributes → access flags. MVUM is a LEGAL
+// designation, not road condition: "open" means motor vehicles are allowed,
+// not that it is passable. opts.trail marks a feature of the MVUM TRAILS layer
+// (a designated 4WD / OHV route — it carries no maintenance level).
+//   closedNow       — at least one full-size vehicle class is designated and
+//                     NONE of them is open on the date;
+//   partlyRestricted — some class is closed while another is open (the data
+//                     often lists passenger cars year-long and high-clearance
+//                     vehicles seasonally on the same road).
+function mvumAccessFlags(props, date, opts) {
+  const lower = {};
+  Object.keys(props || {}).forEach(k => { lower[k.toLowerCase()] = props[k]; });
+  const get = k => { const v = lower[k]; return (v == null || String(v).trim() === '') ? null : v; };
+  const cls = (key, datesKey) => {
+    if (get(key) == null) return { designated: false, dates: null, state: 'not designated' };
+    const dates = get(datesKey || (key + '_datesopen'));
+    return { designated: true, dates: dates ? String(dates) : null, state: mvumSeasonState(dates, date) };
+  };
+  const passenger = cls('passengervehicle'), highClear = cls('highclearancevehicle');
+  const fourwd = cls('fourwd_gt50inches', 'fourwd_gt50_datesopen');
+  const classes = [passenger, highClear, fourwd].filter(c => c.designated);
+  const anyOpen = classes.some(c => c.state === 'open'), anyClosed = classes.some(c => c.state === 'closed');
+  const ml = get('operationalmaintlevel') || get('oper_maint_level');
+  const mlNum = ml != null ? parseInt(String(ml), 10) : NaN;
+  const id = get('id'), name = get('name');
+  const trail = !!(opts && opts.trail);
+  return {
+    id: id != null ? String(id) : null, name: name != null ? String(name) : null,
+    label: [id, name].filter(v => v != null).join(' ') || (trail ? 'MVUM trail' : 'MVUM road'),
+    trail,
+    maintLevel: ml != null ? String(ml) : null,
+    surface: get('surfacetype') || get('surface_type') || null,
+    seasonal: /seasonal/i.test(String(get('seasonal') || '')),
+    highClearance: trail || mlNum === 1 || mlNum === 2 || (!passenger.designated && (highClear.designated || fourwd.designated)),
+    passenger, highClear, fourwd,
+    closedNow: anyClosed && !anyOpen,
+    partlyRestricted: anyClosed && anyOpen,
+    datesOpen: (classes.find(c => c.state === 'closed') || highClear.designated && highClear || fourwd.designated && fourwd || passenger).dates || null,
+  };
+}
+
+function _geojsonLines(geometry) {
+  if (!geometry || !geometry.coordinates) return [];
+  if (geometry.type === 'LineString') return [geometry.coordinates];
+  if (geometry.type === 'MultiLineString') return geometry.coordinates;
+  return [];
+}
+
+// Which MVUM roads the forest part of a route runs along. Every shape vertex
+// of the forest segments (thinned to 300) is matched to the nearest MVUM line
+// within RESPONSE_MVUM_TOL_M. A feature flagged `__mvumTrail` comes from the
+// MVUM trails layer. Returns { roads:[{ flags, hits }], sampled, matched } —
+// `matched` counts the vertices on the listed roads, so `matched < sampled`
+// means part of the forest leg is not an MVUM route (county, private, or
+// outside a National Forest).
+function matchMvumRoads(features, coords, segments, date) {
+  const pts = [];
+  (segments || []).forEach(s => {
+    if (!s || s.kind !== 'forest') return;
+    for (let i = Math.max(0, s.i0 | 0); i <= Math.min((coords || []).length - 1, s.i1 | 0); i++) pts.push(coords[i]);
+  });
+  const step = Math.max(1, Math.ceil(pts.length / 300));
+  const sample = pts.filter((_, i) => i % step === 0);
+  const feats = (features || []).map(f => {
+    const lines = _geojsonLines(f && f.geometry).map(l => l.map(c => [c[1], c[0]]));
+    let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+    lines.forEach(l => l.forEach(p => { if (p[0] < minLat) minLat = p[0]; if (p[0] > maxLat) maxLat = p[0]; if (p[1] < minLng) minLng = p[1]; if (p[1] > maxLng) maxLng = p[1]; }));
+    return { f, lines, minLat, maxLat, minLng, maxLng, hits: 0 };
+  }).filter(x => x.lines.length);
+  const pad = RESPONSE_MVUM_TOL_M / 111000 * 1.5;
+  let matched = 0;
+  sample.forEach(p => {
+    let best = null, bd = RESPONSE_MVUM_TOL_M;
+    feats.forEach(x => {
+      if (p[0] < x.minLat - pad || p[0] > x.maxLat + pad || p[1] < x.minLng - pad * 1.4 || p[1] > x.maxLng + pad * 1.4) return;
+      x.lines.forEach(l => { const n = nearestOnPolyline(l, p[0], p[1], l.map(() => 0)); if (n && n.distM <= bd) { bd = n.distM; best = x; } });
+    });
+    if (best) { best.hits++; matched++; }
+  });
+  // A road counts only when the route runs ALONG it — a few vertices at a
+  // junction (measured: 3 of 94 at the Wrights Lake road end) do not.
+  const need = Math.max(sample.length >= 4 ? 2 : 1, Math.ceil(sample.length * 0.05));
+  const roads = feats.filter(x => x.hits >= need).sort((a, b) => b.hits - a.hits)
+    .map(x => ({ flags: mvumAccessFlags(x.f.properties || {}, date, { trail: !!x.f.__mvumTrail }), hits: x.hits }));
+  const onRoads = roads.reduce((a, r) => a + r.hits, 0);
+  return { roads, sampled: sample.length, matched: onRoads };
+}
+
+// --- Hike-in ---
+
+// Total climb (m) along an elevation profile: the sum of the rises.
+function ascentFromElevations(elevsM) {
+  let up = 0;
+  for (let i = 1; i < (elevsM || []).length; i++) {
+    const a = Number(elevsM[i - 1]), b = Number(elevsM[i]);
+    if (Number.isFinite(a) && Number.isFinite(b) && b > a) up += b - a;
+  }
+  return up;
+}
+
+// h: { trailKm, offTrailKm, ascentM (null = unknown → flat) } → minutes.
+function hikeTimeMin(h, settings) {
+  if (!h) return null;
+  const trailMin = (h.trailKm || 0) / RESPONSE_KM_PER_MI / settings.trailMph * 60;
+  const offMin = (h.offTrailKm || 0) / RESPONSE_KM_PER_MI / settings.offTrailMph * 60;
+  const ascentMin = h.ascentM != null ? (h.ascentM * 3.28084 / 1000) * RESPONSE_ASCENT_MIN_PER_1000FT : 0;
+  return trailMin + offMin + ascentMin;
+}
+
+// A routed trail leg is only used when it is faster than walking straight
+// from the road end (the router can return a long detour whose far end is
+// still nowhere near the observer). gapKm = straight line road end → observer.
+function chooseHikePlan(gapKm, routed, settings) {
+  const direct = { mode: 'direct', trailKm: 0, offTrailKm: gapKm };
+  if (!routed || !(routed.trailKm > 0)) return direct;
+  const viaTrail = { mode: 'trail', trailKm: routed.trailKm, offTrailKm: routed.offTrailKm || 0 };
+  return hikeTimeMin(viaTrail, settings) <= hikeTimeMin(direct, settings) ? viaTrail : direct;
+}
+
+// --- Readout ---
+
+function formatDurationMin(min) {
+  if (min == null || !Number.isFinite(min)) return '--';
+  const m = Math.max(0, Math.round(min));
+  if (m < 60) return m + ' min';
+  const h = Math.floor(m / 60), r = m % 60;
+  return r ? `${h} h ${r} min` : `${h} h`;
+}
+
+function formatMilesKm(km) {
+  if (km == null || !Number.isFinite(km)) return '--';
+  const mi = km / RESPONSE_KM_PER_MI;
+  return (mi < 10 ? mi.toFixed(1) : String(Math.round(mi))) + ' mi';
+}
+
+// Roll one destination's parts into a total.
+// d: { routeStatus:'ok'|'cached'|'error'|'noroad', est (computeDriveEstimate
+//      result or null), hikeMin (null = no hike leg), hikeDegraded,
+//      chain: { status:'ok'|'unverified'|'na', on, may, closedOn, closedMay },
+//      surfaceDetail, accessClosed }
+// A chain control ON the route adds the delay to the total; one that only MAY
+// apply is reported beside it (chainMayMin), never folded in. A closure adds
+// no time: `closed` is set and the total reads as "if open".
+function summarizeResponseDest(d, settings) {
+  d = d || {};
+  const chain = d.chain || { status: 'unverified', on: 0, may: 0, closedOn: 0, closedMay: 0 };
+  const out = { ok: false, loadMin: settings.loadMin, roadMin: null, forestMin: null, hikeMin: d.hikeMin != null ? d.hikeMin : null,
+    chainMin: 0, chainMayMin: 0, totalMin: null, closed: false, closedMay: false, level: 'red' };
+  if (!d.est || d.routeStatus === 'error' || d.routeStatus === 'noroad') return out;
+  out.ok = true;
+  out.roadMin = d.est.roadMin; out.forestMin = d.est.forestMin;
+  if (chain.on > 0) out.chainMin = settings.chainDelayMin;
+  else if (chain.may > 0) out.chainMayMin = settings.chainDelayMin;
+  out.closed = chain.closedOn > 0;
+  out.closedMay = !out.closed && chain.closedMay > 0;
+  out.totalMin = out.loadMin + out.roadMin + out.forestMin + out.chainMin + (out.hikeMin || 0);
+  const weatherHit = (d.est.rainMi + d.est.snowMi + d.est.groundSnowMi) > 0.05;
+  if (out.closed) out.level = 'red';
+  else if (d.routeStatus === 'cached' || !d.est.wxKnown || chain.status === 'unverified' || out.chainMin > 0 || out.chainMayMin > 0
+    || out.closedMay || weatherHit || d.hikeDegraded || d.surfaceDetail === false || d.accessClosed) out.level = 'amber';
+  else out.level = 'green';
+  return out;
+}
+
+// "load 30 + road 52 + forest road 18 + chain control 45 + hike 12 min"
+function responseBreakdownText(sum) {
+  if (!sum || !sum.ok) return '';
+  const parts = [];
+  const r = v => Math.round(v);
+  if (sum.loadMin > 0) parts.push('load ' + r(sum.loadMin));
+  parts.push('road ' + r(sum.roadMin));
+  if (sum.forestMin > 0.5) parts.push('forest road ' + r(sum.forestMin));
+  if (sum.chainMin > 0) parts.push('chain control ' + r(sum.chainMin));
+  if (sum.hikeMin != null && sum.hikeMin > 0.5) parts.push('hike ' + r(sum.hikeMin));
+  return parts.join(' + ') + ' min';
+}
+
+// Memo / cache key for one routed leg. The start is rounded to ~110 m so a
+// parked responder's GPS jitter does not re-route; the destination to ~1 m.
+function responseRouteKey(mode, from, to) {
+  return `${mode}|${(+from.lat).toFixed(3)},${(+from.lng).toFixed(3)}|${(+to.lat).toFixed(5)},${(+to.lng).toFixed(5)}`;
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    RESPONSE_KM_PER_MI, RESPONSE_MAX_DESTS, RESPONSE_AT_ROAD_M, RESPONSE_HAZARD_ON_ROUTE_M, RESPONSE_HAZARD_NEAR_KM,
+    RESPONSE_WX_STEP_KM, RESPONSE_WX_MAX_POINTS, RESPONSE_WX_MAX_TOTAL, RESPONSE_WX_MERGE_KM, RESPONSE_WX_HOURS,
+    RESPONSE_ALERT_STEP_KM, RESPONSE_ALERT_MAX_POINTS, RESPONSE_FIX_FRESH_MS, RESPONSE_CALTRANS_STALE_MS,
+    VALHALLA_BASE_URL, VALHALLA_MIN_INTERVAL_MS,
+    DEFAULT_RESPONSE_SETTINGS, RESPONSE_SETTING_LIMITS, normalizeResponseSettings,
+    decodePolyline6, polylineCumKm, polylineLengthKm, pointAtKm, samplePolyline, nearestOnPolyline, mergeSamplePoints,
+    classifyRoadKind, highwayNumbersFromNames, valhallaError, valhallaRouteLeg, valhallaEdgesToSegments,
+    valhallaManeuversToSegments, routeHighwayNumbers, routeHighwayStretches,
+    parseRouteWeather, routeConditionsAt, adjustSegmentMph, computeDriveEstimate,
+    parseQuickmapKml, matchRouteHazards, summarizeRouteHazards, quickmapNewestUpdateMs,
+    CA_OUTLINE_COARSE, routeTouchesCalifornia,
+    mvumSeasonState, mvumAccessFlags, matchMvumRoads,
+    ascentFromElevations, hikeTimeMin, chooseHikePlan,
+    formatDurationMin, formatMilesKm, summarizeResponseDest, responseBreakdownText, responseRouteKey,
     assessmentDisplay, assessmentLabelForLog, limitsProfileInfo,
     WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, lerpBearing, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,

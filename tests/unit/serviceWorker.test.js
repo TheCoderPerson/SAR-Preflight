@@ -53,6 +53,10 @@ describe('routeStrategy(url)', () => {
     expect(routeStrategy('https://sar-canopy-proxy.joja15.workers.dev/notam?lat=38.68500&lng=-120.99000&radius=25')).toBe('network-only');
     expect(routeStrategy('https://custom-proxy.example.workers.dev/notam?lat=1&lng=2&radius=20')).toBe('network-only'); // custom base, same route shape
     expect(routeStrategy('https://sar-canopy-proxy.joja15.workers.dev/adsb?lat=38.6850&lon=-120.9900&dist=25')).toBe('network-only');
+    // Caltrans chain controls / closures (response-time estimate): a pinned copy
+    // would keep reporting an old "no chain controls" as a live check.
+    expect(routeStrategy('https://sar-canopy-proxy.joja15.workers.dev/caltrans/v2_cc.kml')).toBe('network-only');
+    expect(routeStrategy('https://custom-proxy.example.workers.dev/caltrans/v2_chin.kml')).toBe('network-only');
   });
 
   it('leaves proxy canopy tiles on the cache-first default (range reads skip routing anyway)', () => {

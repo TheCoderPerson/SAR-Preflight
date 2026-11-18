@@ -1,0 +1,463 @@
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+<name>CHIN Messages</name>
+<copyright>(c) 2026 California Department of Transportation. All rights reserved.</copyright>
+<Style id="chin">
+  <IconStyle><Icon>
+    <href>https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4</href>
+    <hotSpot x="0.5" y="0.5" xunits="fraction" yunits="fraction"/>
+  </Icon></IconStyle>
+  <LabelStyle><scale>0</scale></LabelStyle>
+</Style>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Northbound Highway 4 CLOSURE GATE #2</h2>
+        
+        <p class="iw-text">EBBETTS Pass is closed for winter storm.</p>
+        
+        <div font-size:xx-small;'>District: 10 Message ID: 740</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-119.99347320046,38.481731590596,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Eastbound Highway 108 SNOW PARK</h2>
+        
+        <p class="iw-text">SONORA Pass Closed for adverse weather</p>
+        
+        <div font-size:xx-small;'>District: 10 Message ID: 741</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-119.99781794493,38.250715957799,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Eastbound Highway 120 HWY 120 ENTERS YOSEMITE PARK BOUNDRY</h2>
+        
+        <p class="iw-text">TIOGA  Pass Closed due to adverse weather.</p>
+        
+        <div font-size:xx-small;'>District: 10 Message ID: 742</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-119.87270879165,37.810500003833,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Eastbound Highway 89 CLOSURE GATE</h2>
+        
+        <p class="iw-text">MONITOR Pass is closed due to winter storm.</p>
+        
+        <div font-size:xx-small;'>District: 10 Message ID: 743</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-119.71924919004,38.660214975729,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Southbound US 395 WYE RD</h2>
+        
+        <p class="iw-text">HIGH WIND ADVISORY from Bishop to NV State Line - Travel is not recommended for trailers, campers, and permit loads.</p>
+        
+        <div font-size:xx-small;'>District: 9 Message ID: 5498</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-118.39831762366,37.375852336294,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Westbound Interstate 80 NYACK, WB ON FR</h2>
+        
+        <p class="iw-text">WESTBOUND INTERSTATE 80 IN PLACER COUNTY  JUST WEST OF NYACK BIG RIGS ARE REQUIRED TO STOP AT THE DESIGNATED BRAKE CHECK AREA IN MOUNTAINOUS TERRAIN.FAILURE TO STOP MAY RESULT IN CHP ENFORCEMENT ACTION, INCLUDING CITATIONS AND ORDERED INSPECTIONS.CONDUCT MANDATORY BRAKE CHECKS AND MAKE NECESSARY ADJUSTMENTS BEFORE CONTINUING DOWNGRADE.THIS CHECKPOINT IS CRITICAL AND CAN PREVENT BRAKE FAILURE, BRAKE FIRES, WILDFIRES, AND MAJOR TRUCK COLLISIONS.COMPLIANCE IS NOT OPTIONAL SAFETY IS OUR PRIORITY.</p>
+        
+        <div font-size:xx-small;'>District: 3 Message ID: 145529</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-120.68168557503,39.292012997328,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title"> Highway 70 </h2>
+        
+        <p class="iw-text">24/7 Traffic Control for the Cromberg Combined Rehabilitation Project. Expect delays up to 25 minutes. Impacts will continue through end of summer.</p>
+        
+        <div font-size:xx-small;'>District: 2 Message ID: 161614</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-120.6899953858,39.859860586213,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Southbound Interstate 5 WEED (EXIT 748)</h2>
+        
+        <p class="iw-text">Travel is not recommended for high profile vehicles. From Weed to Yreka (Siskiyous County) - Due to a wind advisory.</p>
+        
+        <div font-size:xx-small;'>District: 2 Message ID: 165573</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-122.39876920592,41.425696229854,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Northbound Interstate 5 FAWNDALE SCREENING</h2>
+        
+        <p class="iw-text">Northbound 5 vehicle screening in progress 10 miles north of Redding, at Fawndale Shasta County. All vehicles are required to have chains to proceed.</p>
+        
+        <div font-size:xx-small;'>District: 2 Message ID: 165592</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-122.32148998961,40.728649200638,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Northbound Highway 3 SCOTT MOUNTAIN SUMMIT - ELEV 5401 FT</h2>
+        
+        <p class="iw-text">Northbound and Southbound Hwy 3 is closed at Scott Mountain due to snow and winter weather conditions. A detour is not available. Motorists are advised to use an alternate route.</p>
+        
+        <div font-size:xx-small;'>District: 2 Message ID: 165595</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-122.69751263312,41.275401873613,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Eastbound Highway 32 JCT SR 36</h2>
+        
+        <p class="iw-text">State Route 32 is closed from JCT SR 36 to Butte Meadows - due to winter weather conditions - a detour is not available - motorists are advised to use an alternate route.</p>
+        
+        <div font-size:xx-small;'>District: 2 Message ID: 165637</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-121.42118728286,40.279387768436,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Eastbound Interstate 80 DRUM FOREBAY EB OFF TO</h2>
+        
+        <p class="iw-text">Interstate 80 in Placer County be advised that the Eastbound On and Off Ramps at Drum Forebay Exit 150 will be closed through November 20th, 2026</p>
+        
+        <div font-size:xx-small;'>District: 3 Message ID: 224165</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-120.75384727025,39.235366632942,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Northbound Highway 89 PROSSER DAM RD - ALDER DR</h2>
+        
+        <p class="iw-text">STATE ROUTE 49 IN NEVADA COUNTY AT NEWTON ROAD AND STATE ROUTE 89 NORTH AT SATTLEY 89/49 JUNCTION AND SIERRAVILLE SOUTH BOUND CLOSED TO ALL TRUCKS ALLOWING LOCALS ONLY WITH ID.</p>
+        
+        <div font-size:xx-small;'>District: 3 Message ID: 232097</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-120.172746189,39.345295269693,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Eastbound Interstate 80 DONNER SUMMIT, EB ON FROM REST AREA</h2>
+        
+        <p class="iw-text">EASTBOUND AND WESTBOUND INTERSTATE 80 IN NEVADA COUNTY THE DONNER SUMMIT REST AREAS ARE CLOSED FOR SNOW REMOVAL THERE IS NO ESTIMATED TIME OF OPENING</p>
+        
+        <div font-size:xx-small;'>District: 3 Message ID: 232260</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-120.33998685448,39.342209480752,0</coordinates></Point>
+</Placemark>
+<Placemark>
+  <name> </name>
+  <description><![CDATA[<link rel="stylesheet" type="text/css" href="https://quickmap.dot.ca.gov/css/gm-infowindow.css?v=9" />
+<div class="infowindow-content">
+    <div class="iw-header">
+        <div class="iw-header-left">
+            <img class="iw-icon" src="https://quickmap.dot.ca.gov/img/v2/CaltransHighwayInfo.png?v=4" />
+            Caltrans Highway Information
+        </div>
+    </div>
+
+    <div class="iw-body">
+        <h2 class="iw-title">Northbound Interstate 5 YOLO BYPASS BR 22-124</h2>
+        
+        <p class="iw-text">A High Wind Advisory is in effect for Yolo County. Travel is not recommended for campers, trailers or permit loads.</p>
+        
+        <div font-size:xx-small;'>District: 3 Message ID: 232393</div>
+
+        <p class="iw-attribution">
+            Information courtesy of <strong>Caltrans</strong>
+        </p>
+    </div>
+
+    <div class="iw-footer">
+        <span class="iw-timestamp">Last updated: <strong>11/18/2026</strong> 2:09pm</span>
+    </div>
+</div>]]></description>
+  <styleUrl>#chin</styleUrl>
+  <Point><coordinates>-121.64193799051,38.673484271483,0</coordinates></Point>
+</Placemark>
+</Document>
+</kml>

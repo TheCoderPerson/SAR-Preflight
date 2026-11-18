@@ -775,6 +775,21 @@ select.api-input { cursor: pointer; }
   font-size: 12px; padding: 1px 4px; border-radius: 3px;
 }
 .vs-obs-actions button:hover { background: var(--bg-elevated); color: var(--text-primary); }
+/* Response Time Estimate — one row per destination */
+.resp-dest-row {
+  padding: 5px 8px; margin: 3px 0; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg-secondary); cursor: pointer;
+}
+.resp-dest-row.active { border-color: var(--accent-cyan); background: var(--bg-tertiary); }
+.resp-dest-head { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+.resp-dest-name { flex: 1; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resp-dest-total { font-family: var(--font-mono); font-weight: 600; color: var(--text-primary); white-space: nowrap; }
+.resp-dest-total.green { color: var(--accent-green); }
+.resp-dest-total.amber { color: var(--accent-amber); }
+.resp-dest-total.red { color: var(--accent-red); }
+.resp-dest-sub { font-family: var(--font-mono); font-size: 10px; color: var(--text-secondary); margin-top: 2px; line-height: 1.4; }
+.resp-note { font-size: 10px; color: var(--text-muted); line-height: 1.4; }
+#respStagingBtn.active { border-color: var(--accent-cyan); color: var(--accent-cyan); }
 
 @media (max-width: 900px) {
   html, body { overflow-x: hidden; width: 100%; }
@@ -1439,6 +1454,40 @@ select.api-input { cursor: pointer; }
 
       <!-- Ops Tab -->
       <div id="tab-ops" class="tab-panel" style="display:none;">
+        <div class="data-section" id="responseSection">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-cyan)"></div>Response Time Estimate <span class="fetch-status" id="responseStatus"></span></div>
+          <div class="section-meta" id="meta_response"></div>
+          <div class="api-config" id="respPrompt" style="display:none;"></div>
+          <div class="data-grid">
+            <div class="data-cell full"><div class="data-label">Total (loading + drive + hike)</div><div class="data-value" id="respTotal">--</div></div>
+            <div class="data-cell full"><div class="data-label">Start</div><div class="data-value sm" id="respStart">--</div></div>
+            <div class="data-cell"><div class="data-label">Road Drive</div><div class="data-value sm" id="respRoad">--</div></div>
+            <div class="data-cell"><div class="data-label">Forest / OHV Road</div><div class="data-value sm" id="respForest">--</div></div>
+            <div class="data-cell"><div class="data-label">Hike-in</div><div class="data-value sm" id="respHike">--</div></div>
+            <div class="data-cell"><div class="data-label">Equipment Loading</div><div class="data-value sm" id="respLoad">--</div></div>
+            <div class="data-cell full"><div class="data-label">Chain Controls / Closures (Caltrans)</div><div class="data-value sm" id="respChains">--</div></div>
+            <div class="data-cell full"><div class="data-label">Weather Along Route</div><div class="data-value sm" id="respWx">--</div></div>
+            <div class="data-cell full"><div class="data-label">Forest Road Access (MVUM)</div><div class="data-value sm" id="respAccess">--</div></div>
+          </div>
+          <div class="api-config" style="padding-top:8px;">
+            <div class="data-label">Destinations — one per observer (tap a row to show its details above)</div>
+            <div id="respDestList"></div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
+              <button class="btn btn-ghost" id="respStagingBtn" onclick="startResponseStagingPick()" style="padding:4px 10px;font-size:10px;">Set Staging Point</button>
+              <button class="btn btn-ghost" id="respStagingClear" onclick="clearResponseStaging()" style="padding:4px 10px;font-size:10px;display:none;">Clear Staging Point</button>
+            </div>
+            <div class="resp-note" id="respStagingNote" style="margin-top:4px;"></div>
+            <div class="resp-note" style="margin-top:4px;">With no staging point the drive ends at the road nearest each observer. Set one (tap the button, then the map) when you will park somewhere else: the drive goes there and each observer gets a hike leg from it. Speeds, delays and the saved base location are in Config &rarr; Response Time.</div>
+          </div>
+          <div class="api-config" style="padding-top:8px;">
+            <div class="data-label">Weather Warnings Along Route (NWS)</div>
+            <div id="respAlertList" style="margin-top:4px;"></div>
+          </div>
+          <div class="api-config" style="padding-top:8px;">
+            <div class="resp-note">Estimate only: free-flow routing with no live traffic; construction and county-road closures are not covered; chain controls and warnings are current status; MVUM is a legal designation, not road condition. Verify on <a href="https://quickmap.dot.ca.gov/" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Caltrans QuickMap</a> before leaving.</div>
+            <div class="resp-note" style="margin-top:4px;">Routing by <a href="https://valhalla1.openstreetmap.de/" target="_blank" rel="noopener" style="color:var(--accent-cyan);">FOSSGIS Valhalla</a> &middot; &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener" style="color:var(--accent-cyan);">OpenStreetMap</a> contributors &middot; <a href="https://www.openstreetmap.org/fixthemap" target="_blank" rel="noopener" style="color:var(--accent-cyan);">fix the map</a></div>
+          </div>
+        </div>
         <div class="data-section">
           <div class="data-section-title"><div class="indicator" style="background:var(--accent-cyan)"></div>Battery Performance Estimate</div>
           <div class="data-grid">
@@ -1556,6 +1605,61 @@ select.api-input { cursor: pointer; }
               <button class="btn btn-ghost" onclick="saveCanopyProxy(document.getElementById('cfgCanopyProxy').value)">Save</button>
             </div>
             <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;"><b>Leave blank to use the built-in default proxy</b> — the app works out of the box. Enter your own Cloudflare Worker URL to override (e.g. for a fork hosted elsewhere; the built-in proxy only serves the official app origins). The proxy serves CORS-blocked sources: Meta/WRI CHMv2 canopy tiles and NAIP-CHM canopy/structure tiles (vegetation overlay &amp; viewshed), the FAA TFR GeoServer (live TFRs), the FAA NOTAM Search backend (live NOTAMs), and the USFS/BLM ArcGIS servers (forest roads/trails/MVUM, BLM transport &amp; public-land ownership) — TFRs/NOTAMs auto-fetched per area. NOTAMs come from an unofficial endpoint: treat as advisory and verify officially. Heavy use may briefly rate-limit (⚠ PROXY LIMIT in the header); it clears in about a minute. <a href="https://github.com/TheCoderPerson/SAR-Preflight#data-proxy-setup-cloudflare-worker" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Self-host your own free Cloudflare Worker ↗</a> (step-by-step instructions &amp; code).</div>
+          </div>
+        </div>
+        <div class="data-section">
+          <div class="data-section-title"><div class="indicator" style="background:var(--accent-cyan)"></div>Response Time</div>
+          <p style="font-size:11px;color:var(--text-muted);margin:0 16px 8px;line-height:1.5;">Settings for the Response Time Estimate in the Ops tab. Changes apply at once, with no new request.</p>
+          <div class="api-config">
+            <div class="data-label">Equipment loading (minutes, added once)</div>
+            <input class="api-input" id="cfgRespLoad" type="number" min="0" max="480" step="5" value="30" onchange="saveResponseSetting('loadMin', this.value)" />
+          </div>
+          <div class="api-config">
+            <div class="data-label">Rain — driving speed reduced by (%)</div>
+            <input class="api-input" id="cfgRespRain" type="number" min="0" max="90" step="5" value="25" onchange="saveResponseSetting('rainPct', this.value)" />
+          </div>
+          <div class="api-config">
+            <div class="data-label">Snow — maximum driving speed (mph)</div>
+            <input class="api-input" id="cfgRespSnow" type="number" min="1" max="70" step="1" value="15" onchange="saveResponseSetting('snowMaxMph', this.value)" />
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">Applies to every road where snow is falling, and to forest and minor roads where snow is on the ground (numbered highways are plowed).</div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Chain control on the route — added delay (minutes)</div>
+            <input class="api-input" id="cfgRespChain" type="number" min="0" max="480" step="5" value="45" onchange="saveResponseSetting('chainDelayMin', this.value)" />
+          </div>
+          <div class="api-config">
+            <div class="data-label">Forest / OHV road speed (mph)</div>
+            <input class="api-input" id="cfgRespForest" type="number" min="1" max="45" step="1" value="15" onchange="saveResponseSetting('forestMph', this.value)" />
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">Used on every unpaved road and track on the route. Paved Forest Service roads keep the routing engine's speed.</div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Hiking speed — on trail / off trail (mph)</div>
+            <div class="api-input-group">
+              <input class="api-input" id="cfgRespTrail" type="number" min="0.5" max="6" step="0.25" value="2" onchange="saveResponseSetting('trailMph', this.value)" />
+              <input class="api-input" id="cfgRespOffTrail" type="number" min="0.25" max="4" step="0.25" value="1" onchange="saveResponseSetting('offTrailMph', this.value)" />
+            </div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">Plus 30 minutes for every 1,000 ft climbed.</div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Drive time adjustment (%) — calibrate road times against a drive you know</div>
+            <input class="api-input" id="cfgRespAdjust" type="number" min="-50" max="200" step="5" value="0" onchange="saveResponseSetting('driveAdjustPct', this.value)" />
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">Routing engines assume free-flowing traffic and differ from each other by 20&ndash;30 %. A positive value lengthens paved-road times; forest roads use the speed above.</div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Saved base location — the start when this device's location is unavailable</div>
+            <div class="api-input-group">
+              <input class="api-input" id="cfgRespBase" type="text" placeholder="Address, place name or coordinates" onkeydown="if(event.key==='Enter')saveResponseBase(this.value)" />
+              <button class="btn btn-ghost" onclick="saveResponseBase(document.getElementById('cfgRespBase').value)">Save</button>
+            </div>
+            <div id="cfgRespBaseHint" style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">No base saved — the estimate needs this device's location.</div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">Looked up once when you press Save (an address or place name goes to OpenStreetMap Nominatim). Leave blank and Save to remove it.</div>
+          </div>
+          <div class="api-config">
+            <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--text-secondary);cursor:pointer;">
+              <input type="checkbox" id="cfgRespAuto" checked onchange="saveResponseSetting('auto', this.checked)">
+              Estimate automatically when an area is drawn or an observer changes
+            </label>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">An estimate sends your start point and the destination points to a public routing service (FOSSGIS Valhalla, openstreetmap.de). Nothing is sent until you have pressed &ldquo;Estimate Response Time&rdquo; in the Ops tab once. With this off, estimates run only when you press UPDATE there.</div>
           </div>
         </div>
         <div class="data-section">
@@ -1734,6 +1838,7 @@ select.api-input { cursor: pointer; }
     <label class="export-check-row" id="expViewshedVecRow"><input type="checkbox" id="expViewshedVec" checked> <span id="expViewshedVecLabel">Viewsheds → vector polygons (in the KML / GeoJSON file)</span></label>
     <label class="export-check-row" id="expViewshedRow"><input type="checkbox" id="expViewshedTiff" checked> <span id="expViewshedTiffLabel">Viewsheds → GeoTIFF, Web Mercator (CalTopo Map Sheet / QGIS)</span></label>
     <label class="export-check-row" id="expViewshedKmzRow"><input type="checkbox" id="expViewshedKmz"> <span id="expViewshedKmzLabel">Viewsheds → KMZ overlay (Google Earth)</span></label>
+    <label class="export-check-row" id="expResponseRow"><input type="checkbox" id="expResponse"> Response route(s) and times &mdash; <b>shows your start location</b> to anyone you share the file with</label>
 
     <div class="modal-actions">
       <button class="btn btn-primary" onclick="doExport()">Download KML</button>

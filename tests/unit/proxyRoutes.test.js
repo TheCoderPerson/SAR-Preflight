@@ -48,3 +48,23 @@ describe('resolveTarget /naipchm/ route', () => {
     expect(resolveTarget(u('/naipchm/inference-resources/conditioning-data/climate_pca.tif'))).toBeNull();
   });
 });
+
+// /caltrans/ serves the two Caltrans QuickMap KML files the response-time
+// estimate reads (chain controls + closures, highway information). The origin
+// sends no CORS header; nothing else on that host may pass through.
+describe('resolveTarget /caltrans/ route', () => {
+  it('maps the chain-control and highway-information files to quickmap.dot.ca.gov', () => {
+    const cc = resolveTarget(u('/caltrans/v2_cc.kml'));
+    expect(cc.target).toBe('https://quickmap.dot.ca.gov/data/v2_cc.kml');
+    expect(cc.cacheTtl).toBe(60); // changes by the minute — a short edge copy only
+    expect(resolveTarget(u('/caltrans/v2_chin.kml')).target).toBe('https://quickmap.dot.ca.gov/data/v2_chin.kml');
+  });
+
+  it('rejects every other path under the prefix', () => {
+    expect(resolveTarget(u('/caltrans/'))).toBeNull();
+    expect(resolveTarget(u('/caltrans/v2_lcs2way.kml'))).toBeNull();
+    expect(resolveTarget(u('/caltrans/cc.kml'))).toBeNull();
+    expect(resolveTarget(u('/caltrans/v2_cc.kml/extra'))).toBeNull();
+    expect(resolveTarget(u('/caltrans/sub/v2_cc.kml'))).toBeNull();
+  });
+});

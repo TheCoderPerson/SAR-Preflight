@@ -37,6 +37,7 @@ const ENDPOINT_TTL = {
   parcels:     90 * 24 * 60 * 60000, // 90 days — parcel fabric changes slowly; DWR refresh is quarterly
   utility_wires: 30 * 24 * 60 * 60000, // 30 days — PG&E ICA maps are on a monthly update mandate
   geocode:     30 * 24 * 60 * 60000, // 30 days — place names and street addresses change on a scale of years
+  response_route: 7 * 24 * 60 * 60000, // 7 days — routed drive legs, used ONLY as a labelled fallback when routing fails
 };
 
 // --- Raster cache (ArrayBuffers / typed arrays — structured-cloneable) ---
