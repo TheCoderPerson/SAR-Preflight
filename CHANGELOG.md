@@ -4,6 +4,15 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.11.18-c — 2026-11-18
+
+- Weather: forecast visibility and the freezing level were shown about 3.3 times too high. The forecast service answers both in feet and the app read them as metres, so a freezing level of 6,200 ft showed as 20,344 ft and 0.2 mi of visibility showed as 0.6 mi. Both are now correct on the Weather tab, for every hour on the time bar, and in the assessment. Before this fix the freezing-level advisory and the visibility limit could be missed.
+- A newly drawn area no longer shows the previous area's weather or terrain while its own data loads. Every value on the panel used to stay as it was for the previous area until its own answer arrived, under only a small "Fetching" label, so a slow connection could show a foothill temperature and elevation for a mountain area while the banner kept listing the previous area's limits. A new area now starts with empty values and a LOADING banner, and the previous area's weather and terrain are dropped as soon as the new request starts.
+- Ops tab and banner: battery and service-ceiling figures update as soon as the terrain elevation arrives. They could read "Elevation missing, assuming 9,000 ft" for minutes after the Terrain tab had the elevation, until the slowest lookup for the area finished.
+- Mission log: visibility saved from this version on is in metres. Entries saved earlier hold the number in feet.
+- Response Time Estimate: new Set Start Point button. Tap it, then tap the map, to start the drive from that point instead of this device's location or the saved base. It applies to the current area only and does not move the operational area, so weather and terrain stay with the area you drew. Clear Start Point goes back to the device location or the saved base.
+- Response Time Estimate: starting a draw tool now cancels a staging-point or start-point tap that was still armed. Before, the first click of the new shape also set that point.
+
 ## v2026.11.18-b — 2026-11-18
 
 - Response Time Estimate: where two numbered highways share one road (US 50 and Highway 89 near Meyers), the drive is no longer treated as being on the second highway for its whole length. A chain control on that highway could be listed as "may apply" for a drive that never reaches it.

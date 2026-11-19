@@ -24,6 +24,18 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.11.18-c',
+    date: '2026-11-18',
+    changes: [
+      'Weather: forecast visibility and the freezing level were shown about 3.3 times too high. The forecast service answers both in feet and the app read them as metres, so a freezing level of 6,200 ft showed as 20,344 ft and 0.2 mi of visibility showed as 0.6 mi. Both are now correct on the Weather tab, for every hour on the time bar, and in the assessment. Before this fix the freezing-level advisory and the visibility limit could be missed.',
+      'A newly drawn area no longer shows the previous area\'s weather or terrain while its own data loads. Every value on the panel used to stay as it was for the previous area until its own answer arrived, under only a small "Fetching" label, so a slow connection could show a foothill temperature and elevation for a mountain area while the banner kept listing the previous area\'s limits. A new area now starts with empty values and a LOADING banner, and the previous area\'s weather and terrain are dropped as soon as the new request starts.',
+      'Ops tab and banner: battery and service-ceiling figures update as soon as the terrain elevation arrives. They could read "Elevation missing, assuming 9,000 ft" for minutes after the Terrain tab had the elevation, until the slowest lookup for the area finished.',
+      'Mission log: visibility saved from this version on is in metres. Entries saved earlier hold the number in feet.',
+      'Response Time Estimate: new Set Start Point button. Tap it, then tap the map, to start the drive from that point instead of this device\'s location or the saved base. It applies to the current area only and does not move the operational area, so weather and terrain stay with the area you drew. Clear Start Point goes back to the device location or the saved base.',
+      'Response Time Estimate: starting a draw tool now cancels a staging-point or start-point tap that was still armed. Before, the first click of the new shape also set that point.',
+    ],
+  },
+  {
     version: '2026.11.18-b',
     date: '2026-11-18',
     changes: [
@@ -1255,8 +1267,10 @@ function assessmentLabelForLog(assessment) {
 }
 
 // --- Freezing level (icing aloft) ---
-// Open-Meteo `freezing_level_height` is the 0°C isotherm altitude in METERS above
-// sea level. Returns an advisory (amber) when that level sits within the flight
+// `freezingLevelM` is the 0°C isotherm altitude in METERS above sea level — the
+// app's forecast commit converts Open-Meteo's value to metres first (the API
+// answers in feet for this app's request; see normalizeOpenMeteoLengths).
+// Returns an advisory (amber) when that level sits within the flight
 // envelope — from launch elevation up to launch + maxAltAGL — else null. Icing aloft
 // is a pilot-judgement CAUTION, never an automatic NO-GO.
 function freezingLevelRisk(freezingLevelM, launchElevFt, maxAltAGL) {
@@ -1551,6 +1565,53 @@ function openMeteoTimeToIso(t, utcOffsetSeconds) {
   if (!Number.isFinite(utcOffsetSeconds)) return t;
   const ms = Date.parse(t + (t.length === 16 ? ':00Z' : 'Z'));
   return Number.isFinite(ms) ? new Date(ms - utcOffsetSeconds * 1000).toISOString() : t;
+}
+
+// Open-Meteo reports lengths in the unit system the REQUEST selects and names
+// the unit in `current_units` / `hourly_units`. The area forecast is requested
+// with precipitation_unit=inch, and with that `visibility` and
+// `freezing_level_height` come back in FEET, not metres (verified live
+// 2026-11-18: 1968.5 ft / 6200.8 ft where the metric request gave 600 m /
+// 1890 m). Every consumer reads them as metres, so the freezing level showed
+// 3.28× too high (20,344 ft over a 6,956 ft area in heavy snow — the "within
+// flight envelope" advisory could never fire) and visibility 3.28× too far
+// (0.6 mi shown for 0.19 mi; a true 1 mi read as 3.3 mi, past the 3 SM limit).
+const OPEN_METEO_LENGTH_FIELDS = ['visibility', 'freezing_level_height'];
+
+// One value → metres. No unit given = the API's default (metres). A unit that
+// is neither metres nor feet is unknown: null, never guessed.
+function openMeteoLengthToMeters(value, unit) {
+  if (value == null) return null;
+  const v = Number(value);
+  if (!Number.isFinite(v)) return null;
+  const u = unit == null ? 'm' : String(unit).trim().toLowerCase();
+  if (u === 'm' || u === 'meter' || u === 'meters' || u === 'metre' || u === 'metres') return v;
+  if (u === 'ft' || u === 'foot' || u === 'feet') return v * 0.3048;
+  return null;
+}
+
+// A copy of an Open-Meteo forecast body with those fields in METRES, in both
+// `current` and `hourly`, and the unit blocks saying so (a second pass is a
+// no-op). The input is not modified: the raw body is what gets cached, and a
+// cached copy is normalized again when it is read.
+function normalizeOpenMeteoLengths(json) {
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return json;
+  const out = Object.assign({}, json);
+  [['current', 'current_units'], ['hourly', 'hourly_units']].forEach(([blk, ublk]) => {
+    const b = json[blk];
+    if (!b || typeof b !== 'object') return;
+    const units = (json[ublk] && typeof json[ublk] === 'object') ? json[ublk] : {};
+    const nb = Object.assign({}, b), nu = Object.assign({}, units);
+    OPEN_METEO_LENGTH_FIELDS.forEach(f => {
+      if (!(f in b)) return;
+      const u = units[f];
+      nb[f] = Array.isArray(b[f]) ? b[f].map(v => openMeteoLengthToMeters(v, u)) : openMeteoLengthToMeters(b[f], u);
+      nu[f] = 'm';
+    });
+    out[blk] = nb;
+    out[ublk] = nu;
+  });
+  return out;
 }
 
 // Area (km²) of a Leaflet-style polygon: an array of rings (outer first, then
@@ -6280,6 +6341,7 @@ if (typeof module !== 'undefined' && module.exports) {
     freezingLevelRisk, metarCeilingFt, flightCategory, assessCloudClearance, combineProhibitedAreas,
     arcgisExceededLimit, arcgisPageUrl, ringAreaKm2, polygonAreaKm2, localDateISO,
     WMM2025_EPOCH, WMM2025_COEF, decimalYear, wmmMagneticField, magneticDeclination, formatDeclination, openMeteoTimeToIso,
+    OPEN_METEO_LENGTH_FIELDS, openMeteoLengthToMeters, normalizeOpenMeteoLengths,
     DEFAULT_THRESHOLDS, DRONE_PROFILES,
     classifyTerrain, estimateVegetation, estimateCellCoverage,
     SMA_NONPUBLIC_CODES, smaAgencyInfo, smaIsPublic, classifyAreaPublicPrivate, cellCoverageAt,

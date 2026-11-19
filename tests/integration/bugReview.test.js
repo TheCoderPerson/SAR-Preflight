@@ -58,6 +58,7 @@ function installFetch(handlers) {
 function resetWeatherState() {
   document.body.innerHTML = APP_BODY;
   S.wx = null; S.aqi = null; S.kp = null; S.kpForecast = null;
+  S.wxAreaKey = null; S.aqiAreaKey = null; // no weather held → it belongs to no area
   S.wind = {}; S.elev = {};
   S.sectionMeta = {};
   S.dataSourceErrors = {};

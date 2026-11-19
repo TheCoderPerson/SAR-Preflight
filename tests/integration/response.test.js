@@ -37,6 +37,7 @@ const {
   fetchResponseEstimate, startResponseEstimate, autoResponseEstimate, recomputeResponseForHour,
   _setValhallaInterval, getResponseSettings, saveResponseSetting, saveResponseBase, selectResponseDest,
   onResponseStagingClick, clearResponseStaging, startResponseStagingPick, _resetResponse,
+  startResponseStartPick, onResponseStartClick, clearResponseStart, onResponseMapPick, cancelResponsePick,
   _briefingResponseLines, _exportResponseRecords, buildBriefingText, collectExportFolderGroups,
   invalidateAreaRequests, EXPORT_SKIP_LAYERS, VEC3D_SKIP,
 } = app;
@@ -128,7 +129,8 @@ function seed(opts) {
     + CELL_IDS.map(id => `<div class="data-value" id="${id}">--</div>`).join('')
     + '<div class="data-value" id="respLoad">--</div>'
     + '<div id="respDestList"></div><div id="respAlertList"></div>'
-    + '<button id="respStagingBtn"></button><button id="respStagingClear" style="display:none;"></button><div id="respStagingNote"></div>';
+    + '<button id="respStagingBtn"></button><button id="respStagingClear" style="display:none;"></button><div id="respStagingNote"></div>'
+    + '<button id="respStartBtn"></button><button id="respStartClear" style="display:none;"></button><div id="respStartNote"></div>';
   localStorage.setItem(RESPONSE_CFG_KEY, JSON.stringify(Object.assign({ consent: true, base: BASE }, opts.cfg || {})));
   S.map = { hasLayer: () => true, addLayer: () => {}, removeLayer: () => {}, getContainer: () => ({ style: {} }) };
   S.mapLayers = {};
@@ -137,7 +139,7 @@ function seed(opts) {
   S.viewsheds = opts.observers || [];
   S.activeViewshedId = S.viewsheds.length ? S.viewsheds[0].id : null;
   S.deviceFix = opts.fix || null;
-  S.response = null; S._responseStaging = null; S._responseMemo = null; S._responsePicking = false;
+  S.response = null; S._responseStaging = null; S._responseStart = null; S._responseMemo = null; S._responsePicking = false;
   S.timeIdx = 0; S.wx = null;
   S.dataSourceErrors = {};
   _setValhallaInterval(0);
@@ -148,7 +150,7 @@ beforeEach(() => { localStorage.clear(); });
 afterEach(() => {
   document.body.innerHTML = '';
   S.map = null; S.mapLayers = {}; S.areaCenter = null; S.sectionMeta = {}; S.viewsheds = [];
-  S.response = null; S._responseStaging = null; S._responseMemo = null; S.deviceFix = null; S.wx = null; S.timeIdx = 0;
+  S.response = null; S._responseStaging = null; S._responseStart = null; S._responsePicking = false; S._responseMemo = null; S.deviceFix = null; S.wx = null; S.timeIdx = 0;
   if (S._responseTimer) { clearTimeout(S._responseTimer); S._responseTimer = null; }
   delete globalThis.fetch; delete globalThis.getCachedApiResponse; delete globalThis.cacheApiResponse; delete globalThis.getAppState;
   _setValhallaInterval(1100);
@@ -353,7 +355,7 @@ describe('staging point', () => {
     seed({ observers: [observer('vs_1', 'Observer 1')] });
     mockServices();
     startResponseStagingPick();
-    expect(S._responsePicking).toBe(true);
+    expect(S._responsePicking).toBe('staging');
     onResponseStagingClick({ lat: 38.85, lng: -120.24 });
     expect(S._responsePicking).toBe(false);
     expect(S._responseStaging).toMatchObject({ lat: 38.85, lng: -120.24 });
@@ -413,6 +415,187 @@ describe('start location', () => {
     expect(getResponseSettings().base.lat).toBe(38.7296);
     await saveResponseBase('');
     expect(getResponseSettings().base).toBeNull();
+  });
+});
+
+describe('start point set on the map', () => {
+  const AK = () => globalThis.areaKey(38.86, -120.23);
+  const routeStart = () => JSON.parse(calls.find(c => c.kind === 'route').opts.body).locations[0];
+
+  it('a map tap while armed sets it and it is used instead of a fresh GPS fix and the base', async () => {
+    seed({ fix: { lat: 38.70, lng: -120.90, accM: 12, at: Date.now() - 60000 } });
+    mockServices();
+    startResponseStartPick();
+    expect(S._responsePicking).toBe('start');
+    expect(document.getElementById('respStartBtn').classList.contains('active')).toBe(true);
+    onResponseMapPick({ lat: 38.683, lng: -121.024 });
+    expect(S._responsePicking).toBe(false);
+    expect(document.getElementById('respStartBtn').classList.contains('active')).toBe(false);
+    expect(S._responseStart).toEqual({ areaKey: AK(), lat: 38.683, lng: -121.024 });
+    await vi.waitFor(() => expect(S.response && S.response.computedAt).toBeTruthy());
+    expect(routeStart()).toEqual({ lat: 38.683, lon: -121.024 });
+    expect(S.response.start.kind).toBe('manual');
+    expect(text('respStart')).toBe('Start point set on the map (38.68300, -121.02400)');
+    expect(document.getElementById('respStartClear').style.display).toBe('');
+    expect(document.getElementById('respStartNote').textContent).toMatch(/^Start point set \(38\.68300, -121\.02400\) — used instead of/);
+  });
+
+  it('never asks the device for its position while a start point is set', async () => {
+    seed();
+    mockServices();
+    const getCurrentPosition = vi.fn();
+    const had = Object.getOwnPropertyDescriptor(globalThis.navigator, 'geolocation');
+    Object.defineProperty(globalThis.navigator, 'geolocation', { configurable: true, value: { getCurrentPosition } });
+    try {
+      S._responseStart = { areaKey: AK(), lat: 38.683, lng: -121.024 };
+      await fetchResponseEstimate({ userGesture: true }); // UPDATE: the path that may prompt
+      expect(getCurrentPosition).not.toHaveBeenCalled();
+      expect(routeStart()).toEqual({ lat: 38.683, lon: -121.024 });
+    } finally {
+      if (had) Object.defineProperty(globalThis.navigator, 'geolocation', had); else delete globalThis.navigator.geolocation;
+    }
+  });
+
+  it('does not move the operational area or ask for its weather or terrain', async () => {
+    seed();
+    mockServices();
+    const centre = { lat: S.areaCenter.lat, lng: S.areaCenter.lng };
+    onResponseStartClick({ lat: 38.683, lng: -121.024 });
+    await vi.waitFor(() => expect(S.response && S.response.computedAt).toBeTruthy());
+    expect(S.areaCenter).toEqual(centre);
+    // The only forecast request is the multi-point one along the route.
+    const wx = calls.filter(c => c.kind === 'wx');
+    expect(wx.length).toBe(1);
+    expect(wx[0].url).not.toMatch(/[?&]current=/);
+    expect(count('elev')).toBe(0); // no observers → no hike → no elevation request at all
+  });
+
+  it('clearing it goes back to the device location, else the saved base', async () => {
+    seed();
+    mockServices();
+    S._responseStart = { areaKey: AK(), lat: 38.683, lng: -121.024 };
+    await fetchResponseEstimate({});
+    expect(S.response.start.kind).toBe('manual');
+    clearResponseStart();
+    await vi.waitFor(() => expect(S.response.start.kind).toBe('base'));
+    expect(S._responseStart).toBeNull();
+    expect(document.getElementById('respStartClear').style.display).toBe('none');
+    expect(document.getElementById('respStartNote').textContent).toBe('');
+    expect(text('respStart')).toBe('Saved base: Placerville base');
+  });
+
+  it('resolves "no start location" without GPS or a saved base', async () => {
+    seed({ cfg: { base: null } });
+    mockServices();
+    await fetchResponseEstimate({});
+    expect(document.getElementById('respPrompt').textContent).toMatch(/tap Set Start Point below and then the map/);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    onResponseStartClick({ lat: 38.683, lng: -121.024 });
+    await vi.waitFor(() => expect(S.response && S.response.computedAt).toBeTruthy());
+    expect(document.getElementById('respPrompt').style.display).toBe('none');
+    expect(text('respTotal')).toMatch(/to Road nearest area centre/);
+  });
+
+  it('sends nothing before consent, but keeps the point and marks it on the map', async () => {
+    seed({ cfg: { consent: false } });
+    mockServices();
+    onResponseStartClick({ lat: 38.683, lng: -121.024 });
+    await Promise.resolve();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(S._responseStart).toMatchObject({ lat: 38.683, lng: -121.024 });
+    const marks = S.mapLayers.response_route.getLayers();
+    expect(marks.length).toBe(1);
+    expect(marks[0]._ll).toEqual([38.683, -121.024]);
+    expect(marks[0]._popup).toMatch(/Response start/);
+  });
+
+  it('draws one start marker once the route exists', async () => {
+    seed();
+    mockServices();
+    S._responseStart = { areaKey: AK(), lat: 38.683, lng: -121.024 };
+    await fetchResponseEstimate({});
+    const starts = S.mapLayers.response_route.getLayers().filter(l => /Response start/.test(l._popup || ''));
+    expect(starts.length).toBe(1);
+    expect(starts[0]._ll).toEqual([38.683, -121.024]);
+  });
+
+  it('belongs to one area: another area ignores it, the same area restores it', async () => {
+    seed();
+    mockServices();
+    const saved = { areaKey: AK(), lat: 38.683, lng: -121.024 };
+    globalThis.getAppState = vi.fn(async key => (key === 'responseStart' ? saved : null));
+    // A different area: the stored point is not used.
+    S.areaCenter = { lat: 39.0, lng: -120.3 };
+    await autoResponseEstimate();
+    expect(S._responseStart).toBeNull();
+    expect(routeStart()).toEqual({ lat: BASE.lat, lon: BASE.lng });
+    // Back on the area it was set for.
+    mockServices();
+    S.areaCenter = { lat: 38.86, lng: -120.23 };
+    await autoResponseEstimate();
+    expect(S._responseStart).toEqual(saved);
+    expect(routeStart()).toEqual({ lat: 38.683, lon: -121.024 });
+  });
+
+  it('the two picks are exclusive, and each tap goes to the armed one', async () => {
+    seed({ cfg: { consent: false } });
+    mockServices();
+    startResponseStagingPick();
+    startResponseStartPick(); // switches
+    expect(S._responsePicking).toBe('start');
+    expect(document.getElementById('respStagingBtn').classList.contains('active')).toBe(false);
+    onResponseMapPick({ lat: 38.683, lng: -121.024 });
+    expect(S._responseStart).toMatchObject({ lat: 38.683, lng: -121.024 });
+    expect(S._responseStaging).toBeNull();
+    startResponseStagingPick();
+    expect(S._responsePicking).toBe('staging');
+    onResponseMapPick({ lat: 38.85, lng: -120.24 });
+    expect(S._responseStaging).toMatchObject({ lat: 38.85, lng: -120.24 });
+    expect(S._responseStart).toMatchObject({ lat: 38.683, lng: -121.024 }); // untouched
+    startResponseStartPick();
+    cancelResponsePick();
+    expect(S._responsePicking).toBe(false);
+  });
+
+  it('starting a draw tool disarms the pick, so drawing an area never also sets a point', () => {
+    seed({ cfg: { consent: false } });
+    mockServices();
+    document.body.insertAdjacentHTML('beforeend', '<button class="draw-btn" id="drawCircle"></button>');
+    const enable = vi.fn();
+    globalThis.L.Draw = { Circle: function () { this.enable = enable; this.disable = () => {}; } };
+    try {
+      startResponseStartPick();
+      expect(S._responsePicking).toBe('start');
+      app.startDraw('circle');
+      expect(S._responsePicking).toBe(false);
+      expect(enable).toHaveBeenCalledTimes(1);
+      startResponseStagingPick();
+      app.startDraw('circle');
+      expect(S._responsePicking).toBe(false);
+    } finally {
+      delete globalThis.L.Draw;
+      S.drawHandler = null;
+    }
+  });
+
+  it('clearing the area drops it', async () => {
+    seed();
+    mockServices();
+    S._responseStart = { areaKey: AK(), lat: 38.683, lng: -121.024 };
+    await fetchResponseEstimate({});
+    _resetResponse();
+    expect(S._responseStart).toBeNull();
+    expect(S.mapLayers.response_route.getLayers().length).toBe(0);
+  });
+
+  it('the briefing names it without its coordinates', async () => {
+    seed();
+    mockServices();
+    S._responseStart = { areaKey: AK(), lat: 38.683, lng: -121.024 };
+    await fetchResponseEstimate({});
+    const lines = _briefingResponseLines();
+    expect(lines[0]).toMatch(/^  Start: start point set on the map \| Departure: .* \(now\) \| Equipment loading: 30 min$/);
+    expect(lines.join('\n')).not.toMatch(/38\.683|121\.024|Invalid Date/);
   });
 });
 

@@ -88,7 +88,8 @@ const S = {
   // Response Time Estimate (see fetchResponseEstimate)
   response: null,           // { areaKey, sig, start, staging, dests[], drives{}, wx, caltrans, alerts, mvum, computedAt }
   _responseStaging: null,   // { areaKey, lat, lng } — where the vehicle parks, set by one map tap
-  _responsePicking: false,  // armed: the next map tap sets the staging point
+  _responseStart: null,     // { areaKey, lat, lng } — start set by one map tap; used instead of GPS / saved base for this area
+  _responsePicking: false,  // false | 'staging' | 'start' — armed: the next map tap sets that point
   _responseTimer: null,     // debounce for observer changes
   _responseMemo: null,      // Map<routeKey, leg> — session-scoped, bounded
 };
@@ -931,7 +932,7 @@ function initMap() {
   // land between features but still inside a polygon.
   S.map.on('click', e => {
     if (S._canopyEditing) return; // no aggregate popups while editing canopy
-    if (S._responsePicking) { onResponseStagingClick(e.latlng); return; }
+    if (S._responsePicking) { onResponseMapPick(e.latlng); return; }
     if (S._viewshedPicking) { onViewshedMapClick(e.latlng); return; }
     openAggregatePopup(e.latlng, e);
   });
@@ -989,6 +990,9 @@ function startDraw(type) {
   if (S._canopyEditing) return; // ops-area drawing is disabled in canopy edit mode
   if (S.is3D && typeof _exit3D === 'function') _exit3D(); // drawing happens on the 2D map
   if (typeof cancelViewshedPick === 'function') cancelViewshedPick(); // draw + viewshed-pick are mutually exclusive
+  // …and so is an armed response-time pick: left armed, the first click of the
+  // new shape would also have set the staging / start point.
+  if (typeof cancelResponsePick === 'function') cancelResponsePick();
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
   clearDrawBtns();
   const opts = { shapeOptions: { color: '#3d8bfd', weight: 2, fillOpacity: 0.08, dashArray: '6,4' } };
@@ -1002,6 +1006,7 @@ function clearArea() {
   invalidateAreaRequests(); // pending area requests must not repopulate a cleared area
   stopAdsbPolling();
   S.drawnItems.clearLayers(); S.currentArea = null; S.areaCenter = null;
+  S._processedAreaKey = null; // the next area drawn is a new one, even at the same spot
   Object.keys(WIRE_CATEGORIES).forEach(k => { if (S.mapLayers['wire_' + k]) S.mapLayers['wire_' + k].clearLayers(); });
   if (S.mapLayers.airports) S.mapLayers.airports.clearLayers();
   if (S.mapLayers.nws_alerts) S.mapLayers.nws_alerts.clearLayers();
@@ -1447,6 +1452,38 @@ function locateMe() {
 // ============================================================
 // PROCESS AREA — Triggers all API fetches
 // ============================================================
+function _areaKeyOf(lat, lng) {
+  return typeof areaKey === 'function' ? areaKey(lat, lng) : `${lat.toFixed(3)}_${lng.toFixed(3)}`;
+}
+
+// Sections whose cells are written by a fetch that processArea starts. (Kp is
+// global, ADS-B and the response estimate run their own lifecycle.)
+const AREA_BLANK_SECTIONS = ['weather', 'airQuality', 'airspace', 'elevation', 'obstacles', 'solar', 'fireDanger',
+  'groundAccess', 'publicLands', 'water', 'hospitals', 'trails'];
+
+function _blankSectionCells(keys) {
+  if (typeof document === 'undefined') return;
+  keys.forEach(k => sectionCellsFor(k).forEach(id => { setText(id, '--'); setColor(id, null); }));
+}
+
+// A NEW area starts from an empty panel. Drawing an area does not clear the
+// previous one's state, and each cell used to keep the previous area's value
+// until its own fetch answered, under nothing but a small "Fetching…" pill.
+// A slow request therefore showed another place's numbers for this area —
+// 46 °F and 1,234 ft (a foothill area) for an area at 6,400 ft in snow — and
+// the banner went on listing the previous area's limits. Cells are blanked and
+// the banner says it is loading; the weather and terrain STATE is dropped by
+// their fetchers (fetchWeather / fetchElevation) when their request begins.
+function _resetPanelForNewArea() {
+  if (typeof document === 'undefined') return;
+  _blankSectionCells(AREA_BLANK_SECTIONS);
+  S.assessment = null;
+  const badge = document.getElementById('assessBadge');
+  if (badge) { badge.textContent = 'LOADING'; badge.className = 'assessment-badge'; }
+  const textEl = document.getElementById('assessText');
+  if (textEl) { textEl.textContent = 'Loading data for this area…'; textEl.title = ''; }
+}
+
 async function processArea(layer, type) {
   try { Diag.note('area.process', { type: type, dom: Diag._domSnapshot() }); } catch (_) {}
   // Every request still in flight for the previous area (or an earlier load
@@ -1507,6 +1544,10 @@ async function processArea(layer, type) {
     }
   }
   S.areaCenter = center; S.areaBounds = bounds; S.currentArea = layer;
+  // A different area starts from an empty panel (see _resetPanelForNewArea).
+  const _newAreaKey = _areaKeyOf(center.lat, center.lng);
+  if (S._processedAreaKey !== _newAreaKey) _resetPanelForNewArea();
+  S._processedAreaKey = _newAreaKey;
   document.getElementById('areaCenter').textContent = `${center.lat.toFixed(4)}, ${center.lng.toFixed(4)}`;
   document.getElementById('areaType').textContent = S.areaType;
   // Re-hydrate this area's saved observer viewsheds (markers + active overlay) from IndexedDB.
@@ -2185,7 +2226,15 @@ async function _readOpenMeteo(res, label) {
 // Commit a validated forecast to state + panel. `src` is { live: true } for a
 // network answer, else { cachedAt, badge, label, error } for an offline copy.
 function _commitWeather(wx, k, src, keepHourly) {
+  // Lengths to METRES first: the API answers visibility and freezing level in
+  // feet for this request's unit settings, and everything downstream reads
+  // metres. Works on a copy, so the raw body stays as it arrived for the cache.
+  wx = normalizeOpenMeteoLengths(wx);
   S.wx = wx.current;
+  // An offline copy is current conditions only. Copies cached by earlier
+  // versions carry that fetch's hourly arrays inside `current` (the body was
+  // modified before it was stored), still in the API's units — drop them.
+  if (!keepHourly) delete S.wx.hourly;
   S.wxAreaKey = k;
   // The mission area's own zone (Open-Meteo timezone=auto) — briefings state
   // forecast times in it, since the device may be in another zone.
@@ -2292,11 +2341,7 @@ async function _weatherFailed(err, k, tok) {
     _commitWeather(rec.data, k, _idbCachedSrc(rec, msg), false);
     return;
   }
-  if (S.wxAreaKey !== k) {
-    S.wx = {}; S.wind = {}; S.wxAreaKey = null;
-    renderForecastChart(null);
-    if (typeof hideTimeBar === 'function') hideTimeBar();
-  }
+  if (S.wxAreaKey !== k) _dropWeatherState();
   markSection('weather', { status: 'error', error: msg });
   setStatus('wxStatus', 'error', 'ERROR');
   setStatus('windStatus', 'error', 'ERROR');
@@ -2319,9 +2364,27 @@ async function _aqiFailed(err, k, tok) {
   markSection('airQuality', { status: 'error', error: msg });
 }
 
+// Forget the weather in state (it belongs to another area, or nothing usable
+// arrived): no values, no forecast chart, no time bar.
+function _dropWeatherState() {
+  S.wx = {}; S.wind = {}; S.wxAreaKey = null; S.timeIdx = 0;
+  renderForecastChart(null);
+  if (typeof hideTimeBar === 'function') hideTimeBar();
+  if (typeof document !== 'undefined') {
+    const tb = document.getElementById('windTableBody');
+    if (tb) tb.innerHTML = '';
+    if (typeof updateTimeContextBanner === 'function') updateTimeContextBanner();
+  }
+}
+
 async function fetchWeather(lat, lng) {
   const tok = _beginRequest('weather');
   const k = typeof areaKey === 'function' ? areaKey(lat, lng) : `${lat.toFixed(3)}_${lng.toFixed(3)}`;
+  // Another area's weather goes the moment a request for THIS area begins —
+  // not only if that request fails. While the answer is on its way, neither
+  // the panel nor the assessment may show or judge this area by it.
+  if (S.wxAreaKey != null && S.wxAreaKey !== k) { _dropWeatherState(); _blankSectionCells(['weather']); }
+  if (S.aqiAreaKey != null && S.aqiAreaKey !== k) { S.aqi = null; S.aqiAreaKey = null; _blankSectionCells(['airQuality']); }
   trackFetchStart('Weather');
   setStatus('wxStatus', 'loading', 'Fetching...');
   setStatus('windStatus', 'loading', 'Fetching...');
@@ -3012,9 +3075,31 @@ function _commitElevationSamples(elevationsFt, centerIdx, gridSize, positions, c
   _refreshGpsMaskingForTerrain();
 }
 
+// Terrain arrived after this area's weather: everything derived from both
+// (battery derating, the service-ceiling limit, the freezing-level check,
+// terrain turbulence) was computed without it, and used to stay that way until
+// the LAST fetch of the area finished — minutes when an Overpass mirror hangs —
+// reading "Elevation missing, assuming 9,000 ft" beside a known elevation.
+// With no weather for this area yet there is nothing to redo: its commit
+// computes everything.
+function _refreshDerivedForTerrain(k) {
+  if (typeof document === 'undefined' || !S.currentArea || S.wxAreaKey !== k) return;
+  if (S.wx && S.wx.hourly) { refreshPanelForHour(); return; }
+  renderWeather(); renderWind(); reapplyStaleCells();
+  computeOpsData(); computeAssessment();
+}
+
 async function fetchElevation(center, bounds) {
   const tok = _beginRequest('elevation');
   const k = typeof areaKey === 'function' ? areaKey(center.lat, center.lng) : `${center.lat.toFixed(3)}_${center.lng.toFixed(3)}`;
+  // Another area's terrain goes the moment a request for THIS area begins (as
+  // with weather): launch elevation feeds the service-ceiling limit, battery
+  // derating, cell coverage and the landing zones.
+  if (S.elev && S.elev.center != null && !_dataIsForArea('elevation', k)) {
+    S.elev = {}; S.cellStatus = null; S.lzs = [];
+    if (typeof renderLZMarkers === 'function') renderLZMarkers(S.lzs);
+    _blankSectionCells(['elevation']);
+  }
   trackFetchStart('Elevation');
   setStatus('elevStatus', 'loading', 'Fetching...');
   const ne = bounds.getNorthEast(), sw = bounds.getSouthWest();
@@ -3061,6 +3146,7 @@ async function fetchElevation(center, bounds) {
     _commitElevationSamples(data.results.map(r => Math.round(r.elevation * 3.28084)), centerIdx, gridSize,
       data.points, center);
     _setDataArea('elevation', k);
+    _refreshDerivedForTerrain(k);
 
     // Cache elevation data — only a genuine network answer (see _freshPatch).
     if (!swHit) {
@@ -3107,6 +3193,7 @@ async function fetchElevation(center, bounds) {
           // area — a cached copy used to leave the previous area's in place.
           _commitElevationSamples(elevations, cIdx, cgrid * cgrid === cres.length ? cgrid : 0, posOk ? cpts : null, center);
           _setDataArea('elevation', k);
+          _refreshDerivedForTerrain(k);
           const age = Date.now() - cached.timestamp;
           const badge = cached.status === 'stale' ? 'cached' : 'expired';
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
@@ -7668,7 +7755,7 @@ function renderAdsbMap() {
     // marker on the next rebuild; aggregation skips this layer for the same
     // reason). Pick-mode routing matches _aggFeatureClick.
     marker.on('click', e => {
-      if (S._responsePicking) { onResponseStagingClick(e.latlng); return; }
+      if (S._responsePicking) { onResponseMapPick(e.latlng); return; }
       if (S._viewshedPicking) { onViewshedMapClick(e.latlng); return; }
       openAdsbPanel(ac);
     });
@@ -10421,8 +10508,8 @@ function _aggFeatureClick(e) {
   // While picking a viewshed observer, a click that lands on an interactive
   // feature (TFR/NOTAM polygon) must still place the observer — the feature
   // handler stops propagation, so the map-level click handler never sees it.
-  // The response-time staging pick is routed the same way.
-  if (S._responsePicking) { onResponseStagingClick(e.latlng); return; }
+  // The response-time staging / start picks are routed the same way.
+  if (S._responsePicking) { onResponseMapPick(e.latlng); return; }
   if (S._viewshedPicking) { onViewshedMapClick(e.latlng); return; }
   // An observer-marker tap toggles its viewshed (the marker's own click
   // handler) — anchor the popup at the pin and lift it above the icon so the
@@ -13383,6 +13470,7 @@ async function startCanopyEdit() {
   if (S._canopyEditing || !S.map) return;
   if (S.is3D && typeof _exit3D === 'function') _exit3D();
   if (typeof cancelViewshedPick === 'function') cancelViewshedPick();
+  if (typeof cancelResponsePick === 'function') cancelResponsePick();
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; clearDrawBtns(); }
   if (!S.canopy || !S.canopy.canopyFlat) await loadCanopyForView();
   if (!S.canopy || !S.canopy.canopyFlat) {
@@ -14544,10 +14632,10 @@ const VLOS_RING_STYLE = { color: '#5ec522', weight: 1.5, dashArray: '5,7', fillC
 function startViewshedPick() {
   if (S._canopyEditing) return; // observer pick is disabled in canopy edit mode
   if (S.is3D && typeof _exit3D === 'function') _exit3D(); // observer pick is a 2D map tap
-  // Mutually exclusive with the draw tools and the staging-point pick.
+  // Mutually exclusive with the draw tools and the response-time map picks.
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
   clearDrawBtns();
-  if (S._responsePicking && typeof cancelResponseStagingPick === 'function') cancelResponseStagingPick();
+  if (S._responsePicking && typeof cancelResponsePick === 'function') cancelResponsePick();
   S._viewshedPicking = true;
   document.getElementById('vsPickBtnMap')?.classList.add('active');
   document.getElementById('vsPickBtn')?.classList.add('active');
@@ -16290,6 +16378,7 @@ function _enter3D() {
   // Drop tools that depend on 2D map clicks.
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; clearDrawBtns(); }
   if (typeof cancelViewshedPick === 'function') cancelViewshedPick();
+  if (typeof cancelResponsePick === 'function') cancelResponsePick();
   container.classList.add('mode-3d');
   S.is3D = true;
   const c = S.map.getCenter();
@@ -16678,6 +16767,14 @@ function _responseStaging() {
   return (st && st.areaKey === _currentAreaKey()) ? st : null;
 }
 
+// A start the user set by tapping the map, for the current area only. It is
+// used INSTEAD of the device location and the saved base — a tapped point is
+// a deliberate choice, so no position request is made while one is set.
+function _responseManualStart() {
+  const st = S._responseStart;
+  return (st && st.areaKey === _currentAreaKey() && Number.isFinite(st.lat) && Number.isFinite(st.lng)) ? st : null;
+}
+
 // Every observer of the current area (active first, capped). With a staging
 // point the vehicle parks there and each observer gets a hike leg from it;
 // with no observers the estimate is drive-only (staging point, else the road
@@ -16907,7 +17004,9 @@ async function fetchResponseEstimate(opts) {
     const prev = (S.response && S.response.areaKey === ak) ? S.response : null;
     const ps = prev && prev.start;
     let start;
-    if (!opts.userGesture && ps && ps.kind === 'gps' && (Date.now() - ps.at) <= DEVICE_FIX_MAX_AGE_MS) start = ps;
+    const manual = _responseManualStart();
+    if (manual) start = { kind: 'manual', lat: manual.lat, lng: manual.lng, at: null, accM: null, label: 'Start point set on the map' };
+    else if (!opts.userGesture && ps && ps.kind === 'gps' && (Date.now() - ps.at) <= DEVICE_FIX_MAX_AGE_MS) start = ps;
     else start = await _resolveResponseStart(settings, !!opts.userGesture);
     if (!_requestCurrent(tok)) return;
 
@@ -17020,17 +17119,21 @@ async function autoResponseEstimate() {
   if (!S.areaCenter) return;
   const ak = _currentAreaKey();
   if (S.response && S.response.areaKey !== ak) { S.response = null; renderResponseRouteLayer(); }
-  if (!(S._responseStaging && S._responseStaging.areaKey === ak)) {
-    S._responseStaging = null;
-    if (typeof getAppState === 'function') {
-      try {
-        const st = await getAppState('responseStaging');
-        if (st && st.areaKey === ak && _currentAreaKey() === ak && Number.isFinite(st.lat) && Number.isFinite(st.lng)) S._responseStaging = st;
-      } catch (_) { /* optional */ }
-    }
-  }
+  // The staging point and a tapped start belong to one area: keep this area's,
+  // else restore the ones saved for it (a different area's are never used).
+  const restore = async (prop, stateKey) => {
+    if (S[prop] && S[prop].areaKey === ak) return;
+    S[prop] = null;
+    if (typeof getAppState !== 'function') return;
+    try {
+      const st = await getAppState(stateKey);
+      if (st && st.areaKey === ak && _currentAreaKey() === ak && Number.isFinite(st.lat) && Number.isFinite(st.lng)) S[prop] = st;
+    } catch (_) { /* optional */ }
+  };
+  await restore('_responseStaging', 'responseStaging');
+  await restore('_responseStart', 'responseStart');
   const settings = getResponseSettings();
-  if (!settings.consent || !settings.auto) { renderResponse(); return; }
+  if (!settings.consent || !settings.auto) { renderResponse(); renderResponseRouteLayer(); return; }
   return fetchResponseEstimate({});
 }
 
@@ -17048,37 +17151,57 @@ function _resetResponse() {
   if (S._responseTimer) { clearTimeout(S._responseTimer); S._responseTimer = null; }
   S.response = null;
   S._responseStaging = null;
-  cancelResponseStagingPick();
+  S._responseStart = null;
+  cancelResponsePick();
   if (S.mapLayers && S.mapLayers.response_route) S.mapLayers.response_route.clearLayers();
   renderResponse();
 }
 
-// --- Staging point (one map tap) ---
+// --- Map picks: the staging point and the start point (one map tap each) ---
+// Neither tap touches the operational area: weather, terrain and every other
+// tab stay with the drawn area.
 
-function startResponseStagingPick() {
+const RESPONSE_PICKS = {
+  staging: { btn: 'respStagingBtn', status: 'TAP MAP · STAGING POINT' },
+  start: { btn: 'respStartBtn', status: 'TAP MAP · START POINT' },
+};
+
+function _armResponsePick(which) {
   if (S._canopyEditing || !S.areaCenter) return;
   if (S.is3D && typeof _exit3D === 'function') _exit3D();
   if (S._viewshedPicking) cancelViewshedPick();
   if (S.drawHandler) { S.drawHandler.disable(); S.drawHandler = null; }
   clearDrawBtns();
-  S._responsePicking = true;
+  if (S._responsePicking) cancelResponsePick(); // one pick at a time
+  S._responsePicking = which;
   if (S.map) S.map.getContainer().style.cursor = 'crosshair';
-  document.getElementById('respStagingBtn')?.classList.add('active');
-  setStatus('responseStatus', 'loading', 'TAP MAP · STAGING POINT');
+  document.getElementById(RESPONSE_PICKS[which].btn)?.classList.add('active');
+  setStatus('responseStatus', 'loading', RESPONSE_PICKS[which].status);
 }
 
-function cancelResponseStagingPick() {
+function startResponseStagingPick() { _armResponsePick('staging'); }
+function startResponseStartPick() { _armResponsePick('start'); }
+
+function cancelResponsePick() {
   if (!S._responsePicking) return;
   S._responsePicking = false;
   if (S.map && S.map.getContainer) S.map.getContainer().style.cursor = '';
-  if (typeof document !== 'undefined') document.getElementById('respStagingBtn')?.classList.remove('active');
+  if (typeof document !== 'undefined') {
+    Object.keys(RESPONSE_PICKS).forEach(k => document.getElementById(RESPONSE_PICKS[k].btn)?.classList.remove('active'));
+  }
   // Put the status pill back: the section's own state, or blank when it has none yet.
   if (S.sectionMeta && S.sectionMeta.response) _syncStatusFromMeta('responseStatus', 'response');
   else setStatus('responseStatus', '', '');
 }
 
+// The armed map tap, from any of the three click paths.
+function onResponseMapPick(latlng) {
+  if (S._responsePicking === 'start') onResponseStartClick(latlng);
+  else onResponseStagingClick(latlng);
+}
+
 function onResponseStagingClick(latlng) {
-  cancelResponseStagingPick();
+  cancelResponsePick();
   if (!latlng || !S.areaCenter) return;
   S._responseStaging = { areaKey: _currentAreaKey(), lat: latlng.lat, lng: latlng.lng };
   if (typeof saveAppState === 'function') saveAppState('responseStaging', S._responseStaging);
@@ -17090,6 +17213,27 @@ function clearResponseStaging() {
   S._responseStaging = null;
   if (typeof saveAppState === 'function') saveAppState('responseStaging', null);
   renderResponse();
+  fetchResponseEstimate({});
+}
+
+// Start point: stored on this device only, for this area. Nothing is sent by
+// the tap itself — the estimate that follows still needs consent.
+function onResponseStartClick(latlng) {
+  cancelResponsePick();
+  if (!latlng || !S.areaCenter) return;
+  S._responseStart = { areaKey: _currentAreaKey(), lat: latlng.lat, lng: latlng.lng };
+  if (typeof saveAppState === 'function') saveAppState('responseStart', S._responseStart);
+  renderResponse();
+  renderResponseRouteLayer(); // show the marker at once, estimate or not
+  fetchResponseEstimate({});
+}
+
+// Back to the device location, else the saved base.
+function clearResponseStart() {
+  S._responseStart = null;
+  if (typeof saveAppState === 'function') saveAppState('responseStart', null);
+  renderResponse();
+  renderResponseRouteLayer();
   fetchResponseEstimate({});
 }
 
@@ -17264,6 +17408,7 @@ function _respHikeText(d) {
 function _respStartText(r) {
   const s = r.start;
   if (!s) return { text: '--', level: null };
+  if (s.kind === 'manual') return { text: `Start point set on the map (${s.lat.toFixed(5)}, ${s.lng.toFixed(5)})`, level: null };
   if (s.kind === 'base') return { text: `Saved base: ${s.label}`, level: null };
   const ageMin = Math.max(0, Math.round((Date.now() - s.at) / 60000));
   const acc = s.accM != null ? `, ±${Math.round(s.accM)} m` : '';
@@ -17286,13 +17431,13 @@ function _renderResponsePrompt(settings, r) {
   if (!S.areaCenter) { el.style.display = 'none'; el.innerHTML = ''; return; }
   if (!settings.consent) {
     el.style.display = '';
-    el.innerHTML = `<div style="font-size:11px;color:var(--text-secondary);line-height:1.5;">Estimating sends your <b>start point</b> (this device's location, or the base saved in Config) and the destination points to a public routing service (FOSSGIS Valhalla, openstreetmap.de). Nothing is sent until you tap the button; after that it runs when an area is drawn (switch off in Config → Response Time).</div>`
+    el.innerHTML = `<div style="font-size:11px;color:var(--text-secondary);line-height:1.5;">Estimating sends your <b>start point</b> (this device's location, the base saved in Config, or a start point you set on the map) and the destination points to a public routing service (FOSSGIS Valhalla, openstreetmap.de). Nothing is sent until you tap the button; after that it runs when an area is drawn (switch off in Config → Response Time).</div>`
       + `<button class="btn btn-primary" onclick="startResponseEstimate()" style="padding:5px 12px;font-size:11px;margin-top:8px;">Estimate Response Time</button>`;
     return;
   }
   if (r && r.needStart) {
     el.style.display = '';
-    el.innerHTML = `<div style="font-size:11px;color:var(--accent-amber);line-height:1.5;">No start location. Tap UPDATE to use this device's location, or save a base location in Config → Response Time.</div>`;
+    el.innerHTML = `<div style="font-size:11px;color:var(--accent-amber);line-height:1.5;">No start location. Tap UPDATE to use this device's location, tap Set Start Point below and then the map, or save a base location in Config → Response Time.</div>`;
     return;
   }
   el.style.display = 'none'; el.innerHTML = '';
@@ -17311,6 +17456,15 @@ function renderResponse() {
   if (stNote) {
     const st = _responseStaging();
     stNote.textContent = st ? `Staging point set (${st.lat.toFixed(5)}, ${st.lng.toFixed(5)}) — the vehicle parks here.` : '';
+  }
+  const ms = _responseManualStart();
+  const msBtn = document.getElementById('respStartClear');
+  if (msBtn) msBtn.style.display = ms ? '' : 'none';
+  const msNote = document.getElementById('respStartNote');
+  if (msNote) {
+    msNote.textContent = ms
+      ? `Start point set (${ms.lat.toFixed(5)}, ${ms.lng.toFixed(5)}) — used instead of this device's location and the saved base, for this area only.`
+      : '';
   }
 
   const list = document.getElementById('respDestList');
@@ -17417,6 +17571,7 @@ function renderResponseRouteLayer() {
   g.clearLayers();
   const r = S.response && S.response.areaKey === _currentAreaKey() ? S.response : null;
   const add = l => { g.addLayer(l); return l; };
+  let startDrawn = false;
   if (r) {
     const drawn = {};
     r.dests.forEach(d => {
@@ -17460,12 +17615,20 @@ function renderResponseRouteLayer() {
     if (r.start && L.circleMarker && Object.keys(drawn).length) {
       add(L.circleMarker([r.start.lat, r.start.lng], { radius: 6, color: '#0b1220', weight: 2, fillColor: '#fff', fillOpacity: 1 }))
         .bindPopup(`<b>Response start</b><br>${_esc(_respStartText(r).text)}`);
+      startDrawn = true;
     }
     const st = _responseStaging();
     if (st && L.circleMarker) {
       add(L.circleMarker([st.lat, st.lng], { radius: 7, color: RESPONSE_ROUTE_COLORS.road, weight: 3, fillColor: '#0b1220', fillOpacity: 1 }))
         .bindPopup('<b>Staging point</b><br>The vehicle parks here; hike legs start from the nearest road point.');
     }
+  }
+  // A start point set on the map shows where it was tapped even with no route
+  // yet (before the first estimate, or when routing from it failed).
+  const ms = _responseManualStart();
+  if (ms && !startDrawn && L.circleMarker) {
+    add(L.circleMarker([ms.lat, ms.lng], { radius: 6, color: '#0b1220', weight: 2, fillColor: '#fff', fillOpacity: 1 }))
+      .bindPopup(`<b>Response start</b><br>Start point set on the map (${ms.lat.toFixed(5)}, ${ms.lng.toFixed(5)})`);
   }
   // Shown the first time it has something to draw (the group can be created
   // empty, e.g. while waiting for a start location); afterwards the layer
@@ -17487,7 +17650,9 @@ function _briefingResponseLines() {
   const tzName = ms => new Date(ms).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: _localTZ(), timeZoneName: 'short' });
   // The start is never identified: no coordinates, and not the saved base's
   // label either — a geocoded label is a street address, and briefings get shared.
-  const start = r.start.kind === 'base' ? 'saved base location' : `GPS location (fix ${tzName(r.start.at)})`;
+  const start = r.start.kind === 'base' ? 'saved base location'
+    : r.start.kind === 'manual' ? 'start point set on the map'
+    : `GPS location (fix ${tzName(r.start.at)})`;
   out.push(`  Start: ${start} | Departure: ${tzName(r.departMs || Date.now())}${r.forecastHour ? ' (selected forecast hour)' : ' (now)'} | Equipment loading: ${Math.round(settings.loadMin)} min`);
   r.dests.forEach(d => {
     const drive = d.driveKey ? r.drives[d.driveKey] : null;
@@ -17570,7 +17735,8 @@ if (typeof module !== 'undefined' && module.exports) {
     _valhallaPost, _setValhallaInterval, _routeDrive, _routeHike, _resolveResponseStart, _responsePlan,
     fetchResponseEstimate, startResponseEstimate, autoResponseEstimate, _scheduleResponseEstimate, _resetResponse,
     recomputeResponseForHour, renderResponse, renderResponseRouteLayer, selectResponseDest, _responseDepartMs,
-    startResponseStagingPick, cancelResponseStagingPick, onResponseStagingClick, clearResponseStaging,
+    startResponseStagingPick, cancelResponsePick, onResponseStagingClick, clearResponseStaging,
+    startResponseStartPick, onResponseStartClick, clearResponseStart, onResponseMapPick, _responseManualStart,
     _briefingResponseLines, _exportResponseRecords, _mapNwsAlertFeatures, _nwsAlertCardHtml,
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer,
@@ -17584,6 +17750,7 @@ if (typeof module !== 'undefined' && module.exports) {
     notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _freshPatch, invalidateAreaRequests, _beginRequest, _requestCurrent, _setDataArea, _dataIsForArea, _readArcgisGeoJson, PROTECTED_LAYER_LABELS, _assessBadgeColor, renderAssessProfile, openLimitsProfileConfig, toggleAssessmentCollapsed, _setAssessCollapsed, restoreAssessCollapsed, ASSESS_COLLAPSED_KEY, sendFeedback, openFeedback, closeFeedback,
     fetchFAAairspace, faaAirspaceUnavailableLayers, FAA_AIRSPACE_LAYER_LABELS, fetchFireDanger,
     UNKNOWN_CELL_TEXT, SECTION_CELLS, sectionCellsFor, markCellsUnknown, renderFireDangerUnknown,
+    AREA_BLANK_SECTIONS, _areaKeyOf, _blankSectionCells, _resetPanelForNewArea, _dropWeatherState, _refreshDerivedForTerrain,
     NOTAM_MANUAL_UPDATE_CAUTION, renderNotamManualNotice,
     STALE_CELL_SUFFIX, markCellsStale, reapplyStaleCells, renderFireDangerStale, refreshPanelForHour,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,

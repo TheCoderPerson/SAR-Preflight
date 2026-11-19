@@ -1473,11 +1473,15 @@ select.api-input { cursor: pointer; }
             <div class="data-label">Destinations — one per observer (tap a row to show its details above)</div>
             <div id="respDestList"></div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
+              <button class="btn btn-ghost" id="respStartBtn" onclick="startResponseStartPick()" style="padding:4px 10px;font-size:10px;">Set Start Point</button>
+              <button class="btn btn-ghost" id="respStartClear" onclick="clearResponseStart()" style="padding:4px 10px;font-size:10px;display:none;">Clear Start Point</button>
               <button class="btn btn-ghost" id="respStagingBtn" onclick="startResponseStagingPick()" style="padding:4px 10px;font-size:10px;">Set Staging Point</button>
               <button class="btn btn-ghost" id="respStagingClear" onclick="clearResponseStaging()" style="padding:4px 10px;font-size:10px;display:none;">Clear Staging Point</button>
             </div>
+            <div class="resp-note" id="respStartNote" style="margin-top:4px;"></div>
             <div class="resp-note" id="respStagingNote" style="margin-top:4px;"></div>
-            <div class="resp-note" style="margin-top:4px;">With no staging point the drive ends at the road nearest each observer. Set one (tap the button, then the map) when you will park somewhere else: the drive goes there and each observer gets a hike leg from it. Speeds, delays and the saved base location are in Config &rarr; Response Time.</div>
+            <div class="resp-note" style="margin-top:4px;"><b>Start:</b> this device's location, else the base saved in Config. To start from somewhere else, tap Set Start Point and then the map: that point is used instead, for this area only. It does not move the operational area, so weather and terrain stay with the area you drew.</div>
+            <div class="resp-note" style="margin-top:4px;"><b>Staging:</b> with no staging point the drive ends at the road nearest each observer. Set one (tap the button, then the map) when you will park somewhere else: the drive goes there and each observer gets a hike leg from it. Speeds, delays and the saved base location are in Config &rarr; Response Time.</div>
           </div>
           <div class="api-config" style="padding-top:8px;">
             <div class="data-label">Weather Warnings Along Route (NWS)</div>
@@ -1652,7 +1656,7 @@ select.api-input { cursor: pointer; }
               <button class="btn btn-ghost" onclick="saveResponseBase(document.getElementById('cfgRespBase').value)">Save</button>
             </div>
             <div id="cfgRespBaseHint" style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">No base saved — the estimate needs this device's location.</div>
-            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">Looked up once when you press Save (an address or place name goes to OpenStreetMap Nominatim). Leave blank and Save to remove it.</div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">Looked up once when you press Save (an address or place name goes to OpenStreetMap Nominatim). Leave blank and Save to remove it. To start from a point on the map instead, use Set Start Point in the Ops tab.</div>
           </div>
           <div class="api-config">
             <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--text-secondary);cursor:pointer;">
