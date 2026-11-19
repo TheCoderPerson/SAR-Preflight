@@ -24,6 +24,18 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.11.19-a',
+    date: '2026-11-19',
+    changes: [
+      'A newly drawn area now starts completely clean. Everything fetched for the previous area is dropped as soon as a different area is drawn: weather alerts, FAA airspace, airports, obstacles, protected areas, wildfire data, smoke, avalanche danger, land ownership, wire hazards, the observed ceiling, live TFRs and NOTAMs, and live traffic. Before, each of these stayed until its own check for the new area answered, so a slow check left the previous area\'s warnings in the banner and its layers on the map.',
+      'The banner reads LOADING until the weather for the new area has answered, then lists every check that has not answered yet ("Still loading, not yet checked for this area: ..."). It updates as each check arrives instead of waiting for the slowest one.',
+      'The weather-alert and wildfire cards say they are checking while that check is on its way. They no longer show "no active alerts" or "no fire perimeters" before the answer.',
+      'Weather and terrain requests now give up after 20 and 15 seconds. A stalled connection used to leave "Fetching" on screen for good; it now ends as a failed check, and terrain falls back to its second source.',
+      'Resizing an area around the same centre reloads it like a new area, because half the sources are queried by the area\'s bounds.',
+      'Live traffic for a new area starts as soon as its terrain elevation arrives.',
+    ],
+  },
+  {
     version: '2026.11.18-c',
     date: '2026-11-18',
     changes: [

@@ -1007,11 +1007,10 @@ function clearArea() {
   stopAdsbPolling();
   S.drawnItems.clearLayers(); S.currentArea = null; S.areaCenter = null;
   S._processedAreaKey = null; // the next area drawn is a new one, even at the same spot
-  Object.keys(WIRE_CATEGORIES).forEach(k => { if (S.mapLayers['wire_' + k]) S.mapLayers['wire_' + k].clearLayers(); });
-  if (S.mapLayers.airports) S.mapLayers.airports.clearLayers();
-  if (S.mapLayers.nws_alerts) S.mapLayers.nws_alerts.clearLayers();
-  if (S.mapLayers.cell_towers) S.mapLayers.cell_towers.clearLayers();
-  if (S.mapLayers.fire_perimeters) S.mapLayers.fire_perimeters.clearLayers();
+  S._areaAwaiting = null;
+  // State, map layers and cards fetched for the area (shared with processArea,
+  // which does the same when a different area replaces this one).
+  _dropAreaData();
   // Clear radar layers and stop animation
   if (S.radarAnim) {
     if (S.radarAnim.interval) clearInterval(S.radarAnim.interval);
@@ -1021,18 +1020,6 @@ function clearArea() {
   const radarControls = document.getElementById('radarControls');
   if (radarControls) radarControls.style.display = 'none';
   hideTimeBar();
-  if (S.mapLayers.emergency_lz) S.mapLayers.emergency_lz.clearLayers();
-  if (S.mapLayers.swap_radius) S.mapLayers.swap_radius.clearLayers();
-  if (S.mapLayers.faa_class_airspace) S.mapLayers.faa_class_airspace.clearLayers();
-  if (S.mapLayers.faa_sua) S.mapLayers.faa_sua.clearLayers();
-  if (S.mapLayers.faa_tfr) S.mapLayers.faa_tfr.clearLayers();
-  if (S.mapLayers.faa_laanc) S.mapLayers.faa_laanc.clearLayers();
-  if (S.mapLayers.faa_ns_restrictions) S.mapLayers.faa_ns_restrictions.clearLayers();
-  if (S.mapLayers.faa_prohibited) S.mapLayers.faa_prohibited.clearLayers();
-  if (S.mapLayers.faa_obstacles) S.mapLayers.faa_obstacles.clearLayers();
-  if (S.mapLayers.dams) S.mapLayers.dams.clearLayers();
-  if (S.mapLayers.wilderness) S.mapLayers.wilderness.clearLayers();
-  if (S.mapLayers.national_parks) S.mapLayers.national_parks.clearLayers();
   // Vegetation overlay + viewsheds (analysis overlays) — teardown without rebuilding
   // the layer control (clearArea intentionally leaves that to the next processArea).
   // Saved viewsheds stay in IndexedDB; restoreViewsheds re-hydrates them per area.
@@ -1052,17 +1039,7 @@ function clearArea() {
   if (S.mapLayers.shadow && S.map && S.map.hasLayer(S.mapLayers.shadow)) S.map.removeLayer(S.mapLayers.shadow);
   S._overlayWanted = { canopy: false, viewshed: false, shadow: false };
   const _vsRes = document.getElementById('vsResult'); if (_vsRes) _vsRes.textContent = '';
-  S.faaAirspace = null;
-  S.faaObstacles = null;
-  S.protectedAreas = null;
-  S.lzs = [];
-  S.wireHazardCounts = {};
-  S.utilityWireCounts = {}; S.utilityWireInfo = {};
-  S.towerCount = 0;
-  S.nwsAlerts = []; S.nwsAlertsUnverified = false; S.nwsAlertsSource = null; S.nwsAlertsAt = null;
-  S.metar = null; S.metarUnverified = false; S.metarUnverifiedReason = null; _setDataArea('metar', null);
-  S.activeFires = []; S.fireDanger = null; S.fireDataUnverified = false;
-  _setDataArea('nwsAlerts', null); _setDataArea('fireDanger', null); // nothing held now
+  S.nwsAlertsSource = null; // no area: nothing is being checked
   S.dataSourceErrors = {};
   const dsWarn = document.getElementById('dataSourceWarning');
   if (dsWarn) dsWarn.remove();
@@ -1466,22 +1443,129 @@ function _blankSectionCells(keys) {
   keys.forEach(k => sectionCellsFor(k).forEach(id => { setText(id, '--'); setColor(id, null); }));
 }
 
+// Derived cells (Ops tab) — computed from the weather and the terrain, so they
+// are blanked with them.
+const AREA_DERIVED_CELLS = ['opsTempFactor', 'opsAltFactor', 'opsWindFactor', 'opsFlightTime', 'opsCapacity',
+  'opsBirdRisk', 'opsBirds', 'opsBirdSeason', 'opsBirdTime', 'opsBirdWater', 'opsBirdAlt',
+  'opsSwapTime', 'opsSwapRadius', 'opsSwapLZ'];
+
+function _renderAssessmentLoading() {
+  if (typeof document === 'undefined') return;
+  S.assessment = null;
+  const badge = document.getElementById('assessBadge');
+  if (badge) { badge.textContent = 'LOADING'; badge.className = 'assessment-badge'; }
+  const textEl = document.getElementById('assessText');
+  if (textEl) { textEl.textContent = 'Loading data for this area…'; textEl.title = ''; }
+}
+
 // A NEW area starts from an empty panel. Drawing an area does not clear the
 // previous one's state, and each cell used to keep the previous area's value
 // until its own fetch answered, under nothing but a small "Fetching…" pill.
 // A slow request therefore showed another place's numbers for this area —
 // 46 °F and 1,234 ft (a foothill area) for an area at 6,400 ft in snow — and
 // the banner went on listing the previous area's limits. Cells are blanked and
-// the banner says it is loading; the weather and terrain STATE is dropped by
-// their fetchers (fetchWeather / fetchElevation) when their request begins.
+// the banner says it is loading; the STATE behind them is dropped by
+// _dropAreaData (and, for weather and terrain, again by their fetchers when a
+// request for another area begins).
 function _resetPanelForNewArea() {
   if (typeof document === 'undefined') return;
   _blankSectionCells(AREA_BLANK_SECTIONS);
-  S.assessment = null;
-  const badge = document.getElementById('assessBadge');
-  if (badge) { badge.textContent = 'LOADING'; badge.className = 'assessment-badge'; }
-  const textEl = document.getElementById('assessText');
-  if (textEl) { textEl.textContent = 'Loading data for this area…'; textEl.title = ''; }
+  AREA_DERIVED_CELLS.forEach(id => { setText(id, '--'); setColor(id, null); });
+  _renderAssessmentLoading();
+}
+
+// Every map layer one area's fetches fill.
+const AREA_DATA_LAYERS = ['airports', 'nws_alerts', 'cell_towers', 'fire_perimeters', 'emergency_lz', 'swap_radius',
+  'faa_class_airspace', 'faa_sua', 'faa_tfr', 'faa_laanc', 'faa_ns_restrictions', 'faa_prohibited', 'faa_obstacles',
+  'dams', 'wilderness', 'national_parks', 'hms_smoke', 'avalanche', 'hospitals', 'trails',
+  'usfs_roads', 'usfs_trails', 'mvum_roads', 'mvum_trails', 'blm_gtlf', 'public_lands', 'nhd_water'];
+
+// Forget everything that was fetched FOR AN AREA: state, map layers, cards.
+// One list, used when the area is cleared and when a different area replaces
+// it — a source added here is covered in both. Until v2026.11.19-a a new area
+// kept all of this from the previous one until each fetch answered, so a slow
+// check left the old area's warnings, airspace, fires and obstacles in the
+// banner and on the map. The neutral values below mean "nothing held", never
+// "checked and clear": the banner names every check still on its way
+// (S._areaAwaiting), and the alert / fire cards say they are checking.
+function _dropAreaData() {
+  // Weather, air quality, terrain
+  if (S.wxAreaKey != null || (S.wx && Object.keys(S.wx).length)) _dropWeatherState();
+  S.aqi = null; S.aqiAreaKey = null;
+  S.elev = {}; S.cellStatus = null; S.lzs = [];
+  // Observed ceiling / visibility
+  S.metar = null; S.metarUnverified = false; S.metarUnverifiedReason = null;
+  // NWS alerts — 'checking' keeps the card from reading "no active alerts"
+  S.nwsAlerts = []; S.nwsAlertsUnverified = false; S.nwsAlertsSource = 'checking'; S.nwsAlertsAt = null;
+  // Wildfire
+  S.activeFires = []; S.fireDanger = null; S.fireDataUnverified = false;
+  // Airspace, obstacles, protected areas, wires
+  S.faaAirspace = null; S.nearbyAirports = [];
+  S.faaObstacles = null; S.protectedAreas = null;
+  S.wireHazardCounts = {}; S.utilityWireCounts = {}; S.utilityWireInfo = {}; S.towerCount = 0;
+  // Smoke, avalanche, land ownership, sun times
+  S.hmsSmoke = null; S.avalanche = null;
+  S.publicLands = null; S.landStatus = null;
+  S.astro = null;
+  // The live TFR / NOTAM sets were fetched for the previous area's bounds
+  // (manual imports stay), and its check result says nothing about this one.
+  S.tfrs = (S.tfrs || []).filter(t => !t._live);
+  S.importedNotams = (S.importedNotams || []).filter(n => !n._live);
+  S.autoCheck = null;
+  // No source holds data for any area now.
+  S._dataArea = {};
+
+  if (S.mapLayers) {
+    Object.keys(WIRE_CATEGORIES).forEach(k => { const l = S.mapLayers['wire_' + k]; if (l && l.clearLayers) l.clearLayers(); });
+    AREA_DATA_LAYERS.forEach(id => { const l = S.mapLayers[id]; if (l && l.clearLayers) l.clearLayers(); });
+  }
+  if (typeof document === 'undefined') return;
+  const run = fn => { try { fn(); } catch (e) { console.warn('area reset:', e); } };
+  run(() => renderNWSAlertCards());
+  run(() => renderImportedTfrLayer());
+  run(() => renderImportedNotamLayer());
+  run(() => renderTfrCards());
+  run(() => renderNotamCards());
+  const fireDiv = document.getElementById('fireDangerCards');
+  if (fireDiv) {
+    fireDiv.innerHTML = `<div class="notam-card" style="border-left:3px solid var(--border);">
+      <div class="notam-header"><span class="notam-id">CHECKING WILDFIRE DATA</span></div>
+      <div class="notam-body">Fire perimeters and fire danger for this area have not been checked yet.</div></div>`;
+  }
+}
+
+// --- Checks a NEW area is still waiting for ---
+// Until a check has answered once for this area, its absence from the banner
+// is not a finding. processArea lists them here and each is removed when its
+// fetch settles (any outcome: an answer, a cached copy, or a failure that sets
+// that source's own UNVERIFIED flag). A refresh of the same area does not
+// re-list them — that area's earlier data is still on screen.
+const AREA_AWAIT_LABELS = {
+  weather: 'weather', metar: 'observed ceiling/visibility', elevation: 'terrain elevation',
+  restrictions: 'TFRs and NOTAMs', alerts: 'NWS alerts', airspace: 'FAA airspace',
+  obstacles: 'FAA obstacles', protectedAreas: 'protected areas', fire: 'wildfire data',
+  smoke: 'smoke', avalanche: 'avalanche danger', publicLands: 'land ownership',
+};
+// The list belongs to ONE area (its layer object): it is ignored the moment
+// another area — or none — is current, so it can never outlive its area.
+function _areaAwaitSet() {
+  const a = S._areaAwaiting;
+  return (a && a.area && a.area === S.currentArea) ? a.names : null;
+}
+function _areaAwaits(name) { const set = _areaAwaitSet(); return !!(set && set.has(name)); }
+function _areaAwaitingLabels() {
+  const set = _areaAwaitSet();
+  return set ? Object.keys(AREA_AWAIT_LABELS).filter(k => set.has(k)).map(k => AREA_AWAIT_LABELS[k]) : [];
+}
+// The check answered: the banner is recomputed at once, so its findings show
+// and the "still loading" list shrinks as each one arrives (it used to wait
+// for the slowest lookup of the area).
+function _areaAnswered(name) {
+  if (!_areaAwaits(name)) return;
+  _areaAwaitSet().delete(name);
+  if (typeof document === 'undefined' || !document.getElementById('assessBadge')) return;
+  if (name === 'weather') computeOpsData();
+  computeAssessment();
 }
 
 async function processArea(layer, type) {
@@ -1544,10 +1628,25 @@ async function processArea(layer, type) {
     }
   }
   S.areaCenter = center; S.areaBounds = bounds; S.currentArea = layer;
-  // A different area starts from an empty panel (see _resetPanelForNewArea).
-  const _newAreaKey = _areaKeyOf(center.lat, center.lng);
-  if (S._processedAreaKey !== _newAreaKey) _resetPanelForNewArea();
+  // A different area (another centre, or the same centre with other bounds —
+  // half the sources are queried by bounding box) starts from nothing: the
+  // previous area's data is dropped, the panel is blanked, and the banner
+  // lists every check until it has answered for THIS area. A refresh of the
+  // same area keeps its values on screen and waits for nothing new.
+  const _newAreaKey = _areaKeyOf(center.lat, center.lng) + '|' + _bboxCacheKey(bounds);
+  const isNewArea = S._processedAreaKey !== _newAreaKey;
+  let adsbRestarted = false;
+  if (isNewArea) {
+    stopAdsbPolling(); // the previous area's traffic, distances and search radius
+    _dropAreaData();
+    _resetPanelForNewArea();
+    S._areaAwaiting = { area: layer, names: new Set(Object.keys(AREA_AWAIT_LABELS)) };
+    if (typeof buildLayerControl === 'function' && document.getElementById('layerList')) buildLayerControl();
+  }
   S._processedAreaKey = _newAreaKey;
+  // Each awaited check reports in as it settles (unless a newer area took over).
+  const answered = (name, p) => Promise.resolve(p).then(() => {}, () => {})
+    .then(() => { if (S._areaGen === areaGen) _areaAnswered(name); });
   document.getElementById('areaCenter').textContent = `${center.lat.toFixed(4)}, ${center.lng.toFixed(4)}`;
   document.getElementById('areaType').textContent = S.areaType;
   // Re-hydrate this area's saved observer viewsheds (markers + active overlay) from IndexedDB.
@@ -1567,25 +1666,29 @@ async function processArea(layer, type) {
 
   // Fetch all data in parallel (airports are now dynamic via Overpass)
   await Promise.allSettled([
-    fetchWeather(center.lat, center.lng),
-    fetchAviationWeather(center, bounds),
-    fetchElevation(center, bounds),
+    answered('weather', fetchWeather(center.lat, center.lng)),
+    answered('metar', fetchAviationWeather(center, bounds)),
+    answered('elevation', fetchElevation(center, bounds)).then(() => {
+      // Traffic for a new area starts as soon as its terrain is in (AGL needs
+      // it), not after the slowest lookup of the area.
+      if (isNewArea && S._areaGen === areaGen && !S._adsbPolling) { startAdsbPolling(); adsbRestarted = true; }
+    }),
     fetchSunMoon(center.lat, center.lng),
     renderNotamsTab(center.lat, center.lng),
-    fetchLiveRestrictions(center, bounds),
+    answered('restrictions', fetchLiveRestrictions(center, bounds)),
     fetchWireHazards(bounds),
     fetchUtilityWires(bounds),
-    fetchNWSAlerts(center.lat, center.lng),
+    answered('alerts', fetchNWSAlerts(center.lat, center.lng)),
     fetchRadar(),
-    fetchFAAairspace(bounds),
-    fetchFaaObstacles(bounds),
+    answered('airspace', fetchFAAairspace(bounds)),
+    answered('obstacles', fetchFaaObstacles(bounds)),
     fetchNearbyAirports(center, bounds),
-    fetchProtectedAreas(bounds),
-    fetchFireDanger(center.lat, center.lng, bounds),
-    fetchHMSSmoke(bounds),
-    fetchAvalanche(bounds),
+    answered('protectedAreas', fetchProtectedAreas(bounds)),
+    answered('fire', fetchFireDanger(center.lat, center.lng, bounds)),
+    answered('smoke', fetchHMSSmoke(bounds)),
+    answered('avalanche', fetchAvalanche(bounds)),
     fetchGroundAccess(bounds),
-    fetchPublicLands(bounds),
+    answered('publicLands', fetchPublicLands(bounds)),
     fetchWaterFeatures(bounds),
     fetchHospitals(bounds),
     fetchTrails(bounds),
@@ -1594,9 +1697,9 @@ async function processArea(layer, type) {
   // processArea computes the derived data — don't overwrite it with ours.
   if (S._areaGen !== areaGen) return;
 
-  // Start ADS-B polling (needs elevation data for AGL)
-  stopAdsbPolling();
-  startAdsbPolling();
+  // Start ADS-B polling (needs elevation data for AGL). A new area already
+  // restarted it when its elevation answered.
+  if (!adsbRestarted) { stopAdsbPolling(); startAdsbPolling(); }
 
   // Compute derived data after fetches complete
   computeOpsData();
@@ -2364,6 +2467,39 @@ async function _aqiFailed(err, k, tok) {
   markSection('airQuality', { status: 'error', error: msg });
 }
 
+// fetch() that gives up. A request that never answers must end in its
+// fetcher's failure path (cached copy, fallback source or UNKNOWN) — the
+// weather and terrain requests had no limit at all, so a stalled connection
+// left "Fetching…" on screen for good. A caller's own signal still cancels it
+// (AbortError); running out of time is an ordinary Error.
+const WX_TIMEOUT_MS = 20000;
+const ELEV_TIMEOUT_MS = 15000;
+function _fetchTimed(url, ms, opts) {
+  const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+  const outer = opts && opts.signal;
+  if (ctl && outer) {
+    if (outer.aborted) ctl.abort();
+    else if (outer.addEventListener) outer.addEventListener('abort', () => ctl.abort(), { once: true });
+  }
+  const init = Object.assign({}, opts || {});
+  if (ctl) init.signal = ctl.signal;
+  const args = Object.keys(init).length ? [url, init] : [url];
+  const late = () => new Error('no answer within ' + Math.round(ms / 1000) + ' s');
+  return new Promise((resolve, reject) => {
+    let timedOut = false;
+    // The limit settles the promise itself: it does not rely on the request
+    // rejecting once aborted.
+    const timer = setTimeout(() => { timedOut = true; if (ctl) ctl.abort(); reject(late()); }, ms);
+    // Called at once (not from a later microtask): the request is on its way
+    // before this function returns, exactly as a bare fetch() would be.
+    let p;
+    try { p = fetch(...args); } catch (e) { p = Promise.reject(e); }
+    Promise.resolve(p).then(
+      res => { clearTimeout(timer); resolve(res); },
+      err => { clearTimeout(timer); reject(timedOut ? late() : err); });
+  });
+}
+
 // Forget the weather in state (it belongs to another area, or nothing usable
 // arrived): no values, no forecast chart, no time bar.
 function _dropWeatherState() {
@@ -2406,7 +2542,7 @@ async function fetchWeather(lat, lng) {
 
     // Weather and AQI succeed or fail independently: one bad answer must not
     // discard the other's valid result.
-    const settle = (url, label) => fetch(url).then(r => _readOpenMeteo(r, label))
+    const settle = (url, label) => _fetchTimed(url, WX_TIMEOUT_MS).then(r => _readOpenMeteo(r, label))
       .then(v => ({ ok: true, ...v }), err => ({ ok: false, err }));
     const [wxOut, aqiOut] = await Promise.all([settle(wxUrl, 'Weather'), settle(aqiUrl, 'Air quality')]);
     if (!_requestCurrent(tok)) return; // a newer request / area owns the panel
@@ -2423,6 +2559,9 @@ async function fetchWeather(lat, lng) {
       await _weatherFailed(wxOut.err, k, tok);
       if (!_requestCurrent(tok)) return;
     }
+    // The weather has answered for this area (the Kp request below can take
+    // seconds more): the banner need not wait for the rest of this function.
+    _areaAnswered('weather');
 
     if (aqiOut.ok) {
       const sw = aqiOut.sw;
@@ -2973,7 +3112,7 @@ async function _fetch3depElevations(points, signal) {
   const geometry = JSON.stringify({ points: points.map(p => [p.longitude, p.latitude]), spatialReference: { wkid: 4326 } });
   const url = ELEV_3DEP_SAMPLES_URL + '?geometry=' + encodeURIComponent(geometry)
     + '&geometryType=esriGeometryMultipoint&returnFirstValueOnly=true&f=json';
-  const res = await fetch(url, { signal });
+  const res = await _fetchTimed(url, ELEV_TIMEOUT_MS, { signal });
   if (!res.ok) throw new Error('3DEP HTTP ' + res.status);
   let j;
   try { j = await res.json(); } catch (_) { throw new Error('3DEP response is not valid JSON'); }
@@ -2986,7 +3125,7 @@ async function _fetch3depElevations(points, signal) {
 async function _fetchOpenMeteoElevations(points, signal) {
   const url = ELEV_OPEN_METEO_URL + '?latitude=' + points.map(p => p.latitude.toFixed(5)).join(',')
     + '&longitude=' + points.map(p => p.longitude.toFixed(5)).join(',');
-  const res = await fetch(url, { signal });
+  const res = await _fetchTimed(url, ELEV_TIMEOUT_MS, { signal });
   if (!res.ok) throw new Error('Open-Meteo elevation HTTP ' + res.status);
   let j;
   try { j = await res.json(); } catch (_) { throw new Error('Open-Meteo elevation response is not valid JSON'); }
@@ -4988,7 +5127,12 @@ function renderNWSAlertCards() {
 
   if (S.nwsAlerts.length === 0) {
     section.style.display = '';
-    if (!unverified) {
+    if (S.nwsAlertsSource === 'checking') {
+      // A new area whose alert check has not answered: neither clear nor failed.
+      list.innerHTML = `<div class="notam-card" style="border-left:3px solid var(--border);">
+      <div class="notam-header"><span class="notam-id">CHECKING ALERTS</span></div>
+      <div class="notam-body">NWS weather alerts for this area have not been checked yet.</div></div>`;
+    } else if (!unverified) {
       list.innerHTML = `<div class="notam-card" style="border-left:3px solid var(--accent-green);">
       <div class="notam-header"><span class="notam-id" style="color:var(--accent-green);">NO ACTIVE ALERTS</span>
       <span class="notam-type" style="background:rgba(34,197,94,0.15);color:var(--accent-green);">Clear</span></div>
@@ -8518,6 +8662,11 @@ function computeOpsData(snap) {
 }
 
 function computeAssessment(snap) {
+  // A new area's banner stays in its loading state until the weather for it
+  // has answered (or failed): judging it without any weather would only list
+  // "unavailable" for every weather limit. The request gives up after
+  // WX_TIMEOUT_MS, so this cannot wait forever.
+  if (_areaAwaits('weather')) { _renderAssessmentLoading(); return; }
   snap = snap || snapshotAtIdx(S.timeIdx || 0);
   // Live, effective thresholds (defaults < active profile < edited inputs).
   const thresholds = readActiveThresholds();
@@ -8533,6 +8682,11 @@ function computeAssessment(snap) {
   // emergency traffic.) The banner text is rebuilt by assessmentDisplay.
   const addLimit = msg => { result.level = 'NO-GO'; result.issues.push(msg); };
   const addAdvisory = msg => { if (result.level === 'GO') result.level = 'CAUTION'; result.cautions.push(msg); };
+
+  // Checks that have not answered yet for this (new) area: nothing below can
+  // speak for them, and the banner must not read clean in the meantime.
+  const stillLoading = _areaAwaitingLabels();
+  if (stillLoading.length) addAdvisory('Still loading, not yet checked for this area: ' + stillLoading.join(', '));
 
   // Observed-METAR cloud-clearance + minimum-visibility gate (Part 107 §107.51(c)).
   // Current-time observation from the nearest reporting station; applied to every
@@ -8648,7 +8802,7 @@ function computeAssessment(snap) {
   // request failed with no cached copy) is UNVERIFIED — skipping the block
   // used to leave a NOMINAL banner over an area nobody checked.
   const FAA_UNVERIFIED_HINT = 'check B4UFLY / LAANC and the current sectional before flight';
-  if (S.currentArea && !S.faaAirspace) {
+  if (S.currentArea && !S.faaAirspace && !_areaAwaits('airspace')) {
     addAdvisory('FAA airspace UNVERIFIED — no FAA airspace data loaded for this area; ' + FAA_UNVERIFIED_HINT);
   }
   if (S.faaAirspace) {
@@ -17751,6 +17905,8 @@ if (typeof module !== 'undefined' && module.exports) {
     fetchFAAairspace, faaAirspaceUnavailableLayers, FAA_AIRSPACE_LAYER_LABELS, fetchFireDanger,
     UNKNOWN_CELL_TEXT, SECTION_CELLS, sectionCellsFor, markCellsUnknown, renderFireDangerUnknown,
     AREA_BLANK_SECTIONS, _areaKeyOf, _blankSectionCells, _resetPanelForNewArea, _dropWeatherState, _refreshDerivedForTerrain,
+    AREA_DERIVED_CELLS, AREA_DATA_LAYERS, AREA_AWAIT_LABELS, _dropAreaData, _renderAssessmentLoading,
+    _areaAwaits, _areaAwaitingLabels, _areaAnswered, _fetchTimed, WX_TIMEOUT_MS, ELEV_TIMEOUT_MS,
     NOTAM_MANUAL_UPDATE_CAUTION, renderNotamManualNotice,
     STALE_CELL_SUFFIX, markCellsStale, reapplyStaleCells, renderFireDangerStale, refreshPanelForHour,
     analyticsOptedOut, initUsageAnalytics, setAnalyticsOptOut, _shouldLoadAnalytics,

@@ -4,6 +4,15 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.11.19-a — 2026-11-19
+
+- A newly drawn area now starts completely clean. Everything fetched for the previous area is dropped as soon as a different area is drawn: weather alerts, FAA airspace, airports, obstacles, protected areas, wildfire data, smoke, avalanche danger, land ownership, wire hazards, the observed ceiling, live TFRs and NOTAMs, and live traffic. Before, each of these stayed until its own check for the new area answered, so a slow check left the previous area's warnings in the banner and its layers on the map.
+- The banner reads LOADING until the weather for the new area has answered, then lists every check that has not answered yet ("Still loading, not yet checked for this area: ..."). It updates as each check arrives instead of waiting for the slowest one.
+- The weather-alert and wildfire cards say they are checking while that check is on its way. They no longer show "no active alerts" or "no fire perimeters" before the answer.
+- Weather and terrain requests now give up after 20 and 15 seconds. A stalled connection used to leave "Fetching" on screen for good; it now ends as a failed check, and terrain falls back to its second source.
+- Resizing an area around the same centre reloads it like a new area, because half the sources are queried by the area's bounds.
+- Live traffic for a new area starts as soon as its terrain elevation arrives.
+
 ## v2026.11.18-c — 2026-11-18
 
 - Weather: forecast visibility and the freezing level were shown about 3.3 times too high. The forecast service answers both in feet and the app read them as metres, so a freezing level of 6,200 ft showed as 20,344 ft and 0.2 mi of visibility showed as 0.6 mi. Both are now correct on the Weather tab, for every hour on the time bar, and in the assessment. Before this fix the freezing-level advisory and the visibility limit could be missed.
