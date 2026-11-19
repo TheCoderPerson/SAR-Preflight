@@ -24,6 +24,13 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.11.18-b',
+    date: '2026-11-18',
+    changes: [
+      'Response Time Estimate: where two numbered highways share one road (US 50 and Highway 89 near Meyers), the drive is no longer treated as being on the second highway for its whole length. A chain control on that highway could be listed as "may apply" for a drive that never reaches it.',
+    ],
+  },
+  {
     version: '2026.11.18-a',
     date: '2026-11-18',
     changes: [
@@ -5649,6 +5656,11 @@ function highwayNumbersFromNames(names) {
   return out;
 }
 
+// Order-independent key for the highway numbers in a name list ("50,89").
+function _hwyNumsKey(names) {
+  return highwayNumbersFromNames(names).sort((a, b) => a - b).join(',');
+}
+
 // A Valhalla error body ({ error_code, error }) → { code, message, noRoad, noRoute }.
 function valhallaError(json, status) {
   const code = json && json.error_code != null ? Number(json.error_code) : null;
@@ -5709,7 +5721,12 @@ function valhallaEdgesToSegments(traceJson) {
     const name = names[0] || '';
     const sec = len / spd * 3600;
     const last = segments[segments.length - 1];
-    if (last && last.kind === kind && last.name === name) {
+    // Edges merge only when they carry the same highway NUMBERS. A merged
+    // segment keeps the union of its edges' names, so merging "US 50" with
+    // the short "US 50 / CA 89" concurrency put Highway 89 on the whole
+    // 84 km of US 50 (measured, Placerville → Meyers) and every Highway 89
+    // control near that drive then read as "may apply".
+    if (last && last.kind === kind && last.name === name && _hwyNumsKey(last.names) === _hwyNumsKey(names)) {
       last.km += len; last.baseSec += sec; last.i1 = Number(e.end_shape_index) || last.i1;
       names.forEach(n => { if (last.names.indexOf(n) < 0) last.names.push(n); });
     } else {

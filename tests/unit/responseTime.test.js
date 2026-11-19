@@ -172,6 +172,32 @@ describe('Valhalla adapters', () => {
   it('lists the highway numbers a route uses', () => {
     expect(routeHighwayNumbers(valhallaEdgesToSegments(TRACE).segments)).toEqual([50]);
   });
+  it('keeps a shared highway number on the stretch that carries it', () => {
+    // Measured Nov 2026, Placerville → Meyers: 83 km of US 50, the last 1.3 km
+    // also signed CA 89. Merging on the first name alone put "CA 89" on all of it.
+    const edge = (names, km) => ({ length: km, speed: 80, road_class: 'trunk', names });
+    const t = valhallaEdgesToSegments({ shape: TRACE.shape, units: 'kilometers', edges: [
+      edge(['US 50', 'Route 50'], 40), edge(['US 50'], 43),
+      edge(['US 50', 'CA 89'], 0.8), edge(['CA 89', 'US 50', 'Route 50'], 0.5),
+    ] });
+    expect(t.segments.length).toBe(3);                      // a different first name still splits
+    expect(t.segments[0].km).toBeCloseTo(83, 6);
+    expect(t.segments[0].names).toEqual(['US 50', 'Route 50']);
+    const st = routeHighwayStretches(t.segments);
+    expect(st.map(s => s.num)).toEqual([50, 89]);
+    expect(st[0].fromKm).toBe(0);
+    expect(st[0].toKm).toBeCloseTo(84.3, 6);
+    expect(st[1].fromKm).toBeCloseTo(83, 6);                 // NOT 0
+    expect(st[1].toKm).toBeCloseTo(84.3, 6);
+  });
+  it('still merges edges whose names differ only by an alias', () => {
+    const edge = (names, km) => ({ length: km, speed: 80, road_class: 'trunk', names });
+    const t = valhallaEdgesToSegments({ shape: TRACE.shape, units: 'kilometers', edges: [
+      edge(['US 50'], 10), edge(['US 50', 'Route 50'], 10), edge(['US 50', 'Some Memorial Highway'], 10),
+    ] });
+    expect(t.segments.length).toBe(1);
+    expect(t.segments[0].km).toBeCloseTo(30, 6);
+  });
   it('reads Valhalla error bodies', () => {
     expect(valhallaError({ error_code: 171, error: 'No suitable edges near location' }, 400)).toMatchObject({ noRoad: true, noRoute: false });
     expect(valhallaError({ error_code: 442, error: 'No path could be found for input' }, 400).noRoute).toBe(true);
@@ -443,6 +469,23 @@ describe('matchRouteHazards', () => {
   it('one beyond the far end of the highway stretch does not apply', () => {
     const rec = { kind: 'chain', level: 'R-1', direction: 'E', hwyNum: 88, lat: 38.645, lng: -120.20 };
     expect(matchRouteHazards([rec], joinCoords, joinCum, joinStretches)).toEqual([]);
+  });
+  it('a highway sharing only the last mile of the road is not the whole drive', () => {
+    // East on "US 50", then 1.2 km north-east where the same road is also "CA 89".
+    const coords = [[38.73, -120.80], [38.848, -120.027], [38.857, -120.019]];
+    const c2 = polylineCumKm(coords);
+    const edge = (names, km) => ({ length: km, speed: 80, road_class: 'trunk', names });
+    const segs = valhallaEdgesToSegments({ shape: TRACE.shape, units: 'kilometers',
+      edges: [edge(['US 50'], c2[1]), edge(['US 50', 'CA 89'], c2[2] - c2[1])] }).segments;
+    const st = routeHighwayStretches(segs);
+    expect(st.find(s => s.num === 89).fromKm).toBeCloseTo(c2[1], 3);
+    // Southbound Highway 89 control 4 km south of the junction. The drive uses
+    // 89 only north-eastbound, so it faces the wrong way. With "89" spread over
+    // the whole eastbound drive it read as "may apply".
+    const south = { kind: 'chain', level: 'R-2', direction: 'S', hwyNum: 89, lat: 38.812, lng: -120.02 };
+    expect(matchRouteHazards([south], coords, c2, st)).toEqual([]);
+    // The buggy stretch list, for contrast: this is what it used to report.
+    expect(matchRouteHazards([south], coords, c2, [{ num: 50, fromKm: 0, toKm: c2[2] }, { num: 89, fromKm: 0, toKm: c2[2] }]).map(m => m.rel)).toEqual(['mayApply']);
   });
 });
 

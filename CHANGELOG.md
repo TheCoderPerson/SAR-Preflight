@@ -4,6 +4,10 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.11.18-b — 2026-11-18
+
+- Response Time Estimate: where two numbered highways share one road (US 50 and Highway 89 near Meyers), the drive is no longer treated as being on the second highway for its whole length. A chain control on that highway could be listed as "may apply" for a drive that never reaches it.
+
 ## v2026.11.18-a — 2026-11-18
 
 - New Response Time Estimate at the top of the Ops tab: how long it takes to reach each observer, shown as equipment loading + road drive + forest-road drive + chain-control delay + hike-in, with an ETA. It routes from this device's location (or a base location saved in Config) to every observer placed for the area, or to the road nearest the area centre when none is placed. Nothing is sent until you press "Estimate Response Time" once: the start point and the destinations go to a public routing service (FOSSGIS Valhalla, built on OpenStreetMap).
