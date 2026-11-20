@@ -289,8 +289,11 @@ function resampleUtmToGrid(grid, src) {
       const u = latLngToUtm(lat, lng, zone);
       const fx = (u.x - originX) / resX, fy = (originY - u.y) / resY;
       if (fx < 0 || fy < 0 || fx >= cols || fy >= rows) continue; // centre outside the window
-      const ix0 = Math.max(0, Math.round(fx - kx / 2)), iy0 = Math.max(0, Math.round(fy - ky / 2));
-      const ix1 = Math.min(cols - 1, ix0 + kx - 1), iy1 = Math.min(rows - 1, iy0 + ky - 1);
+      // Size the footprint BEFORE clamping, so a cell near the west/north edge
+      // pools its own (truncated) footprint instead of one shifted east/south.
+      const rx0 = Math.round(fx - kx / 2), ry0 = Math.round(fy - ky / 2);
+      const ix0 = Math.max(0, rx0), iy0 = Math.max(0, ry0);
+      const ix1 = Math.min(cols - 1, rx0 + kx - 1), iy1 = Math.min(rows - 1, ry0 + ky - 1);
       let best = -Infinity;
       for (let iy = iy0; iy <= iy1; iy++) {
         const base = iy * cols;
@@ -507,11 +510,17 @@ function curvatureDrop(rangeM, t) {
 }
 
 // Straight line-of-sight from observer cell (px,py) to target cell (tx,ty).
-// Returns true if the ray clears the DSM at every INTERMEDIATE cell.
+// Returns true if the ray clears the DSM at every INTERMEDIATE cell AND the
+// target itself is not buried in its own cell's obstacle: the drone flies at
+// AGL above BARE ground, so where the canopy/building there stands taller than
+// that altitude the drone is inside the trees/structure and cannot be seen
+// (this also covers the 8 observer-adjacent cells, which have no intermediate
+// cell to test). Safe direction: a smaller viewshed.
 function isVisible(px, py, pilotZ, tx, ty, targetZ, dsm, cols, rows, cellSizeM) {
   const dx = tx - px, dy = ty - py;
   const steps = Math.max(Math.abs(dx), Math.abs(dy));
   if (steps === 0) return true;
+  if (tx >= 0 && tx < cols && ty >= 0 && ty < rows && dsm[ty * cols + tx] > targetZ) return false;
   const rangeM = Math.hypot(dx, dy) * cellSizeM;
   for (let i = 1; i < steps; i++) {
     const t = i / steps;
@@ -646,8 +655,13 @@ function computeShadowMask(grid, dem, sunAzDeg, sunElDeg) {
         } else {
           const idx = Math.round(y) * cols + Math.round(x);
           if (Number.isFinite(dem[idx])) {
-            const d = (frontZ - z) / softM;
-            const v = d >= 1 ? 255 : Math.round(d * 255);
+            // Depth is judged against the HIGHER of the bilinear sample and the
+            // cell's own height: a ray stepping off a crest/plateau rim samples
+            // a blend with the slope below, and without this a sunlit rim cell
+            // standing at/above the front was painted fully shaded. Cells at or
+            // above the front stay lit; the graded depth is otherwise unchanged.
+            const d = (frontZ - Math.max(z, dem[idx])) / softM;
+            const v = d >= 1 ? 255 : d > 0 ? Math.round(d * 255) : 0;
             if (v > out[idx]) out[idx] = v;
           }
         }
@@ -1110,6 +1124,7 @@ function canopyApplyMask(grid, canopyFlat, op) {
   const ySpan = myTop - myBot;
   const toSrcY = lat => ((myTop - (merc ? mercatorY(lat) : lat)) / ySpan) * srcRows;
   const toSrcX = lng => ((lng - sb.west) / (sb.east - sb.west)) * srcCols;
+  const SRC_EPS = 1e-6; // edges that merely TOUCH (float noise ~1e-15 px) are not overlap
 
   const wCells = c1 - c0 + 1, hCells = r1 - r0 + 1;
   const oldValues = new Float32Array(wCells * hCells);
@@ -1119,21 +1134,23 @@ function canopyApplyMask(grid, canopyFlat, op) {
 
   for (let row = r0; row <= r1; row++) {
     const latN = grid.north - row * dLat, latS = latN - dLat;
-    let iy0 = Math.floor(toSrcY(latN)), iy1 = Math.ceil(toSrcY(latS)) - 1;
+    let iy0 = Math.floor(toSrcY(latN) + SRC_EPS), iy1 = Math.ceil(toSrcY(latS) - SRC_EPS) - 1;
+    // Judge "outside" on the RAW window: after clamping, iy1 < 0 could never
+    // fire and a row merely touching the mask's north edge read source row 0.
+    const rowOutside = iy0 > srcRows - 1 || iy1 < 0;
     if (iy0 < 0) iy0 = 0; if (iy1 > srcRows - 1) iy1 = srcRows - 1;
     if (iy1 < iy0) iy1 = iy0;
     const outBase = (row - r0) * wCells;
     const gridBase = row * grid.cols;
-    const rowOutside = iy0 > srcRows - 1 || iy1 < 0;
     for (let col = c0; col <= c1; col++) {
       const idx = gridBase + col;
       oldValues[outBase + (col - c0)] = canopyFlat[idx];
       if (rowOutside) continue;
       const lngW = grid.west + col * dLng, lngE = lngW + dLng;
-      let ix0 = Math.floor(toSrcX(lngW)), ix1 = Math.ceil(toSrcX(lngE)) - 1;
+      let ix0 = Math.floor(toSrcX(lngW) + SRC_EPS), ix1 = Math.ceil(toSrcX(lngE) - SRC_EPS) - 1;
+      if (ix0 > srcCols - 1 || ix1 < 0) continue;   // raw window, before clamping
       if (ix0 < 0) ix0 = 0; if (ix1 > srcCols - 1) ix1 = srcCols - 1;
       if (ix1 < ix0) ix1 = ix0;
-      if (ix0 > srcCols - 1 || ix1 < 0) continue;
       let set = 0, tot = 0;
       for (let sy = iy0; sy <= iy1; sy++) {
         const base = sy * srcCols;
@@ -1724,13 +1741,16 @@ function maskDownsample(mask, cols, rows, bounds, factor, pool) {
   for (let y = 0; y < orow; y++) {
     for (let x = 0; x < oc; x++) {
       let v = and ? 1 : 0, any = false;
+      // A padded (beyond-the-source) pixel is NOT selected: the output bounds
+      // grow to the padded extent, so AND over only the real pixels would
+      // stretch a delete over ground the source never covered.
       for (let dy = 0; dy < f; dy++) {
         const sy = y * f + dy;
-        if (sy >= rows) break;
+        if (sy >= rows) { if (and) v = 0; break; }
         const b = sy * cols;
         for (let dx = 0; dx < f; dx++) {
           const sx = x * f + dx;
-          if (sx >= cols) break;
+          if (sx >= cols) { if (and) v = 0; break; }
           any = true;
           if (and) { if (!mask[b + sx]) v = 0; }
           else if (mask[b + sx]) v = 1;
@@ -1803,7 +1823,12 @@ function vegCandidateMask(planes, opts) {
   let unknownReported = unknown;
   let seed = veg;
   if (!del && opts.reclaimShadow !== false) {
-    const reclaimed = reclaimShadowInVeg(veg, unknown, rows, cols, opts);
+    // Only COVERED dark cells are shadow evidence. A cell with no imagery
+    // (missing/failed tile) was never seen — reclaiming it would paint a whole
+    // missing tile surrounded by forest as canopy; it stays unknown/skipped.
+    const dark = new Uint8Array(n);
+    for (let i = 0; i < n; i++) if (unknown[i] && planes.cover[i]) dark[i] = 1;
+    const reclaimed = reclaimShadowInVeg(veg, dark, rows, cols, opts);
     if (countMask(reclaimed)) {
       seed = new Uint8Array(n);
       unknownReported = new Uint8Array(n);
@@ -2274,8 +2299,11 @@ function zipStore(entries) {
 function makeViewshedRecord(opts) {
   opts = opts || {};
   const o = opts.observer || {};
-  const lat = +o.lat, lng = +o.lng;
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  // `+null === 0`, so a bare Number.isFinite(+v) turned null into a real 0
+  // (an observer at 0,0; "0 OSM footprints" for a compute that had none).
+  const num = v => (v == null || v === '' || !Number.isFinite(+v)) ? null : +v;
+  const lat = num(o.lat), lng = num(o.lng);
+  if (lat == null || lng == null) return null;
   let mask = opts.mask;
   if (mask != null && !(mask instanceof Uint8Array)) mask = new Uint8Array(mask);
   return {
@@ -2283,14 +2311,14 @@ function makeViewshedRecord(opts) {
     areaKey: opts.areaKey != null ? opts.areaKey : null,
     name: opts.name != null ? String(opts.name) : '',
     observer: { lat, lng },
-    aglFt: Number.isFinite(+opts.aglFt) ? +opts.aglFt : 200,
-    vlosFt: Number.isFinite(+opts.vlosFt) ? +opts.vlosFt : 2500,
+    aglFt: num(opts.aglFt) != null ? num(opts.aglFt) : 200,    // missing/null -> the compute default, never 0
+    vlosFt: num(opts.vlosFt) != null ? num(opts.vlosFt) : 2500,
     grid: opts.grid || null,
     mask: mask || null,
     coverage: opts.coverage != null ? opts.coverage : null,
     demSource: opts.demSource || null,
     canopySource: opts.canopySource || null,
-    buildingCount: Number.isFinite(+opts.buildingCount) ? +opts.buildingCount : null, // null = OSM buildings not included in this compute
+    buildingCount: num(opts.buildingCount), // null = OSM buildings not included in this compute
     structuresInCanopy: !!opts.structuresInCanopy, // heights came from NAIP-CHM (buildings inside the surface; OSM not stamped)
     backdrop: Array.isArray(opts.backdrop) ? Array.from(opts.backdrop, Number) : null, // per-sector terrain-backdrop fractions (computeBackdropSectors)
     horizon: (opts.horizon && Array.isArray(opts.horizon.angles))
@@ -2341,7 +2369,8 @@ function observerKmlDescription(rec, extras) {
     rec.canopySource ? `Canopy: ${rec.canopySource}` : '',
     (rec.structuresInCanopy || canopySourceIncludesStructures(rec.canopySource))
       ? 'Buildings: included in the NAIP-CHM height surface (OSM footprints not added)'
-      : (rec.buildingCount != null ? `Buildings: ${rec.buildingCount} OSM footprints as obstacles` : ''),
+      : (rec.buildingCount != null ? `Buildings: ${rec.buildingCount} OSM footprints as obstacles`
+        : (rec.computedAt || rec.mask) ? 'Buildings: unavailable (OSM footprints not modeled; terrain + canopy only)' : ''),
     (extras && extras.glareText) ? `Sun glare (export day): ${extras.glareText} — near-overhead passes can glare any time the sun is up` : '',
     (extras && extras.backdropText) ? `Terrain backdrop toward ${extras.backdropText} — drone below skyline, hard to see` : '',
     rec.computedAt ? `Computed: ${new Date(rec.computedAt).toISOString()}` : '',
@@ -2422,10 +2451,12 @@ function _pointInRing(p, ring) {
 
 // Trace every closed boundary ring of one labeled component on the
 // (rows+1)x(cols+1) vertex lattice. Each boundary cell side becomes a directed
-// edge that keeps the component on the LEFT of travel; walking edges (left ->
-// straight -> right turn preference at diagonal-pinch vertices, which keeps
-// rings simple and deterministic) yields open rings of [col,row] lattice
-// vertices with collinear vertices merged. Returns
+// edge that keeps the component on the LEFT of travel; walking edges (right ->
+// straight -> left turn preference at diagonal-pinch vertices: the right turn
+// crosses the pinch to the diagonal cell, so a hole that touches another hole
+// or the outline at one corner becomes its own simple ring sharing only that
+// vertex — a left turn fused them into one self-touching figure-8 ring)
+// yields open rings of [col,row] lattice vertices with collinear vertices merged. Returns
 // [{ ring, areaCells, isOuter }] — outers have negative shoelace sign.
 function traceLabelRings(labels, rows, cols, label) {
   const VW = cols + 1;                     // lattice width
@@ -2457,7 +2488,7 @@ function traceLabelRings(labels, rows, cols, label) {
         let dir;
         if (prevDir < 0 || avail.length === 1) dir = avail[0];
         else {
-          const pref = [(prevDir + 3) % 4, prevDir, (prevDir + 1) % 4]; // left, straight, right
+          const pref = [(prevDir + 1) % 4, prevDir, (prevDir + 3) % 4]; // right, straight, left
           dir = pref.find(d => avail.includes(d));
           if (dir === undefined) dir = avail[0];
         }

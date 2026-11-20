@@ -369,7 +369,13 @@ async function handleNotam(url, allow) {
       failure = 'FAA NOTAM Search error: ' + ((data && data.error) ? String(data.error) : 'empty response');
       break;
     }
-    const list = Array.isArray(data.notamList) ? data.notamList : [];
+    // A 200 without a notamList ARRAY (`{status:'ERROR'}`, `{}`) is not a
+    // search result: coercing it to [] answered "0 NOTAMs" as a 200.
+    if (!Array.isArray(data.notamList)) {
+      failure = 'FAA NOTAM Search error: response has no notamList';
+      break;
+    }
+    const list = data.notamList;
     all = all.concat(list);
     if (!countsByType && data.countsByType) countsByType = data.countsByType;
     total = (data.totalNotamCount != null) ? Number(data.totalNotamCount) : all.length;
@@ -396,12 +402,18 @@ async function handleNotam(url, allow) {
 
 // ---- ADS-B: first provider that responds wins; pass its JSON through ----
 async function handleAdsb(url, allow, env) {
-  const lat = url.searchParams.get('lat');
-  const lon = url.searchParams.get('lon');
-  let dist = parseInt(url.searchParams.get('dist') || '0', 10);
-  if (!isFinite(parseFloat(lat)) || !isFinite(parseFloat(lon)) || !dist) {
-    return jsonResponse({ error: 'lat, lon, dist required', ac: [] }, 400, allow);
+  // Strict numbers only (Number(), not parseFloat: "38.6/../x" must not pass),
+  // and the PARSED values go into the upstream URLs, never the raw strings.
+  const num = s => (s == null || String(s).trim() === '') ? NaN : Number(s);
+  const r6 = v => Math.round(v * 1e6) / 1e6 + 0;   // plain decimal in the URL, never "1e-7"
+  const lat = r6(num(url.searchParams.get('lat')));
+  const lon = r6(num(url.searchParams.get('lon')));
+  let dist = num(url.searchParams.get('dist'));
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(dist)
+      || Math.abs(lat) > 90 || Math.abs(lon) > 180 || dist < 1) {
+    return jsonResponse({ error: 'lat, lon, dist required (lat ±90, lon ±180, dist ≥ 1)', ac: [] }, 400, allow);
   }
+  dist = Math.round(dist);
   if (dist > 250) dist = 250; // provider cap
 
   // Why each provider failed, returned with the 502 so a dead route can be

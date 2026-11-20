@@ -102,13 +102,22 @@ describe('Analysis section rows', () => {
     expect(rowFor('canopy').classList.contains('active')).toBe(false);
   });
 
+  // Row presence follows the RECORDS (a visible observer with a computed mask),
+  // not whether the overlay is attached — otherwise unchecking it (or the mobile
+  // zoom cap detaching it) deleted the row and left no way back (bug review M17.1).
   it('lists Viewshed only once a mask has been rendered', () => {
     buildLayerControl();
     expect(rowFor('viewshed')).toBeNull();
     S.mapLayers.viewshed = raster('viewshed');
+    S.viewsheds = [{ id: 'a', visible: true, grid: {}, mask: new Uint8Array(1) }];
     S.map = mapWith(['viewshed']);
     buildLayerControl();
     expect(rowFor('viewshed')).toBeTruthy();
+    expect(rowFor('viewshed').classList.contains('active')).toBe(true);
+    S.map = mapWith([]); // unchecked: row stays, unchecked
+    buildLayerControl();
+    expect(rowFor('viewshed')).toBeTruthy();
+    expect(rowFor('viewshed').classList.contains('active')).toBe(false);
   });
 
   it('lists Observers only once observers exist', () => {
@@ -138,7 +147,8 @@ describe('setLayerVisible routing for canopy / shadow', () => {
   beforeEach(reset);
 
   it('checking the canopy row re-drapes the cached raster and marks it wanted', () => {
-    S.mapLayers.canopy = raster('canopy');
+    // Re-show goes through _applyOverlayZoomCap (layer.addTo), so the stub needs addTo.
+    S.mapLayers.canopy = Object.assign(raster('canopy'), { addTo(m) { m.addLayer(this); return this; } });
     S.canopy = { grid: coveringGrid, canopyFlat: new Float32Array(1), source: 'cached' };
     S.map = trackingMap([]);
     setLayerVisible('canopy', true);

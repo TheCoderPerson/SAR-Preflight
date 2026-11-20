@@ -67,6 +67,21 @@ async function processVFRChart(file, onProgress, options) {
     west: Math.min(corners.nw[0], corners.sw[0]),
     east: Math.max(corners.ne[0], corners.se[0]),
   };
+  // LCC parallels are arcs: the top edge's MIDDLE sits at a higher latitude
+  // than its corners, so corner-only bounds clipped the chart's northern arc.
+  // Walk every edge and widen the box to whatever it reaches.
+  const EDGE_STEPS = 32;
+  for (let k = 0; k <= EDGE_STEPS; k++) {
+    const t = k / EDGE_STEPS;
+    const x = originX + t * (endX - originX), y = originY + t * (endY - originY);
+    for (const p of [[x, originY], [x, endY], [originX, y], [endX, y]]) {
+      const ll = toLatLng.forward(p);
+      if (ll[1] > bounds.north) bounds.north = ll[1];
+      if (ll[1] < bounds.south) bounds.south = ll[1];
+      if (ll[0] < bounds.west) bounds.west = ll[0];
+      if (ll[0] > bounds.east) bounds.east = ll[0];
+    }
+  }
 
   onProgress(`Bounds: ${bounds.south.toFixed(2)}°N to ${bounds.north.toFixed(2)}°N`, 10);
 
@@ -126,11 +141,14 @@ async function processVFRChart(file, onProgress, options) {
         const imageData = tileCtx.createImageData(256, 256);
         const pixels = imageData.data;
 
+        const nTiles = Math.pow(2, z);
         for (let py = 0; py < 256; py++) {
+          // Pixel-centre latitude in Web Mercator Y (tile rows are linear in
+          // Mercator, not in latitude — linear lat shifted rows by ~1 px).
+          const lat = Math.atan(Math.sinh(Math.PI * (1 - 2 * (ty + (py + 0.5) / 256) / nTiles))) * 180 / Math.PI;
           for (let px = 0; px < 256; px++) {
             // Pixel center in lat/lng
             const lng = tileBounds.west + (px + 0.5) / 256 * (tileBounds.east - tileBounds.west);
-            const lat = tileBounds.north - (py + 0.5) / 256 * (tileBounds.north - tileBounds.south);
 
             // Transform to LCC coordinates
             const [projX, projY] = fromLatLng.forward([lng, lat]);

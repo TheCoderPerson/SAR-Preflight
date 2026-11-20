@@ -136,7 +136,8 @@ function metarRoutes({ station, visSm, ceilM, when = Date.now() }) {
     'api.weather.gov/points/': resp({ properties: { observationStations: `https://api.weather.gov/gridpoints/${station}/stations` } }),
     [`gridpoints/${station}/stations`]: resp({ features: [{ properties: { stationIdentifier: station, name: station }, geometry: { coordinates: [-120, 39] } }] }),
     [`stations/${station}/observations/latest`]: resp({ properties: {
-      cloudLayers: ceilM == null ? [] : [{ amount: 'OVC', base: { value: ceilM } }],
+      // Clear sky is a CLR layer with no base (real NWS shape); [] = sky not reported.
+      cloudLayers: ceilM == null ? [{ amount: 'CLR', base: { value: null } }] : [{ amount: 'OVC', base: { value: ceilM } }],
       visibility: { value: visSm * OBS_M }, timestamp: new Date(when).toISOString(), rawMessage: station + ' test' } }),
   };
 }

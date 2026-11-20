@@ -24,6 +24,27 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.11.20-d',
+    date: '2026-11-20',
+    changes: [
+      'Observed ceiling: fog, snow or smoke reported as an obscured sky (vertical visibility) is now a ceiling and can trip the cloud-clearance limit. It used to read "Unlimited / VFR". A station that does not report sky condition or visibility now reads "Not reported" / "UNKNOWN (incomplete obs)" with an advisory, never "Unlimited" or VFR, and an invalid future-dated report can no longer replace a valid one.',
+      'Moon phase and illumination were about 13 days off (a new moon showed as nearly full). Density altitude read 600 to 1,800 ft low at mountain elevations. Both are now correct.',
+      'Avalanche zones no longer raise a false "Avalanche warning in effect" in the banner and popups: the forecast service marks every zone with an empty warning field, which the app read as a warning.',
+      'KML and CalTopo exports now contain the GeoJSON-based layers (class airspace, SUA, TFR areas, LAANC, fire perimeters, NWS alerts, wilderness, USFS/BLM roads, water, smoke, avalanche). They exported 0 features even though the export list showed counts.',
+      'More honest data labels: an offline copy of wildfire perimeters is shown dated and amber, a fire list too long to load is marked INCOMPLETE, a capped NOTAM search or a malformed TFR answer is a failed check, going offline mid-check is reported as a failure, cached airspace reads "(cached)", and a failed LAANC or airport lookup reads UNKNOWN. None of these show as "none" or LIVE any more.',
+      'Refreshing the same area no longer blanks good values to UNKNOWN when one source fails: they stay, marked "(stale: Verify)". Cached TFRs/NOTAMs can no longer land on another area, and airspace cells no longer flash green "Class G" while loading.',
+      'Class E surface areas now say LAANC authorization is required. NSFR restrictions are named by facility, "DATA STALE" counts as an advisory, and an area inside a TFR that touches its border is now detected as overlapping it.',
+      'Land ownership now counts private inholdings inside public land; no ownership data reads "verify ownership" instead of "No private land detected". Bird-risk water reads Unknown when the data is missing.',
+      'ADS-B: a refusing provider no longer shows "0 aircraft · LIVE", the lists say waiting / UNKNOWN instead of an all-clear, a hung provider no longer stalls updates, and PLANS mode keeps traffic hidden.',
+      'Viewshed: a drone flying inside taller trees or a building is no longer shown as visible, exported polygons no longer form figure-8 rings, and "Clear all observers" no longer erases other areas\' saved viewsheds or comes back on zoom.',
+      'PDF and email briefings: the map now includes vector overlays, canopy/viewshed/shadow rasters and markers, works in 3D, is captured fresh each time (never the previous area\'s map), and multi-page PDFs no longer repeat content at page breaks.',
+      'Offline: basemap, topo, sectional, hillshade and street tiles are now cached as you browse, pre-downloaded topo tiles match what the map asks for, and the download includes the current sectional edition and the light basemap.',
+      'Re-importing an FAA chart no longer leaves it blank, and imported charts are placed more accurately. Threshold notifications now fire once on entering limits. The default 10-minute auto-refresh now runs on first launch, and the ADS-B on/off setting survives a reload.',
+      'Response Time Estimate: an aborted or failed refresh no longer erases chain controls and closures from the estimate on screen, a destination whose route failed reads UNKNOWN, condition checks give up after 25 s instead of hanging, active chain controls are never shown green, and missing elevation samples no longer add phantom climb.',
+      'Sun shadow no longer darkens sunlit ridge crests, the map wind arrow points downwind like the KML export, opacity sliders can be set to 0 %, the 3D view no longer leaks GPU memory on every refresh, and text from outside feeds is escaped everywhere it is displayed.',
+    ],
+  },
+  {
     version: '2026.11.20-c',
     date: '2026-11-20',
     changes: [
@@ -783,12 +804,14 @@ function hillshadeParams(light) {
 
 function calcMoonPhase(date) {
   const now = date || new Date();
-  const year = now.getFullYear(), month = now.getMonth()+1, day = now.getDate();
-  let c = 0, e = 0;
-  if (month < 3) { c = year - 1; e = month + 12; } else { c = year; e = month; }
-  const jd = Math.floor(365.25*(c+4716)) + Math.floor(30.6001*(e+1)) + day - 1524.5;
-  const daysSinceNew = (jd - 2451550.1) % 29.530588853;
-  const phase = daysSinceNew / 29.530588853;
+  // UTC Julian Day straight from the instant (as calcSunPosition does). The old
+  // calendar formula lacked the Gregorian correction (+13 days, phase ~inverted)
+  // and read the device-local date.
+  const SYN = 29.530588853;
+  const jd = now.getTime() / 86400000 + 2440587.5;
+  // Reference new moon 2000-01-06 18:14 UTC (JD 2451550.26); wrap into [0, SYN).
+  const daysSinceNew = (((jd - 2451550.26) % SYN) + SYN) % SYN;
+  const phase = daysSinceNew / SYN;
   const illum = Math.round((1 - Math.cos(phase * 2 * Math.PI)) / 2 * 100);
   const names = ['New Moon','Waxing Crescent','First Quarter','Waxing Gibbous','Full Moon','Waning Gibbous','Last Quarter','Waning Crescent'];
   const idx = Math.round(phase * 8) % 8;
@@ -800,7 +823,7 @@ function calcMoonPhase(date) {
 function wireHazardName(tags, cat) {
   if (cat === 'power_line') {
     const parts = [];
-    if (tags.voltage) { try { parts.push(Math.round(parseInt(tags.voltage) / 1000) + 'kV'); } catch(e) { parts.push(tags.voltage); } }
+    if (tags.voltage) { const v = parseInt(tags.voltage, 10); parts.push(Number.isFinite(v) ? Math.round(v / 1000) + 'kV' : String(tags.voltage)); }
     if (tags.operator) parts.push(tags.operator);
     if (tags.ref) parts.push('Ref: ' + tags.ref);
     return parts.join(' — ') || 'Transmission Line';
@@ -1096,6 +1119,9 @@ function wxAtHour(hourly, idx, current) {
   WX_HOURLY_FIELDS.forEach(f => {
     const arr = hourly[f];
     if (Array.isArray(arr) && arr[i] != null) snap[f] = arr[i];
+    // A FUTURE hour the forecast left null is unavailable — it must not
+    // inherit NOW's observed value (fog clearing, calm wind, ...).
+    else if (Array.isArray(arr) && i > 0) snap[f] = null;
   });
   snap._idx = i;
   snap._isNow = (i === 0);
@@ -1119,10 +1145,15 @@ function kpAtTime(rows, dateMs) {
 
 // --- Density Altitude ---
 
+// `surfacePressureHPa` is STATION pressure (Open-Meteo `surface_pressure`),
+// not sea-level pressure. Density altitude from the air-density ratio
+// (NWS formula, dry air): σ = (P/1013.25)·(288.15/T_K), DA = 145442.16·(1−σ^0.234969).
+// The old linear "(1013.25 − P) × 30 ft/hPa" sea-level rule understated
+// mountain DA by 600–1,800 ft (the hPa-per-foot step shrinks with height).
 function calcDensityAltitude(tempF, surfacePressureHPa) {
-  const tempC = (tempF - 32) * 5/9;
-  const pressAlt = (1013.25 - surfacePressureHPa) * 30;
-  return Math.round(pressAlt + (120 * (tempC - (15 - 2 * pressAlt / 1000))));
+  const tempK = (tempF - 32) * 5/9 + 273.15;
+  const sigma = (surfacePressureHPa / 1013.25) * (288.15 / tempK);
+  return Math.round(145442.16 * (1 - Math.pow(sigma, 0.234969)));
 }
 
 // --- Battery Derating ---
@@ -1239,9 +1270,16 @@ function assessRisk(wx, wind, elev, maxWindTol, thresholds) {
 
   // Freezing level (0°C isotherm) within the flight envelope — icing aloft (advisory).
   // Guarded on presence so it stays inert where no freezing-level data is supplied.
-  if (wx.freezing_level_height != null) {
-    const fz = freezingLevelRisk(wx.freezing_level_height, centerElev, t.maxAltAGL);
-    if (fz) cautions.push(`Freezing level — ${fz.reason}`);
+  // Like the other elevation gates it needs a real launch elevation: 0 ft used
+  // to miss icing aloft at a mountain launch (or invent it near sea level).
+  if (wx.freezing_level_height != null && Number.isFinite(Number(wx.freezing_level_height))) {
+    if (hasElev) {
+      const fz = freezingLevelRisk(wx.freezing_level_height, centerElev, t.maxAltAGL);
+      if (fz) cautions.push(`Freezing level — ${fz.reason}`);
+    } else {
+      const fzFt = Math.round(Number(wx.freezing_level_height) * 3.28084);
+      cautions.push(`Freezing level ${fzFt.toLocaleString('en-US')} ft MSL — launch elevation unavailable, icing aloft not checked`);
+    }
   }
 
   let level = 'GO', text = 'All conditions nominal for UAS operations';
@@ -1337,7 +1375,10 @@ function metarCeilingFt(clouds) {
   for (const c of clouds) {
     if (!c) continue;
     const cover = String(c.cover || '').toUpperCase();
-    if (cover === 'BKN' || cover === 'OVC' || cover === 'OVX') {
+    // 'VV' = vertical visibility into an obscured sky (NWS api.weather.gov
+    // amount code; aviationweather.gov uses 'OVX') — a ceiling per FAA rules.
+    if (cover === 'BKN' || cover === 'OVC' || cover === 'OVX' || cover === 'VV') {
+      if (c.base == null || c.base === '') continue; // unknown base is not 0 ft
       const base = Number(c.base);
       if (Number.isFinite(base) && (ceil === null || base < ceil)) ceil = base;
     }
@@ -1346,12 +1387,16 @@ function metarCeilingFt(clouds) {
 }
 
 // Aviation flight category from ceiling (ft AGL; null = unlimited) and visibility
-// (statute miles; null = unrestricted). Matches the FAA/AWC thresholds. Returns one
-// of 'VFR' | 'MVFR' | 'IFR' | 'LIFR'.
-function flightCategory(ceilingFt, visSm) {
-  const ceil = (ceilingFt == null) ? Infinity : ceilingFt;
-  const vis = (visSm == null) ? 99 : visSm;
+// (statute miles; null = NOT REPORTED). Matches the FAA/AWC thresholds. Returns one
+// of 'VFR' | 'MVFR' | 'IFR' | 'LIFR', or null when a missing element (visibility
+// not reported, or `ceilingUnknown` — the station reported no sky condition)
+// could still lower the category. Only LIFR (already the worst) is provable
+// from one element; never VFR from a missing one.
+function flightCategory(ceilingFt, visSm, ceilingUnknown) {
+  const ceil = (ceilingUnknown || ceilingFt == null) ? Infinity : ceilingFt;
+  const vis = (visSm == null) ? Infinity : visSm;
   if (ceil < 500 || vis < 1) return 'LIFR';
+  if (visSm == null || ceilingUnknown) return null;
   if (ceil < 1000 || vis < 3) return 'IFR';
   if (ceil <= 3000 || vis <= 5) return 'MVFR';
   return 'VFR';
@@ -1411,6 +1456,9 @@ function combineProhibitedAreas(sua, prohibited) {
     features: out,
     unknown: !usable(sua) || !usable(prohibited),
     cached: [sua, prohibited].some(l => usable(l) && l._cachedAt != null),
+    // A layer cut off at the server record limit (`_truncated`) is
+    // incomplete: an empty merge is then not proof of absence either.
+    truncated: [sua, prohibited].some(l => usable(l) && !!l._truncated),
   };
 }
 
@@ -2096,6 +2144,10 @@ function assessTerrainTurbulence(elevationsFt, gridSize, rangeFt, windDirDeg, wi
     if (aspectDeg !== undefined) {
       let angleDiff = Math.abs(windDirDeg - aspectDeg);
       if (angleDiff > 180) angleDiff = 360 - angleDiff;
+      // Aspect is an axis for this purpose: wind FROM the facing direction
+      // (up the windward face, 0°) and wind FROM behind (over the crest, down
+      // this lee slope, 180°) are both cross-ridge. Fold into [0, 90].
+      angleDiff = Math.min(angleDiff, 180 - angleDiff);
       if (angleDiff < 45) {
         riskScore += 3;
         factors.push('Wind perpendicular to ridge — lee-side turbulence/rotor likely');
@@ -2126,6 +2178,12 @@ function assessTerrainTurbulence(elevationsFt, gridSize, rangeFt, windDirDeg, wi
   return { risk, factors, level };
 }
 
+// A usable coordinate number. Global isFinite(null) / isFinite('') are TRUE
+// (they coerce to 0), which put unlocated features on Null Island (0, 0).
+function _isCoordNum(v) {
+  return v != null && v !== '' && typeof v !== 'boolean' && Number.isFinite(Number(v));
+}
+
 // --- GPS Terrain Masking ---
 
 function analyzeGPSMasking(centerElevFt, elevPoints, gridSize, flightAltAGL, observer) {
@@ -2142,13 +2200,13 @@ function analyzeGPSMasking(centerElevFt, elevPoints, gridSize, flightAltAGL, obs
   // angle needs rise and run in the SAME unit — a count of grid cells is not a
   // distance. The observer is the sample nearest `observer` (the launch
   // point), else nearest the samples' bbox centre.
-  const pts = elevPoints.map(p => (p && isFinite(p.lat) && isFinite(p.lng)) ? p : null);
+  const pts = elevPoints.map(p => (p && _isCoordNum(p.lat) && _isCoordNum(p.lng)) ? p : null);
   const usable = pts.filter(Boolean);
   if (!usable.length) {
     return { maskedDirections: [], skyVisibilityPct: 100, description: 'No terrain geometry — assuming clear sky view' };
   }
   let oLat, oLng;
-  if (observer && isFinite(observer.lat) && isFinite(observer.lng)) { oLat = observer.lat; oLng = observer.lng; }
+  if (observer && _isCoordNum(observer.lat) && _isCoordNum(observer.lng)) { oLat = observer.lat; oLng = observer.lng; }
   else {
     const lats = usable.map(p => p.lat), lngs = usable.map(p => p.lng);
     oLat = (Math.min(...lats) + Math.max(...lats)) / 2;
@@ -2404,8 +2462,28 @@ function segmentsIntersect(p1, p2, p3, p4) {
          ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
 }
 
+// Closed-segment test: crossing, touching (an endpoint on the other segment)
+// and collinear overlap all count. Points are [lat, lng].
+function _segmentsTouchOrCross(p1, p2, p3, p4) {
+  const o = (a, b, c) => {
+    const v = (b[1] - a[1]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[1] - a[1]);
+    const eps = 1e-12 * (Math.abs(b[0] - a[0]) + Math.abs(b[1] - a[1]) + Math.abs(c[0] - a[0]) + Math.abs(c[1] - a[1]) + 1);
+    return Math.abs(v) <= eps ? 0 : (v > 0 ? 1 : -1);
+  };
+  const onSeg = (a, b, c) => Math.min(a[0], b[0]) <= c[0] && c[0] <= Math.max(a[0], b[0]) &&
+                             Math.min(a[1], b[1]) <= c[1] && c[1] <= Math.max(a[1], b[1]);
+  const d1 = o(p3, p4, p1), d2 = o(p3, p4, p2), d3 = o(p1, p2, p3), d4 = o(p1, p2, p4);
+  if (d1 * d2 < 0 && d3 * d4 < 0) return true;
+  return (d1 === 0 && onSeg(p3, p4, p1)) || (d2 === 0 && onSeg(p3, p4, p2)) ||
+         (d3 === 0 && onSeg(p1, p2, p3)) || (d4 === 0 && onSeg(p1, p2, p4));
+}
+
 // True if two rings overlap: bbox prefilter, then vertex-containment (both
-// directions, catches full containment), then edge crossing (partial overlap).
+// directions, catches full containment), then edge contact. Contact includes
+// touching and collinear edges: a polygon drawn inside a TFR along its border
+// has every vertex ON the boundary (pointInPolygon is ambiguous there) and no
+// strictly crossing edge, and was reported as not intersecting. Touching
+// rings therefore count as intersecting — the conservative call for airspace.
 function polygonsIntersect(a, b) {
   if (!a || !b || a.length < 3 || b.length < 3) return false;
   if (!bboxesOverlap(polygonBBox(a), polygonBBox(b))) return false;
@@ -2415,7 +2493,7 @@ function polygonsIntersect(a, b) {
     const a1 = a[i], a2 = a[(i + 1) % a.length];
     for (let j = 0; j < b.length; j++) {
       const b1 = b[j], b2 = b[(j + 1) % b.length];
-      if (segmentsIntersect(a1, a2, b1, b2)) return true;
+      if (_segmentsTouchOrCross(a1, a2, b1, b2)) return true;
     }
   }
   return false;
@@ -2556,6 +2634,14 @@ function smaAgencyInfo(code) {
 
 function smaIsPublic(code) { return smaAgencyInfo(code).isPublic; }
 
+// An entry is either one ring ([[lat,lng], …]) or one polygon WITH holes
+// ([outerRing, hole, …]); a polygon is tested even-odd so a hole (e.g. a
+// private inholding in a National Forest) is outside it.
+function _ringOrPolyContains(lat, lng, entry) {
+  if (!entry || !entry.length) return false;
+  return Array.isArray(entry[0] && entry[0][0]) ? pointInRings(lat, lng, entry) : pointInPolygon(lat, lng, entry);
+}
+
 // What fraction of an operating area falls on non-public land.
 // aoiRing: closed ring of [lat,lng]; publicRings: flat array of public-land rings
 // ([lat,lng] each). Lays an n×n lattice over the AOI bbox, keeps the points inside
@@ -2578,7 +2664,7 @@ function classifyAreaPublicPrivate(aoiRing, publicRings, n) {
       res.sampled++;
       let isPublic = false;
       for (const ring of (publicRings || [])) {
-        if (pointInPolygon(lat, lng, ring)) { isPublic = true; break; }
+        if (_ringOrPolyContains(lat, lng, ring)) { isPublic = true; break; }
       }
       if (!isPublic) res.privateCount++;
     }
@@ -2595,7 +2681,7 @@ function cellCoverageAt(lat, lng, carriers) {
   ['att', 'tmobile', 'verizon'].forEach(k => {
     const rings = carriers[k];
     if (rings && rings.length) {
-      for (const ring of rings) { if (pointInPolygon(lat, lng, ring)) { out[k] = true; break; } }
+      for (const ring of rings) { if (_ringOrPolyContains(lat, lng, ring)) { out[k] = true; break; } }
     }
     if (out[k]) out.count++;
   });
@@ -2797,6 +2883,14 @@ function _extractDetailPolygons(not) {
   return polys;
 }
 
+function _tfrAltValue(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : s.toUpperCase();
+}
+
 // Normalize a parsed FAA "XNOTAM-Update" detail document (altitudes + times).
 function normalizeTfrDetailDoc(doc) {
   const errors = [], tfrs = [];
@@ -2816,8 +2910,10 @@ function normalizeTfrDetailDoc(doc) {
         type: _tagText(not, 'codeType') || '',
         artcc: _tagText(not, 'codeFacility') || '',
         state: _tagText(not, 'txtNameUSState') || '',
-        lowerAlt: lower != null ? Number(lower) : null,
-        upperAlt: upper != null ? Number(upper) : null,
+        // Empty tag → unknown (not 0 ft); a word such as "UNL" stays as written
+        // (Number('UNL') is NaN and printed "NaN").
+        lowerAlt: _tfrAltValue(lower),
+        upperAlt: _tfrAltValue(upper),
         altUom: uom || null,
         effectiveStart: normalizeFaaDate(_tagText(not, 'dateEffective')),
         effectiveEnd: normalizeFaaDate(_tagText(not, 'dateExpire')),
@@ -3266,8 +3362,10 @@ function expandNotamText(body) {
 function toDmsDisplay(lat, lng) {
   const d = (v, pos, neg, deg) => {
     const hemi = v < 0 ? neg : pos; v = Math.abs(v);
-    const D = Math.floor(v), mF = (v - D) * 60; let M = Math.floor(mF), S = Math.round((mF - M) * 60);
-    if (S === 60) { S = 0; M += 1; }
+    // Round once, in whole seconds, so 59.99" carries into minutes AND degrees
+    // (38.9999 used to print 38°60'00").
+    const tot = Math.round(v * 3600);
+    const D = Math.floor(tot / 3600), M = Math.floor((tot % 3600) / 60), S = tot % 60;
     return `${String(D).padStart(deg, '0')}°${String(M).padStart(2, '0')}'${String(S).padStart(2, '0')}"${hemi}`;
   };
   return `${d(lat, 'N', 'S', 2)} ${d(lng, 'E', 'W', 3)}`;
@@ -3488,14 +3586,14 @@ function _kmlCoord(lng, lat, alt) {
 
 // Ring of [lat,lng] pairs -> "lng,lat,0 ..." (auto-closed).
 function kmlRingFromLatLng(ring) {
-  const pts = (ring || []).filter(p => p && isFinite(p[0]) && isFinite(p[1])).map(p => _kmlCoord(p[1], p[0]));
+  const pts = (ring || []).filter(p => p && _isCoordNum(p[0]) && _isCoordNum(p[1])).map(p => _kmlCoord(p[1], p[0]));
   if (pts.length && pts[0] !== pts[pts.length - 1]) pts.push(pts[0]);
   return pts.join(' ');
 }
 
 // Ring of GeoJSON [lng,lat] pairs -> "lng,lat,0 ..." (auto-closed).
 function kmlRingFromGeoJson(ring) {
-  const pts = (ring || []).filter(p => p && isFinite(p[0]) && isFinite(p[1])).map(p => _kmlCoord(p[0], p[1]));
+  const pts = (ring || []).filter(p => p && _isCoordNum(p[0]) && _isCoordNum(p[1])).map(p => _kmlCoord(p[0], p[1]));
   if (pts.length && pts[0] !== pts[pts.length - 1]) pts.push(pts[0]);
   return pts.join(' ');
 }
@@ -3517,14 +3615,14 @@ function kmlPolygonPlacemark(o) {
 }
 
 function kmlPointPlacemark(o) {
-  if (!isFinite(o.lat) || !isFinite(o.lng)) return '';
+  if (!_isCoordNum(o.lat) || !_isCoordNum(o.lng)) return '';
   return _kmlHead(o.name, o.styleUrl, o.description, o.timestamp) +
     `<Point><coordinates>${_kmlCoord(o.lng, o.lat)}</coordinates></Point></Placemark>`;
 }
 
 // coords: array of [lat,lng] pairs.
 function kmlLinePlacemark(o) {
-  const pts = (o.coords || []).filter(p => p && isFinite(p[0]) && isFinite(p[1])).map(p => _kmlCoord(p[1], p[0]));
+  const pts = (o.coords || []).filter(p => p && _isCoordNum(p[0]) && _isCoordNum(p[1])).map(p => _kmlCoord(p[1], p[0]));
   if (pts.length < 2) return '';
   return _kmlHead(o.name, o.styleUrl, o.description, o.timestamp) +
     `<LineString><tessellate>1</tessellate><coordinates>${pts.join(' ')}</coordinates></LineString></Placemark>`;
@@ -3631,6 +3729,19 @@ function _bearingPlacemark(name, centerLat, centerLng, bearingDeg, lengthM, styl
     bearingLineGeometry(centerLat, centerLng, bearingDeg, lengthM) + `</Placemark>`;
 }
 
+// Hour label for an arrow. Hourly times are ISO UTC instants: label them in
+// the mission zone (opts.timeZone, with its abbreviation) when given, else as
+// UTC with a 'Z' — a bare "17:00" read as local time is 7 h off in PDT.
+function _arrowHourLabel(t, timeZone) {
+  const d = new Date(t);
+  if (isNaN(d.getTime())) return String(t).slice(11, 16);
+  if (timeZone) {
+    try {
+      return new Intl.DateTimeFormat('en-US', { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZoneName: 'short' }).format(d);
+    } catch (_) { /* unknown zone: fall through to UTC */ }
+  }
+  return d.toISOString().slice(11, 16) + 'Z';
+}
 // Sun arrows for each timestamp where the sun is above the horizon. Arrow points
 // TOWARD the sun (azimuth). `opts.calcSunPosition` overridable for tests.
 function sunArrowsKml(lat, lng, times, centerLat, centerLng, opts) {
@@ -3646,7 +3757,7 @@ function sunArrowsKml(lat, lng, times, centerLat, centerLng, opts) {
     const sp = calc(lat, lng, d);
     if (!sp || !(sp.elevation > 0)) continue; // sun down — skip
     const az = Math.round(sp.azimuth), el = Math.round(sp.elevation);
-    const hhmm = String(t).slice(11, 16);
+    const hhmm = _arrowHourLabel(t, opts.timeZone);
     const name = `Sun ${hhmm} — AZ ${az}° EL ${el}°`;
     const desc = `Sun position at ${t}\nAzimuth: ${az}° (true) — line points toward the sun\nElevation: ${el}° above horizon`;
     inner += _bearingPlacemark(name, centerLat, centerLng, sp.azimuth, lengthM, 'sunArrow', desc, t);
@@ -3671,7 +3782,7 @@ function windArrowsKml(times, dir, speed, gust, centerLat, centerLng, opts) {
     const toward = (from + 180) % 360;
     const frac = spd != null ? Math.min(spd, speedMax) / speedMax : 0.5;
     const len = lengthM * (0.4 + 0.6 * frac);
-    const hhmm = String(t).slice(11, 16);
+    const hhmm = _arrowHourLabel(t, opts.timeZone);
     const name = `Wind ${hhmm} — FROM ${Math.round(from)}°` + (spd != null ? ` ${Math.round(spd)} mph` : '');
     const desc = `Wind at ${t}\nFROM ${Math.round(from)}° (true)\nSpeed: ${spd != null ? Math.round(spd) + ' mph' : '--'}` +
       (g != null ? `\nGust: ${Math.round(g)} mph` : '') + `\nLine points downwind (direction of drift).`;
@@ -3718,7 +3829,7 @@ function geojsonFolderFeature(id, title) {
 
 // o: { name, description, lat, lng, styleId }
 function geojsonMarkerFeature(id, folderId, o) {
-  if (!isFinite(o.lat) || !isFinite(o.lng)) return null;
+  if (!_isCoordNum(o.lat) || !_isCoordNum(o.lng)) return null;
   const props = Object.assign({ title: o.name, class: 'Marker' }, caltopoStyleProps(o.styleId));
   if (o.description) props.description = o.description;
   if (folderId) props.folderId = folderId;
@@ -3736,14 +3847,14 @@ function geojsonShapeFeature(id, folderId, o) {
 
 // coords: array of [lat,lng] -> GeoJSON LineString ([lng,lat]).
 function geojsonLineGeometry(coords) {
-  const pts = (coords || []).filter(p => p && isFinite(p[0]) && isFinite(p[1])).map(p => [+p[1], +p[0]]);
+  const pts = (coords || []).filter(p => p && _isCoordNum(p[0]) && _isCoordNum(p[1])).map(p => [+p[1], +p[0]]);
   return { type: 'LineString', coordinates: pts };
 }
 
 // rings: array of [lat,lng] rings (rings[0] outer) -> GeoJSON Polygon (auto-closed, [lng,lat]).
 function geojsonPolygonGeometry(rings) {
   const out = (rings || []).map(ring => {
-    const c = (ring || []).filter(p => p && isFinite(p[0]) && isFinite(p[1])).map(p => [+p[1], +p[0]]);
+    const c = (ring || []).filter(p => p && _isCoordNum(p[0]) && _isCoordNum(p[1])).map(p => [+p[1], +p[0]]);
     if (c.length && (c[0][0] !== c[c.length - 1][0] || c[0][1] !== c[c.length - 1][1])) c.push(c[0]);
     return c;
   }).filter(r => r.length >= 4);
@@ -3823,6 +3934,15 @@ function buildSectionMetaLine(meta, nowMs, tz) {
     // still cached, never "Not loaded" and never a fresh "Updated".
     return { state: 'cached', tone: 'cached', text: 'Cached (age unknown)', ageText: '', title: meta.error || '', canUpdate: true };
   }
+  if (upd != null && status === 'partial') {
+    // A rollup with a sub-source that has not reported is not a complete
+    // live check: amber, never the green "Updated".
+    const age = relAge(upd, nowMs);
+    const ageText = age ? '(' + age + ' ago)' : '';
+    const text = 'Incomplete — updated ' + formatStamp(upd, nowMs, tz) + (ageText ? ' ' + ageText : '') + '; some sources not loaded';
+    return { state: 'partial', tone: 'cached', text, ageText,
+      title: meta.missing && meta.missing.length ? 'Not loaded: ' + meta.missing.join(', ') : '', canUpdate: true };
+  }
   if (upd != null) {
     const age = relAge(upd, nowMs);
     const ageText = age ? '(' + age + ' ago)' : '';
@@ -3842,7 +3962,7 @@ function rollupSources(sources, nowMs) {
   let anyError = false, anyCached = false, allLive = true;
   let oldestUpdated = null, oldestCached = null, latestError = null, errMsg = null;
   let cachedLabel, cachedNote = null;
-  const detail = [];
+  const detail = [], missing = [];
   for (const name of names) {
     const s = sources[name] || {};
     const st = s.status || 'never';
@@ -3850,6 +3970,10 @@ function rollupSources(sources, nowMs) {
       anyError = true; allLive = false;
       if (s.errorAt != null && (latestError == null || s.errorAt > latestError)) latestError = s.errorAt;
       errMsg = errMsg || s.error;
+      // A failed refresh that kept this piece's earlier data: that data's
+      // time is what "showing … data" must name (oldest piece wins).
+      if (s.updatedAt != null && (oldestUpdated == null || s.updatedAt < oldestUpdated)) oldestUpdated = s.updatedAt;
+      if (s.cachedAt != null && (oldestCached == null || s.cachedAt < oldestCached)) oldestCached = s.cachedAt;
     } else if (st === 'cached') {
       anyCached = true; allLive = false;
       if (s.cachedAt != null && (oldestCached == null || s.cachedAt < oldestCached)) {
@@ -3861,6 +3985,7 @@ function rollupSources(sources, nowMs) {
       if (s.updatedAt != null && (oldestUpdated == null || s.updatedAt < oldestUpdated)) oldestUpdated = s.updatedAt;
     } else {
       allLive = false;
+      missing.push(name);
     }
     detail.push(name + ' ' + st);
   }
@@ -3868,8 +3993,10 @@ function rollupSources(sources, nowMs) {
   if (anyError) status = 'error';
   else if (anyCached) status = 'cached';
   else if (allLive) status = 'live';
+  else if (oldestUpdated != null) status = 'partial'; // some live, some never reported
   return {
     status,
+    missing,
     updatedAt: oldestUpdated,
     cachedAt: oldestCached,
     cachedLabel: status === 'cached' ? cachedLabel : undefined,
@@ -4801,10 +4928,12 @@ function utmToLatLng(zone, band, easting, northing) {
 function parseAngleFlexible(str) {
   let s = String(str == null ? '' : str).trim();
   if (!s) return null;
-  let hemi = 0;
+  let hemi = 0, axis = null;
   const first = s[0].toUpperCase(), last = s[s.length - 1].toUpperCase();
+  const letter = 'NSEW'.indexOf(last) >= 0 ? last : ('NSEW'.indexOf(first) >= 0 ? first : null);
   if ('NSEW'.indexOf(last) >= 0) { hemi = (last === 'S' || last === 'W') ? -1 : 1; s = s.slice(0, -1); }
   else if ('NSEW'.indexOf(first) >= 0) { hemi = (first === 'S' || first === 'W') ? -1 : 1; s = s.slice(1); }
+  if (letter) axis = (letter === 'N' || letter === 'S') ? 'lat' : 'lng';
   s = s.trim();
   let neg = false;
   if (s[0] === '-') { neg = true; s = s.slice(1); }
@@ -4822,7 +4951,7 @@ function parseAngleFlexible(str) {
   let value = d + m / 60 + sec / 3600;
   if (neg) value = -value;
   if (hemi) value = Math.abs(value) * hemi;
-  return { value, parts: toks.length };
+  return axis ? { value, parts: toks.length, axis } : { value, parts: toks.length };
 }
 
 // Full "Enter Coordinates" input: a coordinate in any supported format,
@@ -4842,9 +4971,12 @@ function parseCoordinateInput(raw) {
   // separate DDM/DMS components inside each half).
   const segs = s.split(',').map(x => x.trim()).filter(Boolean);
   if (segs.length < 2 || segs.length > 3) return null;
-  const latA = parseAngleFlexible(segs[0]);
-  const lngA = parseAngleFlexible(segs[1]);
+  let latA = parseAngleFlexible(segs[0]);
+  let lngA = parseAngleFlexible(segs[1]);
   if (!latA || !lngA) return null;
+  // Hemisphere letters name the AXIS: "74.0° W, 40.7° N" is lng-first.
+  if (latA.axis && latA.axis === lngA.axis) return null; // "38 N, 120 N": contradictory
+  if (latA.axis === 'lng' || lngA.axis === 'lat') { const t = latA; latA = lngA; lngA = t; }
   if (Math.abs(latA.value) > 90 || Math.abs(lngA.value) > 180) return null;
   let radiusM = null;
   if (segs.length === 3) {
@@ -5350,7 +5482,10 @@ function parcelChipState(st) {
     text = `Parcels: ${cfg.label || 'CA statewide (DWR/LightBox)'} · ${cfg.refresh || 'quarterly'} · APN+address only`;
     tone = 'ok';
   }
-  if (st.count === 0) text = `Parcels: ${cfg.label || 'source'} · 0 parcels in view`;
+  // Zero parcels must not hide that the county source failed (fallback in use).
+  if (st.count === 0) text = (cfg.tier !== 1 && st.failedTier1)
+    ? `⚠ County source unavailable — ${cfg.label || 'CA statewide (DWR/LightBox)'} · 0 parcels in view`
+    : `Parcels: ${cfg.label || 'source'} · 0 parcels in view`;
   if (st.truncated) {
     text += ` · first ${st.count} only — zoom in`;
     if (tone === 'ok') tone = 'warn';
@@ -5613,7 +5748,8 @@ function normalizeResponseSettings(raw) {
   out.auto = r.auto == null ? DEFAULT_RESPONSE_SETTINGS.auto : !!r.auto;
   out.consent = !!r.consent;
   const b = r.base;
-  const blat = b ? Number(b.lat) : NaN, blng = b ? Number(b.lng) : NaN;
+  const num = v => (v == null || v === '') ? NaN : Number(v); // Number(null) is 0 = Null Island
+  const blat = b ? num(b.lat) : NaN, blng = b ? num(b.lng) : NaN;
   out.base = (b && Number.isFinite(blat) && Number.isFinite(blng) && Math.abs(blat) <= 90 && Math.abs(blng) <= 180)
     ? { label: String(b.label || '').trim() || 'Saved base', lat: blat, lng: blng } : null;
   return out;
@@ -6043,14 +6179,21 @@ const _RESP_DIR_BEARING = { N: 0, E: 90, S: 180, W: 270 };
 // are one stretch; a highway with two numbers yields one stretch per number).
 function routeHighwayStretches(segments) {
   const out = [];
-  let along = 0;
+  let along = 0, lastNumEnd = null;
   (segments || []).forEach(s => {
     const km = (s && s.km) || 0;
-    highwayNumbersFromNames((s && (s.names || [s.name])) || []).forEach(num => {
+    const nums = highwayNumbersFromNames((s && (s.names || [s.name])) || []);
+    nums.forEach(num => {
       const last = out.filter(x => x.num === num).pop();
-      if (last && Math.abs(last.toKm - along) < 0.05) last.toKm = along + km;
+      const gap = last ? along - last.toKm : Infinity;
+      // A short UNNUMBERED piece (e.g. a bridge mapped without the highway
+      // ref) between two pieces of the same highway does not end the
+      // stretch — splitting there made mayApply read the bridge as the exit
+      // and drop controls before it. Only when nothing numbered intervened.
+      if (last && (Math.abs(gap) < 0.05 || (gap > 0 && gap <= 0.5 && last.toKm === lastNumEnd))) last.toKm = along + km;
       else out.push({ num, fromKm: along, toKm: along + km });
     });
+    if (nums.length) lastNumEnd = along + km;
     along += km;
   });
   return out;
@@ -6152,11 +6295,23 @@ function routeTouchesCalifornia(coords) {
 
 // "04/01-12/31" (one or several ranges; a range may wrap the new year) →
 // 'open' | 'closed' on the given date, 'unknown' when nothing is parseable.
-function mvumSeasonState(datesOpen, date) {
+// `date`: a Date, or an ISO date-only 'YYYY-MM-DD' (read as that calendar
+// day — `new Date('2026-04-01')` is UTC midnight, i.e. March 31 in the US).
+// `timeZone` (IANA, the mission zone) picks the calendar day of a Date in
+// that zone; without it the device's local day is used.
+function mvumSeasonState(datesOpen, date, timeZone) {
   const s = String(datesOpen == null ? '' : datesOpen).trim();
-  const d = date instanceof Date ? date : new Date(date);
-  if (!s || isNaN(d.getTime())) return 'unknown';
-  const md = (d.getMonth() + 1) * 100 + d.getDate();
+  const iso = typeof date === 'string' && /^(\d{4})-(\d{2})-(\d{2})$/.exec(date.trim());
+  const d = iso ? null : (date instanceof Date ? date : new Date(date));
+  if (!s || (!iso && isNaN(d.getTime()))) return 'unknown';
+  let md = iso ? Number(iso[2]) * 100 + Number(iso[3]) : (d.getMonth() + 1) * 100 + d.getDate();
+  if (!iso && timeZone) {
+    try {
+      const p = new Intl.DateTimeFormat('en-US', { timeZone, month: 'numeric', day: 'numeric' }).formatToParts(d);
+      const g = t => Number((p.find(x => x.type === t) || {}).value);
+      if (Number.isFinite(g('month')) && Number.isFinite(g('day'))) md = g('month') * 100 + g('day');
+    } catch (_) { /* unknown zone: device-local day */ }
+  }
   const re = /(\d{1,2})\/(\d{1,2})\s*-\s*(\d{1,2})\/(\d{1,2})/g;
   let m, any = false, open = false;
   while ((m = re.exec(s))) {
@@ -6183,7 +6338,7 @@ function mvumAccessFlags(props, date, opts) {
   const cls = (key, datesKey) => {
     if (get(key) == null) return { designated: false, dates: null, state: 'not designated' };
     const dates = get(datesKey || (key + '_datesopen'));
-    return { designated: true, dates: dates ? String(dates) : null, state: mvumSeasonState(dates, date) };
+    return { designated: true, dates: dates ? String(dates) : null, state: mvumSeasonState(dates, date, opts && opts.timeZone) };
   };
   const passenger = cls('passengervehicle'), highClear = cls('highclearancevehicle');
   const fourwd = cls('fourwd_gt50inches', 'fourwd_gt50_datesopen');
@@ -6222,7 +6377,7 @@ function _geojsonLines(geometry) {
 // `matched` counts the vertices on the listed roads, so `matched < sampled`
 // means part of the forest leg is not an MVUM route (county, private, or
 // outside a National Forest).
-function matchMvumRoads(features, coords, segments, date) {
+function matchMvumRoads(features, coords, segments, date, timeZone) {
   const pts = [];
   (segments || []).forEach(s => {
     if (!s || s.kind !== 'forest') return;
@@ -6250,7 +6405,7 @@ function matchMvumRoads(features, coords, segments, date) {
   // junction (measured: 3 of 94 at the Wrights Lake road end) do not.
   const need = Math.max(sample.length >= 4 ? 2 : 1, Math.ceil(sample.length * 0.05));
   const roads = feats.filter(x => x.hits >= need).sort((a, b) => b.hits - a.hits)
-    .map(x => ({ flags: mvumAccessFlags(x.f.properties || {}, date, { trail: !!x.f.__mvumTrail }), hits: x.hits }));
+    .map(x => ({ flags: mvumAccessFlags(x.f.properties || {}, date, { trail: !!x.f.__mvumTrail, timeZone }), hits: x.hits }));
   const onRoads = roads.reduce((a, r) => a + r.hits, 0);
   return { roads, sampled: sample.length, matched: onRoads };
 }
@@ -6259,10 +6414,15 @@ function matchMvumRoads(features, coords, segments, date) {
 
 // Total climb (m) along an elevation profile: the sum of the rises.
 function ascentFromElevations(elevsM) {
-  let up = 0;
-  for (let i = 1; i < (elevsM || []).length; i++) {
-    const a = Number(elevsM[i - 1]), b = Number(elevsM[i]);
-    if (Number.isFinite(a) && Number.isFinite(b) && b > a) up += b - a;
+  // A missing sample (null / '' / NaN) is skipped — Number(null) is 0, which
+  // turned one gap at 2,000 m into a 2,000 m phantom climb. Rises are measured
+  // between consecutive VALID samples.
+  let up = 0, prev = null;
+  for (const v of (elevsM || [])) {
+    if (v == null || v === '' || !Number.isFinite(Number(v))) continue;
+    const b = Number(v);
+    if (prev != null && b > prev) up += b - prev;
+    prev = b;
   }
   return up;
 }
@@ -6326,6 +6486,7 @@ function summarizeResponseDest(d, settings) {
   const weatherHit = (d.est.rainMi + d.est.snowMi + d.est.groundSnowMi) > 0.05;
   if (out.closed) out.level = 'red';
   else if (d.routeStatus === 'cached' || !d.est.wxKnown || chain.status === 'unverified' || out.chainMin > 0 || out.chainMayMin > 0
+    || chain.on > 0 || chain.may > 0 // an active control is never green, even with a 0-min delay setting
     || out.closedMay || weatherHit || d.hikeDegraded || d.surfaceDetail === false || d.accessClosed) out.level = 'amber';
   else out.level = 'green';
   return out;

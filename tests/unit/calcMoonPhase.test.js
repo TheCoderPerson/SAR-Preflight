@@ -46,10 +46,10 @@ describe('calcMoonPhase()', () => {
     });
   });
 
-  describe('known full moon per algorithm (2026-04-18)', () => {
+  describe('known full moon (2026-04-02, actual full moon ~02:12 UTC)', () => {
     beforeEach(() => {
       vi.useFakeTimers();
-      vi.setSystemTime(new Date('2026-04-18T12:00:00Z'));
+      vi.setSystemTime(new Date('2026-04-02T12:00:00Z'));
     });
 
     it('should report Full Moon', () => {
@@ -69,10 +69,10 @@ describe('calcMoonPhase()', () => {
     });
   });
 
-  describe('known new moon per algorithm (2026-04-05)', () => {
+  describe('known new moon (2026-04-17, actual new moon ~11:52 UTC)', () => {
     beforeEach(() => {
       vi.useFakeTimers();
-      vi.setSystemTime(new Date('2026-04-05T12:00:00Z'));
+      vi.setSystemTime(new Date('2026-04-17T12:00:00Z'));
     });
 
     it('should report New Moon', () => {

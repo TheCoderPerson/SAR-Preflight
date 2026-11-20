@@ -61,10 +61,15 @@ afterEach(() => {
   delete globalThis.getCachedApiResponse;
 });
 
+// The fixtures carry exceededTransferLimit, so the fetcher pages on with
+// resultOffset; answer that continuation with an empty, complete page.
+const LAST_PAGE = { ok: true, json: async () => ({ type: 'FeatureCollection', features: [] }) };
+
 function mockFetchOk() {
   const urls = [];
   globalThis.fetch = async (url) => {
     urls.push(url);
+    if (url.includes('resultOffset=')) return LAST_PAGE;
     if (url.includes('services2.arcgis.com/mJaJSax0KPHoCNB6')) return { ok: true, json: async () => pgeFixture };
     if (url.includes('services3.arcgis.com/bWPjFyq029ChCGur')) return { ok: true, json: async () => cecFixture };
     throw new Error('unexpected url ' + url);
@@ -76,7 +81,7 @@ describe('fetchUtilityWires — coverage gating + rendering', () => {
   it('El Dorado op area queries both sources and renders their categories', async () => {
     const urls = mockFetchOk();
     await fetchUtilityWires(EDC_BOUNDS);
-    expect(urls).toHaveLength(2);
+    expect(urls.filter(u => !u.includes('resultOffset='))).toHaveLength(2);
     expect(distLayer().getLayers()).toHaveLength(2);   // PG&E fixture feeders
     expect(transLayer().getLayers()).toHaveLength(3);  // CEC minus Proposed + geometry-less
     expect(S.utilityWireCounts).toEqual({ utility_distribution: 2, utility_transmission: 3 });
@@ -102,7 +107,7 @@ describe('fetchUtilityWires — coverage gating + rendering', () => {
     const html = transLayer().getLayers()[0].getPopup().getContent();
     expect(html).toContain('CA Transmission (CEC)');
     expect(html).toContain('115 kV · Overhead');
-    expect(html).toContain('Owner: PG&E');
+    expect(html).toContain('Owner: PG&amp;E');   // utility GIS text is HTML-escaped
     expect(html).toContain('California Energy Commission');
   });
 
@@ -126,7 +131,9 @@ describe('fetchUtilityWires — coverage gating + rendering', () => {
     expect(cached.every(c => c.endpoint === 'utility_wires')).toBe(true);
     expect(cached.map(c => c.key).join('|')).toContain('pge-grip-feeders');
     expect(cached[0].data.recs.length).toBeGreaterThan(0);
-    expect(cached[0].data.truncated).toBe(true); // fixtures carry exceededTransferLimit
+    // Fixtures carry exceededTransferLimit; the paged-through result is complete.
+    // (A result that cannot be completed is never cached — see bugReviewNov_fetchers.)
+    expect(cached[0].data.truncated).toBe(false);
   });
 });
 
@@ -134,6 +141,7 @@ describe('fetchUtilityWires — degradation', () => {
   it('one source failing still renders the other and records the error', async () => {
     globalThis.fetch = async (url) => {
       if (url.includes('mJaJSax0KPHoCNB6')) return { ok: false, status: 503 };
+      if (url.includes('resultOffset=')) return LAST_PAGE;
       return { ok: true, json: async () => cecFixture };
     };
     await fetchUtilityWires(EDC_BOUNDS);

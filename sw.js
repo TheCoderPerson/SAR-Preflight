@@ -417,7 +417,7 @@ function getCacheName(url) {
 // chart when offline; the URL's ?ed= query is ignored for the fallback) ---
 async function sectionalTileStrategy(request) {
   const cached = await caches.match(request);
-  if (cached) return cached;
+  if (useCachedResponse(cached, request)) return cached;
   try {
     const response = await fetch(request);
     if (response.status === 200) {
@@ -481,6 +481,9 @@ async function downloadTiles(config, client) {
     basemap_labels: 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
     // Legacy alias: an old cached shell can still send 'carto' to this newer SW.
     carto: 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+    // Light canvas pair, for the light-map / full-light themes.
+    basemap_light: 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+    basemap_light_labels: 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
     satellite: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     topo: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
     sectional: 'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}',
@@ -496,6 +499,7 @@ async function downloadTiles(config, client) {
     sectional: { min: 8, max: 12 },
     streets_roads: { min: 0, max: 15 }, streets_labels: { min: 0, max: 15 },
     basemap: { min: 0, max: 16 }, basemap_labels: { min: 0, max: 16 }, carto: { min: 0, max: 16 },
+    basemap_light: { min: 0, max: 16 }, basemap_light_labels: { min: 0, max: 16 },
   };
 
   const selectedProviders = providers || ['basemap', 'basemap_labels'];
@@ -511,7 +515,10 @@ async function downloadTiles(config, client) {
           if (!template) continue;
           const zr = providerZoom[prov];
           if (zr && (z < zr.min || z > zr.max)) continue;
-          let url = template.replace('{z}', z).replace('{x}', x).replace('{y}', y).replace('{s}', 'a');
+          // {s}: the SAME subdomain the map will request, or the offline
+          // lookup (exact URL match) misses — Leaflet and MapLibre both pick
+          // subdomains[(x + y) % n].
+          let url = template.replace('{z}', z).replace('{x}', x).replace('{y}', y).replace('{s}', tileSubdomain(x, y));
           if (prov === 'sectional' && config.sectionalEdition) {
             url += '?ed=' + encodeURIComponent(config.sectionalEdition);
           }
@@ -521,7 +528,7 @@ async function downloadTiles(config, client) {
     }
   }
 
-  let done = 0;
+  let done = 0, cached = 0;
   const total = tiles.length;
   const BATCH = 4;
 
@@ -534,6 +541,7 @@ async function downloadTiles(config, client) {
           if (resp.ok) {
             const cache = await caches.open(getCacheName(url));
             await cache.put(url, resp);
+            cached++;
           }
         } catch (e) { /* skip failed tiles */ }
       })
@@ -547,16 +555,30 @@ async function downloadTiles(config, client) {
   }
 
   if (client?.postMessage) {
-    client.postMessage({ type: 'TILE_DOWNLOAD_COMPLETE', total: done });
+    // `total` = tiles actually stored (an older app reads only this field);
+    // a failed fetch is never reported as cached.
+    client.postMessage({ type: 'TILE_DOWNLOAD_COMPLETE', total: cached, cached, attempted: done, failed: done - cached });
   }
+}
+
+// Leaflet's default 'abc' and the 3D view's [a,b,c] both choose (x + y) % 3.
+function tileSubdomain(x, y, subdomains) {
+  const s = subdomains || ['a', 'b', 'c'];
+  return s[Math.abs(x + y) % s.length];
 }
 
 function latlngToTile(lat, lng, zoom) {
   const n = Math.pow(2, zoom);
-  const x = Math.floor((lng + 180) / 360 * n);
-  const latRad = lat * Math.PI / 180;
+  // Clamp to the Web Mercator range and the tile grid: lat ±90 gives ±Infinity
+  // and a world-wrapped view gives x outside [0, n), which would enumerate
+  // nonexistent (or endlessly many) tiles.
+  const MAX_LAT = 85.05112878;
+  const la = Math.max(-MAX_LAT, Math.min(MAX_LAT, +lat));
+  const ln = Math.max(-180, Math.min(180, +lng));
+  const x = Math.floor((ln + 180) / 360 * n);
+  const latRad = la * Math.PI / 180;
   const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
-  return { x, y };
+  return { x: Math.max(0, Math.min(n - 1, x)), y: Math.max(0, Math.min(n - 1, y)) };
 }
 
 async function getCacheSize() {
@@ -570,7 +592,7 @@ async function getCacheSize() {
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    routeStrategy, latlngToTile, getCacheName, refreshAppShell,
+    routeStrategy, latlngToTile, tileSubdomain, downloadTiles, sectionalTileStrategy, getCacheName, refreshAppShell,
     navigationStrategy, stripRedirect, useCachedResponse, cacheFirst,
     networkFirst, stampCachedAt, markSwCacheFallback, SW_CACHED_AT_HDR, SW_CACHE_FALLBACK_HDR,
     CURRENT_CACHES, APP_SHELL, CDN_ASSETS,

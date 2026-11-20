@@ -42,8 +42,11 @@ describe('calcMoonPosition(lat, lng, date)', () => {
     // Antipodal within the moon's orbital tilt + daily phase-sample
     // granularity + series truncation.
     expect(Math.abs(sun.elevation + moon.elevation)).toBeLessThan(35);
+    // azDiff = sun-moon azimuth separation; antipodal means it is near 180.
+    // (This used to assert < 45, which only held because calcMoonPhase's
+    // 'full' date was really a new moon.)
     const azDiff = Math.abs(((sun.azimuth - moon.azimuth + 540) % 360) - 180);
-    expect(azDiff).toBeLessThan(45);
+    expect(180 - azDiff).toBeLessThan(45);
   });
 });
 

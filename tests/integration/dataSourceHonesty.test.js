@@ -906,7 +906,9 @@ describe('B03 — disabling ADS-B stops traffic for good', () => {
       document.getElementById('cfgAdsbEnabled').value = '1'; app.toggleAdsbPolling();
       oldRelease(resp(emergency));                  // the retired chain's fetch lands late
       for (let i = 0; i < 10; i++) await Promise.resolve();
-      expect(vi.getTimerCount()).toBe(0);           // ...and schedules nothing: no second chain
+      // ...and schedules nothing: no second chain. The one timer left is the
+      // live chain's per-request time limit (ADSB_FETCH_TIMEOUT_MS), not a poll.
+      expect(vi.getTimerCount()).toBe(1);
       releaseOld(resp({ ac: [] }));                 // the live chain's fetch
       for (let i = 0; i < 10; i++) await Promise.resolve();
       expect(vi.getTimerCount()).toBe(1);

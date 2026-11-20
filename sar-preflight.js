@@ -446,13 +446,17 @@ function _localTZ() {
   try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (_) { return 'America/New_York'; }
 }
 
+// A COUNT per source: area A's late `finally` must not clear area B's
+// still-running fetch of the same source (the header dot turned green early).
 function trackFetchStart(source) {
-  S._activeFetches[source] = true;
+  S._activeFetches[source] = (Number(S._activeFetches[source]) || 0) + 1;
   _updateFetchActivity();
 }
 
 function trackFetchEnd(source) {
-  delete S._activeFetches[source];
+  const n = (Number(S._activeFetches[source]) || 0) - 1;
+  if (n > 0) S._activeFetches[source] = n;
+  else delete S._activeFetches[source];
   _updateFetchActivity();
 }
 
@@ -641,9 +645,20 @@ async function _completeArcgisGeoJson(url, json, label, init, fromSw) {
 // ============================================================
 // DOM HELPERS
 // ============================================================
-function setText(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+function setText(id, val) {
+  const el = document.getElementById(id); if (!el) return;
+  el.textContent = val;
+  // A real value written over UNKNOWN (markCellsUnknown) drops its red: a
+  // renderer that only sets text must not leave a recovered value styled as
+  // a failure. A renderer that colors the cell calls setColor right after.
+  if (el.dataset && el.dataset.unknown && val !== UNKNOWN_CELL_TEXT) {
+    delete el.dataset.unknown;
+    if (el.classList) el.classList.remove('red');
+  }
+}
 function setColor(id, level) {
   const el = document.getElementById(id); if (!el) return;
+  if (el.dataset && el.dataset.unknown) delete el.dataset.unknown; // the cell's color is the caller's now
   el.classList.remove('green','amber','red','cyan'); if (level) el.classList.add(level);
 }
 function setStatus(id, type, text) {
@@ -694,6 +709,8 @@ async function resolveSectionalEdition() {
   try {
     const res = await fetch(VFR_SECTIONAL_BASE + '?f=json', { cache: 'no-cache' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
+    // A SW offline-fallback body is an OLD edition check — never label it "current".
+    if (_swCacheStamp(res)) throw new Error('offline fallback');
     const meta = await res.json();
     // The edition stamp lives in documentInfo.subject for this service
     // (e.g. "Updated with the latest charts on 07-09-2026."; older builds of
@@ -843,8 +860,8 @@ function initMap() {
   // service, so each basemap is a base+labels pair in one layer group; native
   // z16 in North America, upscaled past that (like the sectional).
   const esriCanvasPair = kind => L.layerGroup([
-    L.tileLayer(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${kind}_Gray_Base/MapServer/tile/{z}/{y}/{x}`, { maxNativeZoom: 16, maxZoom: 19, attribution: 'Esri, HERE, Garmin, OpenStreetMap contributors' }),
-    L.tileLayer(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${kind}_Gray_Reference/MapServer/tile/{z}/{y}/{x}`, { maxNativeZoom: 16, maxZoom: 19 }),
+    L.tileLayer(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${kind}_Gray_Base/MapServer/tile/{z}/{y}/{x}`, { maxNativeZoom: 16, maxZoom: 19, crossOrigin: 'anonymous', attribution: 'Esri, HERE, Garmin, OpenStreetMap contributors' }),
+    L.tileLayer(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${kind}_Gray_Reference/MapServer/tile/{z}/{y}/{x}`, { maxNativeZoom: 16, maxZoom: 19, crossOrigin: 'anonymous' }),
   ]);
   S.mapLayers.basemap_dark = esriCanvasPair('Dark');
   S.mapLayers.basemap_light = esriCanvasPair('Light');
@@ -853,12 +870,14 @@ function initMap() {
   // them CORS-mode means the tiles Leaflet has already displayed land in the SW
   // tile cache as readable (non-opaque) responses, so classification reuses them
   // — no second download, and it works offline for anything already viewed.
-  // Only this layer needs it; the others are never sampled.
+  // The other tile layers set it too (every host verified to send
+  // Access-Control-Allow-Origin, Nov 2026): a no-cors tile is OPAQUE (status 0),
+  // which the SW never caches, so without it those layers had no offline copy.
   S.mapLayers.satellite = L.tileLayer(SAT_TILE_TEMPLATE, { maxZoom: 19, crossOrigin: 'anonymous' });
-  S.mapLayers.topo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { maxZoom: 17 });
-  S.mapLayers.sectional = L.tileLayer(sectionalTileUrl(getStoredSectionalEdition()), { maxNativeZoom: 12, maxZoom: 18, opacity: 1.0, attribution: 'FAA Aeronautical Information Services' });
+  S.mapLayers.topo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { maxZoom: 17, crossOrigin: 'anonymous' });
+  S.mapLayers.sectional = L.tileLayer(sectionalTileUrl(getStoredSectionalEdition()), { maxNativeZoom: 12, maxZoom: 18, opacity: 1.0, crossOrigin: 'anonymous', attribution: 'FAA Aeronautical Information Services' });
   // Terrain hillshade (steepness) — Esri World Hillshade XYZ tiles (free, CORS-OK).
-  S.mapLayers.slope = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Elevation/World_Hillshade/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, opacity: 0.6, attribution: 'USGS 3DEP / Esri' });
+  S.mapLayers.slope = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Elevation/World_Hillshade/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, opacity: 0.6, crossOrigin: 'anonymous', attribution: 'USGS 3DEP / Esri' });
   // Assessor parcels — live vector layer (El Dorado County GIS where available,
   // CA statewide DWR/LightBox fallback). View-driven, zoom-gated; filled by
   // loadParcelsForView(). Replaced the ReGrid boundary-only tile layer.
@@ -871,8 +890,8 @@ function initMap() {
   // labels only (it assumes the imagery shows the road), so upscale the z15
   // tiles instead — road geometry stays visible at close zoom.
   S.mapLayers.streets = L.layerGroup([
-    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 15, maxZoom: 19, zIndex: 250, attribution: 'Esri' }),
-    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 15, maxZoom: 19, zIndex: 250 }),
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 15, maxZoom: 19, zIndex: 250, crossOrigin: 'anonymous', attribution: 'Esri' }),
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 15, maxZoom: 19, zIndex: 250, crossOrigin: 'anonymous' }),
   ]);
   S.drawnItems = new L.FeatureGroup();
   S.map.addLayer(S.drawnItems);
@@ -1005,12 +1024,19 @@ function clearDrawBtns() { document.querySelectorAll('.draw-btn').forEach(b => b
 function clearArea() {
   invalidateAreaRequests(); // pending area requests must not repopulate a cleared area
   stopAdsbPolling();
-  S.drawnItems.clearLayers(); S.currentArea = null; S.areaCenter = null;
+  S.drawnItems.clearLayers(); S.currentArea = null; S.areaCenter = null; S.areaBounds = null;
   S._processedAreaKey = null; // the next area drawn is a new one, even at the same spot
   S._areaAwaiting = null;
   // State, map layers and cards fetched for the area (shared with processArea,
   // which does the same when a different area replaces this one).
+  _resetAreaSectionMeta();
   _dropAreaData();
+  _resetPanelForNewArea(); // no cleared area's values left in the (hidden) cells
+  // Nothing is loading after a clear: blanked cells read "--", not UPDATING….
+  if (typeof document !== 'undefined') {
+    AREA_BLANK_SECTIONS.forEach(k => sectionCellsFor(k).forEach(id => { setText(id, '--'); setColor(id, null); }));
+  }
+  renderAllSectionMeta();
   // Clear radar layers and stop animation
   if (S.radarAnim) {
     if (S.radarAnim.interval) clearInterval(S.radarAnim.interval);
@@ -1032,6 +1058,9 @@ function clearArea() {
   } catch (_) {}
   S.viewsheds = []; S.activeViewshedId = null;
   if (typeof _resetResponse === 'function') _resetResponse(); // routes + staging point belong to the cleared area
+  // The observer it stood at is gone: leave the 3D eye view, drop stale list rows.
+  if (S.observerView && typeof exitObserverView === 'function') exitObserverView();
+  if (S.mapLayers.observers && typeof renderObserverList === 'function') renderObserverList();
   if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
   if (S.mapLayers.canopy && S.map && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
   // Shadow too: leaving it draped while clearing _overlayWanted.shadow stranded
@@ -1159,7 +1188,16 @@ function onCoordSearchKey(e) {
     _highlightGeocodeRow();
     return;
   }
-  if (e.key !== 'Enter') return;
+  if (e.key !== 'Enter') {
+    // Editing the text drops the highlighted row: otherwise Enter on a NEW
+    // query would jump to a result of the old one instead of searching.
+    // (Only clears the selection — never searches on a keystroke.)
+    if ((e.key && e.key.length === 1 || e.key === 'Backspace' || e.key === 'Delete') && S._geocodeSel >= 0) {
+      S._geocodeSel = -1;
+      _highlightGeocodeRow();
+    }
+    return;
+  }
   e.preventDefault();
   // A highlighted row means "go there"; otherwise Enter runs the search.
   if (S._geocodeSel >= 0 && S._geocodeSel < n) { pickGeocodeResult(S._geocodeSel); return; }
@@ -1451,6 +1489,9 @@ function _blankSectionCells(keys) {
 const AREA_DERIVED_CELLS = ['opsTempFactor', 'opsAltFactor', 'opsWindFactor', 'opsFlightTime', 'opsCapacity',
   'opsBirdRisk', 'opsBirds', 'opsBirdSeason', 'opsBirdTime', 'opsBirdWater', 'opsBirdAlt',
   'opsSwapTime', 'opsSwapRadius', 'opsSwapLZ'];
+// Observed ceiling / flight category (METAR): blanked for a new area, but not
+// in SECTION_CELLS.weather — a failed forecast must not blank a valid observation.
+const AREA_METAR_CELLS = ['wxCeiling', 'wxFlightCat'];
 
 function _renderAssessmentLoading() {
   if (typeof document === 'undefined') return;
@@ -1474,6 +1515,7 @@ function _resetPanelForNewArea() {
   if (typeof document === 'undefined') return;
   _blankSectionCells(AREA_BLANK_SECTIONS);
   AREA_DERIVED_CELLS.forEach(id => { setText(id, '--'); setColor(id, null); });
+  AREA_METAR_CELLS.forEach(id => { setText(id, '--'); setColor(id, null); });
   _renderAssessmentLoading();
 }
 
@@ -1481,7 +1523,8 @@ function _resetPanelForNewArea() {
 const AREA_DATA_LAYERS = ['airports', 'nws_alerts', 'cell_towers', 'fire_perimeters', 'emergency_lz', 'swap_radius',
   'faa_class_airspace', 'faa_sua', 'faa_tfr', 'faa_laanc', 'faa_ns_restrictions', 'faa_prohibited', 'faa_obstacles',
   'dams', 'wilderness', 'national_parks', 'hms_smoke', 'avalanche', 'hospitals', 'trails',
-  'usfs_roads', 'usfs_trails', 'mvum_roads', 'mvum_trails', 'blm_gtlf', 'public_lands', 'nhd_water'];
+  'usfs_roads', 'usfs_trails', 'mvum_roads', 'mvum_trails', 'blm_gtlf', 'public_lands', 'nhd_water',
+  'buildings'];
 
 // Forget everything that was fetched FOR AN AREA: state, map layers, cards.
 // One list, used when the area is cleared and when a different area replaces
@@ -1510,11 +1553,17 @@ function _dropAreaData() {
   S.hmsSmoke = null; S.avalanche = null;
   S.publicLands = null; S.landStatus = null;
   S.astro = null;
+  // OSM buildings (3D view) were fetched for the previous area's bbox; the
+  // next 3D entry refetches. An in-flight fetch was aborted with the area.
+  S.buildings = null; S._buildingsFetching = false;
   // The live TFR / NOTAM sets were fetched for the previous area's bounds
   // (manual imports stay), and its check result says nothing about this one.
   S.tfrs = (S.tfrs || []).filter(t => !t._live);
   S.importedNotams = (S.importedNotams || []).filter(n => !n._live);
   S.autoCheck = null;
+  // Their stamps go with them (a manual import's meta stays with the import).
+  if (S.tfrImportMeta && S.tfrImportMeta.fileName === 'live') S.tfrImportMeta = null;
+  S.notamFetchMeta = null; S.restrictionCacheExpired = null;
   // No source holds data for any area now.
   S._dataArea = {};
 
@@ -1535,6 +1584,18 @@ function _dropAreaData() {
       <div class="notam-header"><span class="notam-id">CHECKING WILDFIRE DATA</span></div>
       <div class="notam-body">Fire perimeters and fire danger for this area have not been checked yet.</div></div>`;
   }
+}
+
+// Freshness lines belong to an area, except global (Kp) and map-view (canopy)
+// sources; a new area's failed fetch must not count the old area's data as
+// "prior data for this area". Area-bound source errors go with it.
+const AREA_GLOBAL_SECTIONS = ['spaceWx'];
+const VIEW_ERROR_SOURCES = /^(Canopy|Sun shadow|Viewshed|DEM \(3DEP\))/;
+function _resetAreaSectionMeta() {
+  Object.keys(SECTION_DEFS).forEach(k => {
+    if (!SECTION_DEFS[k].viewBased && AREA_GLOBAL_SECTIONS.indexOf(k) < 0) delete S.sectionMeta[k];
+  });
+  Object.keys(S.dataSourceErrors || {}).forEach(src => { if (!VIEW_ERROR_SOURCES.test(src)) delete S.dataSourceErrors[src]; });
 }
 
 // --- Checks a NEW area is still waiting for ---
@@ -1577,10 +1638,6 @@ async function processArea(layer, type) {
   // of this one) loses ownership: its late answer must not land here.
   invalidateAreaRequests();
   const areaGen = S._areaGen;
-  // Freshness is per area: without this reset a failed fetch on a NEW area
-  // would count the previous area's last update as "prior data" and keep its
-  // values on screen. View-based sections (canopy) are not tied to the area.
-  Object.keys(SECTION_DEFS).forEach(k => { if (!SECTION_DEFS[k].viewBased) delete S.sectionMeta[k]; });
   document.getElementById('noAreaOverlay').style.display = 'none';
   document.getElementById('assessmentBanner').style.display = 'flex';
   document.getElementById('areaInfoBar').style.display = 'flex';
@@ -1640,6 +1697,11 @@ async function processArea(layer, type) {
   const isNewArea = S._processedAreaKey !== _newAreaKey;
   let adsbRestarted = false;
   if (isNewArea) {
+    // Freshness is per area: without this reset a failed fetch on a NEW area
+    // would count the previous area's last update as "prior data" and keep its
+    // values on screen. A refresh of the SAME area keeps it, so a failed
+    // update there flags its values stale instead of blanking them.
+    _resetAreaSectionMeta();
     stopAdsbPolling(); // the previous area's traffic, distances and search radius
     _dropAreaData();
     _resetPanelForNewArea();
@@ -1782,7 +1844,9 @@ async function retryFailedSource(source) {
   if (fn) {
     const cells = DATA_SOURCE_SECTION[source];
     if (cells) markCellsUpdating(sectionCellsFor(cells[0], cells[1]));
+    const gen = S._areaGen;
     await fn();
+    if (S._areaGen !== gen) return; // area changed or cleared meanwhile: its own load computes and settles
     if (cells) _settleSectionUpdating(cells[0]);
     computeOpsData();
     computeAssessment();
@@ -1825,7 +1889,7 @@ function showDataSourceStatus() {
 
   const summary = document.createElement('div');
   summary.style.cssText = 'display:flex;align-items:center;gap:8px;';
-  summary.innerHTML = `<span>\u26A0 DATA SOURCE ERRORS: ${errors.map(e => e[0]).join(', ')}</span>`
+  summary.innerHTML = `<span>\u26A0 DATA SOURCE ERRORS: ${_esc(errors.map(e => e[0]).join(', '))}</span>`
     + `<button class="btn btn-ghost" style="padding:2px 8px;font-size:9px;color:var(--accent-red);border-color:var(--accent-red);" onclick="retryAllFailed()">RETRY ALL</button>`
     + `<span style="color:var(--text-muted);cursor:pointer;font-size:9px;" onclick="this.parentElement.nextElementSibling.style.display=this.parentElement.nextElementSibling.style.display==='none'?'block':'none'">[details]</span>`;
   div.appendChild(summary);
@@ -1837,9 +1901,11 @@ function showDataSourceStatus() {
     const row = document.createElement('div');
     row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:3px 0;';
     const age = err.timestamp ? formatAge(Date.now() - err.timestamp) : '';
-    row.innerHTML = `<span style="min-width:90px;"><b>${name}</b></span>`
-      + `<span style="color:var(--text-muted);flex:1;">${err.message}${err.status ? ' (HTTP ' + err.status + ')' : ''}${age ? ' \u2014 ' + age + ' ago' : ''}</span>`
-      + `<button class="btn btn-ghost" style="padding:1px 6px;font-size:9px;color:var(--accent-cyan);" onclick="retryFailedSource('${name}')">RETRY</button>`;
+    row.innerHTML = `<span style="min-width:90px;"><b>${_esc(name)}</b></span>`
+      + `<span style="color:var(--text-muted);flex:1;">${_esc(err.message)}${err.status ? ' (HTTP ' + _esc(err.status) + ')' : ''}${age ? ' \u2014 ' + age + ' ago' : ''}</span>`
+      + `<button class="btn btn-ghost" style="padding:1px 6px;font-size:9px;color:var(--accent-cyan);">RETRY</button>`;
+    // Listener, not an inline onclick: the source name must never be spliced into JS.
+    row.querySelector('button').addEventListener('click', () => retryFailedSource(name));
     details.appendChild(row);
   });
   div.appendChild(details);
@@ -1874,7 +1940,7 @@ function refreshData() {
 const UNKNOWN_CELL_TEXT = 'UNKNOWN: NEEDS UPDATE';
 const SECTION_CELLS = {
   weather: ['wxTemp', 'wxFeels', 'wxDew', 'wxHumidity', 'wxPressure', 'wxDensity', 'wxVis', 'wxCloud', 'wxConditions',
-            'wxPrecip', 'wxUV', 'wxIcing', 'wxFreezing',
+            'wxPrecip', 'wxUV', 'wxIcing', 'wxFreezing', 'wxLightning', 'wxFire', // wxFire is RH-derived (renderWeather)
             'windMax', 'windGustMax', 'windDir', 'windImpact', 'windGustFactor', 'windShear', 'windTurbulence'],
   airQuality: ['wxAQI', 'wxPM25', 'wxPM10', 'wxOzone'],
   spaceWx: ['wxKp', 'satKp', 'satAccuracy', 'satAssessment'],
@@ -1887,7 +1953,7 @@ const SECTION_CELLS = {
   solar: ['astSunrise', 'astSunset', 'astTwilightAM', 'astTwilightPM', 'astNauticalAM', 'astNauticalPM', 'astSolarNoon',
           'astSunAz', 'astSunEl', 'astMoonPhase', 'astMoonIllum', 'astDayWindow', 'astNightOps', 'astShadow'], // astMagDec: computed locally (WMM), not from this fetch
   adsb: ['adsbCount', 'adsbRadius', 'adsbNearest', 'adsbNearestAlt', 'adsbLowCount', 'adsbSource'],
-  fireDanger: ['wxFire'],
+  fireDanger: [], // the fetch renders its own card (renderFireDangerUnknown / renderFireDangerStale)
   groundAccess: ['terrGroundAccess'],
   publicLands: ['terrLandOwnership'],
   water: ['terrWater'],
@@ -1906,7 +1972,11 @@ function sectionCellsFor(key, source) {
 }
 
 function markCellsUnknown(ids) {
-  (ids || []).forEach(id => { setText(id, UNKNOWN_CELL_TEXT); setColor(id, 'red'); });
+  (ids || []).forEach(id => {
+    setText(id, UNKNOWN_CELL_TEXT); setColor(id, 'red');
+    const el = document.getElementById(id);
+    if (el && el.dataset) el.dataset.unknown = '1'; // see setText: cleared by the next real value
+  });
 }
 
 // While a source is still being fetched — including every mirror or fallback
@@ -2012,7 +2082,8 @@ function _sectionHasPriorData(meta) {
 const SECTION_DEFS = {
   weather: {
     label: 'Weather', computes: 'both',
-    fetch: (c, b) => fetchWeather(c.lat, c.lng),
+    // The observed ceiling / visibility (METAR) is shown in this section too.
+    fetch: (c, b) => Promise.allSettled([fetchWeather(c.lat, c.lng), fetchAviationWeather(c, b)]),
     lines: [{ id: 'meta_wx', button: true }, { id: 'meta_vis' }, { id: 'meta_precip' },
             { id: 'meta_forecast' }, { id: 'meta_wind', button: true }],
   },
@@ -2042,7 +2113,7 @@ const SECTION_DEFS = {
     lines: [{ id: 'meta_elev', button: true }],
   },
   obstacles: {
-    label: 'Obstacles & Hazards', computes: 'ops',
+    label: 'Obstacles & Hazards', computes: 'both', // protected areas / obstacles feed the banner
     fetch: (c, b) => Promise.allSettled([fetchWireHazards(b), fetchUtilityWires(b), fetchFaaObstacles(b), fetchProtectedAreas(b)]),
     lines: [{ id: 'meta_obstacles', button: true }],
   },
@@ -2134,16 +2205,23 @@ function markSection(key, patch) {
   if (patch.status === 'error' && patch.errorAt == null) patch.errorAt = Date.now();
   // A cachedLabel describes only the status that set it; any new status clears it.
   if (patch.status && !('cachedLabel' in patch)) patch.cachedLabel = undefined;
+  // Likewise `partial` (the fetcher handles its own cells) describes only the
+  // outcome that set it — a later success or plain failure must not inherit it.
+  if (patch.status && !('partial' in patch)) patch.partial = undefined;
+  // A cached copy now on screen supersedes an earlier live stamp ("showing
+  // HH:MM data" must name the copy shown), and a live answer supersedes a copy.
+  if (patch.status === 'cached' && patch.cachedAt != null && !('updatedAt' in patch)) patch.updatedAt = null;
+  if (patch.status === 'live' && !('cachedAt' in patch)) patch.cachedAt = null;
   const cur = S.sectionMeta[key] || { status: 'never', updatedAt: null, cachedAt: null, error: null, errorAt: null };
   let prior;
   if (patch.source) {
     const src = patch.source;
     const sub = Object.assign({}, patch); delete sub.source;
     cur.sources = cur.sources || {};
-    prior = cur.sources[src];
+    prior = cur.sources[src] ? Object.assign({}, cur.sources[src]) : undefined; // state BEFORE this patch
     cur.sources[src] = Object.assign(cur.sources[src] || {}, sub);
   } else {
-    prior = cur;
+    prior = Object.assign({}, cur); // state BEFORE this patch, not an alias of it
     Object.assign(cur, patch);
   }
   S.sectionMeta[key] = cur;
@@ -2208,15 +2286,20 @@ async function updateSection(key) {
   meta.loading = true;
   renderSectionMeta(key);
   markCellsUpdating(sectionCellsFor(key));
+  const gen = S._areaGen;
   try {
     await def.fetch(S.areaCenter, S.areaBounds); // fetch's own branches mark live/cached/error
+    if (!def.viewBased && S._areaGen !== gen) return; // the area changed or was cleared meanwhile
     if (def.computes === 'ops' || def.computes === 'both') { if (typeof computeOpsData === 'function') computeOpsData(); }
     if (def.computes === 'assessment' || def.computes === 'both') { if (typeof computeAssessment === 'function') computeAssessment(); }
   } catch (e) {
-    markSection(key, { status: 'error', error: e && e.message ? e.message : String(e) });
+    if (def.viewBased || S._areaGen === gen) markSection(key, { status: 'error', error: e && e.message ? e.message : String(e) });
   } finally {
     if (S.sectionMeta[key]) S.sectionMeta[key].loading = false;
-    _settleSectionUpdating(key);
+    meta.loading = false; // the record may have been replaced by a new area's
+    // A new area manages (and settles) its own cells: settling here would
+    // judge them by the previous area's outcome.
+    if (def.viewBased || S._areaGen === gen) _settleSectionUpdating(key);
     renderSectionMeta(key);
     if (typeof showDataSourceStatus === 'function') showDataSourceStatus();
   }
@@ -2239,6 +2322,14 @@ function snapshotAtIdx(idx) {
 // Render the Weather tab from a snapshot (defaults to the selected hour).
 function renderWeather(snap) {
   snap = snap || snapshotAtIdx(S.timeIdx || 0);
+  // A forecast hour with no value reads '--', never the last-rendered hour's value.
+  if (snap._isNow === false) {
+    [['temperature_2m', 'wxTemp'], ['apparent_temperature', 'wxFeels'], ['dew_point_2m', 'wxDew'],
+     ['relative_humidity_2m', 'wxHumidity'], ['surface_pressure', 'wxPressure'], ['visibility', 'wxVis'],
+     ['cloud_cover', 'wxCloud'], ['weather_code', 'wxConditions'], ['freezing_level_height', 'wxFreezing']]
+      .forEach(([f, id]) => { if (snap[f] == null) { setText(id, '--'); setColor(id, null); } });
+    if (snap.temperature_2m == null || snap.surface_pressure == null) { setText('wxDensity', '--'); setColor('wxDensity', null); }
+  }
   if (snap.temperature_2m != null) setText('wxTemp', `${Math.round(snap.temperature_2m)}°F`);
   if (snap.apparent_temperature != null) setText('wxFeels', `${Math.round(snap.apparent_temperature)}°F`);
   if (snap.dew_point_2m != null) setText('wxDew', `${Math.round(snap.dew_point_2m)}°F`);
@@ -2518,8 +2609,10 @@ function _commitAqi(aqi, k, src) {
   const c = aqi.current;
   S.aqi = c.us_aqi;  // expose for the risk assessment (AQI gate)
   S.aqiAreaKey = k;
-  setText('wxAQI', `${c.us_aqi}`);
-  setColor('wxAQI', c.us_aqi < 50 ? 'green' : c.us_aqi < 100 ? 'amber' : 'red');
+  // A null AQI is "not reported", not a green "null".
+  const aqiKnown = c.us_aqi != null && Number.isFinite(Number(c.us_aqi));
+  setText('wxAQI', aqiKnown ? `${c.us_aqi}` : 'Not reported');
+  setColor('wxAQI', !aqiKnown ? null : c.us_aqi < 50 ? 'green' : c.us_aqi < 100 ? 'amber' : 'red');
   if (c.pm2_5 != null) setText('wxPM25', `${c.pm2_5.toFixed(1)} µg/m³`);
   setText('wxPM10', `${c.pm10?.toFixed(1) ?? '--'} µg/m³`);
   setText('wxOzone', `${c.ozone?.toFixed(1) ?? '--'} µg/m³`);
@@ -2532,7 +2625,7 @@ function _commitAqi(aqi, k, src) {
 function _idbCachedSrc(rec, errMsg) {
   return {
     cachedAt: rec.timestamp,
-    badge: rec.status === 'stale' ? 'cached' : 'expired',
+    badge: rec.status === 'expired' ? 'expired' : 'cached',
     label: typeof formatAge === 'function' ? 'CACHED ' + formatAge(Date.now() - rec.timestamp) : 'CACHED',
     error: errMsg,
   };
@@ -2661,7 +2754,10 @@ async function fetchWeather(lat, lng) {
 
     if (wxOut.ok) {
       const sw = wxOut.sw;
-      _commitWeather(wxOut.json, k, sw ? { cachedAt: sw.cachedAt, label: _swCachedLabel(sw) } : { live: true }, true);
+      // A SW offline-fallback body is an old copy: current conditions only,
+      // like the IndexedDB fallback — its hourly arrays would put a stale
+      // forecast on the time bar with its first hour labeled NOW.
+      _commitWeather(wxOut.json, k, sw ? { cachedAt: sw.cachedAt, label: _swCachedLabel(sw) } : { live: true }, !sw);
       clearDataSourceError('Weather');
       // Only a genuine network answer is cached / stamped: re-caching the SW's
       // offline copy would give an old body a fresh acquisition time.
@@ -2737,6 +2833,17 @@ function metarAgeState(m, now) {
   if (age <= METAR_CURRENT_MAX_MS) return 'current';
   return age <= METAR_RETAIN_MAX_MS ? 'retained' : 'expired';
 }
+// Is observation `a` a better one to hold than `b`? A usable age beats an
+// unusable one (current > retained > expired > unknown — a future-dated or
+// undated report must never displace a valid one), then the newer wins.
+const _METAR_AGE_RANK = { current: 3, retained: 2, expired: 1, unknown: 0 };
+function _metarBetter(a, b) {
+  if (!a) return false;
+  if (!b) return true;
+  const ra = _METAR_AGE_RANK[metarAgeState(a)] || 0, rb = _METAR_AGE_RANK[metarAgeState(b)] || 0;
+  if (ra !== rb) return ra > rb;
+  return (a.obsTime || 0) > (b.obsTime || 0);
+}
 function _fmtAgeShort(ms) {
   const h = ms / 3600e3;
   return h >= 1 ? `${h >= 10 ? Math.round(h) : h.toFixed(1)} h` : `${Math.max(1, Math.round(ms / 60e3))} min`;
@@ -2768,18 +2875,25 @@ async function fetchAviationWeather(center, bounds) {
     // no ceiling/visibility (e.g. 'KBQP ... PWINO') — walk the list until one is usable.
     // Only a CURRENT observation ends the walk; an old one is remembered and
     // the next station is tried.
-    let metar = null;
+    let metar = null, partial = null;
     for (const st of (sj.features || []).slice(0, 4)) {
       if (!_requestCurrent(tok)) return;
       const m = await _fetchStationObservation(st, c.lat, c.lng, tok.signal);
       if (!m) continue;
-      if (metarAgeState(m) === 'current') { metar = m; break; }
-      if (!staleCandidate || (m.obsTime || 0) > (staleCandidate.obsTime || 0)) staleCandidate = m;
+      if (metarAgeState(m) === 'current') {
+        // A current report missing sky condition or visibility is kept only
+        // as a last resort: a later station may report both.
+        if (!m.ceilingUnknown && m.visSm != null) { metar = m; break; }
+        if (!partial) partial = m;
+        continue;
+      }
+      if (_metarBetter(m, staleCandidate)) staleCandidate = m;
     }
     if (!_requestCurrent(tok)) return;
+    if (!metar && partial) metar = partial;
     if (!metar && staleCandidate) {
       const age = metarObsAgeMs(staleCandidate);
-      throw new Error(age == null
+      throw new Error((age == null || metarAgeState(staleCandidate) === 'unknown')
         ? `Latest ${staleCandidate.station} observation has no valid time`
         : `Latest ${staleCandidate.station} observation is ${_fmtAgeShort(Math.max(0, age))} old — no current METAR`);
     }
@@ -2795,13 +2909,13 @@ async function fetchAviationWeather(center, bounds) {
     let held = _dataIsForArea('metar', k) ? S.metar : null;
     // An old observation from this pass counts like a held one: it may still
     // gate (within the retention window) but never as a current check.
-    if (staleCandidate && (!held || (staleCandidate.obsTime || 0) > (held.obsTime || 0))) held = staleCandidate;
+    if (_metarBetter(staleCandidate, held)) held = staleCandidate;
     if (typeof getCachedApiResponse === 'function') {
       try {
         const cached = await getCachedApiResponse('metar', k);
         if (!_requestCurrent(tok)) return;
         const cm = cached && cached.data;
-        if (cm && cm.ok && (!held || (cm.obsTime || 0) > (held.obsTime || 0))) held = Object.assign({}, cm, { cachedAt: cached.timestamp });
+        if (cm && cm.ok && _metarBetter(cm, held)) held = Object.assign({}, cm, { cachedAt: cached.timestamp });
       } catch (_) { if (!_requestCurrent(tok)) return; }
     }
     const st = held ? metarAgeState(held) : null;
@@ -2820,12 +2934,18 @@ async function _fetchStationObservation(st, lat, lng, signal) {
     if (!r.ok) return null;
     const sw = _swCacheStamp(r);
     const p = (await r.json()).properties || {};
-    const clouds = (p.cloudLayers || [])
-      .filter(cl => cl && cl.base && cl.base.value != null)
+    const layers = Array.isArray(p.cloudLayers) ? p.cloudLayers.filter(Boolean) : [];
+    const clouds = layers
+      .filter(cl => cl.base && cl.base.value != null)
       .map(cl => ({ cover: cl.amount, base: Math.round(cl.base.value * 3.28084) })); // m \u2192 ft
     const visSm = (p.visibility && p.visibility.value != null)
       ? p.visibility.value / 1609.344 : null; // m \u2192 statute miles
     if (!clouds.length && visSm == null) return null; // nothing usable \u2014 try next station
+    // Clear sky arrives as a CLR/SKC layer; NO layer at all means the station
+    // reported no sky condition (no ceilometer) \u2014 not "Unlimited". A ceiling
+    // layer with no base (e.g. VV///) leaves the ceiling unknown too.
+    const ceilingUnknown = !layers.length || layers.some(cl =>
+      /^(BKN|OVC|OVX|VV)$/i.test(String(cl.amount || '')) && !(cl.base && cl.base.value != null));
     const ceilingFt = metarCeilingFt(clouds);
     const co = st.geometry && st.geometry.coordinates; // [lon, lat]
     const dKm = co ? haversine(lat, lng, co[1], co[0]) : null;
@@ -2835,8 +2955,9 @@ async function _fetchStationObservation(st, lat, lng, signal) {
       name: (st.properties && st.properties.name) || '',
       distNm: dKm != null ? dKm * 0.539957 : null,
       ceilingFt,
+      ...(ceilingUnknown ? { ceilingUnknown: true } : {}),
       visSm,
-      fltCat: flightCategory(ceilingFt, visSm),
+      fltCat: flightCategory(ceilingFt, visSm, ceilingUnknown),
       obsTime: p.timestamp ? Date.parse(p.timestamp) : null,
       raw: p.rawMessage || '',
       lat: co ? co[1] : null, lon: co ? co[0] : null,
@@ -2860,16 +2981,35 @@ function renderObservedCeiling(snap) {
       : '';
     const cf = m.ceilingFt;
     const tone = c => (stale && c === 'green') ? 'amber' : c;
-    setText('wxCeiling', (cf == null ? 'Unlimited' : `${cf.toLocaleString()} ft`) + ` (${m.station})` + stale);
-    setColor('wxCeiling', tone((cf == null || cf >= 3000) ? 'green' : cf >= 1000 ? 'amber' : 'red'));
-    const fc = m.fltCat || flightCategory(cf, m.visSm);
-    setText('wxFlightCat', fc + stale);
-    setColor('wxFlightCat', tone(fc === 'VFR' ? 'green' : fc === 'MVFR' ? 'amber' : 'red'));
+    if (m.ceilingUnknown) {
+      // No sky condition reported: never "Unlimited".
+      setText('wxCeiling', (cf == null ? 'Not reported' : `${cf.toLocaleString()} ft or lower`) + ` (${m.station})` + stale);
+      setColor('wxCeiling', (cf != null && cf < 1000) ? 'red' : 'amber');
+    } else {
+      setText('wxCeiling', (cf == null ? 'Unlimited' : `${cf.toLocaleString()} ft`) + ` (${m.station})` + stale);
+      setColor('wxCeiling', tone((cf == null || cf >= 3000) ? 'green' : cf >= 1000 ? 'amber' : 'red'));
+    }
+    const fc = m.fltCat !== undefined ? m.fltCat : flightCategory(cf, m.visSm, m.ceilingUnknown);
+    if (fc == null) {
+      setText('wxFlightCat', 'UNKNOWN (incomplete obs)' + stale);
+      setColor('wxFlightCat', 'amber');
+    } else {
+      setText('wxFlightCat', fc + stale);
+      setColor('wxFlightCat', tone(fc === 'VFR' ? 'green' : fc === 'MVFR' ? 'amber' : 'red'));
+    }
   } else {
+    // At NOW with the METAR check failed (nothing held), the model estimate is
+    // all there is: shown, but never green, and UNKNOWN without it.
+    const metarFailed = !!(snap._isNow && S.metarUnverified);
     if (snap.cloud_cover != null) {
       const cc = snap.cloud_cover;
-      setText('wxCeiling', cc < 10 ? 'CLR (est)' : cc < 30 ? '15,000+ ft (est)' : cc < 70 ? '5,000-15,000 ft (est)' : '< 5,000 ft (est)');
-      setColor('wxCeiling', cc < 70 ? 'green' : 'amber');
+      setText('wxCeiling', (cc < 10 ? 'CLR (est)' : cc < 30 ? '15,000+ ft (est)' : cc < 70 ? '5,000-15,000 ft (est)' : '< 5,000 ft (est)')
+        + (metarFailed ? ' · no METAR' : ''));
+      setColor('wxCeiling', (cc < 70 && !metarFailed) ? 'green' : 'amber');
+    } else if (metarFailed) {
+      setText('wxCeiling', UNKNOWN_CELL_TEXT); setColor('wxCeiling', 'red');
+    } else {
+      setText('wxCeiling', '--'); setColor('wxCeiling', null);
     }
     if (snap._isNow && S.metarUnverified) {
       setText('wxFlightCat', UNKNOWN_CELL_TEXT); setColor('wxFlightCat', 'red');
@@ -3446,7 +3586,7 @@ async function fetchElevation(center, bounds) {
           _setDataArea('elevation', k);
           _refreshDerivedForTerrain(k);
           const age = Date.now() - cached.timestamp;
-          const badge = cached.status === 'stale' ? 'cached' : 'expired';
+          const badge = cached.status === 'expired' ? 'expired' : 'cached';
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
           setStatus('elevStatus', badge, label);
           markSection('elevation', { status: 'cached', cachedAt: cached.timestamp, error: _elevErrMsg });
@@ -3491,6 +3631,32 @@ function renderMagDeclination(lat, lng) {
   setText('astMagDec', formatDeclination(f.declination) + (f.outOfRange ? ' (WMM2025 expired — verify)' : ' (WMM2025)'));
   if (f.outOfRange) setColor('astMagDec', 'amber'); else setColor('astMagDec', null);
 }
+// Sun position, shadow length and moon phase are computed locally — they are
+// shown whether the sun-times request succeeded, fell back to a cached copy,
+// or failed. Returns the moon phase for S.astro.
+function _renderLocalAstro(lat, lng) {
+  const sunPos = calcSunPosition(lat, lng);
+  setText('astSunAz', `${sunPos.azimuth.toFixed(1)}°`);
+  setText('astSunEl', `${sunPos.elevation.toFixed(1)}°`);
+
+  if (sunPos.elevation > 5) {
+    const shadowMult = (1 / Math.tan(sunPos.elevation * Math.PI / 180)).toFixed(1);
+    setText('astShadow', `${shadowMult}x object height`);
+  } else {
+    setText('astShadow', 'Sun low — long shadows');
+  }
+
+  const moonPhase = calcMoonPhase();
+  setText('astMoonPhase', moonPhase.name);
+  setText('astMoonIllum', `${moonPhase.illumination}%`);
+
+  const nightAssess = moonPhase.illumination > 50 ? 'Good lunar illumination for night ops' :
+                      moonPhase.illumination > 20 ? 'Moderate lunar light — supplement with anti-collision' :
+                      'Low illumination — ensure adequate anti-collision lighting';
+  setText('astNightOps', nightAssess);
+  return moonPhase;
+}
+
 async function fetchSunMoon(lat, lng) {
   renderMagDeclination(lat, lng);
   const tok = _beginRequest('sunMoon');
@@ -3530,26 +3696,7 @@ async function fetchSunMoon(lat, lng) {
     // Clear an earlier "other day" (cached) highlight.
     ['astSunrise', 'astSunset', 'astTwilightAM', 'astTwilightPM', 'astDayWindow'].forEach(id => setColor(id, null));
 
-    const sunPos = calcSunPosition(lat, lng);
-    setText('astSunAz', `${sunPos.azimuth.toFixed(1)}°`);
-    setText('astSunEl', `${sunPos.elevation.toFixed(1)}°`);
-
-    if (sunPos.elevation > 5) {
-      const shadowMult = (1 / Math.tan(sunPos.elevation * Math.PI / 180)).toFixed(1);
-      setText('astShadow', `${shadowMult}x object height`);
-    } else {
-      setText('astShadow', 'Sun low — long shadows');
-    }
-
-    const moonPhase = calcMoonPhase();
-    setText('astMoonPhase', moonPhase.name);
-    setText('astMoonIllum', `${moonPhase.illumination}%`);
-
-    const nightAssess = moonPhase.illumination > 50 ? 'Good lunar illumination for night ops' :
-                        moonPhase.illumination > 20 ? 'Moderate lunar light — supplement with anti-collision' :
-                        'Low illumination — ensure adequate anti-collision lighting';
-    setText('astNightOps', nightAssess);
-
+    const moonPhase = _renderLocalAstro(lat, lng);
 
     S.astro = { sunrise: r.sunrise, sunset: r.sunset, twAM: r.civil_twilight_begin, twPM: r.civil_twilight_end, moonPhase, date: today };
 
@@ -3569,6 +3716,7 @@ async function fetchSunMoon(lat, lng) {
     recordDataSourceError('Sun/Moon', err);
     const _astroErrMsg = err && err.message ? err.message : String(err);
     markSection('solar', { status: 'error', error: _astroErrMsg });
+    const localMoon = _renderLocalAstro(lat, lng); // local computations stand on their own
     // Try cached sunrise data
     if (typeof getCachedApiResponse === 'function') {
       try {
@@ -3588,13 +3736,16 @@ async function fetchSunMoon(lat, lng) {
           setText('astSunset', fmt(r.sunset));
           setText('astTwilightAM', fmt(r.civil_twilight_begin));
           setText('astTwilightPM', fmt(r.civil_twilight_end));
+          setText('astNauticalAM', fmt(r.nautical_twilight_begin));
+          setText('astNauticalPM', fmt(r.nautical_twilight_end));
+          setText('astSolarNoon', fmt(r.solar_noon));
           const dFmt = iso => new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: tz });
           setText('astDayWindow', `${dFmt(r.civil_twilight_begin)} — ${dFmt(r.civil_twilight_end)} ${tzAbbr} · ${cDate ? _sunDateLabel(cDate) : 'unknown day'}`
             + (otherDay ? ' — NOT TODAY: verify' : ''));
           if (otherDay) ['astSunrise', 'astSunset', 'astTwilightAM', 'astTwilightPM', 'astDayWindow'].forEach(id => setColor(id, 'amber'));
-          S.astro = { sunrise: r.sunrise, sunset: r.sunset, twAM: r.civil_twilight_begin, twPM: r.civil_twilight_end, date: cDate };
+          S.astro = { sunrise: r.sunrise, sunset: r.sunset, twAM: r.civil_twilight_begin, twPM: r.civil_twilight_end, moonPhase: localMoon, date: cDate };
           const age = Date.now() - cached.timestamp;
-          const badge = (cached.status === 'stale' && !otherDay) ? 'cached' : 'expired';
+          const badge = (cached.status !== 'expired' && !otherDay) ? 'cached' : 'expired';
           const label = (typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED')
             + (otherDay ? ' · ' + (cDate ? _sunDateLabel(cDate) : 'UNKNOWN DAY') : '');
           setStatus('astroStatus', badge, label);
@@ -3640,10 +3791,19 @@ function tfrGeoJsonUrlForBounds(bounds) {
 // Live TFR retrieval through the data proxy (Cloudflare Worker, /tfr/ route).
 // No-op when no proxy is configured — the manual download/import flow in the
 // NOTAMs tab still applies. Reuses the same parse/merge/render pipeline as import.
+// Offline: the leg did not check anything — record that as its failure, so the
+// combined check (which reads S.dataSourceErrors) can never call it CHECKED.
+function _restrictionLegOffline(kind, tok) {
+  if (!_requestCurrent(tok)) return;
+  const err = new Error('Offline — live check not run');
+  recordDataSourceError(kind === 'tfr' ? 'TFR' : 'NOTAM', err);
+  markSection(kind, { status: 'error', error: err.message });
+}
+
 async function fetchLiveTFRs(bounds, tok) {
   const base = (typeof getCanopyProxyBase === 'function') ? getCanopyProxyBase() : null;
   if (!base || !bounds) return;
-  if (typeof isOnline === 'function' && !isOnline()) return;
+  if (typeof isOnline === 'function' && !isOnline()) { _restrictionLegOffline('tfr', tok); return; }
   trackFetchStart('TFR');
   setStatus('notamStatus', 'loading', 'TFR…');
   try {
@@ -3654,6 +3814,9 @@ async function fetchLiveTFRs(bounds, tok) {
     if (!res.ok) throw new Error('TFR HTTP ' + res.status);
     const gj = await res.json();
     const parsed = (typeof parseTfrGeoJson === 'function') ? parseTfrGeoJson(gj) : { tfrs: [] };
+    // A 200 whose body is not a TFR feature collection (or whose features did
+    // not parse) is a failed check, never "NO TFR (LIVE)".
+    if (parsed.errors && parsed.errors.length) throw new Error('TFR response malformed: ' + parsed.errors[0]);
     const tfrs = (parsed.tfrs || []).map(t => Object.assign({}, t, { _live: true }));
     // Enrich each live TFR with altitude band + effective/expire times from its
     // detail XML (the GeoServer WFS feed carries geometry + id + title only).
@@ -3729,7 +3892,7 @@ function _buildNotamAoi(lat, lng, searchRadiusNm) {
 async function fetchNotams(lat, lng, radiusNm, tok) {
   const base = (typeof getCanopyProxyBase === 'function') ? getCanopyProxyBase() : null;
   if (!base || lat == null || lng == null) return;
-  if (typeof isOnline === 'function' && !isOnline()) return;
+  if (typeof isOnline === 'function' && !isOnline()) { _restrictionLegOffline('notam', tok); return; }
   trackFetchStart('NOTAM');
   try {
     const r = Math.max(5, Math.min(100, Math.round(radiusNm || 20)));
@@ -3758,6 +3921,16 @@ async function fetchNotams(lat, lng, radiusNm, tok) {
     renderNotamCards();
     if (S.currentArea) computeAssessment();
     S.notamFetchMeta = { fetchedAtMs: Date.now(), source: 'live' };
+    if (data.truncated) {
+      // The search stopped at its page cap: the NOTAMs listed are real, but
+      // more may exist. An incomplete list is not a complete LIVE check, and
+      // it is not written to IndexedDB as one.
+      S.notamFetchMeta.truncated = true;
+      const err = new Error('NOTAM search incomplete — stopped after ' + notams.length + ' results, more may exist');
+      recordDataSourceError('NOTAM', err);
+      markSection('notam', { status: 'error', partial: true, error: err.message });
+      return;
+    }
     markSection('notam', { status: 'live', updatedAt: S.notamFetchMeta.fetchedAtMs, error: null });
     if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
     // NOTAMs persist on their own success: afterFaaImport runs inside
@@ -3800,8 +3973,14 @@ async function fetchLiveRestrictions(center, bounds) {
   const proxySet = typeof getCanopyProxyBase === 'function' && !!getCanopyProxyBase();
   if (!proxySet) { S.autoCheck = { state: 'idle', ms: 0, tfrCount: 0, notamCount: 0 }; renderAutoCheckStatus(); reassess(); return; }
   if (typeof isOnline === 'function' && !isOnline()) {
+    // Neither leg ran: both are failures (freshness lines, the red manual-
+    // update notice and the empty-state lines all read the section status).
+    _restrictionLegOffline('tfr', tok); _restrictionLegOffline('notam', tok);
     S.autoCheck = { state: 'error', ms: Date.now(), tfrCount: 0, notamCount: 0, tfrOk: false, notamOk: false };
     renderAutoCheckStatus();
+    renderTfrCards(); renderNotamCards();
+    showDataSourceStatus();
+    setStatus('notamStatus', 'error', 'CHECK FAILED');
     reassess();
     return;
   }
@@ -3969,26 +4148,37 @@ function currentAreaPolygon() {
 async function renderNotamsTab(lat, lng) {
   if ((!S.tfrs || !S.tfrs.length) && (!S.importedNotams || !S.importedNotams.length) &&
       typeof getCachedApiResponse === 'function' && S.areaCenter) {
+    const gen = S._areaGen;
     try {
       const rec = await getCachedApiResponse('tfr_import', areaKey(S.areaCenter.lat, S.areaCenter.lng));
+      // Another area (or a clear) took over during the read: this copy is not
+      // for it, and that area's own processArea renders its tab.
+      if (S._areaGen !== gen) return;
       // Re-check emptiness AFTER the await — fetchLiveRestrictions runs
       // concurrently from processArea, and a late IDB read must never
-      // clobber a live result that landed in the meantime.
+      // clobber a live result that landed in the meantime. A live check that
+      // found NOTHING is a result too: that leg keeps its empty answer.
       const stillEmpty = (!S.tfrs || !S.tfrs.length) && (!S.importedNotams || !S.importedNotams.length);
-      if (rec && rec.data && stillEmpty) {
+      const liveLeg = k => !!(S.sectionMeta && S.sectionMeta[k] && S.sectionMeta[k].status === 'live');
+      const tfrLive = liveLeg('tfr'), notamLive = liveLeg('notam');
+      if (rec && rec.data && stillEmpty && !(tfrLive && notamLive)) {
         if (rec.status === 'expired') {
           // >4x the 1 h TTL — refuse to show it. Restrictions this old are
           // more dangerous rendered than absent.
           S.restrictionCacheExpired = { atMs: (rec.data.meta && rec.data.meta.importedAtMs) || rec.timestamp };
           setStatus('notamStatus', 'expired', 'CACHE EXPIRED');
         } else { // 'fresh' or 'stale' — show, loudly labeled as cached
-          S.tfrs = rec.data.tfrs || [];
-          S.importedNotams = rec.data.notams || [];
-          S.tfrImportMeta = rec.data.meta || null;
-          if (S.tfrImportMeta) S.tfrImportMeta.cached = true;
-          S.notamFetchMeta = rec.data.notamMeta ? Object.assign({}, rec.data.notamMeta, { cached: true }) : null;
-          if (S.tfrs.length) markSection('tfr', { status: 'cached', cachedAt: rec.timestamp });
-          if (S.importedNotams.length) markSection('notam', { status: 'cached', cachedAt: rec.timestamp });
+          if (!tfrLive) {
+            S.tfrs = rec.data.tfrs || [];
+            S.tfrImportMeta = rec.data.meta || null;
+            if (S.tfrImportMeta) S.tfrImportMeta.cached = true;
+            if (S.tfrs.length) markSection('tfr', { status: 'cached', cachedAt: rec.timestamp });
+          }
+          if (!notamLive) {
+            S.importedNotams = rec.data.notams || [];
+            S.notamFetchMeta = rec.data.notamMeta ? Object.assign({}, rec.data.notamMeta, { cached: true }) : null;
+            if (S.importedNotams.length) markSection('notam', { status: 'cached', cachedAt: rec.timestamp });
+          }
           renderImportedTfrLayer();
           renderImportedNotamLayer();
         }
@@ -4006,7 +4196,9 @@ async function renderNotamsTab(lat, lng) {
       (S.tfrs && S.tfrs.length) ? `${S.tfrs.length} TFR${S.tfrs.length > 1 ? 'S' : ''}` : 'IMPORT');
   }
   renderAutoCheckStatus();
-  computeAirspace(lat, lng);
+  // No computeAirspace here: it reads only the FAA airspace and airport data,
+  // whose own fetches render it — run now, it repainted a new area's blanked
+  // cells green ("Class G", "None found") while those were still loading.
 }
 
 function renderDeepLinks(lat, lng) {
@@ -4396,6 +4588,9 @@ function clearImportedNotams() {
   if (ta) ta.value = '';
   renderImportedNotamLayer();
   renderNotamCards();
+  // The banner and the per-area restriction cache must not keep the cleared NOTAMs.
+  _persistRestrictionCache();
+  if (S.currentArea) computeAssessment();
 }
 
 // Fire danger renders into #fireDangerCards (a static element in the NOTAMs tab).
@@ -4451,9 +4646,13 @@ async function _fetchNationalNFDRS(lat, lng) {
 // Approximate a value's climatological percentile from FEMS threshold values at the
 // 50/70/90/97th levels (piecewise-linear, clamped to 1-99). Null when unavailable.
 function _nfdrsPercentile(value, thresholds) {
-  if (value == null || !thresholds) return null;
-  const pts = [[Number(thresholds['50th']), 50], [Number(thresholds['70th']), 70],
-               [Number(thresholds['90th']), 90], [Number(thresholds['97th']), 97]]
+  // null / '' are MISSING, not 0 (Number(null) === 0 made every threshold 0,
+  // so any value read as the 99th percentile = EXTREME).
+  const num = v => (v == null || v === '') ? NaN : Number(v);
+  if (!thresholds || !Number.isFinite(num(value))) return null;
+  value = num(value);
+  const pts = [[num(thresholds['50th']), 50], [num(thresholds['70th']), 70],
+               [num(thresholds['90th']), 90], [num(thresholds['97th']), 97]]
     .filter(p => Number.isFinite(p[0]));
   if (!pts.length) return null;
   if (value <= pts[0][0]) return Math.max(1, Math.round(50 * value / (pts[0][0] || 1)));
@@ -4482,21 +4681,20 @@ async function fetchFireDanger(lat, lng, bounds) {
 
     // Fetch active fire perimeters (US-wide) and NFDRS fire danger (CA only) in parallel
     const isCA = lat >= 32.5 && lat <= 42.0 && lng >= -124.5 && lng <= -114.0;
-    const fetches = [
-      // NIFC's Current_WildlandFire_Perimeters service went token-gated
-      // (499 "Token Required", Sept 2026); WFIGS_Interagency_Perimeters_Current
-      // on the same org is the public replacement (same poly_* fields,
-      // containment is attr_PercentContained).
-      fetch(`https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query`
-        + `?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326`
-        + `&outFields=poly_IncidentName,poly_GISAcres,attr_PercentContained,poly_CreateDate`
-        + `&outSR=4326&f=geojson&resultRecordCount=50`, { signal: tok.signal }),
-    ];
+    // NIFC's Current_WildlandFire_Perimeters service went token-gated
+    // (499 "Token Required", Sept 2026); WFIGS_Interagency_Perimeters_Current
+    // on the same org is the public replacement (same poly_* fields,
+    // containment is attr_PercentContained).
+    const firesUrl = `https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query`
+      + `?where=1=1&geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326`
+      + `&outFields=poly_IncidentName,poly_GISAcres,attr_PercentContained,poly_CreateDate`
+      + `&outSR=4326&f=geojson&resultRecordCount=50`;
+    const fetches = [fetch(firesUrl, { signal: tok.signal })];
     if (isCA) {
       fetches.push(fetch(`https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/CA_NFDRS/FeatureServer/1/query`
         + `?where=1=1&geometry=${lng},${lat}&geometryType=esriGeometryPoint&inSR=4326`
         + `&outFields=PSAName,Avg_BI,Avg_BI_Pct,Avg_ERC,Avg_ERC_Pct,Avg_FM100Hr,Avg_FM1000Hr`
-        + `&outSR=4326&f=geojson&resultRecordCount=1`));
+        + `&outSR=4326&f=geojson&resultRecordCount=1`, { signal: tok.signal }));
     }
     // Outside California, resolve NFDRS from the nearest RAWS station via FEMS (national).
     const nationalNfdrs = isCA ? null : _fetchNationalNFDRS(lat, lng).catch(() => null);
@@ -4510,13 +4708,18 @@ async function fetchFireDanger(lat, lng, bounds) {
     // Process active fires. A failed perimeter request is an ERROR, not "no
     // fires": it must not clear the map and report LIVE.
     if (firesRes.status !== 'fulfilled') throw (firesRes.reason instanceof Error) ? firesRes.reason : new Error('Fire perimeters: ' + firesRes.reason);
-    if (!firesRes.value.ok) throw new Error('Fire perimeters HTTP ' + firesRes.value.status);
-    const firesSw = _swCacheStamp(firesRes.value);
+    // HTTP status, an ArcGIS error body and a body with no features ARRAY all
+    // fail here — a malformed 200 must never read as "no fires".
+    const firesFirst = await _readArcgisGeoJson(firesRes.value, 'Fire perimeters');
+    // More than one page of perimeters (active season) is paged to completion;
+    // one that cannot be completed is kept but labeled INCOMPLETE, never LIVE.
+    const firesData = await _completeArcgisGeoJson(firesUrl, firesFirst.json, 'Fire perimeters', { signal: tok.signal }, !!firesFirst.sw);
+    const firesSw = _mergeSwStamps(firesFirst.sw, firesData._pageSw);
+    const firesTruncated = !!firesData._truncated;
     let fires = [];
     {
-      const data = await firesRes.value.json();
-      if (data && data.error) throw new Error('Fire perimeters: ' + (data.error.message || 'ArcGIS error'));
-      fires = (data.features || []).map(f => {
+      const data = firesData;
+      fires = data.features.map(f => {
         const p = f.properties || {};
         // Distance to the FOOTPRINT (0 inside it), not to a vertex: the first
         // vertex of a large perimeter put a launch inside the fire 38 nm away.
@@ -4538,8 +4741,11 @@ async function fetchFireDanger(lat, lng, bounds) {
     // Process NFDRS fire danger
     let fireDanger = null;
     if (nfdrsRes && nfdrsRes.status === 'fulfilled' && nfdrsRes.value.ok) {
-      const data = await nfdrsRes.value.json();
-      const f = data.features?.[0]?.properties;
+      // The rating is optional: a malformed NFDRS body must not discard the
+      // perimeters that were already read.
+      let data = null;
+      try { data = await nfdrsRes.value.json(); } catch (_) { data = null; }
+      const f = data && data.features?.[0]?.properties;
       if (f) {
         fireDanger = {
           psa: f.PSAName || 'Unknown',
@@ -4550,26 +4756,37 @@ async function fetchFireDanger(lat, lng, bounds) {
       }
     }
 
+    // The isCA box also covers western Nevada / Arizona (Reno, Tahoe NV, Las
+    // Vegas), where CA_NFDRS has no PSA — fall back to the national RAWS path.
+    if (!fireDanger && isCA) fireDanger = await _fetchNationalNFDRS(lat, lng).catch(() => null);
     if (!fireDanger && nationalNfdrs) fireDanger = await nationalNfdrs;
     if (!_requestCurrent(tok)) return;
 
     S.fireDanger = fireDanger;
     S.activeFires = fires;
-    S.fireDataUnverified = false;
+    // A Service-Worker offline copy or an incomplete (truncated) list is not a
+    // verified fire check: the banner keeps the UNVERIFIED advisory.
+    S.fireDataUnverified = !!firesSw || firesTruncated;
     _setDataArea('fireDanger', _fireAreaKey);
 
     // Render fire perimeters on map
     renderFirePerimeters(fires);
 
     // Render fire info in NOTAMs tab
-    renderFireDangerCard(fires, fireDanger, lat, lng);
+    renderFireDangerCard(fires, fireDanger, lat, lng, { sw: firesSw, truncated: firesTruncated });
 
-    clearDataSourceError('Fire Danger');
-    if (firesSw) {
+    if (firesTruncated) {
+      const why = firesData._truncatedError || 'result truncated';
+      recordDataSourceError('Fire Danger', new Error('Fire perimeters incomplete — ' + why));
+      markSection('fireDanger', { status: 'error', partial: true, error: why,
+        updatedAt: firesSw ? null : Date.now(), cachedAt: firesSw ? firesSw.cachedAt : null });
+    } else if (firesSw) {
+      clearDataSourceError('Fire Danger');
       // Perimeters came from the Service Worker's offline fallback, not NIFC —
       // label them by their stored time instead of stamping "now".
-      markSection('fireDanger', { status: 'cached', cachedAt: firesSw.cachedAt, error: null });
+      markSection('fireDanger', { status: 'cached', cachedAt: firesSw.cachedAt, updatedAt: null, error: null });
     } else {
+      clearDataSourceError('Fire Danger');
       markSection('fireDanger', { status: 'live', updatedAt: Date.now(), error: null });
     }
   } catch (err) {
@@ -4638,7 +4855,7 @@ function renderFirePerimeters(fires) {
         style: { color: '#ef4444', fillColor: '#f97316', fillOpacity: 0.25, weight: 2 },
       });
       layer.bindPopup(
-        `<b style="color:#ef4444">${fire.name}</b><br>` +
+        `<b style="color:#ef4444">${_esc(fire.name)}</b><br>` +
         `${fire.acres.toLocaleString()} acres<br>` +
         (fire.contained != null ? `${fire.contained}% contained<br>` : '') +
         `${fireDistLabel(fire)} from area`
@@ -4649,26 +4866,32 @@ function renderFirePerimeters(fires) {
   buildLayerControl();
 }
 
-function renderFireDangerCard(fires, danger, lat, lng) {
+function renderFireDangerCard(fires, danger, lat, lng, opts) {
   const notamDiv = document.getElementById('notamList');
   if (!notamDiv) return;
+  opts = opts || {};
+  // Offline SW copy: dated + amber, never "Live" / a green all-clear.
+  const cachedTag = opts.sw ? (opts.sw.cachedAt ? 'CACHED ' + new Date(opts.sw.cachedAt).toLocaleString() : 'CACHED (age unknown)') : null;
 
   // Find the existing wildfire card or append after the TFR card
   let html = '';
 
   // Fire danger rating card
   if (danger) {
-    const biLevel = danger.biPct >= 90 ? 'red' : danger.biPct >= 70 ? 'amber' : 'green';
-    const ercLevel = danger.ercPct >= 90 ? 'red' : danger.ercPct >= 70 ? 'amber' : 'green';
-    const biColor = biLevel === 'red' ? '#ef4444' : biLevel === 'amber' ? '#f59e0b' : '#22c55e';
-    const ercColor = ercLevel === 'red' ? '#ef4444' : ercLevel === 'amber' ? '#f59e0b' : '#22c55e';
-    const adjective = danger.ercPct >= 97 ? 'EXTREME' : danger.ercPct >= 90 ? 'VERY HIGH' : danger.ercPct >= 70 ? 'HIGH' : danger.ercPct >= 50 ? 'MODERATE' : 'LOW';
+    // A missing percentile is UNKNOWN (neutral), never a green LOW.
+    const pctLevel = p => (p == null || !Number.isFinite(Number(p))) ? null : p >= 90 ? 'red' : p >= 70 ? 'amber' : 'green';
+    const biLevel = pctLevel(danger.biPct);
+    const ercLevel = pctLevel(danger.ercPct);
+    const lvlColor = l => l === 'red' ? '#ef4444' : l === 'amber' ? '#f59e0b' : l === 'green' ? '#22c55e' : 'var(--text-muted)';
+    const biColor = lvlColor(biLevel);
+    const ercColor = lvlColor(ercLevel);
+    const adjective = ercLevel == null ? 'UNKNOWN' : danger.ercPct >= 97 ? 'EXTREME' : danger.ercPct >= 90 ? 'VERY HIGH' : danger.ercPct >= 70 ? 'HIGH' : danger.ercPct >= 50 ? 'MODERATE' : 'LOW';
     const cardClass = danger.ercPct >= 90 ? 'tfr' : danger.ercPct >= 70 ? 'notam-style' : '';
 
     html += `<div class="notam-card ${cardClass}">
       <div class="notam-header">
         <span class="notam-id">FIRE DANGER: ${adjective}</span>
-        <span class="notam-type ${danger.ercPct >= 90 ? 'tfr-type' : 'notam-type-tag'}">${danger.psa}</span>
+        <span class="notam-type ${danger.ercPct >= 90 ? 'tfr-type' : 'notam-type-tag'}">${_esc(danger.psa)}</span>
       </div>
       <div class="notam-body" style="font-family:var(--font-mono);font-size:11px;">
         <div style="display:flex;gap:16px;flex-wrap:wrap;">
@@ -4685,17 +4908,27 @@ function renderFireDangerCard(fires, danger, lat, lng) {
   if (fires.length > 0) {
     html += `<div class="notam-card tfr">
       <div class="notam-header">
-        <span class="notam-id">ACTIVE FIRES: ${fires.length}</span>
-        <span class="notam-type tfr-type">Live</span>
+        <span class="notam-id">ACTIVE FIRES: ${fires.length}${opts.truncated ? '+' : ''}</span>
+        <span class="notam-type tfr-type">${opts.truncated ? 'INCOMPLETE' : cachedTag ? _esc(cachedTag) : 'Live'}</span>
       </div>
       <div class="notam-body" style="font-family:var(--font-mono);font-size:11px;">
+        ${opts.truncated ? `<div style="color:var(--accent-amber);">List incomplete (server record limit) — more fires may exist. Check InciWeb / CAL FIRE.</div>` : ''}
+        ${cachedTag ? `<div style="color:var(--accent-amber);">Offline copy — perimeters may have changed since it was stored.</div>` : ''}
         ${fires.slice(0, 10).map(f =>
-          `<div style="padding:2px 0;">${f.name} &mdash; ${f.acres.toLocaleString()} ac, ${fireDistLabel(f)}` +
+          `<div style="padding:2px 0;">${_esc(f.name)} &mdash; ${f.acres.toLocaleString()} ac, ${fireDistLabel(f)}` +
           (f.contained != null ? ` (${f.contained}% cont.)` : '') + `</div>`
         ).join('')}
         ${fires.length > 10 ? `<div style="color:var(--text-muted);">+ ${fires.length - 10} more</div>` : ''}
       </div>
       <div class="notam-meta">Wildfire TFRs activate with &lt;30 min notice &bull; NIFC perimeter data</div>
+    </div>`;
+  } else if (cachedTag) {
+    html += `<div class="notam-card" style="border-color:var(--accent-amber);">
+      <div class="notam-header">
+        <span class="notam-id" style="color:var(--accent-amber);">NO FIRES IN OFFLINE COPY</span>
+        <span class="notam-type" style="background:rgba(245,158,11,0.15);color:var(--accent-amber);">${_esc(cachedTag)}</span>
+      </div>
+      <div class="notam-body">No wildland fire perimeters within ~30 nm in the stored copy. It is not a current check — verify on InciWeb / CAL FIRE before flight.</div>
     </div>`;
   } else {
     html += `<div class="notam-card" style="border-color:var(--accent-green);">
@@ -4718,6 +4951,23 @@ function renderFireDangerCard(fires, danger, lat, lng) {
   }
 }
 
+// The Part-Time National Security UAS restriction layer has no NAME field: a
+// site is named by its Facility (or Base).
+function nsRestrictionName(f, fallback) {
+  const p = (f && f.properties) || {};
+  return p.NAME || p.Facility || p.Base || fallback;
+}
+
+// Class E SURFACE area (E2, and the E3/E4 extensions — floor at the surface):
+// Part 107 §107.41 needs authorization there, like B/C/D. Class E5 (700 /
+// 1,200 ft floor, LOWER_VAL > 0) leaves the surface Class G.
+function isClassESurfaceArea(p) {
+  p = p || {};
+  const lt = String(p.LOCAL_TYPE || '').toUpperCase();
+  if (lt) return /^CLASS_E[234]$/.test(lt);
+  return p.LOWER_VAL != null && p.LOWER_VAL !== '' && Number(p.LOWER_VAL) === 0;
+}
+
 function computeAirspace(lat, lng) {
   // Compute nearest airport from dynamically fetched data
   const nearby = filterAirportsByDistance(S.nearbyAirports || [], lat, lng, 100);
@@ -4725,8 +4975,15 @@ function computeAirspace(lat, lng) {
   const nearDist = nearest ? nearest.distKm : Infinity;
   const nearNm = (nearDist * 0.539957).toFixed(1);
 
-  if (nearest) {
+  // The airport lookup failed with nothing for this area: its cells stay
+  // UNKNOWN (an FAA answer arriving later must not repaint them "None found").
+  const aptSrc = S.sectionMeta.airspace && S.sectionMeta.airspace.sources && S.sectionMeta.airspace.sources.airports;
+  const airportsUnknown = !!(aptSrc && aptSrc.status === 'error' && !_sectionHasPriorData(aptSrc));
+  if (airportsUnknown) {
+    markCellsUnknown(sectionCellsFor('airspace', 'airports'));
+  } else if (nearest) {
     setText('airNearAirport', `${nearest.icao} \u2014 ${nearest.name}`);
+    setColor('airNearAirport', null);
     setText('airNearDist', `${nearNm} nm`);
     setColor('airNearDist', nearDist < 9.26 ? 'red' : nearDist < 18.52 ? 'amber' : 'green');
   } else {
@@ -4736,7 +4993,9 @@ function computeAirspace(lat, lng) {
 
   // Count nearby heliports
   const heliports = nearby.filter(a => a.type === 'heliport');
-  if (heliports.length > 0) {
+  if (airportsUnknown) {
+    // left UNKNOWN above
+  } else if (heliports.length > 0) {
     const hList = heliports.slice(0, 3).map(h => `${h.icao} (${h.distKm.toFixed(1)} km)`).join(', ');
     setText('airHeliports', `${heliports.length} nearby: ${hList}`);
     setColor('airHeliports', 'amber');
@@ -4752,7 +5011,7 @@ function computeAirspace(lat, lng) {
     if (faaFailed) return 'unknown';
     const l = S.faaAirspace && S.faaAirspace[k];
     if (!l) return null;
-    return l._unavailable ? 'unknown' : l._truncated ? 'partial' : (l._cachedAt ? 'cached' : null);
+    return l._unavailable ? 'unknown' : l._truncated ? 'partial' : (l._cachedAt != null ? 'cached' : null);
   };
   // "None" is only an answer when the layer actually loaded. Empty + failed
   // is UNKNOWN (red); a cached copy keeps its value but says so (amber).
@@ -4775,39 +5034,55 @@ function computeAirspace(lat, lng) {
     // The FAA class-airspace fetch failed with nothing cached: do not guess
     // from the built-in airport table — the operator must update.
     markCellsUnknown(['airClass', 'airLAANC', 'airLAANCAlt']);
-  } else if (S.faaAirspace && S.faaAirspace.classAirspace && S.faaAirspace.classAirspace.features && S.faaAirspace.classAirspace.features.length > 0) {
-    // Find the most restrictive class airspace intersecting the area
-    const classPriority = { B: 1, C: 2, D: 3, E: 4 };
+  } else if (!S.faaAirspace && _areaAwaits('airspace')) {
+    // A new area whose FAA airspace has not answered yet: no airport-table
+    // guess (it would read green "Class G" while the real answer is loading).
+    ['airClass', 'airLAANC', 'airLAANCAlt'].forEach(id => { setText(id, '--'); setColor(id, null); });
+  } else if (S.faaAirspace && S.faaAirspace.classAirspace && Array.isArray(S.faaAirspace.classAirspace.features)) {
+    // Find the most restrictive class airspace intersecting the area. A Class
+    // E surface area needs authorization like B/C/D (isClassESurfaceArea);
+    // other Class E (700/1,200 ft floor) leaves the surface Class G.
+    const classPriority = { B: 1, C: 2, D: 3, ES: 4, E: 5 };
     let mostRestrictive = null;
     S.faaAirspace.classAirspace.features.forEach(f => {
-      const cls = (f.properties.CLASS || '').charAt(0);
-      const pri = classPriority[cls] || 99;
-      if (!mostRestrictive || pri < (classPriority[mostRestrictive.cls] || 99)) {
-        const upper = f.properties.UPPER_VAL ? `${f.properties.UPPER_VAL} ${f.properties.UPPER_UOM || 'MSL'}` : '';
-        const lower = f.properties.LOWER_VAL != null ? `${f.properties.LOWER_VAL} ${f.properties.LOWER_UOM || ''}` : 'Surface';
+      const p = f.properties || {};
+      const cls = (p.CLASS || '').charAt(0);
+      const rank = (cls === 'E' && isClassESurfaceArea(p)) ? 'ES' : cls;
+      const pri = classPriority[rank] || 99;
+      if (!mostRestrictive || pri < (classPriority[mostRestrictive.rank] || 99)) {
+        const upper = p.UPPER_VAL ? `${p.UPPER_VAL} ${p.UPPER_UOM || 'MSL'}` : '';
+        const lower = p.LOWER_VAL != null ? `${p.LOWER_VAL} ${p.LOWER_UOM || ''}` : 'Surface';
         mostRestrictive = {
-          cls: cls,
-          name: f.properties.IDENT || f.properties.NAME || '',
-          label: `Class ${cls} \u2014 ${f.properties.IDENT || f.properties.NAME || ''} ${lower} to ${upper}`.trim(),
-          controlled: cls === 'B' || cls === 'C' || cls === 'D',
+          cls: cls, rank: rank,
+          name: p.IDENT || p.NAME || '',
+          label: `Class ${cls}${rank === 'ES' ? ' surface area' : ''} \u2014 ${p.IDENT || p.NAME || ''} ${lower} to ${upper}`.trim(),
+          controlled: cls === 'B' || cls === 'C' || cls === 'D' || rank === 'ES',
         };
       }
     });
+    const clsSt = layerState('classAirspace');
+    const clsTag = clsSt === 'cached' ? ' (cached)' : clsSt === 'partial' ? ' (INCOMPLETE \u2014 truncated)' : '';
 
     if (mostRestrictive) {
-      setText('airClass', mostRestrictive.label);
-      setColor('airClass', mostRestrictive.controlled ? 'amber' : 'green');
+      setText('airClass', mostRestrictive.label + clsTag);
+      setColor('airClass', mostRestrictive.controlled ? 'amber' : (clsTag ? 'amber' : 'green'));
       setText('airLAANC', mostRestrictive.controlled ? 'Yes \u2014 required' : 'N/A (Class G)');
-      setColor('airLAANC', mostRestrictive.controlled ? 'amber' : 'green');
+      setColor('airLAANC', mostRestrictive.controlled ? 'amber' : (clsTag ? 'amber' : 'green'));
+    } else if (clsSt === 'partial') {
+      markCellsUnknown(['airClass', 'airLAANC']);
     } else {
-      setText('airClass', 'Class G \u2014 Uncontrolled');
-      setColor('airClass', 'green');
+      // The FAA layer answered with nothing intersecting the area: Class G.
+      setText('airClass', 'Class G \u2014 Uncontrolled' + clsTag);
+      setColor('airClass', clsTag ? 'amber' : 'green');
       setText('airLAANC', 'N/A (Class G)');
-      setColor('airLAANC', 'green');
+      setColor('airLAANC', clsTag ? 'amber' : 'green');
     }
 
     // LAANC ceiling from facility map
-    if (S.faaAirspace.laanc && S.faaAirspace.laanc.features && S.faaAirspace.laanc.features.length > 0) {
+    if (layerState('laanc') === 'unknown') {
+      // The facility-map request failed: no ceiling is known, not "400 ft".
+      markCellsUnknown(['airLAANCAlt']);
+    } else if (S.faaAirspace.laanc && S.faaAirspace.laanc.features && S.faaAirspace.laanc.features.length > 0) {
       // Find the minimum ceiling (most restrictive) in the operational area
       let minCeiling = Infinity;
       S.faaAirspace.laanc.features.forEach(f => {
@@ -4818,10 +5093,11 @@ function computeAirspace(lat, lng) {
         setText('airLAANCAlt', minCeiling === 0 ? 'No UAS operations (0 ft)' : `${minCeiling} ft AGL`);
         setColor('airLAANCAlt', minCeiling === 0 ? 'red' : minCeiling <= 100 ? 'amber' : 'green');
       } else {
-        setText('airLAANCAlt', '400 ft AGL');
+        setText('airLAANCAlt', '400 ft AGL'); setColor('airLAANCAlt', null);
       }
     } else {
       setText('airLAANCAlt', (mostRestrictive && mostRestrictive.controlled) ? 'No LAANC grid data' : '400 ft AGL');
+      setColor('airLAANCAlt', null);
     }
   } else {
     // Fallback: use hardcoded classification
@@ -4831,6 +5107,7 @@ function computeAirspace(lat, lng) {
     setText('airLAANC', airspace.controlled ? 'Yes \u2014 required' : 'N/A (Class G)');
     setColor('airLAANC', airspace.controlled ? 'amber' : 'green');
     setText('airLAANCAlt', airspace.controlled ? 'Check grid cell' : '400 ft AGL');
+    setColor('airLAANCAlt', null);
   }
 
   // Special Use Airspace from FAA data
@@ -4838,9 +5115,9 @@ function computeAirspace(lat, lng) {
     markCellsUnknown(['airMOA', 'airRestricted']);
   } else if (S.faaAirspace && S.faaAirspace.sua && S.faaAirspace.sua.features) {
     const sua = S.faaAirspace.sua.features;
-    const names = fallback => fs => fs.map(f => f.properties.NAME || fallback).join(', ');
-    showLayer('airMOA', 'sua', sua.filter(f => (f.properties.TYPE_CODE || '').startsWith('M')), names('MOA'), 'amber');
-    showLayer('airRestricted', 'sua', sua.filter(f => (f.properties.TYPE_CODE || '').startsWith('R')), names('Restricted'), 'red');
+    const names = fallback => fs => fs.map(f => (f.properties || {}).NAME || fallback).join(', ');
+    showLayer('airMOA', 'sua', sua.filter(f => ((f.properties || {}).TYPE_CODE || '').startsWith('M')), names('MOA'), 'amber');
+    showLayer('airRestricted', 'sua', sua.filter(f => ((f.properties || {}).TYPE_CODE || '').startsWith('R')), names('Restricted'), 'red');
   }
   // Prohibited areas: SUA P-types AND the dedicated Prohibited_Areas layer
   // (combineProhibitedAreas). A hit in either is shown even when the other
@@ -4849,12 +5126,12 @@ function computeAirspace(lat, lng) {
     markCellsUnknown(['airProhibited']);
   } else if (S.faaAirspace) {
     const pa = combineProhibitedAreas(S.faaAirspace.sua, S.faaAirspace.prohibited);
-    const tag = pa.cached ? ' (cached)' : '';
+    const tag = pa.truncated ? ' (INCOMPLETE — truncated)' : pa.cached ? ' (cached)' : '';
     if (pa.features.length) {
       setText('airProhibited', pa.features.map(f => (f.properties || {}).NAME || 'Prohibited').join(', ') + tag);
       setColor('airProhibited', 'red');
-    } else if (pa.unknown) {
-      setText('airProhibited', UNKNOWN_CELL_TEXT); setColor('airProhibited', 'red');
+    } else if (pa.unknown || pa.truncated) {
+      setText('airProhibited', UNKNOWN_CELL_TEXT + (pa.truncated ? ' (truncated)' : '')); setColor('airProhibited', 'red');
     } else {
       setText('airProhibited', 'None' + tag); setColor('airProhibited', pa.cached ? 'amber' : 'green');
     }
@@ -4864,14 +5141,14 @@ function computeAirspace(lat, lng) {
   if (layerState('tfrs') === 'unknown') {
     markCellsUnknown(['airTFR']);
   } else if (S.faaAirspace && S.faaAirspace.tfrs && S.faaAirspace.tfrs.features) {
-    showLayer('airTFR', 'tfrs', S.faaAirspace.tfrs.features, fs => fs.map(f => f.properties.NAME || 'TFR').join(', '), 'red');
+    showLayer('airTFR', 'tfrs', S.faaAirspace.tfrs.features, fs => fs.map(f => (f.properties || {}).NAME || 'TFR').join(', '), 'red');
   }
 
   // National Security UAS Restrictions
   if (layerState('nsRestrictions') === 'unknown') {
     markCellsUnknown(['airNSRestrict']);
   } else if (S.faaAirspace && S.faaAirspace.nsRestrictions && S.faaAirspace.nsRestrictions.features) {
-    showLayer('airNSRestrict', 'nsRestrictions', S.faaAirspace.nsRestrictions.features, fs => fs.map(f => f.properties.NAME || 'NS Restriction').join(', '), 'red');
+    showLayer('airNSRestrict', 'nsRestrictions', S.faaAirspace.nsRestrictions.features, fs => fs.map(f => nsRestrictionName(f, 'NS Restriction')).join(', '), 'red');
   }
   reapplyStaleCells();
 }
@@ -4882,7 +5159,9 @@ function computeAirspace(lat, lng) {
 async function fetchNearbyAirports(center, bounds) {
   const tok = _beginRequest('airports');
   trackFetchStart('Airports');
-  const cacheKey = typeof areaKey === 'function' ? areaKey(center.lat, center.lng) : `${center.lat.toFixed(3)}_${center.lng.toFixed(3)}`;
+  // Keyed by the queried bbox, not just the centre: a same-centre resize is a
+  // different airport search.
+  const cacheKey = _bboxCacheKey(bounds);
   const commit = elements => {
     S.nearbyAirports = _parseOverpassAirports(elements);
     _noteSourceAnswer('airports', true);
@@ -4895,21 +5174,9 @@ async function fetchNearbyAirports(center, bounds) {
     const pad = 0.8; // ~55nm buffer for airport search
     const bbox = `${sw.lat - pad},${sw.lng - pad},${ne.lat + pad},${ne.lng + pad}`;
 
-    // Try cached first
-    if (typeof getCachedApiResponse === 'function') {
-      const cached = await getCachedApiResponse('airports', cacheKey);
-      if (!_requestCurrent(tok)) return;
-      if (cached && cached.data && cached.status !== 'expired') {
-        commit(cached.data);
-        clearDataSourceError('Airports');
-        const _aptFresh = cached.status === 'fresh';
-        markSection('airspace', _aptFresh
-          ? { source: 'airports', status: 'live', updatedAt: cached.timestamp, error: null }
-          : { source: 'airports', status: 'cached', cachedAt: cached.timestamp, error: null });
-        return;
-      }
-    }
-
+    // Network first: a stored copy used to be served (and labeled LIVE when
+    // under 7 days old) before any request — even on UPDATE. The IndexedDB
+    // copy is now only the failure fallback below, labeled CACHED.
     const query = `[out:json][timeout:30];(`
       + `nwr["aeroway"="aerodrome"](${bbox});`
       + `nwr["aeroway"="helipad"](${bbox});`
@@ -4963,9 +5230,10 @@ function _parseOverpassAirports(data) {
     if (!isHelipad && !isAerodrome) return;
 
     // Get coordinates (node has lat/lon directly, way/relation uses center)
-    const lat = el.lat || el.center?.lat;
-    const lng = el.lon || el.center?.lon;
-    if (!lat || !lng) return;
+    // 0 is a valid coordinate (equator / prime meridian) — only MISSING drops.
+    const lat = el.lat != null ? el.lat : el.center?.lat;
+    const lng = el.lon != null ? el.lon : el.center?.lon;
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
 
     // Deduplicate by coordinate proximity
     const coordKey = `${lat.toFixed(4)}_${lng.toFixed(4)}`;
@@ -5044,7 +5312,7 @@ function renderAirportMarkers(lat, lng) {
 
     const marker = L.marker([a.lat, a.lng], { icon });
 
-    marker.bindTooltip(a.icao, {
+    marker.bindTooltip(_esc(a.icao), {
       permanent: false,
       direction: 'top',
       className: 'airport-tooltip',
@@ -5053,10 +5321,10 @@ function renderAirportMarkers(lat, lng) {
 
     marker.bindPopup(
       `<div style="font-family:var(--font-mono,monospace);font-size:12px;">` +
-      `<b style="color:${color}">${a.icao}</b> — ${a.name}<br>` +
+      `<b style="color:${color}">${_esc(a.icao)}</b> — ${_esc(a.name)}<br>` +
       `<span style="opacity:0.7">${typeLabel}</span><br>` +
       (a.elevation_ft ? `Elev: ${a.elevation_ft.toLocaleString()} ft<br>` : '') +
-      (a.municipality ? `${a.municipality}<br>` : '') +
+      (a.municipality ? `${_esc(a.municipality)}<br>` : '') +
       `<b>${distNm} nm</b> from area center</div>`
     );
 
@@ -5098,16 +5366,18 @@ function _nwsAlertCardHtml(a, metaExtra) {
   const expires = a.expires ? new Date(a.expires).toLocaleString('en-US', { timeZone: _localTZ(), month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
   // Show the full hazard detail (HAZARD/SOURCE/IMPACT block), not just the headline —
   // for e.g. a Special Weather Statement the headline alone says nothing about wind/hail/flood.
-  const desc = ((a.description || '').substring(0, 600) + ((a.description || '').length > 600 ? '...' : '')).replace(/\n{2,}/g, '<br><br>').replace(/\n/g, ' ');
-  const instr = ((a.instruction || '').substring(0, 300) + ((a.instruction || '').length > 300 ? '...' : '')).replace(/\n+/g, ' ');
+  // NWS text is plain text — escaped BEFORE the newline → <br> markup is added
+  // (real alerts contain "< 1/4 mile", which used to break the card).
+  const desc = _esc((a.description || '').substring(0, 600) + ((a.description || '').length > 600 ? '...' : '')).replace(/\n{2,}/g, '<br><br>').replace(/\n/g, ' ');
+  const instr = _esc((a.instruction || '').substring(0, 300) + ((a.instruction || '').length > 300 ? '...' : '')).replace(/\n+/g, ' ');
 
   return `<div class="notam-card" style="border-left:3px solid ${sevColor};">
       <div class="notam-header">
-        <span class="notam-id" style="color:${sevColor};">${a.event}</span>
-        <span class="notam-type" style="background:${sevBg};color:${sevColor};">${a.severity}</span>
+        <span class="notam-id" style="color:${sevColor};">${_esc(a.event)}</span>
+        <span class="notam-type" style="background:${sevBg};color:${sevColor};">${_esc(a.severity)}</span>
       </div>
-      <div class="notam-body">${a.headline ? `<b>${a.headline}</b>` : ''}${a.headline && desc ? '<br>' : ''}${desc}${instr ? `<div style="margin-top:4px;font-style:italic;opacity:0.85;">⚠ ${instr}</div>` : ''}</div>
-      <div class="notam-meta">${onset ? `Onset: ${onset}` : ''}${expires ? ` • Expires: ${expires}` : ''}${a.senderName ? ` • ${a.senderName}` : ''}${metaExtra ? ` • ${metaExtra}` : ''}</div>
+      <div class="notam-body">${a.headline ? `<b>${_esc(a.headline)}</b>` : ''}${a.headline && desc ? '<br>' : ''}${desc}${instr ? `<div style="margin-top:4px;font-style:italic;opacity:0.85;">⚠ ${instr}</div>` : ''}</div>
+      <div class="notam-meta">${onset ? `Onset: ${onset}` : ''}${expires ? ` • Expires: ${expires}` : ''}${a.senderName ? ` • ${_esc(a.senderName)}` : ''}${metaExtra ? ` • ${_esc(metaExtra)}` : ''}</div>
     </div>`;
 }
 
@@ -5151,7 +5421,9 @@ async function fetchNWSAlerts(lat, lng) {
     const alertsSw = _swCacheStamp(res);
     const data = await res.json();
     if (!_requestCurrent(tok)) return;
-    const features = data.features || [];
+    // A 200 without a features ARRAY is a failure, never "no active alerts".
+    if (!data || !Array.isArray(data.features)) throw new Error('NWS response has no features list');
+    const features = data.features;
     if (alertsSw && heldAt() >= (alertsSw.cachedAt || 0)) {
       // Offline, and the SW's copy is no newer than what we hold: keep ours.
       failNoData();
@@ -5206,8 +5478,9 @@ async function fetchNWSAlerts(lat, lng) {
           _setDataArea('nwsAlerts', k);
           renderNWSAlertCards();
           renderNWSAlertPolygons();
+          buildLayerControl();
           const age = Date.now() - cached.timestamp;
-          const badge = cached.status === 'stale' ? 'cached' : 'expired';
+          const badge = cached.status === 'expired' ? 'expired' : 'cached';
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
           setStatus('alertStatus', badge, label);
           markSection('alerts', { status: 'cached', cachedAt: cached.timestamp, error: _alertErrMsg });
@@ -5289,7 +5562,7 @@ function renderNWSAlertPolygons() {
     const layer = L.geoJSON(a.geometry, {
       style: { color: fillColor, weight: 2, fillColor: fillColor, fillOpacity: 0.15, dashArray: '4,4' },
     });
-    layer.bindPopup(`<b>${a.event}</b><br>${a.severity} \u2014 ${a.urgency}<br><span style="font-size:11px;">${(a.headline || '').substring(0, 200)}</span>${a.description ? `<br><span style="font-size:11px;">${a.description.substring(0, 400).replace(/\n+/g, ' ')}${a.description.length > 400 ? '...' : ''}</span>` : ''}`, { maxWidth: 320 });
+    layer.bindPopup(`<b>${_esc(a.event)}</b><br>${_esc(a.severity)} \u2014 ${_esc(a.urgency)}<br><span style="font-size:11px;">${_esc((a.headline || '').substring(0, 200))}</span>${a.description ? `<br><span style="font-size:11px;">${_esc(a.description.substring(0, 400)).replace(/\n+/g, ' ')}${a.description.length > 400 ? '...' : ''}</span>` : ''}`, { maxWidth: 320 });
     S.mapLayers.nws_alerts.addLayer(layer);
   });
 }
@@ -5370,6 +5643,9 @@ async function fetchFAAairspace(bounds) {
       if (r.status === 'fulfilled') {
         data[k] = r.value.json;
         if (r.value.sw) {
+          // An offline-fallback body is a cached copy: its cells say so
+          // ("None (cached)"), never a live green "None". 0 = age unknown.
+          data[k]._cachedAt = r.value.sw.cachedAt != null ? r.value.sw.cachedAt : 0;
           swFallback = true;
           if (r.value.sw.cachedAt != null) swCachedAt = (swCachedAt == null) ? r.value.sw.cachedAt : Math.min(swCachedAt, r.value.sw.cachedAt);
         }
@@ -5402,8 +5678,8 @@ async function fetchFAAairspace(bounds) {
 
     // Render map layers
     renderFAAairspaceLayers();
-    // Update airspace tab with live FAA data
-    computeAirspace(S.areaCenter.lat, S.areaCenter.lng);
+    // Update airspace tab with live FAA data (no area = "cache current view": nothing to classify)
+    if (S.areaCenter) computeAirspace(S.areaCenter.lat, S.areaCenter.lng);
 
     // Cache — only a COMPLETE live result. A partial one would overwrite the
     // last good copy with empties, and a SW offline fallback is already cached.
@@ -5411,7 +5687,7 @@ async function fetchFAAairspace(bounds) {
     if (!failed.length && !truncatedLayers.length && !swFallback && typeof cacheApiResponse === 'function') {
       cacheApiResponse('faa_airspace', cacheKey, data);
     }
-    if (typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
+    if (!failed.length && !swFallback && typeof setLastDataTimestamp === 'function') setLastDataTimestamp(Date.now());
     buildLayerControl();
 
     if (failed.length) {
@@ -5466,10 +5742,15 @@ async function fetchFAAairspace(bounds) {
         const cached = await getCachedApiResponse('faa_airspace', cacheKey);
         if (!_requestCurrent(tok)) return;
         if (cached && cached.data) {
-          S.faaAirspace = cached.data;
+          // Every layer is the stored copy — tag each so its cells read "(cached)".
+          S.faaAirspace = {};
+          Object.keys(cached.data).forEach(k => {
+            const l = cached.data[k];
+            S.faaAirspace[k] = (l && typeof l === 'object' && !l._unavailable) ? Object.assign({}, l, { _cachedAt: cached.timestamp }) : l;
+          });
           _setDataArea('faaAirspace', cacheKey);
           renderFAAairspaceLayers();
-          computeAirspace(S.areaCenter.lat, S.areaCenter.lng);
+          if (S.areaCenter) computeAirspace(S.areaCenter.lat, S.areaCenter.lng);
           buildLayerControl();
           const age = Date.now() - cached.timestamp;
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
@@ -5513,7 +5794,7 @@ function renderFAAairspaceLayers() {
       const name = f.properties.NAME || f.properties.IDENT || '';
       const upper = f.properties.UPPER_VAL ? `${f.properties.UPPER_VAL} ${f.properties.UPPER_UOM || ''}` : '';
       const lower = f.properties.LOWER_VAL != null ? `${f.properties.LOWER_VAL} ${f.properties.LOWER_UOM || ''}` : 'SFC';
-      layer.bindPopup(`<b>Class ${cls}</b> — ${name}<br>${lower} to ${upper}`);
+      layer.bindPopup(`<b>Class ${_esc(cls)}</b> — ${_esc(name)}<br>${_esc(lower)} to ${_esc(upper)}`);
       S.mapLayers.faa_class_airspace.addLayer(layer);
     });
   }
@@ -5528,7 +5809,7 @@ function renderFAAairspaceLayers() {
       const layer = L.geoJSON(f, {
         style: { color: color, weight: 2, fillColor: color, fillOpacity: 0.12, dashArray: '5,5' },
       });
-      layer.bindPopup(`<b>${f.properties.NAME || 'SUA'}</b><br>Type: ${f.properties.LOCAL_TYPE || f.properties.TYPE_CODE || '--'}`);
+      layer.bindPopup(`<b>${_esc(f.properties.NAME || 'SUA')}</b><br>Type: ${_esc(f.properties.LOCAL_TYPE || f.properties.TYPE_CODE || '--')}`);
       S.mapLayers.faa_sua.addLayer(layer);
     });
   }
@@ -5541,7 +5822,7 @@ function renderFAAairspaceLayers() {
       const layer = L.geoJSON(f, {
         style: { color: '#ef4444', weight: 3, fillColor: '#ef4444', fillOpacity: 0.20, dashArray: '3,3' },
       });
-      layer.bindPopup(`<b>TFR</b> — ${f.properties.NAME || ''}<br>${f.properties.CITY || ''} ${f.properties.STATE || ''}`);
+      layer.bindPopup(`<b>TFR</b> — ${_esc(f.properties.NAME || '')}<br>${_esc(f.properties.CITY || '')} ${_esc(f.properties.STATE || '')}`);
       S.mapLayers.faa_tfr.addLayer(layer);
     });
   }
@@ -5551,13 +5832,14 @@ function renderFAAairspaceLayers() {
   else S.mapLayers.faa_laanc = typeof L.layerGroup === 'function' ? L.layerGroup() : null;
   if (S.mapLayers.faa_laanc && S.faaAirspace.laanc && S.faaAirspace.laanc.features) {
     S.faaAirspace.laanc.features.forEach(f => {
-      const ceil = f.properties.CEILING != null ? f.properties.CEILING : -1;
+      // A missing ceiling is UNKNOWN — it used to print "-1 ft AGL".
+      const ceil = f.properties.CEILING != null ? _esc(f.properties.CEILING) + ' ft AGL' : 'unknown — verify in LAANC';
       const color = laancCeilingColor(f.properties.CEILING);
       const layer = L.geoJSON(f, {
         style: { color: color, weight: 1, fillColor: color, fillOpacity: 0.15 },
       });
       const aptName = f.properties.APT1_NAME || f.properties.APT1_FAAID || '';
-      layer.bindPopup(`<b>LAANC Grid</b><br>Ceiling: ${ceil} ft AGL<br>${aptName}`);
+      layer.bindPopup(`<b>LAANC Grid</b><br>Ceiling: ${ceil}<br>${_esc(aptName)}`);
       S.mapLayers.faa_laanc.addLayer(layer);
     });
   }
@@ -5575,11 +5857,11 @@ function renderFAAairspaceLayers() {
         style: { color: '#dd1133', weight: 2, fillColor: '#dd1133', fillOpacity: 0.18, dashArray: '6,3' },
       });
       const title = p.Facility || p.Base || p.NAME || 'National Security UAS Restriction';
-      const lines = [`<b>${title}</b>`];
-      if (p.Reason) lines.push(p.Reason);
+      const lines = [`<b>${_esc(title)}</b>`];
+      if (p.Reason) lines.push(_esc(p.Reason));
       const alt = [p.Floor, p.Ceiling].filter(Boolean).join(' to ');
-      if (alt) lines.push(alt);
-      if (p.POC) lines.push(`POC: ${p.POC}`);
+      if (alt) lines.push(_esc(alt));
+      if (p.POC) lines.push(`POC: ${_esc(p.POC)}`);
       layer.bindPopup(lines.join('<br>'));
       S.mapLayers.faa_ns_restrictions.addLayer(layer);
     });
@@ -5596,7 +5878,7 @@ function renderFAAairspaceLayers() {
         style: { color: '#991b1b', weight: 2, fillColor: '#991b1b', fillOpacity: 0.20 },
       });
       const nm = p.NAME || p.LOCAL_TYPE || p.TYPE_CODE || 'Prohibited Area';
-      layer.bindPopup(`<b>Prohibited Area</b><br>${nm}`);
+      layer.bindPopup(`<b>Prohibited Area</b><br>${_esc(nm)}`);
       S.mapLayers.faa_prohibited.addLayer(layer);
     });
   }
@@ -5715,22 +5997,26 @@ function renderObstacleLayer() {
     const lng = g.coordinates[0], lat = g.coordinates[1];
     if (lat == null || lng == null) return;
     const p = f.properties || {};
-    const agl = Number(p.AGL);
+    // A missing height is unknown, not 0 ft (Number(null) === 0).
+    const num = v => (v == null || v === '') ? NaN : Number(v);
+    const agl = num(p.AGL);
+    const amsl = num(p.AMSL);
     const color = obstacleMarkerColor(agl);
     const marker = L.circleMarker([lat, lng], {
       radius: 5, color: '#000', weight: 1, fillColor: color, fillOpacity: 0.9,
       aglFt: isFinite(agl) && agl > 0 ? agl : null, // 3D view extrudes this as a cylinder
     });
-    const lines = [`<b style="color:${color}">${obstacleLabel(p)}</b>`];
+    const lines = [`<b style="color:${color}">${_esc(obstacleLabel(p))}</b>`];
     const h = [];
     if (isFinite(agl)) h.push(`${agl} ft AGL`);
-    if (isFinite(Number(p.AMSL))) h.push(`${Number(p.AMSL)} ft MSL`);
+    if (isFinite(amsl)) h.push(`${amsl} ft MSL`);
+    if (!h.length) h.push('Height unknown');
     if (h.length) lines.push(h.join(' / '));
     lines.push(`Lighting: ${obstacleLighting(p.Lighting)}`);
     if ((p.Verified || '').toString().trim().toUpperCase() === 'U') {
       lines.push('<span style="color:#f59e0b">UNVERIFIED position/height</span>');
     }
-    lines.push(`<span style="font-size:10px;opacity:0.6">FAA DOF ${p.OAS_Number || ''}</span>`);
+    lines.push(`<span style="font-size:10px;opacity:0.6">FAA DOF ${_esc(p.OAS_Number || '')}</span>`);
     marker.bindPopup(lines.join('<br>'));
     S.mapLayers.faa_obstacles.addLayer(marker);
   });
@@ -5758,9 +6044,10 @@ const PROTECTED_LAYER_LABELS = { dams: 'Dams', wilderness: 'Wilderness', nationa
 // Show the dam line (or UNKNOWN when the dam layer could not be checked).
 function _renderProtectedDamCell(data) {
   if ((data._unavailable || []).includes('dams')) { markCellsUnknown(['terrHwy']); return; }
-  if (data.dams.length > 0) {
-    setText('terrHwy', `${data.dams.length} dam${data.dams.length > 1 ? 's' : ''} within area — see map`);
-  }
+  // A loaded answer replaces an earlier UNKNOWN (red) — zero dams leaves the
+  // cell neutral rather than stuck on a failure that has since recovered.
+  setText('terrHwy', data.dams.length > 0 ? `${data.dams.length} dam${data.dams.length > 1 ? 's' : ''} within area — see map` : '--');
+  setColor('terrHwy', null);
 }
 
 async function fetchProtectedAreas(bounds) {
@@ -6105,6 +6392,8 @@ async function _fetchGeoJsonLayer(endpoint, cacheKey, url, opts) {
     // ArcGIS servers report many failures as HTTP 200 + {"error":{...}} — that is
     // an ERROR, not an empty layer, and must never be cached or rendered as data.
     if (gj && gj.error) throw new Error('ArcGIS ' + (gj.error.code || 'error') + ': ' + (gj.error.message || 'query failed'));
+    // A body with no features ARRAY is not a result either — never "none found".
+    if (!gj || !Array.isArray(gj.features)) throw new Error('response has no features list');
     return gj;
   };
   // One request (first or continuation page) under the time limit and the
@@ -6271,15 +6560,15 @@ function _usfsRoadPopup(p) {
   const num = _prop(p, 'ID', 'id'), name = _prop(p, 'NAME', 'name');
   const surf = _prop(p, 'SURFACE_TYPE', 'surface_type');
   const oml = _prop(p, 'OPER_MAINT_LEVEL', 'operationalmaintlevel', 'oper_maint_level');
-  return `<b style="color:#c98a3a">NFS Road ${[num, name].filter(Boolean).join(' — ') || ''}</b>`
-    + (surf ? `<br>Surface: ${surf}` : '')
-    + (oml ? `<br>Maint level: ${oml}` : '')
+  return `<b style="color:#c98a3a">NFS Road ${_esc([num, name].filter(Boolean).join(' — ') || '')}</b>`
+    + (surf ? `<br>Surface: ${_esc(surf)}` : '')
+    + (oml ? `<br>Maint level: ${_esc(oml)}` : '')
     + `<br><span style="font-size:10px;opacity:0.6">USFS National Forest System road</span>`;
 }
 function _usfsTrailPopup(p) {
   const name = _prop(p, 'TRAIL_NAME', 'name') || 'NFS Trail';
   const num = _prop(p, 'TRAIL_NO', 'trailnumber', 'id');
-  return `<b style="color:#8b5a2b">${name}</b>` + (num ? `<br>#${num}` : '')
+  return `<b style="color:#8b5a2b">${_esc(name)}</b>` + (num ? `<br>#${_esc(num)}` : '')
     + `<br><span style="font-size:10px;opacity:0.6">USFS National Forest System trail</span>`;
 }
 const MVUM_VEHICLE_FIELDS = [
@@ -6295,10 +6584,10 @@ function _mvumPopup(p) {
   const allowed = [];
   MVUM_VEHICLE_FIELDS.forEach(([f, label]) => { if (_prop(p, f) != null) allowed.push(label); });
   const season = _prop(p, 'SEASONAL', 'seasonal');
-  return `<b style="color:#e0a458">${name}</b>`
-    + (sym ? `<br>${sym}` : '')
+  return `<b style="color:#e0a458">${_esc(name)}</b>`
+    + (sym ? `<br>${_esc(sym)}` : '')
     + (allowed.length ? `<br>Open to: ${allowed.join(', ')}` : '')
-    + (season ? `<br>Seasonal: ${season}` : '')
+    + (season ? `<br>Seasonal: ${_esc(season)}` : '')
     + `<br><span style="font-size:10px;opacity:0.6">USFS MVUM — verify current designation on the official map</span>`;
 }
 function _blmGtlfStyle(p) {
@@ -6310,9 +6599,9 @@ function _blmGtlfPopup(p) {
   const name = _prop(p, 'RTE_PRMRY_NM', 'PLAN_PRMRY_NM', 'NAME', 'name') || 'BLM route';
   const dsgn = _prop(p, 'PLAN_OHV_ROUTE_DSGNTN', 'dsgntn');
   const surf = _prop(p, 'SURF_ACST_TYPE', 'surface');
-  return `<b style="color:#84cc16">${name}</b>`
-    + (dsgn ? `<br>OHV: ${dsgn}` : '')
-    + (surf ? `<br>Surface: ${surf}` : '')
+  return `<b style="color:#84cc16">${_esc(name)}</b>`
+    + (dsgn ? `<br>OHV: ${_esc(dsgn)}` : '')
+    + (surf ? `<br>Surface: ${_esc(surf)}` : '')
     + `<br><span style="font-size:10px;opacity:0.6">BLM ground transportation route</span>`;
 }
 
@@ -6349,14 +6638,18 @@ async function fetchGroundAccess(bounds) {
     if (!_requestCurrent(tok)) return;
     // A constituent that failed with no cached copy is CLEARED, not left holding
     // another area's (or an older) lines that would count toward this readout.
+    // A same-area refresh that fails keeps this area's lines (markSection
+    // flags them stale) instead of wiping them.
+    const sameArea = _dataIsForArea('groundAccess', cacheKey);
     specs.forEach((s, i) => {
       const r = results[i].status === 'fulfilled' ? results[i].value : null;
       allResults.push(r);
-      _renderVectorLayer(s.mapId, (r && r.features) || [], s.style, s.popup);
+      if ((r && r.features) || !sameArea) _renderVectorLayer(s.mapId, (r && r.features) || [], s.style, s.popup);
     });
     allResults.push(gr, gt);
     const merged = [].concat((gr && gr.features) || [], (gt && gt.features) || []);
-    _renderVectorLayer('blm_gtlf', merged, _blmGtlfStyle, _blmGtlfPopup);
+    if ((gr && gr.features && gt && gt.features) || !sameArea) _renderVectorLayer('blm_gtlf', merged, _blmGtlfStyle, _blmGtlfPopup);
+    _setDataArea('groundAccess', cacheKey);
     // Readout + freshness
     const summary = _markSectionFromResults('groundAccess', allResults, null,
       ['USFS roads', 'USFS trails', 'MVUM roads', 'MVUM trails', 'BLM roads', 'BLM trails']);
@@ -6397,10 +6690,10 @@ function _smokeStyleFor(props) {
 }
 function _smokePopup(props) {
   const p = props || {};
-  return `<b style="color:#b45309">Wildfire smoke — ${p.Density || 'Smoke'}</b>`
-    + (p.Satellite ? `<br>Satellite: ${p.Satellite}` : '')
-    + (p.Start ? `<br>Start: ${p.Start} UTC` : '')
-    + (p.End_ ? `<br>End: ${p.End_} UTC` : '')
+  return `<b style="color:#b45309">Wildfire smoke — ${_esc(p.Density || 'Smoke')}</b>`
+    + (p.Satellite ? `<br>Satellite: ${_esc(p.Satellite)}` : '')
+    + (p.Start ? `<br>Start: ${_esc(p.Start)} UTC` : '')
+    + (p.End_ ? `<br>End: ${_esc(p.End_)} UTC` : '')
     + `<br><span style="color:#f59e0b;font-size:10px;font-weight:bold;">Reduces visibility / VLOS — advisory, current-day satellite analysis</span>`;
 }
 
@@ -6445,15 +6738,26 @@ function _avalancheStyle(props) {
   const lvl = Number(p.danger_level) || 0;
   return { color: '#374151', weight: 1, fillColor: p.color || '#9ca3af', fillOpacity: lvl >= 1 ? 0.35 : 0.12 };
 }
+// avalanche.org sends `warning: { product: null }` for EVERY zone without a
+// warning — a truthy object — so only a warning with an actual product (or a
+// legacy non-empty string / true) counts as one in effect.
+function avalancheWarningActive(p) {
+  const w = p && p.warning;
+  if (!w) return false;
+  if (typeof w === 'string') return w.trim() !== '';
+  if (typeof w === 'object') return !!w.product;
+  return w === true;
+}
 function _avalanchePopup(props) {
   const p = props || {};
   const lvl = (p.danger_level != null && p.danger_level >= 1) ? p.danger_level : null;
   const label = lvl != null ? (AVALANCHE_DANGER_NAMES[lvl] || `Level ${lvl}`) : 'No rating / off-season';
-  return `<b>${p.name || 'Avalanche zone'}</b>`
-    + (p.center ? `<br>${p.center}` : '')
-    + `<br>Danger: <b style="color:${p.color || '#999'}">${label}</b>`
-    + (p.warning ? `<br><span style="color:#ef4444;font-weight:bold;">⚠ Avalanche warning in effect</span>` : '')
-    + (p.travel_advice ? `<br><span style="font-size:10px;opacity:0.7">${String(p.travel_advice).slice(0, 160)}</span>` : '')
+  const color = /^[#a-z0-9(),.%\s]+$/i.test(String(p.color || '')) ? p.color : '#999';
+  return `<b>${_esc(p.name || 'Avalanche zone')}</b>`
+    + (p.center ? `<br>${_esc(p.center)}` : '')
+    + `<br>Danger: <b style="color:${color}">${_esc(label)}</b>`
+    + (avalancheWarningActive(p) ? `<br><span style="color:#ef4444;font-weight:bold;">⚠ Avalanche warning in effect</span>` : '')
+    + (p.travel_advice ? `<br><span style="font-size:10px;opacity:0.7">${_esc(String(p.travel_advice).slice(0, 160))}</span>` : '')
     + `<br><span style="font-size:10px;opacity:0.6">avalanche.org — verify at the source before travel</span>`;
 }
 // True when a [lat,lng] ring's bbox overlaps the padded area bbox.
@@ -6477,14 +6781,23 @@ async function fetchAvalanche(bounds) {
   const tok = _beginRequest('avalanche');
   const areaK = _bboxCacheKey(b);
   try {
-    let fc = null;
+    let fc = null, cacheErr = null;
     if (online) {
-      const res = await fetch(AVALANCHE_MAPLAYER_URL, { signal: tok.signal });
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      fc = await res.json();
-      if (!fc || !Array.isArray(fc.features)) throw new Error('avalanche.org response has no features list');
-      // The SW's offline copy is already cached — re-saving it would restamp it "now".
-      if (!_swCacheStamp(res) && typeof cacheApiResponse === 'function') cacheApiResponse('avalanche', 'us', fc);
+      try {
+        const res = await fetch(AVALANCHE_MAPLAYER_URL, { signal: tok.signal });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        fc = await res.json();
+        if (!fc || !Array.isArray(fc.features)) throw new Error('avalanche.org response has no features list');
+        // The SW's offline copy is already cached — re-saving it would restamp it "now".
+        if (!_swCacheStamp(res) && typeof cacheApiResponse === 'function') cacheApiResponse('avalanche', 'us', fc);
+      } catch (netErr) {
+        // An online failure falls back to the stored copy too, not only offline.
+        if (netErr && netErr.name === 'AbortError') throw netErr;
+        const c = await _cachedFeatures('avalanche', 'us');
+        if (!c) throw netErr;
+        fc = { features: c.features };
+        cacheErr = new Error(((netErr && netErr.message) || String(netErr)) + ' — showing cached copy');
+      }
     } else {
       const c = await _cachedFeatures('avalanche', 'us');
       if (c) fc = { features: c.features };
@@ -6497,7 +6810,7 @@ async function fetchAvalanche(bounds) {
     S.avalanche = near;
     _setDataArea('avalanche', areaK);
     _renderVectorLayer('avalanche', near, _avalancheStyle, _avalanchePopup);
-    clearDataSourceError('Avalanche');
+    if (cacheErr) recordDataSourceError('Avalanche', cacheErr); else clearDataSourceError('Avalanche');
     buildLayerControl();
     if (S.currentArea) computeAssessment();
   } catch (e) {
@@ -6606,12 +6919,20 @@ function _renderPublicLands(features) {
     const info = smaAgencyInfo(_prop(f.properties, 'ADMIN_AGENCY_CODE'));
     const layer = L.geoJSON(f, { style: { color: info.color, weight: 1, fillColor: info.color, fillOpacity: info.isPublic ? 0.12 : 0.22 } });
     const unit = _prop(f.properties, 'ADMIN_UNIT_NAME');
-    layer.bindPopup(`<b style="color:${info.color}">${info.label}</b>` + (unit ? `<br>${unit}` : '')
+    layer.bindPopup(`<b style="color:${info.color}">${_esc(info.label)}</b>` + (unit ? `<br>${_esc(unit)}` : '')
       + (info.isPublic ? '' : `<br><span style="color:#f59e0b;font-size:10px;font-weight:bold;">Non-public surface — verify landowner permission</span>`));
     S.mapLayers.public_lands.addLayer(layer);
     n++;
   });
   return n;
+}
+// Every polygon of a GeoJSON (Multi)Polygon as [outer, hole, …] rings in
+// [lat,lng] — unlike geoJsonOuterRings, the holes are KEPT.
+function _geoJsonPolygonsLatLng(geom) {
+  if (!geom) return [];
+  const swap = ring => ring.map(c => [c[1], c[0]]);
+  const polys = geom.type === 'Polygon' ? [geom.coordinates] : geom.type === 'MultiPolygon' ? geom.coordinates : [];
+  return (polys || []).filter(p => Array.isArray(p) && p[0] && p[0].length).map(p => p.filter(r => Array.isArray(r) && r.length).map(swap));
 }
 function computeLandStatus(features) {
   if (!Array.isArray(features) || !features.length) return null;
@@ -6621,7 +6942,8 @@ function computeLandStatus(features) {
   const publicRings = [];
   features.forEach(f => {
     if (smaIsPublic(_prop(f.properties, 'ADMIN_AGENCY_CODE'))) {
-      geoJsonOuterRings(f.geometry).forEach(r => publicRings.push(r));
+      // Holes kept: a private inholding inside a National Forest is not public.
+      _geoJsonPolygonsLatLng(f.geometry).forEach(p => publicRings.push(p));
     }
   });
   return classifyAreaPublicPrivate(aoi, publicRings, 11);
@@ -6646,16 +6968,22 @@ async function fetchPublicLands(bounds) {
       S.publicLands = r.features;
       _renderPublicLands(r.features);
       S.landStatus = computeLandStatus(r.features);
-    } else {
+      _setDataArea('publicLands', cacheKey);
+    } else if (!_dataIsForArea('publicLands', cacheKey)) {
+      // Failed with no cached copy: another area's land status must not stand
+      // in. A same-area failure keeps this area's (flagged stale by markSection).
       S.publicLands = null; S.landStatus = null;
       _renderPublicLands([]);
     }
     const summary = _markSectionFromResults('publicLands', [r], null, ['BLM surface management']);
-    if (S.landStatus && S.landStatus.sampled > 0) {
+    if (r && r.features && S.landStatus && S.landStatus.sampled > 0) {
       const pub = Math.round((1 - S.landStatus.privateFrac) * 100);
       setText('terrLandOwnership', `Public ~${pub}% · Private ~${100 - pub}%` + (summary.complete ? '' : ' (INCOMPLETE — result truncated)'));
+      setColor('terrLandOwnership', null);
     } else if (r && r.features) {
-      setText('terrLandOwnership', summary.complete ? 'No private land detected' : 'UNKNOWN — result truncated');
+      // No SMA polygons (or no sampled point) is NO DATA, not "no private land".
+      setText('terrLandOwnership', summary.complete ? 'No land-status data for area — verify ownership' : 'UNKNOWN — result truncated');
+      setColor('terrLandOwnership', 'amber');
     } else if (!getCanopyProxyBase()) {
       setText('terrLandOwnership', 'Needs data proxy (set in Config)');
     } // else: failed — markSection set the cell UNKNOWN / stale
@@ -6682,13 +7010,17 @@ async function fetchWaterFeatures(bounds) {
       _fetchGeoJsonLayer('nhd_water', 'wb_' + cacheKey, _arcgisGeoJsonUrl(base, '12', bounds, '*', { resultRecordCount: 1000 }), lopts),
     ]);
     if (!_requestCurrent(tok)) return;
-    if (typeof L !== 'undefined') {
+    // Both failed on a same-area refresh: keep this area's water on the map
+    // (markSection flags it stale) instead of wiping it.
+    const waterKeep = !(flow && flow.features) && !(wb && wb.features) && _dataIsForArea('water', cacheKey);
+    _setDataArea('water', cacheKey);
+    if (typeof L !== 'undefined' && !waterKeep) {
       if (S.mapLayers.nhd_water) S.mapLayers.nhd_water.clearLayers();
       else S.mapLayers.nhd_water = L.layerGroup();
       const popup = (p) => {
         const nm = _prop(p, 'gnis_name', 'GNIS_NAME', 'name');
         const t = _prop(p, 'fcode_description', 'FCODE_DESCRIPTION', 'ftype');
-        return `<b style="color:#3b82f6">${nm || 'Water feature'}</b>` + (t ? `<br>${t}` : '');
+        return `<b style="color:#3b82f6">${_esc(nm || 'Water feature')}</b>` + (t ? `<br>${_esc(t)}` : '');
       };
       ((flow && flow.features) || []).forEach(f => {
         if (!f.geometry) return;
@@ -6742,9 +7074,9 @@ function _renderHospitals(elements) {
       html: `<svg width="${sz}" height="${sz}" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="4" fill="${color}" fill-opacity="0.92" stroke="#fff" stroke-width="1.5"/><text x="12" y="17" text-anchor="middle" fill="#fff" font-size="14" font-weight="bold" font-family="sans-serif">${glyph}</text></svg>`,
       className: '', iconSize: [sz, sz], iconAnchor: [sz / 2, sz / 2],
     });
-    const popup = `<b style="color:${color}">${name}</b>`
+    const popup = `<b style="color:${color}">${_esc(name)}</b>`
       + (isHeli ? '<br>Helicopter landing site' : (t.emergency === 'yes' ? '<br>Emergency department' : ''))
-      + (t['addr:city'] ? `<br>${t['addr:city']}` : '');
+      + (t['addr:city'] ? `<br>${_esc(t['addr:city'])}` : '');
     L.marker([lat, lng], { icon }).bindPopup(popup).addTo(S.mapLayers.hospitals);
     if (isHeli) nL++; else nH++;
   });
@@ -6810,11 +7142,11 @@ function _renderTrails(records) {
   if (S.mapLayers.trails) S.mapLayers.trails.clearLayers();
   else S.mapLayers.trails = L.layerGroup().addTo(S.map);
   (records || []).forEach(rec => {
-    const popup = `<b style="color:${TRAILS_COLOR}">${rec.name}</b>`
-      + `<br>${trailTypeLabel(rec.type)}`
-      + (rec.surface ? `<br>Surface: ${rec.surface}` : '')
-      + (rec.sacScale ? `<br>SAC scale: ${rec.sacScale.replace(/_/g, ' ')}` : '')
-      + `<br><span style="font-size:10px;opacity:0.6">OSM Way ${rec.id}</span>`;
+    const popup = `<b style="color:${TRAILS_COLOR}">${_esc(rec.name)}</b>`
+      + `<br>${_esc(trailTypeLabel(rec.type))}`
+      + (rec.surface ? `<br>Surface: ${_esc(rec.surface)}` : '')
+      + (rec.sacScale ? `<br>SAC scale: ${_esc(String(rec.sacScale).replace(/_/g, ' '))}` : '')
+      + `<br><span style="font-size:10px;opacity:0.6">OSM Way ${_esc(rec.id)}</span>`;
     L.polyline(rec.coords, { color: TRAILS_COLOR, weight: 2, dashArray: '5,4', opacity: 0.85 })
       .bindPopup(popup).addTo(S.mapLayers.trails);
   });
@@ -6883,7 +7215,8 @@ function _ringsBBox(ringsByCarrier) {
   ['att', 'tmobile', 'verizon'].forEach(k => {
     const rings = ringsByCarrier[k];
     if (!Array.isArray(rings)) return;
-    rings.forEach(ring => ring.forEach(pt => {
+    // An entry may be a polygon WITH holes ([outer, hole, …]): its outer ring bounds it.
+    rings.forEach(ring => (Array.isArray(ring[0] && ring[0][0]) ? ring[0] : ring).forEach(pt => {
       any = true;
       if (pt[0] < minLat) minLat = pt[0]; if (pt[0] > maxLat) maxLat = pt[0];
       if (pt[1] < minLng) minLng = pt[1]; if (pt[1] > maxLng) maxLng = pt[1];
@@ -6924,14 +7257,25 @@ async function loadCellCoverage() {
     if (gj && gj.features && gj.features.length) {
       loadedAny = true;
       _renderCellLayer(c.mapId, gj.features, c.color, c.label);
-      gj.features.forEach(f => geoJsonOuterRings(f.geometry).forEach(r => coverage[c.key].push(r)));
+      // Holes kept (cellCoverageAt tests each polygon even-odd): a coverage gap
+      // inside a carrier's polygon is NOT coverage.
+      gj.features.forEach(f => _geoJsonPolygonsLatLng(f.geometry).forEach(p => coverage[c.key].push(p)));
     }
   }
   if (loadedAny) {
     coverage.region = _ringsBBox(coverage);
     S.cellCoverage = coverage;
     if (typeof buildLayerControl === 'function') buildLayerControl();
-    if (S.areaCenter && typeof computeOpsData === 'function') computeOpsData(); // refresh cell readout
+    // Refresh the cell readout (terrCell / S.cellStatus — written by the
+    // elevation commit, not computeOpsData) and the banner's no-LTE advisory.
+    if (S.areaCenter && S.elev && Number.isFinite(S.elev.center)) {
+      const cell = cellCoverageReadout(S.areaCenter.lat, S.areaCenter.lng, S.elev.center);
+      S.cellStatus = cell;
+      setText('terrCell', cell.label);
+      setColor('terrCell', cell.level);
+      reapplyStaleCells();
+      if (S.currentArea && typeof computeAssessment === 'function') computeAssessment();
+    }
   }
   return loadedAny;
 }
@@ -7100,17 +7444,110 @@ async function _overpassFetchMirrors(query, opts) {
   throw new Error('Overpass: all mirrors failed (' + (lastErr ? lastErr.message : 'unknown') + ')');
 }
 
-async function fetchWireHazards(bounds) {
-  const tok = _beginRequest('wireHazards');
-  trackFetchStart('Wire Hazards');
-  setStatus('wireStatus', 'loading', 'Fetching...');
-  // Only the OSM-sourced categories — the utility_* layers belong to
-  // fetchUtilityWires and must survive an independent OSM refresh.
+// Draw Overpass wire ways + tower nodes into the OSM wire layers and
+// cell_towers (cleared first). ONE renderer for a live answer and the
+// IndexedDB fallback, so a cached copy is drawn, not just counted.
+function _renderOsmWireElements(elements) {
+  _clearOsmWireLayers();
+  const nodes = {};
+  elements.forEach(el => {
+    if (el.type === 'node') nodes[el.id] = [el.lat, el.lon];
+  });
+
+  const counts = {};
+  elements.forEach(el => {
+    if (el.type !== 'way') return;
+    const tags = el.tags || {};
+    let cat = null;
+    if (tags.power === 'line') cat = 'power_line';
+    else if (tags.power === 'minor_line') cat = 'power_minor_line';
+    else if (tags.power === 'cable') cat = 'power_cable';
+    else if (tags.communication === 'line' || tags.telecom === 'line' || tags.telephone === 'line') cat = 'telecom_line';
+    else if (tags.aerialway) cat = 'aerialway';
+    if (!cat) return;
+
+    const coords = (el.nodes || []).map(nid => nodes[nid]).filter(Boolean);
+    if (coords.length < 2) return;
+
+    counts[cat] = (counts[cat] || 0) + 1;
+    const info = WIRE_CATEGORIES[cat];
+    const name = wireHazardName(tags, cat);
+
+    const polyline = L.polyline(coords, { color: info.color, weight: info.weight, opacity: 0.8 })
+      .bindPopup(`<b style="color:${info.color}">${info.label}</b><br>${_esc(name)}<br><span style="font-size:10px;opacity:0.6">OSM Way ${_esc(el.id)}</span>`);
+    S.mapLayers['wire_' + cat].addLayer(polyline);
+  });
+
+  // Tower/structure node processing (comm towers, masts, chimneys, wind turbines, etc.)
+  let towerCount = 0;
+  const TOWER_TYPES = {
+    'communications_tower': 'Comm Tower',
+    'mast': 'Mast',
+    'tower': 'Tower',
+    'chimney': 'Chimney',
+    'lighthouse': 'Lighthouse',
+    'water_tower': 'Water Tower',
+    'wind_turbine': 'Wind Turbine',
+    'antenna': 'Antenna',
+  };
+  elements.forEach(el => {
+    if (el.type !== 'node') return;
+    const tags = el.tags || {};
+    const mm = tags['man_made'];
+    const isTower = TOWER_TYPES[mm] || tags['tower:type'] === 'communication';
+    if (!isTower) return;
+    towerCount++;
+
+    const label = TOWER_TYPES[mm] || 'Comm Tower';
+    const parsedH = osmTowerHeightFt(tags);
+    const heightFt = parsedH ? parsedH.heightFt : null;
+    const heightLabel = heightFt ? heightFt + "'" : '';
+
+    // FAA sectional-style tower icon: solid inverted triangle with dot on top
+    const color = '#00CCFF';
+    const sz = 28;
+    const svgIcon = `<svg width="${sz}" height="${sz}" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg" style="filter:drop-shadow(0 0 1px #000) drop-shadow(0 0 1px #000);">`
+      + `<line x1="14" y1="4" x2="14" y2="22" stroke="${color}" stroke-width="1.5"/>`
+      + `<circle cx="14" cy="4" r="2.5" fill="${color}"/>`
+      + `<line x1="8" y1="12" x2="14" y2="8" stroke="${color}" stroke-width="1"/>`
+      + `<line x1="20" y1="12" x2="14" y2="8" stroke="${color}" stroke-width="1"/>`
+      + `<line x1="6" y1="18" x2="14" y2="13" stroke="${color}" stroke-width="1"/>`
+      + `<line x1="22" y1="18" x2="14" y2="13" stroke="${color}" stroke-width="1"/>`
+      + (heightLabel ? `<text x="14" y="27" text-anchor="middle" fill="${color}" font-family="sans-serif" font-size="7" font-weight="bold">${heightLabel}</text>` : '')
+      + `</svg>`;
+
+    const icon = L.divIcon({ html: svgIcon, className: '', iconSize: [sz, sz], iconAnchor: [sz / 2, sz / 2] });
+    const popupParts = [`<b style="color:${color}">${label}</b>`];
+    if (tags.name) popupParts.push(_esc(tags.name));
+    if (heightFt) popupParts.push(`Height: ${heightFt} ft (${_esc(parsedH.raw)})`);
+    else popupParts.push(`<span style="opacity:0.6">Height not in OSM</span>`);
+    if (tags.operator) popupParts.push(`Operator: ${_esc(tags.operator)}`);
+    popupParts.push(`<span style="font-size:10px;opacity:0.6">OSM Node ${_esc(el.id)}</span>`);
+
+    L.marker([el.lat, el.lon], { icon, aglFt: heightFt || null, cylColor: color })
+      .bindPopup(popupParts.join('<br>'))
+      .addTo(S.mapLayers.cell_towers);
+  });
+  return { counts, towerCount };
+}
+// Clear/create only the OSM-sourced categories — the utility_* layers belong
+// to fetchUtilityWires and must survive an independent OSM refresh.
+function _clearOsmWireLayers() {
   Object.keys(WIRE_CATEGORIES).filter(k => WIRE_CATEGORIES[k].src === 'osm').forEach(k => {
     const lid = 'wire_' + k;
     if (S.mapLayers[lid]) { S.mapLayers[lid].clearLayers(); }
     else { S.mapLayers[lid] = L.layerGroup().addTo(S.map); }
   });
+  if (!S.mapLayers.cell_towers) S.mapLayers.cell_towers = L.layerGroup().addTo(S.map);
+  else S.mapLayers.cell_towers.clearLayers();
+}
+
+async function fetchWireHazards(bounds) {
+  const tok = _beginRequest('wireHazards');
+  trackFetchStart('Wire Hazards');
+  setStatus('wireStatus', 'loading', 'Fetching...');
+  // Layers are redrawn by _renderOsmWireElements only once data (live or
+  // cached) is in hand — a same-area failure keeps this area's wires.
 
   const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
   const pad = 0.015;
@@ -7143,89 +7580,7 @@ async function fetchWireHazards(bounds) {
     const data = await _overpassFetch(query, { signal: tok.signal });
     // A newer area/refresh owns the wire layers now — don't draw into them.
     if (!_requestCurrent(tok)) return;
-    const elements = data.elements || [];
-
-    const nodes = {};
-    elements.forEach(el => {
-      if (el.type === 'node') nodes[el.id] = [el.lat, el.lon];
-    });
-
-    const counts = {};
-    elements.forEach(el => {
-      if (el.type !== 'way') return;
-      const tags = el.tags || {};
-      let cat = null;
-      if (tags.power === 'line') cat = 'power_line';
-      else if (tags.power === 'minor_line') cat = 'power_minor_line';
-      else if (tags.power === 'cable') cat = 'power_cable';
-      else if (tags.communication === 'line' || tags.telecom === 'line' || tags.telephone === 'line') cat = 'telecom_line';
-      else if (tags.aerialway) cat = 'aerialway';
-      if (!cat) return;
-
-      const coords = (el.nodes || []).map(nid => nodes[nid]).filter(Boolean);
-      if (coords.length < 2) return;
-
-      counts[cat] = (counts[cat] || 0) + 1;
-      const info = WIRE_CATEGORIES[cat];
-      const name = wireHazardName(tags, cat);
-
-      const polyline = L.polyline(coords, { color: info.color, weight: info.weight, opacity: 0.8 })
-        .bindPopup(`<b style="color:${info.color}">${info.label}</b><br>${name}<br><span style="font-size:10px;opacity:0.6">OSM Way ${el.id}</span>`);
-      S.mapLayers['wire_' + cat].addLayer(polyline);
-    });
-
-    // Tower/structure node processing (comm towers, masts, chimneys, wind turbines, etc.)
-    if (!S.mapLayers.cell_towers) S.mapLayers.cell_towers = L.layerGroup().addTo(S.map);
-    else S.mapLayers.cell_towers.clearLayers();
-    let towerCount = 0;
-    const TOWER_TYPES = {
-      'communications_tower': 'Comm Tower',
-      'mast': 'Mast',
-      'tower': 'Tower',
-      'chimney': 'Chimney',
-      'lighthouse': 'Lighthouse',
-      'water_tower': 'Water Tower',
-      'wind_turbine': 'Wind Turbine',
-      'antenna': 'Antenna',
-    };
-    elements.forEach(el => {
-      if (el.type !== 'node') return;
-      const tags = el.tags || {};
-      const mm = tags['man_made'];
-      const isTower = TOWER_TYPES[mm] || tags['tower:type'] === 'communication';
-      if (!isTower) return;
-      towerCount++;
-
-      const label = TOWER_TYPES[mm] || 'Comm Tower';
-      const parsedH = osmTowerHeightFt(tags);
-      const heightFt = parsedH ? parsedH.heightFt : null;
-      const heightLabel = heightFt ? heightFt + "'" : '';
-
-      // FAA sectional-style tower icon: solid inverted triangle with dot on top
-      const color = '#00CCFF';
-      const sz = 28;
-      const svgIcon = `<svg width="${sz}" height="${sz}" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg" style="filter:drop-shadow(0 0 1px #000) drop-shadow(0 0 1px #000);">`
-        + `<line x1="14" y1="4" x2="14" y2="22" stroke="${color}" stroke-width="1.5"/>`
-        + `<circle cx="14" cy="4" r="2.5" fill="${color}"/>`
-        + `<line x1="8" y1="12" x2="14" y2="8" stroke="${color}" stroke-width="1"/>`
-        + `<line x1="20" y1="12" x2="14" y2="8" stroke="${color}" stroke-width="1"/>`
-        + `<line x1="6" y1="18" x2="14" y2="13" stroke="${color}" stroke-width="1"/>`
-        + `<line x1="22" y1="18" x2="14" y2="13" stroke="${color}" stroke-width="1"/>`
-        + (heightLabel ? `<text x="14" y="27" text-anchor="middle" fill="${color}" font-family="sans-serif" font-size="7" font-weight="bold">${heightLabel}</text>` : '')
-        + `</svg>`;
-
-      const icon = L.divIcon({ html: svgIcon, className: '', iconSize: [sz, sz], iconAnchor: [sz / 2, sz / 2] });
-      const popupParts = [`<b style="color:${color}">${label}</b>`];
-      if (tags.name) popupParts.push(tags.name);
-      if (heightFt) popupParts.push(`Height: ${heightFt} ft (${parsedH.raw})`);
-      else popupParts.push(`<span style="opacity:0.6">Height not in OSM</span>`);
-      if (tags.operator) popupParts.push(`Operator: ${tags.operator}`);
-      popupParts.push(`<span style="font-size:10px;opacity:0.6">OSM Node ${el.id}</span>`);
-
-      L.marker([el.lat, el.lon], { icon, aglFt: heightFt || null, cylColor: color })
-        .bindPopup(popupParts.join('<br>'))
-        .addTo(S.mapLayers.cell_towers);
-    });
+    const { counts, towerCount } = _renderOsmWireElements(data.elements || []);
     S.towerCount = towerCount;
 
     S.wireHazardCounts = counts;
@@ -7267,30 +7622,18 @@ async function fetchWireHazards(bounds) {
         const cached = await getCachedApiResponse('overpass', k);
         if (!_requestCurrent(tok)) return;
         if (cached && cached.data && cached.data.elements) {
-          const elements = cached.data.elements;
-          const nodes = {};
-          elements.forEach(el => { if (el.type === 'node') nodes[el.id] = [el.lat, el.lon]; });
-          const counts = {};
-          elements.forEach(el => {
-            if (el.type !== 'way') return;
-            const tags = el.tags || {};
-            let cat = null;
-            if (tags.power === 'line') cat = 'power_line';
-            else if (tags.power === 'minor_line') cat = 'power_minor_line';
-            else if (tags.power === 'cable') cat = 'power_cable';
-            else if (tags.communication === 'line' || tags.telecom === 'line' || tags.telephone === 'line') cat = 'telecom_line';
-            else if (tags.aerialway) cat = 'aerialway';
-            if (cat) counts[cat] = (counts[cat] || 0) + 1;
-          });
+          const { counts, towerCount } = _renderOsmWireElements(cached.data.elements);
+          S.towerCount = towerCount;
           S.wireHazardCounts = counts;
           _setDataArea('wireHazards', wireKey);
           _noteSourceAnswer('wire', true);
           const total = Object.values(counts).reduce((a, b) => a + b, 0);
-          updateWireDisplay(counts, 0);
+          updateWireDisplay(counts, towerCount);
+          buildLayerControl();
           const age = Date.now() - cached.timestamp;
-          const badge = cached.status === 'stale' ? 'cached' : 'expired';
+          const badge = cached.status === 'expired' ? 'expired' : 'cached';
           const label = typeof formatAge === 'function' ? 'CACHED ' + formatAge(age) : 'CACHED';
-          setStatus('wireStatus', badge, `${total} FEAT ${label}`);
+          setStatus('wireStatus', badge, `${total + towerCount} FEAT ${label}`);
           markSection('obstacles', { source: 'wire', status: 'cached', cachedAt: cached.timestamp, error: _wireErrMsg });
         } else {
           setStatus('wireStatus', 'error', 'ERROR');
@@ -7302,11 +7645,13 @@ async function fetchWireHazards(bounds) {
     } else {
       setStatus('wireStatus', 'error', 'ERROR');
     }
-    // The layers were cleared up front; drop another area's counts too so
-    // the mission log / exports never report them for this area.
+    // Failed with no cached copy: another area's wires/towers must not stay on
+    // the map, and its counts must not reach the mission log / exports.
     if (!_dataIsForArea('wireHazards', wireKey)) {
+      _clearOsmWireLayers();
       S.wireHazardCounts = {}; S.towerCount = 0;
       _setDataArea('wireHazards', wireKey);
+      buildLayerControl();
     }
   } finally {
     trackFetchEnd('Wire Hazards');
@@ -7322,85 +7667,123 @@ async function fetchWireHazards(bounds) {
 // (Tahoe basin, Roseville, out of state) keeps exactly the old behavior.
 async function fetchUtilityWires(bounds) {
   const tok = _beginRequest('utilityWires');
-  // Clear/create only the utility categories; the OSM ones belong to fetchWireHazards.
-  Object.keys(WIRE_CATEGORIES).filter(k => WIRE_CATEGORIES[k].src === 'utility').forEach(k => {
-    const lid = 'wire_' + k;
-    if (S.mapLayers[lid]) { S.mapLayers[lid].clearLayers(); }
-    else { S.mapLayers[lid] = L.layerGroup().addTo(S.map); }
-  });
-  S.utilityWireCounts = {};
-  S.utilityWireInfo = {};
-
   const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
   const pad = 0.015; // same op-area padding as the OSM wire fetch
   const bbox = { west: sw.lng - pad, south: sw.lat - pad, east: ne.lng + pad, north: ne.lat + pad };
   const sources = utilityWireSourcesForBounds(UTILITY_WIRE_SOURCES, bbox);
+  const cLat = (sw.lat + ne.lat) / 2, cLng = (sw.lng + ne.lng) / 2;
+  const k = typeof areaKey === 'function' ? areaKey(cLat, cLng) : `${cLat.toFixed(3)}_${cLng.toFixed(3)}`;
+  // A same-area refresh keeps a FAILED source's lines and count (flagged stale
+  // by markSection) instead of wiping them; any other area's are cleared.
+  const sameArea = sources.length > 0 && _dataIsForArea('utilityWires', k);
+  const prevCounts = S.utilityWireCounts || {}, prevInfo = S.utilityWireInfo || {};
+  // Clear/create only the utility categories; the OSM ones belong to fetchWireHazards.
+  Object.keys(WIRE_CATEGORIES).filter(c => WIRE_CATEGORIES[c].src === 'utility').forEach(c => {
+    const lid = 'wire_' + c;
+    if (!S.mapLayers[lid]) S.mapLayers[lid] = L.layerGroup().addTo(S.map);
+    else if (!sameArea) S.mapLayers[lid].clearLayers();
+  });
+  S.utilityWireCounts = {};
+  S.utilityWireInfo = {};
   if (sources.length === 0) return; // out of coverage — not an error, OSM is the wire source here
 
   trackFetchStart('Utility Circuits');
-  const cLat = (sw.lat + ne.lat) / 2, cLng = (sw.lng + ne.lng) / 2;
-  const k = typeof areaKey === 'function' ? areaKey(cLat, cLng) : `${cLat.toFixed(3)}_${cLng.toFixed(3)}`;
-  let anyLive = false, anyFailed = false, anyCached = false, lastErr = null, oldestCache = null;
-  const noteCache = t => { anyCached = true; if (t != null && (oldestCache == null || t < oldestCache)) oldestCache = t; };
-
-  await Promise.all(sources.map(async cfg => {
-    try {
-      // HTTP status, ArcGIS error-in-200 bodies and a missing features list
-      // all fail here (same lesson as parcels) — never "no circuits".
-      const { json: gj, sw: swHit } = await _readArcgisGeoJson(await fetch(utilityWireQueryUrl(cfg, bbox)), cfg.label);
-      if (!_requestCurrent(tok)) return; // a newer area owns the utility layers
-      const recs = normalizeUtilityWires(gj.features, cfg, Date.now(), bbox);
-      const truncated = !!(gj.properties && gj.properties.exceededTransferLimit) || !!gj.exceededTransferLimit;
+  try {
+    let anyLive = false, anyFailed = false, anyCached = false, lastErr = null, oldestCache = null;
+    const truncatedSrc = [];
+    const noteCache = t => { anyCached = true; if (t != null && (oldestCache == null || t < oldestCache)) oldestCache = t; };
+    // One source per category: (re)draw it from fresh records.
+    const draw = (cfg, recs) => {
+      const layer = S.mapLayers['wire_' + cfg.category];
+      if (sameArea && layer) layer.clearLayers();
       _renderUtilityWires(recs);
       S.utilityWireCounts[cfg.category] = (S.utilityWireCounts[cfg.category] || 0) + recs.length;
-      S.utilityWireInfo[cfg.id] = swHit
-        ? { label: cfg.label, count: recs.length, truncated, fromCache: true, cachedAt: swHit.cachedAt }
-        : { label: cfg.label, count: recs.length, truncated };
-      // A SW offline copy is labeled cached and not re-saved with a fresh time.
-      if (swHit) noteCache(swHit.cachedAt);
-      else {
-        anyLive = true;
-        if (typeof cacheApiResponse === 'function') cacheApiResponse('utility_wires', `${k}:${cfg.id}`, { recs, truncated });
-      }
-    } catch (err) {
-      if (!_requestCurrent(tok)) return;
-      console.warn(`Utility circuits (${cfg.label}) fetch failed:`, err);
-      lastErr = err;
-      let served = false;
-      if (typeof getCachedApiResponse === 'function') {
-        try {
-          const cached = await getCachedApiResponse('utility_wires', `${k}:${cfg.id}`);
-          if (!_requestCurrent(tok)) return;
-          if (cached && cached.data && Array.isArray(cached.data.recs)) {
-            _renderUtilityWires(cached.data.recs);
-            S.utilityWireCounts[cfg.category] = (S.utilityWireCounts[cfg.category] || 0) + cached.data.recs.length;
-            S.utilityWireInfo[cfg.id] = {
-              label: cfg.label, count: cached.data.recs.length, truncated: !!cached.data.truncated,
-              fromCache: true, cachedAt: cached.timestamp,
-            };
-            noteCache(cached.timestamp);
-            served = true;
-          }
-        } catch (cacheErr) { console.warn('Utility circuits cache fallback failed:', cacheErr); }
-      }
-      if (!served) { anyFailed = true; S.utilityWireInfo[cfg.id] = { label: cfg.label, failed: true }; }
-    }
-  }));
-  if (!_requestCurrent(tok)) { trackFetchEnd('Utility Circuits'); return; }
+    };
 
-  updateWireDisplay(S.wireHazardCounts, S.towerCount);
-  buildLayerControl();
-  if (anyFailed) {
-    recordDataSourceError('Utility Circuits', lastErr || new Error('fetch failed'));
-    markSection('obstacles', { source: 'utility', status: 'error', error: lastErr && lastErr.message ? lastErr.message : 'fetch failed' });
-  } else {
-    clearDataSourceError('Utility Circuits');
-    // Any circuit layer served from a cache makes the whole line "cached"
-    // (oldest time) — a live answer for one source must not relabel the other.
-    if (anyCached) markSection('obstacles', { source: 'utility', status: 'cached', cachedAt: oldestCache, updatedAt: null, error: null });
-    else if (anyLive) markSection('obstacles', { source: 'utility', status: 'live', updatedAt: Date.now(), error: null });
+    await Promise.all(sources.map(async cfg => {
+      try {
+        const url = utilityWireQueryUrl(cfg, bbox);
+        const init = { signal: tok.signal };
+        // HTTP status, ArcGIS error-in-200 bodies and a missing features list
+        // all fail here (same lesson as parcels) — never "no circuits".
+        const first = await _readArcgisGeoJson(await _fetchTimed(url, GEOJSON_FETCH_TIMEOUT_MS, init), cfg.label);
+        // A capped answer is paged to completion; one that cannot be completed
+        // is drawn but labeled INCOMPLETE and never cached as an inventory.
+        const gj = await _completeArcgisGeoJson(url, first.json, cfg.label, init, !!first.sw);
+        const swHit = _mergeSwStamps(first.sw, gj._pageSw);
+        if (!_requestCurrent(tok)) return; // a newer area owns the utility layers
+        const recs = normalizeUtilityWires(gj.features, cfg, Date.now(), bbox);
+        const truncated = !!gj._truncated;
+        if (truncated) truncatedSrc.push(cfg.label + ' (' + (gj._truncatedError || 'result truncated') + ')');
+        draw(cfg, recs);
+        S.utilityWireInfo[cfg.id] = swHit
+          ? { label: cfg.label, count: recs.length, truncated, fromCache: true, cachedAt: swHit.cachedAt }
+          : { label: cfg.label, count: recs.length, truncated };
+        // A SW offline copy is labeled cached and not re-saved with a fresh time.
+        if (swHit) noteCache(swHit.cachedAt);
+        else {
+          anyLive = true;
+          if (!truncated && typeof cacheApiResponse === 'function') cacheApiResponse('utility_wires', `${k}:${cfg.id}`, { recs, truncated });
+        }
+      } catch (err) {
+        if (!_requestCurrent(tok)) return;
+        console.warn(`Utility circuits (${cfg.label}) fetch failed:`, err);
+        lastErr = err;
+        let served = false;
+        if (typeof getCachedApiResponse === 'function') {
+          try {
+            const cached = await getCachedApiResponse('utility_wires', `${k}:${cfg.id}`);
+            if (!_requestCurrent(tok)) return;
+            if (cached && cached.data && Array.isArray(cached.data.recs)) {
+              draw(cfg, cached.data.recs);
+              S.utilityWireInfo[cfg.id] = {
+                label: cfg.label, count: cached.data.recs.length, truncated: !!cached.data.truncated,
+                fromCache: true, cachedAt: cached.timestamp,
+              };
+              if (cached.data.truncated) truncatedSrc.push(cfg.label + ' (cached copy was truncated)');
+              noteCache(cached.timestamp);
+              served = true;
+            }
+          } catch (cacheErr) { console.warn('Utility circuits cache fallback failed:', cacheErr); }
+        }
+        if (!served) {
+          anyFailed = true;
+          if (sameArea && prevInfo[cfg.id] && (!prevInfo[cfg.id].failed || prevInfo[cfg.id].stale)) {
+            // Keep this area's earlier lines on the map; the count stays with them.
+            S.utilityWireCounts[cfg.category] = (S.utilityWireCounts[cfg.category] || 0) + (prevCounts[cfg.category] || 0);
+            S.utilityWireInfo[cfg.id] = Object.assign({}, prevInfo[cfg.id], { failed: true, stale: true });
+          } else {
+            const layer = S.mapLayers['wire_' + cfg.category];
+            if (layer) layer.clearLayers();
+            S.utilityWireInfo[cfg.id] = { label: cfg.label, failed: true };
+          }
+        }
+      }
+    }));
+    if (!_requestCurrent(tok)) return;
+    _setDataArea('utilityWires', k);
+
+    updateWireDisplay(S.wireHazardCounts, S.towerCount);
+    buildLayerControl();
+    if (anyFailed) {
+      recordDataSourceError('Utility Circuits', lastErr || new Error('fetch failed'));
+      markSection('obstacles', { source: 'utility', status: 'error', error: lastErr && lastErr.message ? lastErr.message : 'fetch failed' });
+    } else if (truncatedSrc.length) {
+      // Drawn, but not every circuit: incomplete, never LIVE.
+      const msg = 'Utility circuits incomplete — ' + truncatedSrc.join(', ');
+      recordDataSourceError('Utility Circuits', new Error(msg));
+      markSection('obstacles', { source: 'utility', status: 'error', partial: true, error: msg,
+        updatedAt: anyCached ? null : Date.now(), cachedAt: anyCached ? oldestCache : null });
+    } else {
+      clearDataSourceError('Utility Circuits');
+      // Any circuit layer served from a cache makes the whole line "cached"
+      // (oldest time) — a live answer for one source must not relabel the other.
+      if (anyCached) markSection('obstacles', { source: 'utility', status: 'cached', cachedAt: oldestCache, updatedAt: null, error: null });
+      else if (anyLive) markSection('obstacles', { source: 'utility', status: 'live', updatedAt: Date.now(), error: null });
+    }
+  } finally {
+    trackFetchEnd('Utility Circuits');
   }
-  trackFetchEnd('Utility Circuits');
 }
 
 // Draw normalized utility wire records into their category layers.
@@ -7420,15 +7803,17 @@ function _renderUtilityWires(recs) {
 function _utilityWirePopup(rec, info) {
   const OHUG = { OH: 'Overhead', UG: 'Underground', UW: 'Underwater' };
   const parts = [`<b style="color:${info.color}">${info.label}</b>`];
+  // Field values come from the utilities' GIS — escaped; caveat/attribution
+  // are the app's own registry strings.
   const name = rec.lineName || rec.name;
-  if (name) parts.push(name);
+  if (name) parts.push(_esc(name));
   if (rec.voltageKv != null) {
-    parts.push(`${rec.voltageKv} kV` + (rec.ohUg ? ` · ${OHUG[rec.ohUg] || rec.ohUg}` : ''));
+    parts.push(`${_esc(rec.voltageKv)} kV` + (rec.ohUg ? ` · ${_esc(OHUG[rec.ohUg] || rec.ohUg)}` : ''));
   }
-  if (rec.substation) parts.push(`Substation: ${rec.substation}`);
-  if (rec.owner) parts.push(`Owner: ${rec.owner}`);
-  if (rec.circuit) parts.push(`Circuit: ${rec.circuit}`);
-  if (rec.status && rec.status !== 'Operational') parts.push(`Status: ${rec.status}`);
+  if (rec.substation) parts.push(`Substation: ${_esc(rec.substation)}`);
+  if (rec.owner) parts.push(`Owner: ${_esc(rec.owner)}`);
+  if (rec.circuit) parts.push(`Circuit: ${_esc(rec.circuit)}`);
+  if (rec.status && rec.status !== 'Operational') parts.push(`Status: ${_esc(rec.status)}`);
   if (rec.caveat) parts.push(`<span style="font-size:10px;opacity:0.6">⚠ ${rec.caveat}</span>`);
   if (rec.attribution) parts.push(`<span style="font-size:10px;opacity:0.6">${rec.attribution}</span>`);
   return parts.join('<br>');
@@ -7463,28 +7848,35 @@ function _buildings3dMode() {
 }
 
 async function fetchBuildings(bounds) {
-  if (S._buildingsFetching) return;
   const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
   const bb = clampBBoxSpan(sw.lat, sw.lng, ne.lat, ne.lng);
   const bboxKey = `${bb.south.toFixed(3)}_${bb.west.toFixed(3)}_${bb.north.toFixed(3)}_${bb.east.toFixed(3)}`;
+  // Only the SAME bbox already in flight is skipped: a different (new-area)
+  // bbox supersedes it instead of being blocked by it.
+  if (S._buildingsFetching === bboxKey) return;
   if (S.buildings && S.buildings.bboxKey === bboxKey) return;
-  S._buildingsFetching = true;
+  // A late answer for another area / an older bbox must not draw its buildings.
+  const tok = _beginRequest('buildings');
+  S._buildingsFetching = bboxKey;
   const bbox = `${bb.south},${bb.west},${bb.north},${bb.east}`;
   // `out body N` caps the way count server-side; `>;` still recurses the
   // member nodes of the returned ways.
   const query = `[out:json][timeout:60];way["building"](${bbox});out body ${_buildingsCap()};>;out skel qt;`;
   try {
-    const data = await _overpassFetch(query);
+    const data = await _overpassFetch(query, { signal: tok.signal });
+    if (!_requestCurrent(tok)) return;
     S.buildings = { list: parseOverpassBuildings(data, _buildingsCap()), bboxKey, fetchedAt: Date.now() };
     renderBuildingsLayer();
     if (typeof cacheApiResponse === 'function') cacheApiResponse('osm_buildings', bboxKey, data);
     buildLayerControl();
     sync3d();
   } catch (err) {
+    if (!_requestCurrent(tok)) return; // superseded / aborted — the newer request owns the layer
     console.warn('Buildings fetch error:', err);
     if (typeof getCachedApiResponse === 'function') {
       try {
         const cached = await getCachedApiResponse('osm_buildings', bboxKey);
+        if (!_requestCurrent(tok)) return;
         if (cached && cached.data) {
           S.buildings = { list: parseOverpassBuildings(cached.data, _buildingsCap()), bboxKey, fetchedAt: cached.timestamp };
           renderBuildingsLayer();
@@ -7494,7 +7886,7 @@ async function fetchBuildings(bounds) {
       } catch (cacheErr) { /* buildings are an enhancement — stay silent */ }
     }
   } finally {
-    S._buildingsFetching = false;
+    if (S._buildingsFetching === bboxKey) S._buildingsFetching = false;
   }
 }
 
@@ -7511,10 +7903,10 @@ function renderBuildingsLayer() {
     const latlngs = b.footprint.map(p => [p[1], p[0]]);
     const hFt = Math.round(b.heightM * 3.28084);
     const parts = [`<b style="color:${BUILDING_3D_COLOR}">Building</b>`];
-    if (b.name) parts.push(b.name);
-    if (b.type) parts.push(b.type.replace(/_/g, ' '));
+    if (b.name) parts.push(_esc(b.name));
+    if (b.type) parts.push(_esc(String(b.type).replace(/_/g, ' ')));
     parts.push(`Height: ${b.est ? '~' : ''}${hFt} ft${b.est ? ' (est.)' : ' (OSM)'}`);
-    parts.push(`<span style="font-size:10px;opacity:0.6">OSM Way ${b.id}</span>`);
+    parts.push(`<span style="font-size:10px;opacity:0.6">OSM Way ${_esc(b.id)}</span>`);
     L.polygon(latlngs, { color: BUILDING_3D_COLOR, weight: 1, opacity: 0.85, fillColor: BUILDING_3D_COLOR, fillOpacity: 0.35 })
       .bindPopup(parts.join('<br>'))
       .addTo(S.mapLayers.buildings);
@@ -7610,6 +8002,9 @@ async function _fetchRainViewerFrames() {
 // (unless opts.force), and keep the radar hidden if the user had hidden it.
 async function fetchRadar(opts) {
   const o = opts || {};
+  // A cleared map or a newer load (new area, source change) must not get this
+  // answer's frames.
+  const tok = _beginRequest('radar');
   trackFetchStart('Radar');
   try {
     const prev = S.radarAnim;
@@ -7628,6 +8023,7 @@ async function fetchRadar(opts) {
       }
     }
     if (!frames) frames = await _fetchRainViewerFrames();
+    if (!_requestCurrent(tok)) return;
     if (frames.length === 0) return;
 
     if (o.background && !o.force && prev && prev.frames && prev.frames.length) {
@@ -7668,6 +8064,7 @@ async function fetchRadar(opts) {
     buildLayerControl();
     if (S.is3D && typeof sync3d === 'function') sync3d();
   } catch (err) {
+    if (!_requestCurrent(tok)) return;
     console.error('Radar fetch error:', err);
     recordDataSourceError('Radar', err);
   } finally {
@@ -8140,7 +8537,9 @@ async function fetch3DEPPointElevations(points) {
     f: 'json',
   }).toString();
   const doFetch = async () => {
-    const res = await fetch(url, {
+    // Time-limited: a hung socket here used to wedge S._adsbHiresFetching
+    // forever, so no low+close aircraft was ever refined again.
+    const res = await _fetchTimed(url, ELEV_TIMEOUT_MS, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body,
@@ -8207,6 +8606,20 @@ function _onAdsbTrafficChanged() {
   if (S.currentArea) computeAssessment();
 }
 
+// Settle `p` within ADSB_FETCH_TIMEOUT_MS or reject ("no answer within N s"),
+// calling `onTimeout` (aborts the request) — the limit does not rely on the
+// request honoring its signal.
+const ADSB_FETCH_TIMEOUT_MS = 10000;
+function _adsbTimed(p, onTimeout) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      try { if (onTimeout) onTimeout(); } catch (_) {}
+      reject(new Error('no answer within ' + Math.round(ADSB_FETCH_TIMEOUT_MS / 1000) + ' s'));
+    }, ADSB_FETCH_TIMEOUT_MS);
+    Promise.resolve(p).then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
+  });
+}
+
 async function fetchAdsb() {
   if (!S.areaCenter || !S.adsbSearchRadiusNm) return;
   // A poll that started before the area changed must not land on the new one.
@@ -8222,15 +8635,24 @@ async function fetchAdsb() {
     let lastErr = null;
     let usedApi = null;
     for (const a of _adsbAttemptUrls(lat, lon, dist)) {
+      // Per-source time limit: the poll chain is sequential, so one hung socket
+      // used to stall traffic updates indefinitely.
+      const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+      const stop = () => { if (ctl) ctl.abort(); };
+      if (ctl && tok.signal) { if (tok.signal.aborted) stop(); else tok.signal.addEventListener('abort', stop, { once: true }); }
       try {
-        const res = await _proxyFetch(a.url, { signal: tok.signal });
+        const res = await _adsbTimed(_proxyFetch(a.url, { signal: ctl ? ctl.signal : tok.signal }), stop);
         if (!res.ok) {
           // The proxy's 502 names each upstream's failure; keep it in the reason.
           let why = '';
           if (a.proxy) { try { why = adsbProxyFailureSummary(await res.json()); } catch (_) {} }
           throw new Error(`HTTP ${res.status}` + (why ? ` (${why})` : ''));
         }
-        json = await res.json();
+        const body = await _adsbTimed(res.json(), stop);
+        // A 200 without an aircraft LIST (e.g. { msg: "Rate limited" }) is a
+        // failure, never "0 aircraft · LIVE".
+        if (!body || !(Array.isArray(body.ac) || Array.isArray(body.aircraft))) throw new Error('response has no aircraft list');
+        json = body;
         if (!_requestCurrent(tok)) return;
         if (a.idx != null) S._adsbApiIndex = a.idx;
         usedApi = a.proxy ? ('proxy (' + (res.headers && res.headers.get && res.headers.get('X-Adsb-Source') || '?') + ')') : a.name;
@@ -8239,6 +8661,8 @@ async function fetchAdsb() {
         if (!_requestCurrent(tok)) return; // superseded or stopped: try no further source
         lastErr = e;
         fails.push(`${a.name}: ${e.message}`);
+      } finally {
+        if (tok.signal && tok.signal.removeEventListener) tok.signal.removeEventListener('abort', stop);
       }
     }
     if (!json) throw lastErr || new Error('All ADS-B APIs failed');
@@ -8276,6 +8700,11 @@ async function fetchAdsb() {
     setStatus('adsbStatus', 'error', 'UNAVAILABLE — RETRY ' + delayS + 's');
     const pollEl = document.getElementById('adsbPollStatus');
     if (pollEl) pollEl.textContent = 'Unavailable — retrying every ' + delayS + 's';
+    // An empty list must not keep reading "No aircraft detected" while the
+    // feed is down (SECTION_CELLS only covers the summary cells).
+    if (!(S.adsbAircraft && S.adsbAircraft.length)) {
+      _setAdsbListsMsg('<span style="color:var(--accent-red);">ADS-B feed unavailable — traffic UNKNOWN, not clear</span>');
+    }
     refreshAdsbPanel(); // keep an open aircraft card's data-age ticking through the outage
   } finally {
     trackFetchEnd('ADS-B');
@@ -8332,6 +8761,15 @@ function renderAdsbMap() {
     needsLayerControlRebuild = true;
   } else {
     S.mapLayers.adsb_trails.clearLayers();
+  }
+  // PLANS mode owns traffic until the user re-checks it. _applyPlansMode skips
+  // EMPTY groups, so a first empty poll left them attached and later polls
+  // drew aircraft straight onto the decluttered map — detach them here.
+  for (const id of ['adsb_aircraft', 'adsb_trails']) {
+    if (_plansSuppressed(id) && S.map.hasLayer(S.mapLayers[id])) {
+      S.map.removeLayer(S.mapLayers[id]);
+      needsLayerControlRebuild = true;
+    }
   }
 
   const activeHexes = new Set(S.adsbAircraft.map(ac => ac.hex));
@@ -8390,30 +8828,32 @@ function renderAdsbMap() {
 
 // Shared 2D-marker / 3D-cylinder popup for one ADS-B aircraft.
 function _adsbPopupHtml(ac) {
-  const callsign = ac.flight || ac.hex.toUpperCase();
-  const altMsl = ac.alt_baro != null ? ac.alt_baro.toLocaleString() + ' ft MSL' : 'N/A';
+  const callsign = _esc(ac.flight || String(ac.hex).toUpperCase());
+  // Barometric altitude, else the geometric (GNSS) one the AGL was derived from.
+  const altMsl = ac.alt_baro != null ? ac.alt_baro.toLocaleString() + ' ft MSL'
+    : ac.alt_geom != null ? ac.alt_geom.toLocaleString() + ' ft MSL (geometric)' : 'N/A';
   const altAgl = ac.agl.toLocaleString() + ' ft AGL';
   const hiRes = !!(S._adsbHiresCache && S._adsbHiresCache.has(_adsbHiresKey(ac.lat, ac.lon)));
   const terrainBelow = (ac.groundElevFt != null && isFinite(ac.groundElevFt))
     ? `<span style="opacity:0.6;">Terrain below: ${ac.groundElevFt.toLocaleString()} ft MSL${hiRes ? ' (3DEP point)' : ''}</span><br>` : '';
   const speed = ac.gs != null ? Math.round(ac.gs) + ' kts' : 'N/A';
   const track = ac.track != null ? Math.round(ac.track) + '\u00B0' : 'N/A';
-  const vrate = ac.baro_rate != null ? (ac.baro_rate > 0 ? '+' : '') + ac.baro_rate + ' ft/min' : 'N/A';
-  const sqk = ac.squawk || 'N/A';
+  const vrate = ac.baro_rate != null ? (ac.baro_rate > 0 ? '+' : '') + _esc(ac.baro_rate) + ' ft/min' : 'N/A';
+  const sqk = _esc(ac.squawk || 'N/A');
   const isEmergency = ac.squawk === '7500' || ac.squawk === '7600' || ac.squawk === '7700' || (ac.emergency && ac.emergency !== 'none');
   const sqkStyle = isEmergency ? 'color:#ef4444;font-weight:bold;' : '';
   return `<div style="font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;">` +
     `<b style="color:#06b6d4;font-size:13px;">${callsign}</b><br>` +
-    (ac.reg ? `Reg: ${ac.reg}<br>` : '') +
-    (ac.type ? `Type: ${ac.type}<br>` : '') +
+    (ac.reg ? `Reg: ${_esc(ac.reg)}<br>` : '') +
+    (ac.type ? `Type: ${_esc(ac.type)}<br>` : '') +
     `Alt: ${altMsl} / ${altAgl}<br>` +
     terrainBelow +
     `GS: ${speed} | Trk: ${track}<br>` +
     `VS: ${vrate}<br>` +
     `<span style="${sqkStyle}">Squawk: ${sqk}</span>` +
     (isEmergency ? ' <b style="color:#ef4444;">EMERGENCY</b>' : '') + `<br>` +
-    `Dist: ${ac.distNm} nm<br>` +
-    `<span style="opacity:0.5;">ICAO: ${ac.hex.toUpperCase()}</span>` +
+    `Dist: ${_esc(ac.distNm)} nm<br>` +
+    `<span style="opacity:0.5;">ICAO: ${_esc(String(ac.hex).toUpperCase())}</span>` +
   `</div>`;
 }
 
@@ -8520,7 +8960,8 @@ function renderAdsbTab(usedApi) {
     const label = nearest.flight || nearest.hex.toUpperCase();
     setText('adsbNearest', label + ' (' + nearest.distNm + ' nm)');
     setText('adsbNearestAlt', nearest.agl + ' ft AGL');
-    setColor('adsbNearestAlt', nearest.agl < 500 ? 'red' : nearest.agl < 1500 ? 'amber' : 'green');
+    // agl 0 = on the ground (as on the map and in the low-altitude count), not a red low flyer.
+    setColor('adsbNearestAlt', nearest.agl <= 0 ? null : nearest.agl < 500 ? 'red' : nearest.agl < 1500 ? 'amber' : 'green');
   } else {
     setText('adsbNearest', 'None');
     setText('adsbNearestAlt', '--');
@@ -8542,9 +8983,10 @@ function renderAdsbTab(usedApi) {
       emergencyEl.innerHTML = '<span style="color:var(--text-muted);">No emergency squawks detected</span>';
     } else {
       emergencyEl.innerHTML = emergencies.map(ac => {
-        const label = ac.flight || ac.hex.toUpperCase();
-        const sqkLabel = ac.squawk === '7500' ? '7500 HIJACK' : ac.squawk === '7600' ? '7600 COMMS' : ac.squawk === '7700' ? '7700 EMERG' : ac.emergency.toUpperCase();
-        return `<div class="adsb-emergency-card"><b style="color:var(--accent-red);">${sqkLabel}</b> &mdash; ${label} @ ${ac.agl} ft AGL, ${ac.distNm} nm</div>`;
+        // Feed text (callsign, emergency code) is escaped — it is rebuilt every poll.
+        const label = _esc(ac.flight || String(ac.hex).toUpperCase());
+        const sqkLabel = ac.squawk === '7500' ? '7500 HIJACK' : ac.squawk === '7600' ? '7600 COMMS' : ac.squawk === '7700' ? '7700 EMERG' : _esc(String(ac.emergency).toUpperCase());
+        return `<div class="adsb-emergency-card"><b style="color:var(--accent-red);">${sqkLabel}</b> &mdash; ${label} @ ${_esc(ac.agl)} ft AGL, ${_esc(ac.distNm)} nm</div>`;
       }).join('');
     }
   }
@@ -8559,23 +9001,32 @@ function renderAdsbTab(usedApi) {
         '<th>Callsign</th><th>Alt AGL</th><th>Dist</th><th>GS</th><th>Squawk</th>' +
         '</tr></thead><tbody>';
       for (const ac of aircraft) {
-        const label = ac.flight || ac.hex.toUpperCase();
+        const label = _esc(ac.flight || String(ac.hex).toUpperCase());
         const color = adsbAglColor(ac.agl);
-        const aglStr = formatAltitudeAgl(ac.agl);
-        const gs = ac.gs != null ? Math.round(ac.gs) + 'kt' : '--';
-        const sqk = ac.squawk || '--';
+        const aglStr = _esc(formatAltitudeAgl(ac.agl));
+        const gs = ac.gs != null ? _esc(Math.round(ac.gs)) + 'kt' : '--';
+        const sqk = _esc(ac.squawk || '--');
         const isEmergency = ac.squawk === '7500' || ac.squawk === '7600' || ac.squawk === '7700';
         const sqkStyle = isEmergency ? 'color:#ef4444;font-weight:bold;' : '';
-        html += `<tr class="adsb-row" onclick="focusAdsbAircraft('${ac.hex}')">` +
+        // hex goes in a data attribute (escaped) + one delegated listener — an
+        // inline onclick="…('${hex}')" let a crafted hex run script.
+        html += `<tr class="adsb-row" data-hex="${_esc(ac.hex)}">` +
           `<td style="color:var(--accent-cyan);">${label}</td>` +
           `<td style="color:${color};font-weight:600;">${aglStr}</td>` +
-          `<td>${ac.distNm} nm</td>` +
+          `<td>${_esc(ac.distNm)} nm</td>` +
           `<td>${gs}</td>` +
           `<td style="${sqkStyle}">${sqk}</td>` +
           `</tr>`;
       }
       html += '</tbody></table>';
       listEl.innerHTML = html;
+      if (!listEl._adsbRowClick) {
+        listEl._adsbRowClick = true;
+        listEl.addEventListener('click', e => {
+          const row = e.target && e.target.closest ? e.target.closest('tr[data-hex]') : null;
+          if (row && listEl.contains(row)) focusAdsbAircraft(row.getAttribute('data-hex'));
+        });
+      }
     }
   }
 }
@@ -8631,7 +9082,8 @@ function stopAdsbPolling() {
   S._adsbHiresCache = null;
   if (S.mapLayers.adsb_aircraft) S.mapLayers.adsb_aircraft.clearLayers();
   if (S.mapLayers.adsb_trails) S.mapLayers.adsb_trails.clearLayers();
-  if (S._adsbEnabled) renderAdsbTab();
+  // No poll has answered yet: neutral "waiting", never an all-clear list.
+  if (S._adsbEnabled) _renderAdsbWaiting();
   else _renderAdsbDisabled();
   const statusEl = document.getElementById('adsbPollStatus');
   if (statusEl) statusEl.textContent = S._adsbEnabled ? 'Idle' : 'Disabled';
@@ -8653,6 +9105,21 @@ function _renderAdsbDisabled() {
   if (emergencyEl) emergencyEl.innerHTML = msg;
   const listEl = document.getElementById('adsbAircraftList');
   if (listEl) listEl.innerHTML = msg;
+}
+
+// Both traffic lists at once (emergency squawks + aircraft table).
+function _setAdsbListsMsg(html) {
+  ['adsbEmergencyList', 'adsbAircraftList'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = html;
+  });
+}
+
+// Polling (re)starting with no answer yet: neutral, not "No aircraft detected".
+function _renderAdsbWaiting() {
+  ['adsbCount', 'adsbNearest', 'adsbNearestAlt', 'adsbLowCount'].forEach(id => { setText(id, '--'); setColor(id, null); });
+  setText('adsbRadius', S.adsbSearchRadiusNm ? S.adsbSearchRadiusNm + ' nm' : '-- nm');
+  _setAdsbListsMsg('<span style="color:var(--text-muted);">Waiting for ADS-B data — traffic not yet checked</span>');
 }
 
 function toggleAdsbPolling() {
@@ -8711,9 +9178,12 @@ function initTimeBar() {
       e.preventDefault();
       onMove(e.touches[0].clientX);
       const tm = ev => onMove(ev.touches[0].clientX);
-      const te = () => { document.removeEventListener('touchmove', tm); document.removeEventListener('touchend', te); };
+      // touchcancel too (OS gesture, incoming call): otherwise the move handler
+      // stays attached and every later page touch scrubs the time bar.
+      const te = () => { document.removeEventListener('touchmove', tm); document.removeEventListener('touchend', te); document.removeEventListener('touchcancel', te); };
       document.addEventListener('touchmove', tm);
       document.addEventListener('touchend', te);
+      document.addEventListener('touchcancel', te);
     });
   }
 
@@ -8729,7 +9199,7 @@ function _updateTimeBar(frac) {
   S.timeIdx = idx;
 
   // Update scrubber position
-  const pct = (idx / (n - 1)) * 100;
+  const pct = n > 1 ? (idx / (n - 1)) * 100 : 0; // a 1-hour forecast would be 0/0 = NaN%
   const fill = document.getElementById('tbFill');
   const thumb = document.getElementById('tbThumb');
   if (fill) fill.style.width = pct + '%';
@@ -8773,10 +9243,13 @@ function _updateWindArrow(dir, speed) {
   }
 
   const len = Math.min(30, 14 + speed * 0.6); // arrow length scales with speed
+  // `dir` is the meteorological FROM bearing; the north-pointing glyph is
+  // rotated to point DOWNWIND (drift direction), matching windArrowsKml.
+  const toward = (Number(dir) + 180) % 360;
   const svgHtml = `<svg width="60" height="60" viewBox="0 0 60 60" style="overflow:visible;filter:drop-shadow(0 0 1px #000) drop-shadow(0 0 1px #000);">
     <defs><marker id="wah" markerWidth="6" markerHeight="5" refX="3" refY="2.5" orient="auto"><polygon points="0 0,6 2.5,0 5" fill="#3d8bfd"/></marker></defs>
     <line x1="30" y1="30" x2="30" y2="${30 - len}" stroke="#3d8bfd" stroke-width="2.5" marker-end="url(#wah)"
-          transform="rotate(${dir}, 30, 30)"/>
+          transform="rotate(${toward}, 30, 30)"/>
     <circle cx="30" cy="30" r="3" fill="#3d8bfd" opacity="0.6"/>
   </svg>`;
 
@@ -9021,8 +9494,17 @@ function computeOpsData(snap) {
   // Multi-factor bird strike risk assessment (follows the selected timeline hour
   // when one is set; falls back to the real clock for no-arg/test callers).
   const when = snap._time ? new Date(snap._time) : new Date();
-  const month = when.getMonth();
-  const hour = when.getHours();
+  // Month/hour at the MISSION location (S.wx.missionTz), not the device's zone;
+  // device-local only when the zone is unknown.
+  let month = when.getMonth(), hour = when.getHours();
+  const birdTz = S.wx && S.wx.missionTz;
+  if (birdTz) {
+    try {
+      const p = new Intl.DateTimeFormat('en-US', { timeZone: birdTz, month: 'numeric', hour: 'numeric', hourCycle: 'h23' }).formatToParts(when);
+      const g = t => Number((p.find(x => x.type === t) || {}).value);
+      if (Number.isFinite(g('month')) && Number.isFinite(g('hour'))) { month = g('month') - 1; hour = g('hour') % 24; }
+    } catch (_) { /* unknown zone: device-local */ }
+  }
   let birdScore = 0;
   const factors = [];
 
@@ -9056,16 +9538,24 @@ function computeOpsData(snap) {
 
   // Water proximity factor (0-2 points) — check elevation data for low-lying flat areas
   // Also check if terrain features indicate valleys/water corridors
+  // "No water" is a finding only when its inputs loaded: the terrain AND the
+  // NHD streams/lakes lookup. Missing data stays Unknown (never green), and a
+  // missing elevation is not a number (`null < 1000` used to read as true).
   let waterText = 'Unknown', waterLevel = 'amber';
-  const hasLowTerrain = S.elev && S.elev.min != null && S.elev.min < 500;
-  const hasWetlandTerrain = S.elev && S.elev.range != null && S.elev.range < 100 && S.elev.center < 1000;
-  const nearWater = S.protectedAreas && S.protectedAreas.dams && S.protectedAreas.dams.length > 0;
+  const ev = S.elev || {};
+  const terrainKnown = Number.isFinite(ev.min) && Number.isFinite(ev.range) && Number.isFinite(ev.center);
+  const hasLowTerrain = Number.isFinite(ev.min) && ev.min < 500;
+  const hasWetlandTerrain = Number.isFinite(ev.range) && Number.isFinite(ev.center) && ev.range < 100 && ev.center < 1000;
+  const nhdCount = (S.mapLayers && S.mapLayers.nhd_water && S.mapLayers.nhd_water.getLayers) ? S.mapLayers.nhd_water.getLayers().length : 0;
+  const waterMeta = S.sectionMeta && S.sectionMeta.water;
+  const waterChecked = !!(waterMeta && (waterMeta.status === 'live' || waterMeta.status === 'cached'));
+  const nearWater = (S.protectedAreas && S.protectedAreas.dams && S.protectedAreas.dams.length > 0) || nhdCount > 0;
   if (nearWater || hasWetlandTerrain) {
     birdScore += 2; waterText = 'Water/wetland nearby — waterfowl likely'; waterLevel = 'red';
     factors.push('Near water');
   } else if (hasLowTerrain) {
     birdScore += 1; waterText = 'Low terrain — possible watercourses'; waterLevel = 'amber';
-  } else {
+  } else if (terrainKnown && waterChecked) {
     birdScore += 0; waterText = 'No water features detected'; waterLevel = 'green';
   }
   setText('opsBirdWater', waterText);
@@ -9173,6 +9663,8 @@ function computeAssessment(snap) {
     const cc = assessCloudClearance(S.metar.ceilingFt, S.metar.visSm, thresholds.maxAltAGL, thresholds);
     cc.issues.forEach(s => addLimit(`${s} (${S.metar.station})`));
     cc.cautions.forEach(s => addAdvisory(`${s} (${S.metar.station})`));
+    const missing = [S.metar.ceilingUnknown && 'sky condition/ceiling', S.metar.visSm == null && 'visibility'].filter(Boolean);
+    if (missing.length) addAdvisory(`Observed ${missing.join(' and ')} not reported by ${S.metar.station} — check current METAR before flight`);
   }
   // A failed / empty METAR check is not "no ceiling or visibility limit".
   // Nor is an observation that is not CURRENT (fetched old, or aged since).
@@ -9208,12 +9700,12 @@ function computeAssessment(snap) {
     const c = S.areaCenter;
     const danger = S.avalanche.find(f => {
       const p = f.properties || {};
-      if (!((p.danger_level != null && p.danger_level >= 3) || p.warning)) return false;
+      if (!((p.danger_level != null && p.danger_level >= 3) || avalancheWarningActive(p))) return false;
       return geoJsonOuterRings(f.geometry).some(r => pointInPolygon(c.lat, c.lng, r));
     });
     if (danger) {
       const p = danger.properties || {};
-      addAdvisory(p.warning ? 'Avalanche warning in effect for area' : `Avalanche danger level ${p.danger_level} — ground-team hazard`);
+      addAdvisory(avalancheWarningActive(p) ? 'Avalanche warning in effect for area' : `Avalanche danger level ${p.danger_level} — ground-team hazard`);
     }
   }
 
@@ -9295,7 +9787,7 @@ function computeAssessment(snap) {
     }
     // NO-GO: active TFR
     if (S.faaAirspace.tfrs && S.faaAirspace.tfrs.features && S.faaAirspace.tfrs.features.length > 0) {
-      addLimit('Active TFR: ' + S.faaAirspace.tfrs.features.map(f => f.properties.NAME || 'TFR').join(', '));
+      addLimit('Active TFR: ' + S.faaAirspace.tfrs.features.map(f => (f.properties || {}).NAME || 'TFR').join(', '));
     }
     // NO-GO: prohibited airspace — from the SUA P-types AND the dedicated
     // Prohibited_Areas layer, so a failed SUA lookup cannot hide a P-area the
@@ -9308,13 +9800,14 @@ function computeAssessment(snap) {
     }
     // NO-GO: national security UAS restrictions
     if (S.faaAirspace.nsRestrictions && S.faaAirspace.nsRestrictions.features && S.faaAirspace.nsRestrictions.features.length > 0) {
-      addLimit('NS UAS restriction: ' + S.faaAirspace.nsRestrictions.features.map(f => f.properties.NAME || 'NS area').join(', '));
+      addLimit('NS UAS restriction: ' + S.faaAirspace.nsRestrictions.features.map(f => nsRestrictionName(f, 'NS area')).join(', '));
     }
-    // CAUTION: Class B/C/D without LAANC
+    // CAUTION: Class B/C/D (or a Class E surface area) without LAANC
     if (S.faaAirspace.classAirspace && S.faaAirspace.classAirspace.features) {
       const controlled = S.faaAirspace.classAirspace.features.filter(f => {
-        const cls = (f.properties.CLASS || '').charAt(0);
-        return cls === 'B' || cls === 'C' || cls === 'D';
+        const p = f.properties || {};
+        const cls = (p.CLASS || '').charAt(0);
+        return cls === 'B' || cls === 'C' || cls === 'D' || (cls === 'E' && isClassESurfaceArea(p));
       });
       if (controlled.length > 0) {
         const hasLaanc = S.faaAirspace.laanc && S.faaAirspace.laanc.features && S.faaAirspace.laanc.features.length > 0;
@@ -9323,7 +9816,7 @@ function computeAssessment(snap) {
     }
     // CAUTION: MOA present
     if (S.faaAirspace.sua && S.faaAirspace.sua.features) {
-      const moas = S.faaAirspace.sua.features.filter(f => (f.properties.TYPE_CODE || '').startsWith('M'));
+      const moas = S.faaAirspace.sua.features.filter(f => ((f.properties || {}).TYPE_CODE || '').startsWith('M'));
       if (moas.length > 0) addAdvisory('MOA active — check with ATC');
     }
   }
@@ -9428,18 +9921,19 @@ function computeAssessment(snap) {
     }
   }
 
-  // No verdict word: the banner names what was found and lists every item
-  // (limits first, then advisories); the decision stays with the RPIC.
-  const display = assessmentDisplay(result);
-
-  // Append staleness warning if data is older than 30 minutes
+  // Staleness: data older than 30 minutes is a real advisory (counted in the
+  // badge, listed in S.assessment.advisories), not text tacked on afterwards.
   if (typeof _lastDataTimestamp !== 'undefined' && _lastDataTimestamp) {
     const dataAge = Date.now() - _lastDataTimestamp;
     if (dataAge > 30 * 60 * 1000) {
       const ageStr = typeof formatAge === 'function' ? formatAge(dataAge) : Math.round(dataAge / 60000) + 'm';
-      display.text = (display.text ? display.text + ' | ' : '') + 'DATA STALE (' + ageStr + ' old) — refresh recommended';
+      addAdvisory('DATA STALE (' + ageStr + ' old) — refresh recommended');
     }
   }
+
+  // No verdict word: the banner names what was found and lists every item
+  // (limits first, then advisories); the decision stays with the RPIC.
+  const display = assessmentDisplay(result);
 
   S.assessment = { level: result.level, label: display.label, cls: display.cls, limits: display.limits, advisories: display.advisories, text: display.text };
   const badge = document.getElementById('assessBadge');
@@ -9449,6 +9943,7 @@ function computeAssessment(snap) {
   textEl.textContent = display.text;
   textEl.title = display.text; // full listing on hover while collapsed to one line
   renderAssessProfile();
+  if (typeof checkAndNotify === 'function') checkAndNotify(S.assessment); // no-op unless notifications enabled; fires on entry into limits only
 }
 
 // "Limits from Config profile: <name>" under the advisories: which Config →
@@ -9582,32 +10077,63 @@ function _polyRingsGroups(latlngs) {
 // A record is: { kind:'point'|'line'|'polygon', name, description, styleId,
 //   lat,lng | coords:[[lat,lng],...] | rings:[[[lat,lng],...], ...] }.
 
+// Test for "this part's bounding box comes within the area's bounds, padded by
+// the area's own size and at least ~10 km". Null with no area drawn (nothing
+// to clip against: every part is kept).
+function _exportNearAreaTest() {
+  const b = S.areaBounds;
+  if (!b || typeof b.getSouth !== 'function') return null;
+  const padLat = Math.max(b.getNorth() - b.getSouth(), 0.09);
+  const padLng = Math.max(b.getEast() - b.getWest(), 0.12);
+  const s = b.getSouth() - padLat, n = b.getNorth() + padLat, w = b.getWest() - padLng, e = b.getEast() + padLng;
+  return pts => {
+    let ps = 90, pn = -90, pw = 180, pe = -180;
+    for (const p of pts) { if (p[0] < ps) ps = p[0]; if (p[0] > pn) pn = p[0]; if (p[1] < pw) pw = p[1]; if (p[1] > pe) pe = p[1]; }
+    return pts.length > 0 && pn >= s && ps <= n && pe >= w && pw <= e;
+  };
+}
+
 // Convert every popup-bearing feature in a layer group into export records.
 function _exportLayerRecords(key, group) {
   const styleId = _exportStyleForLayer(key);
   const fallback = _aggMeta(key).label || 'Feature';
   const recs = [];
+  // Multi-part features can span far beyond the area: the land-status layer
+  // holds statewide multipolygons (~9,000 parts, ~170k vertices, of which a
+  // few dozen are near the area). Parts of a MULTI-part feature that do not
+  // come within the area's padded bounds are left out of the file; a
+  // single-part feature is always kept (a bbox query already matched it).
+  const near = _exportNearAreaTest();
+  const keepParts = (parts, ptsOf) => (parts.length > 1 && near) ? parts.filter(p => near(ptsOf(p))) : parts;
   eachPopupLayer(group, pl => {
     let html = '';
     try { html = _aggContentToHtml(pl.getPopup().getContent()); } catch (e) { html = ''; }
     const name = _exportPlainText(html).slice(0, 48) || fallback;
     // Descriptions are plain text (no HTML markup) so they read cleanly in CalTopo notes.
     const description = (typeof htmlToPlainText === 'function') ? htmlToPlainText(html) : html;
-    try {
-      if (typeof L !== 'undefined' && L.Polygon && pl instanceof L.Polygon) {
-        _polyRingsGroups(pl.getLatLngs()).forEach(rings => {
-          recs.push({ kind: 'polygon', name, styleId, description, rings });
-        });
-      } else if (typeof L !== 'undefined' && L.Polyline && pl instanceof L.Polyline) {
-        const segs = [];
-        const collect = a => { if (!Array.isArray(a)) return; if (a.length && a[0] && typeof a[0].lat === 'number') segs.push(a); else a.forEach(collect); };
-        collect(pl.getLatLngs());
-        segs.forEach(seg => { recs.push({ kind: 'line', name, styleId, description, coords: seg.map(p => [p.lat, p.lng]) }); });
-      } else if (pl.getLatLng) {
-        const ll = pl.getLatLng();
-        recs.push({ kind: 'point', name, styleId, description, lat: ll.lat, lng: ll.lng });
-      }
-    } catch (e) { /* skip malformed feature */ }
+    // A popup bound on a group (the L.geoJSON wrapper most layers use) covers
+    // every leaf geometry inside it — descend, reusing the group's name/description.
+    const emit = (lyr) => {
+      try {
+        if (typeof L !== 'undefined' && L.Polygon && lyr instanceof L.Polygon) {
+          keepParts(_polyRingsGroups(lyr.getLatLngs()), rings => rings[0] || []).forEach(rings => {
+            recs.push({ kind: 'polygon', name, styleId, description, rings });
+          });
+        } else if (typeof L !== 'undefined' && L.Polyline && lyr instanceof L.Polyline) {
+          const segs = [];
+          const collect = a => { if (!Array.isArray(a)) return; if (a.length && a[0] && typeof a[0].lat === 'number') segs.push(a); else a.forEach(collect); };
+          collect(lyr.getLatLngs());
+          keepParts(segs.map(seg => seg.map(p => [p.lat, p.lng])), c => c)
+            .forEach(coords => { recs.push({ kind: 'line', name, styleId, description, coords }); });
+        } else if (lyr.getLatLng) {
+          const ll = lyr.getLatLng();
+          recs.push({ kind: 'point', name, styleId, description, lat: ll.lat, lng: ll.lng });
+        } else if (lyr.getLayers) {
+          lyr.getLayers().forEach(emit);
+        }
+      } catch (e) { /* skip malformed feature */ }
+    };
+    emit(pl);
   });
   return recs;
 }
@@ -9683,7 +10209,7 @@ function _exportAirportRecords() {
     const description = [
       `${a.icao || ''} — ${a.name || ''}`.trim(),
       typeLabel ? `Type: ${typeLabel}` : '',
-      a.elevation_ft ? `Elevation: ${a.elevation_ft} ft` : '',
+      (a.elevation_ft != null && a.elevation_ft !== '' && isFinite(a.elevation_ft)) ? `Elevation: ${a.elevation_ft} ft` : '',
       a.municipality ? `Municipality: ${a.municipality}` : '',
     ].filter(Boolean).join('\n');
     recs.push({ kind: 'point', name: a.icao || a.name || 'Airport', styleId: isHeli ? 'heliport' : 'airport', description, lat: a.lat, lng: a.lng });
@@ -9859,12 +10385,13 @@ function buildSunWindFolders() {
   const times = hourly && hourly.time;
   if (!c || !times) return folders;
   const lengthM = _exportArrowLengthM();
+  const timeZone = (S.wx && S.wx.missionTz) || undefined; // hour labels in mission-local time
   if (document.getElementById('expSun')?.checked && typeof sunArrowsKml === 'function') {
-    folders += kmlFolder('Sun Position (hourly, daylight only)', sunArrowsKml(c.lat, c.lng, times, c.lat, c.lng, { lengthM }),
+    folders += kmlFolder('Sun Position (hourly, daylight only)', sunArrowsKml(c.lat, c.lng, times, c.lat, c.lng, { lengthM, timeZone }),
       { description: 'Hourly bearing lines pointing toward the sun over the next 24 h (omitted while the sun is below the horizon). Drag the Google Earth time slider to animate.' });
   }
   if (document.getElementById('expWind')?.checked && typeof windArrowsKml === 'function') {
-    folders += kmlFolder('Wind (hourly)', windArrowsKml(times, hourly.wind_direction_10m, hourly.wind_speed_10m, hourly.wind_gusts_10m, c.lat, c.lng, { lengthM }),
+    folders += kmlFolder('Wind (hourly)', windArrowsKml(times, hourly.wind_direction_10m, hourly.wind_speed_10m, hourly.wind_gusts_10m, c.lat, c.lng, { lengthM, timeZone }),
       { description: 'Hourly wind bearing lines for the next 24 h. Line points DOWNWIND (drift direction); label gives the meteorological FROM bearing, speed and gust. Drag the time slider to animate.' });
   }
   return folders;
@@ -9883,7 +10410,9 @@ function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = filename; a.click();
-  URL.revokeObjectURL(url);
+  // Revoking synchronously can cancel the download before the browser has read
+  // the blob (Safari/Firefox) — release it once the download has started.
+  setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) { /* already gone */ } }, 30000);
 }
 
 // RFC-4122 v4 id for CalTopo GeoJSON features (crypto where available).
@@ -10000,7 +10529,13 @@ function exportRasterKmz(layerId, ref) {
 }
 
 function exportAllViewshedKmz() {
-  (S.viewsheds || []).filter(r => r.grid && r.mask).forEach(rec => exportRasterKmz('viewshed', rec.id));
+  const seen = {};
+  (S.viewsheds || []).filter(r => r.grid && r.mask).forEach(rec => {
+    let slug = viewshedFilenameSlug(rec.name);
+    if (seen[slug]) { seen[slug]++; slug = slug + '_' + seen[slug]; } else { seen[slug] = 1; }
+    // Same de-dup as exportAllViewshedGeoTiffs — two "Observer" records must not share a filename.
+    exportRasterKmz('viewshed', Object.assign({}, rec, { name: slug }));
+  });
 }
 
 function openExport() {
@@ -10363,7 +10898,7 @@ function buildLayerControl() {
   const hasAirports = S.mapLayers.airports && S.mapLayers.airports.getLayers().length > 0;
   const hasTowers = S.mapLayers.cell_towers && S.mapLayers.cell_towers.getLayers().length > 0;
   const hasLZs = S.mapLayers.emergency_lz && S.mapLayers.emergency_lz.getLayers().length > 0;
-  if (hasAirports || hasTowers || hasLZs || _layerHasFeatures('hospitals')) {
+  if (hasAirports || hasTowers || hasLZs || _layerHasFeatures('hospitals') || _layerHasFeatures('buildings')) {
     html += _sectionOpen('facilities', 'Facilities');
     if (hasAirports) {
       const airportCount = S.mapLayers.airports.getLayers().length;
@@ -10626,8 +11161,10 @@ function buildLayerControl() {
       const c = S.faaCharts[cid];
       const lid = 'chart_' + cid;
       const on = S.map.hasLayer(c.layer);
-      html += `<div class="layer-item${on ? ' active' : ''}" data-layer="${lid}" onclick="toggleLayer('${lid}',this)">
-        <div class="layer-check"></div><div class="layer-color" style="background:#e879f9"></div><span>${c.chartName}</span>
+      // Chart names come from user file names: escape, and read the id back
+      // from data-layer rather than splicing it into the onclick JS.
+      html += `<div class="layer-item${on ? ' active' : ''}" data-layer="${_esc(lid)}" onclick="toggleLayer(this.dataset.layer,this)">
+        <div class="layer-check"></div><div class="layer-color" style="background:#e879f9"></div><span>${_esc(c.chartName)}</span>
       </div>`;
     }
     html += _sectionClose();
@@ -10645,7 +11182,13 @@ function buildLayerControl() {
   // never be gated on the overlay already being displayed. Observers/viewshed
   // still appear only once they exist.
   const hasCanopy = !!(S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy));
-  const hasViewshed = !!(S.mapLayers.viewshed && S.map.hasLayer(S.mapLayers.viewshed));
+  // Viewshed row: present while a visible observer has a computed mask (NOT
+  // while attached — unchecking it, or the mobile zoom cap detaching it, used
+  // to delete the row and leave no way back); checked = the user's intent.
+  const hasViewshed = !!(S.mapLayers.viewshed
+    && (S.viewsheds || []).some(r => r && r.visible !== false && r.grid && r.mask));
+  const viewshedOn = hasViewshed && !!((S._overlayWanted && S._overlayWanted.viewshed)
+    || S.map.hasLayer(S.mapLayers.viewshed));
   const hasShadow = !!(S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow));
   const hasObservers = !!(S.mapLayers.observers && (S.viewsheds || []).length);
   // Inline slider under a checked raster row; its twin lives in the Terrain tab
@@ -10671,10 +11214,10 @@ function buildLayerControl() {
   </div>`;
   if (hasCanopy) html += _opacityRow('Canopy', 'setCanopyOpacity', _overlayOpacity('canopy', CANOPY_OVERLAY_OPACITY));
   if (hasViewshed) {
-    html += `<div class="layer-item active" data-layer="viewshed" onclick="toggleLayer('viewshed',this)">
+    html += `<div class="layer-item${viewshedOn ? ' active' : ''}" data-layer="viewshed" onclick="toggleLayer('viewshed',this)">
       <div class="layer-check"></div><div class="layer-color" style="background:#22c55e"></div><span>Viewshed</span>
     </div>`;
-    html += _opacityRow('Viewshed', 'setViewshedOpacity', _overlayOpacity('viewshed', VIEWSHED_OVERLAY_OPACITY));
+    if (viewshedOn) html += _opacityRow('Viewshed', 'setViewshedOpacity', _overlayOpacity('viewshed', VIEWSHED_OVERLAY_OPACITY));
   }
   html += `<div class="layer-item${hasShadow ? ' active' : ''}" data-layer="shadow" onclick="toggleLayer('shadow',this)">
     <div class="layer-check"></div><div class="layer-color" style="background:#0b1220;border:1px solid #475569"></div><span>Sun Shadow</span>
@@ -10760,6 +11303,9 @@ function setLayerVisible(id, on) {
   } else if (id === 'glm_lightning') {
     const layer = ensureGlmLayer();
     if (layer) { if (on) S.map.addLayer(layer); else S.map.removeLayer(layer); }
+  } else if (id === 'buildings' && S.mapLayers.buildings) {
+    // OSM footprints — also the visibility gate for the 3D prisms (sync3d below).
+    if (on) S.map.addLayer(S.mapLayers.buildings); else S.map.removeLayer(S.mapLayers.buildings);
   } else if (id === 'canopy' || id === 'shadow') {
     // These two OWN their fetch: checking the row must load the raster, not just
     // re-attach a layer that may not exist yet. Both re-run buildLayerControl.
@@ -11202,7 +11748,10 @@ window.addEventListener('load', () => {
 const DISCLAIMER_VERSION = '2026.08.30';
 
 function checkDisclaimer() {
-  const accepted = localStorage.getItem('sar_disclaimer_version');
+  // Storage can throw (blocked site data, strict WebViews) — that must show the
+  // disclaimer, not abort startApp() before initMap().
+  let accepted = null;
+  try { accepted = localStorage.getItem('sar_disclaimer_version'); } catch (e) { /* storage blocked */ }
   if (accepted !== DISCLAIMER_VERSION) {
     document.getElementById('disclaimerModal')?.classList.add('active');
   }
@@ -11215,7 +11764,7 @@ function showDisclaimer() {
 }
 
 function acceptDisclaimer() {
-  localStorage.setItem('sar_disclaimer_version', DISCLAIMER_VERSION);
+  try { localStorage.setItem('sar_disclaimer_version', DISCLAIMER_VERSION); } catch (e) { /* storage blocked — still close */ }
   document.getElementById('disclaimerModal')?.classList.remove('active');
   // A pending update supersedes What's New: the update modal shows the NEWER
   // version's notes, so showing last update's notes too would just stack modals.
@@ -11301,7 +11850,8 @@ function startApp() {
       }
       if (event.data?.type === 'TILE_DOWNLOAD_COMPLETE') {
         const text = document.getElementById('tileProgressText');
-        if (text) text.textContent = `Download complete: ${event.data.total} tiles cached`;
+        const failed = +event.data.failed || 0;
+        if (text) text.textContent = `Download complete: ${event.data.total} tiles cached` + (failed ? ` · ${failed} failed (not cached)` : '');
         document.getElementById('btnDownloadTiles')?.removeAttribute('disabled');
         updateCacheStatus();
       }
@@ -11770,11 +12320,15 @@ function downloadTilesForView() {
     },
     zooms,
     providers: getSelectedTileProviders(),
+    sectionalEdition: getStoredSectionalEdition(), // same ?ed= URL the layer requests
   });
 }
 
 function getSelectedTileProviders() {
-  const providers = ['basemap', 'basemap_labels']; // always include base map (Esri canvas base + labels)
+  // Always include the base map (Esri canvas base + labels) — the pair the
+  // CURRENT theme displays, or a light-theme user has no basemap offline.
+  const light = S.theme === 'light' || S.theme === 'light-map';
+  const providers = light ? ['basemap_light', 'basemap_light_labels'] : ['basemap', 'basemap_labels'];
   if (document.getElementById('cfgTileSat')?.checked) providers.push('satellite');
   if (document.getElementById('cfgTileTopo')?.checked) providers.push('topo');
   if (document.getElementById('cfgTileSectional')?.checked) providers.push('sectional');
@@ -11807,41 +12361,107 @@ async function _cacheViewRaster(kind, bounds) {
 // Pre-fetch + cache all vector layers (and optionally DEM/vegetation rasters) for
 // the CURRENT map view so they're available offline — independent of the SW tile
 // flow (which caches base/sat/topo/sectional/hillshade image tiles).
+// The fetchers report their outcome through markSection, not a return value, so
+// each job names the section (+ rollup sub-source) it marks.
+const CACHE_VIEW_JOBS = [
+  { label: 'FAA airspace', key: 'airspace', src: 'faa', run: (c, b) => fetchFAAairspace(b) },
+  { label: 'FAA obstacles', key: 'obstacles', src: 'dof', run: (c, b) => fetchFaaObstacles(b) },
+  { label: 'Wire hazards', key: 'obstacles', src: 'wire', run: (c, b) => fetchWireHazards(b) },
+  { label: 'Utility circuits', key: 'obstacles', src: 'utility', run: (c, b) => fetchUtilityWires(b) },
+  { label: 'Protected areas', key: 'obstacles', src: 'protected', run: (c, b) => fetchProtectedAreas(b) },
+  { label: 'Airports', key: 'airspace', src: 'airports', run: (c, b) => fetchNearbyAirports(c, b) },
+  { label: 'Land ownership', key: 'publicLands', run: (c, b) => fetchPublicLands(b) },
+  { label: 'Ground access', key: 'groundAccess', run: (c, b) => fetchGroundAccess(b) },
+  { label: 'Water', key: 'water', run: (c, b) => fetchWaterFeatures(b) },
+  { label: 'Fire', key: 'fireDanger', run: (c, b) => fetchFireDanger(c.lat, c.lng, b) },
+  { label: 'Hospitals', key: 'hospitals', run: (c, b) => fetchHospitals(b) },
+  { label: 'Trails', key: 'trails', run: (c, b) => fetchTrails(b) },
+];
+function _cacheViewSectionMeta(key, src) {
+  const m = S.sectionMeta && S.sectionMeta[key];
+  return m ? (src ? (m.sources && m.sources[src]) || null : m) : null;
+}
+// 'ok' | 'failed' | 'stale' (network failed, older offline copy kept) | 'skipped'
+// (the fetcher marked nothing — e.g. utility circuits outside coverage).
+function _cacheViewJobOutcome(job, before, settled) {
+  if (settled === 'rejected') return 'failed';
+  const m = _cacheViewSectionMeta(job.key, job.src);
+  if (!m || JSON.stringify(m) === before) return 'skipped';
+  if (m.status === 'live') return 'ok';
+  if (m.status === 'cached') return 'stale';
+  if (m.status === 'error') return 'failed';
+  return 'skipped';
+}
 async function cacheCurrentView() {
   if (!S.map) return;
-  const bounds = S.map.getBounds();
-  const center = bounds.getCenter();
+  // The fetchers commit what they load into the live state (map layers, panel,
+  // assessment). With an area drawn, fetching the viewport would replace that
+  // area's data with another place's — so cache the DRAWN area instead.
+  const areaDrawn = !!(S.areaCenter && S.areaBounds);
+  const bounds = areaDrawn ? S.areaBounds : S.map.getBounds();
+  const center = areaDrawn ? S.areaCenter : bounds.getCenter();
   const btn = document.getElementById('btnCacheView');
   const prog = document.getElementById('viewCacheProgress');
   if (btn) btn.setAttribute('disabled', 'true');
-  const jobs = [
-    fetchFAAairspace(bounds), fetchFaaObstacles(bounds), fetchWireHazards(bounds),
-    fetchUtilityWires(bounds),
-    fetchProtectedAreas(bounds), fetchNearbyAirports(center, bounds),
-    fetchPublicLands(bounds), fetchGroundAccess(bounds), fetchWaterFeatures(bounds),
-    fetchFireDanger(center.lat, center.lng, bounds), fetchHospitals(bounds),
-    fetchTrails(bounds),
-  ];
-  if (document.getElementById('cfgViewDEM')?.checked) jobs.push(_cacheViewRaster('dem', bounds));
-  if (document.getElementById('cfgViewCanopy')?.checked) jobs.push(_cacheViewRaster('canopy', bounds));
-  const total = jobs.length;
+  const before = CACHE_VIEW_JOBS.map(j => JSON.stringify(_cacheViewSectionMeta(j.key, j.src)));
+  const jobs = CACHE_VIEW_JOBS.map(j => { try { return j.run(center, bounds); } catch (e) { return Promise.reject(e); } });
+  const rasters = [];
+  if (document.getElementById('cfgViewDEM')?.checked) rasters.push({ label: 'DEM', p: _cacheViewRaster('dem', bounds) });
+  if (document.getElementById('cfgViewCanopy')?.checked) rasters.push({ label: 'Canopy', p: _cacheViewRaster('canopy', bounds) });
+  const all = jobs.concat(rasters.map(r => r.p));
+  const total = all.length;
   let done = 0;
   if (prog) prog.textContent = `Caching 0/${total}…`;
-  await Promise.all(jobs.map(j => Promise.resolve(j).catch(() => null).then(r => {
+  const settled = await Promise.all(all.map(j => Promise.resolve(j).then(
+    v => ({ s: 'fulfilled', v }), () => ({ s: 'rejected' })).then(r => {
     done++; if (prog) prog.textContent = `Caching ${done}/${total}…`; return r;
   })));
-  if (prog) prog.textContent = `Cached ${total} data sources for this view ✓ (add base tiles with "Download" above)`;
+  const ok = [], failed = [], stale = [];
+  CACHE_VIEW_JOBS.forEach((j, i) => {
+    const o = _cacheViewJobOutcome(j, before[i], settled[i].s);
+    if (o === 'ok') ok.push(j.label); else if (o === 'failed') failed.push(j.label); else if (o === 'stale') stale.push(j.label);
+  });
+  rasters.forEach((r, i) => {
+    const res = settled[jobs.length + i];
+    const v = res.v;
+    if (res.s === 'fulfilled' && v && !v.error && v.source !== 'no proxy') ok.push(r.label); else failed.push(r.label);
+  });
+  const counted = ok.length + failed.length + stale.length;
+  const where = areaDrawn ? 'the drawn area (clear the area to cache a different view)' : 'this view';
+  let msg;
+  if (!failed.length && !stale.length) {
+    msg = `Cached ${ok.length} data sources for ${where} ✓ (add base tiles with "Download" above)`;
+  } else {
+    msg = `Cached ${ok.length}/${counted} data sources for ${where}`
+      + (failed.length ? ` — FAILED: ${failed.join(', ')}` : '')
+      + (stale.length ? ` — not refreshed, older offline copy kept: ${stale.join(', ')}` : '')
+      + '. Check the connection and retry.';
+  }
+  if (prog) prog.textContent = msg;
+  // Same-area data was just re-committed — re-derive like a source retry does.
+  if (areaDrawn) { computeOpsData(); computeAssessment(); }
   if (btn) btn.removeAttribute('disabled');
   if (typeof updateCacheStatus === 'function') updateCacheStatus();
 }
 
 function clearAllCaches() {
+  let chartsDropped = 0;
   if (navigator.serviceWorker?.controller) {
     navigator.serviceWorker.controller.postMessage({ type: 'CLEAR_TILE_CACHE' });
+    // The SW wipe deletes sar-tiles-v1, which holds the imported FAA chart
+    // tiles — drop the charts too, or their layers keep rendering blank tiles.
+    Object.keys(S.faaCharts || {}).forEach(id => {
+      const c = S.faaCharts[id];
+      if (S.map && c && c.layer && S.map.hasLayer(c.layer)) S.map.removeLayer(c.layer);
+      delete S.faaCharts[id];
+      delete S.mapLayers['chart_' + id];
+      chartsDropped++;
+    });
+    if (chartsDropped) { _saveFaaChartsState(); updateChartList(); if (S.map) buildLayerControl(); }
   }
   if (typeof clearApiCache === 'function') clearApiCache();
   const el = document.getElementById('cacheStatus');
-  if (el) el.textContent = 'Caches cleared';
+  if (el) el.textContent = 'Caches cleared' + (chartsDropped ? ` (${chartsDropped} imported chart${chartsDropped === 1 ? '' : 's'} removed — re-import to use)` : '');
 }
 
 function updateCacheStatus() {
@@ -11888,9 +12508,22 @@ async function restoreConfig() {
     if (el) el.value = rpic;
   }
   const refreshInterval = await getAppState('refreshInterval');
-  if (refreshInterval !== null && refreshInterval !== undefined) {
+  {
+    // A fresh install has no stored value: the select's default ("Every 10
+    // min") must actually run, not just be displayed.
     const el = document.getElementById('cfgRefreshInterval');
-    if (el) { el.value = refreshInterval; setAutoRefresh(); }
+    if (el) {
+      if (refreshInterval !== null && refreshInterval !== undefined) el.value = refreshInterval;
+      setAutoRefresh();
+    }
+  }
+  // ADS-B on/off (saved by toggleAdsbPolling) — it used to reset to Enabled on every reload.
+  const adsbEnabled = await getAppState('cfgAdsbEnabled');
+  if (adsbEnabled === '0' || adsbEnabled === '1') {
+    const el = document.getElementById('cfgAdsbEnabled');
+    if (el) el.value = adsbEnabled;
+    S._adsbEnabled = adsbEnabled === '1';
+    if (!S._adsbEnabled) stopAdsbPolling(); // also paints the DISABLED panel
   }
   // Restore active profile. Migrate the legacy aircraft-dropdown selection to its
   // matching built-in profile for users upgrading from before the merge.
@@ -12040,6 +12673,26 @@ function parseKML(kmlText) {
     return;
   }
 
+  // Fewer than 3 distinct vertices (a 2-point LineString, a ring that closes on
+  // itself) is no polygon: every area-intersection check (TFR, NOTAM, smoke,
+  // land) needs >= 3 vertices and would silently answer "no overlap". One point
+  // → the point area; two → a padded rectangle around the segment.
+  let segmentBox = null;
+  if (shapeType === 'polygon') {
+    const distinct = coords.filter((p, i) => coords.findIndex(q => q[0] === p[0] && q[1] === p[1]) === i);
+    if (distinct.length === 1) {
+      shapeType = 'point';
+    } else if (distinct.length === 2) {
+      const padM = 500;
+      const [a, b] = distinct;
+      const midLat = (a[0] + b[0]) / 2;
+      const dLat = padM / 111320, dLng = padM / (111320 * Math.max(0.01, Math.cos(midLat * Math.PI / 180)));
+      segmentBox = [[Math.min(a[0], b[0]) - dLat, Math.min(a[1], b[1]) - dLng],
+                    [Math.max(a[0], b[0]) + dLat, Math.max(a[1], b[1]) + dLng]];
+      alert('The KML line has only two points, which does not outline an area. Using a rectangle 500 m around it as the operational area.');
+    }
+  }
+
   // Clear existing drawn items
   S.drawnItems.clearLayers();
 
@@ -12053,6 +12706,13 @@ function parseKML(kmlText) {
     S.drawnItems.addLayer(layer);
     S.map.fitBounds(layer.getBounds(), { padding: [40, 40] });
     processArea(layer, 'circle');
+  } else if (segmentBox) {
+    layer = L.rectangle(segmentBox, {
+      color: '#3d8bfd', weight: 2, fillColor: '#3d8bfd', fillOpacity: 0.08, dashArray: '6,4'
+    });
+    S.drawnItems.addLayer(layer);
+    S.map.fitBounds(layer.getBounds(), { padding: [40, 40] });
+    processArea(layer, 'rectangle');
   } else {
     // Remove duplicate closing point if present
     if (coords.length > 2) {
@@ -12251,12 +12911,11 @@ function generatePDFBriefing() {
 
   // Capture the map by compositing layers separately:
   // 1. html2canvas for tiles only (works correctly for <img> tiles)
-  // 2. Native SVG→Image→Canvas for vector overlays (avoids html2canvas SVG transform bugs)
+  // 2. Overlay-pane canvases / image overlays / SVG drawn natively
   // 3. Marker icons drawn from their screen positions
-  const mapEl = document.getElementById('map');
+  // (In 3D the WebGL canvas is read instead — see _captureBriefingMap.)
   setTimeout(() => {
-    _compositeMapCapture(mapEl).then(mapDataUrl => {
-      S._lastMapImage = mapDataUrl;
+    _captureBriefingMap().then(mapDataUrl => {
       _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic, aircraft, assessBadge, assessText, dateStr, timeLocal, timeUTC, btn, now);
     }).catch(err => {
       console.warn('Map capture failed, generating PDF without map:', err);
@@ -12265,12 +12924,54 @@ function generatePDFBriefing() {
   }, 300);
 }
 
-// Composite map capture: renders tiles via html2canvas, SVG overlays natively,
+// The map image for a briefing, captured fresh every time (a cached image would
+// show whatever area/layers were on screen at an earlier capture). Resolves to
+// a data URL or null.
+function _captureBriefingMap() {
+  if (S.is3D && S.map3d) return _capture3dMap();
+  const mapEl = document.getElementById('map');
+  return mapEl ? _compositeMapCapture(mapEl) : Promise.resolve(null);
+}
+
+// The 3D map is created without preserveDrawingBuffer, so its WebGL canvas is
+// only readable in the frame it was drawn: read it from the 'render' event.
+function _capture3dMap() {
+  return new Promise((resolve, reject) => {
+    const m = S.map3d;
+    if (!m || typeof m.getCanvas !== 'function') return reject(new Error('3D map unavailable'));
+    let done = false;
+    // rAF never fires in a hidden tab — don't wedge the briefing on it.
+    const timer = setTimeout(() => { if (!done) { done = true; reject(new Error('3D render timed out')); } }, 3000);
+    m.once('render', () => {
+      if (done) return;
+      done = true; clearTimeout(timer);
+      try { resolve(m.getCanvas().toDataURL('image/jpeg', 0.90)); } catch (e) { reject(e); }
+    });
+    m.triggerRepaint();
+  });
+}
+
+// Can this image be drawn without tainting the capture canvas (which would make
+// toDataURL throw)? data:/blob:, same-origin and CORS-loaded images are clean.
+function _captureImgClean(img) {
+  const src = img.currentSrc || img.src || '';
+  if (!src || !img.complete || !img.naturalWidth) return false;
+  if (/^(data|blob):/i.test(src) || img.crossOrigin) return true;
+  try { return new URL(src, location.href).origin === location.origin; } catch (e) { return false; }
+}
+function _captureCanvasClean(cv) {
+  try { const c = cv.getContext && cv.getContext('2d'); if (c) c.getImageData(0, 0, 1, 1); return true; } catch (e) { return false; }
+}
+
+// Composite map capture: renders tiles via html2canvas, overlays natively,
 // and markers via screen position — avoids html2canvas SVG transform bugs entirely.
-async function _compositeMapCapture(mapEl) {
+// opts.noTiles: skip the tile layer (retry after a tainted capture).
+async function _compositeMapCapture(mapEl, opts) {
+  const noTiles = !!(opts && opts.noTiles);
   const mapRect = mapEl.getBoundingClientRect();
   const w = Math.round(mapRect.width);
   const h = Math.round(mapRect.height);
+  if (!w || !h) return null; // hidden map (e.g. 3D mode) — nothing to capture
   const scale = 2;
   const canvas = document.createElement('canvas');
   canvas.width = w * scale;
@@ -12278,12 +12979,16 @@ async function _compositeMapCapture(mapEl) {
   const ctx = canvas.getContext('2d');
   ctx.scale(scale, scale);
 
-  // Layer 1: Tiles via html2canvas (only the tile pane — html2canvas handles tiles correctly)
-  try {
+  // Layer 1: Tiles via html2canvas (only the tile pane — html2canvas handles tiles correctly).
+  // allowTaint:false — a tile server without CORS headers is skipped (blank
+  // there) instead of tainting the canvas, which made toDataURL throw.
+  ctx.fillStyle = '#0a0e14';
+  ctx.fillRect(0, 0, w, h);
+  if (!noTiles) try {
     const tileCanvas = await html2canvas(mapEl, {
       scale: scale,
       useCORS: true,
-      allowTaint: true,
+      allowTaint: false,
       logging: false,
       ignoreElements: (el) => {
         // Capture ONLY tiles — ignore overlays, markers, and UI controls
@@ -12299,41 +13004,41 @@ async function _compositeMapCapture(mapEl) {
                el.classList?.contains('leaflet-control-zoom');
       },
     });
-    ctx.drawImage(tileCanvas, 0, 0, w, h);
+    if (_captureCanvasClean(tileCanvas)) ctx.drawImage(tileCanvas, 0, 0, w, h);
+    else console.warn('Tile capture tainted — map image without base tiles');
   } catch(e) {
-    console.warn('Tile capture failed:', e);
-    // Fill with dark background as fallback
-    ctx.fillStyle = '#0a0e14';
-    ctx.fillRect(0, 0, w, h);
+    console.warn('Tile capture failed:', e); // dark background stays as the fallback
   }
 
-  // Layer 2: SVG overlays rendered natively (power lines, circles, swap radius)
-  const svgs = mapEl.querySelectorAll('.leaflet-overlay-pane svg');
-  for (const svg of svgs) {
+  // Layer 2: overlay pane in stacking (DOM) order. With preferCanvas:true the
+  // vectors are on <canvas>; canopy / viewshed / shadow rasters are <img>
+  // image overlays; any SVG-renderer layers stay <svg>.
+  const overlays = mapEl.querySelectorAll('.leaflet-overlay-pane canvas, .leaflet-overlay-pane img, .leaflet-overlay-pane svg');
+  for (const el of overlays) {
+    if (el.parentElement && el.parentElement.closest('svg')) continue; // part of an outer <svg>
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'svg') {
+      await _captureSvgOverlay(ctx, el, mapRect);
+      continue;
+    }
     try {
-      const svgRect = svg.getBoundingClientRect();
-      const clone = svg.cloneNode(true);
-      clone.style.transform = 'none';
-      clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-      const svgStr = new XMLSerializer().serializeToString(clone);
-      const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const img = await new Promise((resolve, reject) => {
-        const i = new Image();
-        i.onload = () => resolve(i);
-        i.onerror = reject;
-        i.src = url;
-      });
-      const x = svgRect.left - mapRect.left;
-      const y = svgRect.top - mapRect.top;
-      ctx.drawImage(img, x, y, svgRect.width, svgRect.height);
-      URL.revokeObjectURL(url);
-    } catch(e) {
-      console.warn('SVG overlay capture failed:', e);
+      const r = el.getBoundingClientRect();
+      if (!r.width || !r.height) continue;
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      if (tag === 'img' ? !_captureImgClean(el) : !_captureCanvasClean(el)) continue;
+      const op = parseFloat(cs.opacity);
+      ctx.globalAlpha = Number.isFinite(op) ? op : 1;
+      // The rect already includes the pane / zoom-animation transforms.
+      ctx.drawImage(el, r.left - mapRect.left, r.top - mapRect.top, r.width, r.height);
+    } catch (e) {
+      console.warn('Overlay capture failed:', e);
+    } finally {
+      ctx.globalAlpha = 1;
     }
   }
 
-  // Layer 3: Marker icons (airports, cell towers, heliports)
+  // Layer 3: Marker icons (airports, cell towers, heliports, observer pins)
   const markerPane = mapEl.querySelector('.leaflet-marker-pane');
   if (markerPane) {
     const markers = markerPane.querySelectorAll('.leaflet-marker-icon');
@@ -12341,6 +13046,11 @@ async function _compositeMapCapture(mapEl) {
       const mRect = marker.getBoundingClientRect();
       const x = mRect.left - mapRect.left;
       const y = mRect.top - mapRect.top;
+      if (marker.tagName.toLowerCase() === 'img') {
+        // Image icons (L.icon) — drawn when they cannot taint the capture.
+        try { if (_captureImgClean(marker)) ctx.drawImage(marker, x, y, mRect.width, mRect.height); } catch (e) {}
+        continue;
+      }
       const innerSvg = marker.querySelector('svg');
       if (innerSvg) {
         try {
@@ -12362,13 +13072,61 @@ async function _compositeMapCapture(mapEl) {
     }
   }
 
-  return canvas.toDataURL('image/jpeg', 0.90);
+  try {
+    return canvas.toDataURL('image/jpeg', 0.90);
+  } catch (e) {
+    // Something cross-origin still tainted the canvas: retry without base
+    // tiles rather than failing the whole briefing.
+    if (!noTiles) return _compositeMapCapture(mapEl, { noTiles: true });
+    throw e;
+  }
+}
+
+// One overlay-pane <svg> (SVG-renderer vectors) drawn natively.
+async function _captureSvgOverlay(ctx, svg, mapRect) {
+  try {
+    const svgRect = svg.getBoundingClientRect();
+    if (!svgRect.width || !svgRect.height) return;
+    const clone = svg.cloneNode(true);
+    clone.style.transform = 'none';
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    const svgStr = new XMLSerializer().serializeToString(clone);
+    const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = reject;
+      i.src = url;
+    });
+    const x = svgRect.left - mapRect.left;
+    const y = svgRect.top - mapRect.top;
+    ctx.drawImage(img, x, y, svgRect.width, svgRect.height);
+    URL.revokeObjectURL(url);
+  } catch(e) {
+    console.warn('SVG overlay capture failed:', e);
+  }
+}
+
+// Shown in place of the map when it could not be captured — never a silent gap.
+const BRIEFING_NO_MAP_HTML = '<div style="margin:10px 0;padding:8px;border:1px dashed #999;color:#666;font-size:11px;">Map image unavailable (capture failed) \u2014 attach a screenshot of the map if needed.</div>';
+
+// Split a rendered page of canvasHeightPx into per-page slices of at most
+// usableMm (pxPerMm = canvas px per PDF mm). Pure — slices never overlap.
+function briefingPdfSlices(canvasHeightPx, pxPerMm, usableMm) {
+  const out = [];
+  const step = Math.max(1, Math.floor(usableMm * pxPerMm));
+  for (let y = 0; y < canvasHeightPx; y += step) {
+    const hPx = Math.min(step, canvasHeightPx - y);
+    out.push({ yPx: y, hPx, hMm: hPx / pxPerMm });
+  }
+  return out;
 }
 
 function _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic, aircraft, assessBadge, assessText, dateStr, timeLocal, timeUTC, btn, now) {
   const mapHtml = mapDataUrl
-    ? `<div style="margin-bottom:12px;border:1px solid #ccc;"><img src="${mapDataUrl}" style="width:100%;display:block;" /></div>`
-    : '';
+    ? `<div style="margin-bottom:12px;border:1px solid #ccc;"><img src="${_esc(mapDataUrl)}" style="width:100%;display:block;" /></div>`
+    : BRIEFING_NO_MAP_HTML;
 
   // Build an off-screen styled HTML div for rendering
   const container = document.createElement('div');
@@ -12381,7 +13139,7 @@ function _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic
         <div style="font-size:11px;color:#555;margin-top:4px;">SAR UAS Team</div>
       </div>
       <div style="text-align:right;">
-        <div style="font-size:18px;font-weight:bold;padding:4px 14px;border-radius:4px;background:${badgeColor};color:#fff;display:inline-block;">${assessBadge}</div>
+        <div style="font-size:18px;font-weight:bold;padding:4px 14px;border-radius:4px;background:${badgeColor};color:#fff;display:inline-block;">${_esc(assessBadge)}</div>
       </div>
     </div>
     <table style="width:100%;font-size:11px;margin-bottom:12px;border-collapse:collapse;">
@@ -12391,19 +13149,19 @@ function _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic
         <td style="padding:3px 0;"><b>UTC:</b> ${timeUTC}Z</td>
       </tr>
       <tr>
-        <td style="padding:3px 0;"><b>RPIC:</b> ${rpic}</td>
-        <td style="padding:3px 0;"><b>Aircraft:</b> ${aircraft}</td>
-        <td style="padding:3px 0;"><b>Area:</b> ${document.getElementById('areaCenter')?.textContent || '--'}</td>
+        <td style="padding:3px 0;"><b>RPIC:</b> ${_esc(rpic)}</td>
+        <td style="padding:3px 0;"><b>Aircraft:</b> ${_esc(aircraft)}</td>
+        <td style="padding:3px 0;"><b>Area:</b> ${_esc(document.getElementById('areaCenter')?.textContent || '--')}</td>
       </tr>
     </table>
     <div style="margin-bottom:12px;padding:8px;background:#f0f0f0;border-left:4px solid ${badgeColor};font-size:12px;">
-      <b>Assessment: ${assessBadge}</b> \u2014 ${assessText}
+      <b>Assessment: ${_esc(assessBadge)}</b> \u2014 ${_esc(assessText)}
     </div>
     ${mapHtml}
     ${sections.map(s => {
       const lines = s.split('\n');
-      const title = lines[0];
-      const body = lines.slice(1).join('<br>');
+      const title = _esc(lines[0]);
+      const body = lines.slice(1).map(_esc).join('<br>');
       return `<div style="margin-bottom:10px;"><div style="font-size:13px;font-weight:bold;border-bottom:1px solid #ccc;padding-bottom:2px;margin-bottom:4px;">${title}</div><div style="font-size:11px;color:#333;">${body}</div></div>`;
     }).join('')}
     <div style="margin-top:20px;border-top:2px solid #111;padding-top:10px;">
@@ -12428,24 +13186,18 @@ function _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic
     const pageHeight = 279.4; // letter height mm
     const margin = 10;
     const imgWidth = pageWidth - margin * 2;
-    const imgHeight = (canvas.height * imgWidth) / canvas.width;
-    const imgData = canvas.toDataURL('image/jpeg', 0.92);
-
-    let yOffset = margin;
-    let remainingHeight = imgHeight;
     const usableHeight = pageHeight - margin * 2;
 
-    // First page
-    pdf.addImage(imgData, 'JPEG', margin, yOffset, imgWidth, imgHeight);
-
-    // Add more pages if content overflows
-    remainingHeight -= usableHeight;
-    while (remainingHeight > 0) {
-      pdf.addPage();
-      yOffset -= usableHeight;
-      pdf.addImage(imgData, 'JPEG', margin, yOffset, imgWidth, imgHeight);
-      remainingHeight -= usableHeight;
-    }
+    // One canvas slice per page, placed inside the margins. Shifting the whole
+    // image up per page repeated 2 × margin of content at every page break
+    // and bled into the top/bottom margins.
+    briefingPdfSlices(canvas.height, canvas.width / imgWidth, usableHeight).forEach((sl, i) => {
+      const slice = document.createElement('canvas');
+      slice.width = canvas.width; slice.height = sl.hPx;
+      slice.getContext('2d').drawImage(canvas, 0, sl.yPx, canvas.width, sl.hPx, 0, 0, canvas.width, sl.hPx);
+      if (i) pdf.addPage();
+      pdf.addImage(slice.toDataURL('image/jpeg', 0.92), 'JPEG', margin, margin, imgWidth, sl.hMm);
+    });
 
     const ts = now.toISOString().split('T')[0];
     pdf.save(`SAR_Briefing_${ts}.pdf`);
@@ -12464,20 +13216,10 @@ function _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic
 function shareBriefingEmail() {
   if (!S.currentArea) return alert('Draw an operational area first.');
 
-  // Use cached map image from PDF, or capture fresh via composite method
-  if (S._lastMapImage) {
-    _openEmailBriefingWindow(S._lastMapImage);
-  } else {
-    const mapEl = document.getElementById('map');
-    if (mapEl) {
-      _compositeMapCapture(mapEl).then(dataUrl => {
-        S._lastMapImage = dataUrl;
-        _openEmailBriefingWindow(dataUrl);
-      }).catch(() => _openEmailBriefingWindow(null));
-    } else {
-      _openEmailBriefingWindow(null);
-    }
-  }
+  // Always capture fresh: an image kept from an earlier PDF would show
+  // whatever area and layers were on screen back then.
+  _captureBriefingMap().then(dataUrl => _openEmailBriefingWindow(dataUrl))
+    .catch(() => _openEmailBriefingWindow(null));
 }
 
 function _openEmailBriefingWindow(mapDataUrl) {
@@ -12491,9 +13233,9 @@ function _openEmailBriefingWindow(mapDataUrl) {
   const timeStr = now.toLocaleTimeString('en-US', { hour12: false, timeZone: _localTZ() });
   const briefingText = buildBriefingText();
   const sections = briefingText.split('\n\n');
-  const mapHtml = mapDataUrl ? `<img src="${mapDataUrl}" style="width:100%;max-width:700px;border:1px solid #ccc;margin:10px 0;" />` : '';
+  const mapHtml = mapDataUrl ? `<img src="${_esc(mapDataUrl)}" style="width:100%;max-width:700px;border:1px solid #ccc;margin:10px 0;" />` : BRIEFING_NO_MAP_HTML;
 
-  const html = `<!DOCTYPE html><html><head><title>SAR Briefing - ${dateStr}</title>
+  const html = `<!DOCTYPE html><html><head><title>SAR Briefing - ${_esc(dateStr)}</title>
     <style>body{font-family:Arial,sans-serif;max-width:750px;margin:20px auto;padding:0 20px;color:#111;font-size:13px;line-height:1.5}
     h1{font-size:20px;letter-spacing:2px;margin:0}
     .badge{display:inline-block;padding:4px 14px;border-radius:4px;color:#fff;font-weight:bold;font-size:16px}
@@ -12502,16 +13244,16 @@ function _openEmailBriefingWindow(mapDataUrl) {
     @media print{body{margin:0;font-size:11px}}</style></head><body>
     <div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #111;padding-bottom:10px;margin-bottom:15px;">
       <div><h1>SAR UAS PRE-FLIGHT BRIEFING</h1><div style="font-size:11px;color:#555;">SAR UAS Team</div></div>
-      <div><span class="badge" style="background:${badgeColor}">${assessBadge}</span></div>
+      <div><span class="badge" style="background:${badgeColor}">${_esc(assessBadge)}</span></div>
     </div>
     <table style="width:100%;font-size:12px;margin-bottom:10px;"><tr>
-      <td><b>Date:</b> ${dateStr}</td><td><b>Local:</b> ${timeStr}</td><td><b>RPIC:</b> ${rpic}</td><td><b>Aircraft:</b> ${aircraft}</td>
+      <td><b>Date:</b> ${dateStr}</td><td><b>Local:</b> ${timeStr}</td><td><b>RPIC:</b> ${_esc(rpic)}</td><td><b>Aircraft:</b> ${_esc(aircraft)}</td>
     </tr></table>
     <div style="padding:8px;background:#f0f0f0;border-left:4px solid ${badgeColor};margin-bottom:12px;">
-      <b>Assessment: ${assessBadge}</b> \u2014 ${assessText}
+      <b>Assessment: ${_esc(assessBadge)}</b> \u2014 ${_esc(assessText)}
     </div>
     ${mapHtml}
-    ${sections.map(s => { const lines = s.split('\n'); return `<div class="section"><div class="section-title">${lines[0]}</div><div>${lines.slice(1).join('<br>')}</div></div>`; }).join('')}
+    ${sections.map(s => { const lines = s.split('\n'); return `<div class="section"><div class="section-title">${_esc(lines[0])}</div><div>${lines.slice(1).map(_esc).join('<br>')}</div></div>`; }).join('')}
     <div style="margin-top:20px;border-top:2px solid #111;padding-top:10px;">
       <div style="font-size:10px;color:#7a5d00;background:#fff8e1;border-left:4px solid #f59e0b;padding:6px 8px;margin-bottom:10px;"><b>Advisory planning aid only — NOT an official FAA briefing.</b> Verify airspace, TFRs, NOTAMs and weather via official sources (1800wxbrief.com) before flight.</div>
       <div style="font-size:11px;color:#555;margin-bottom:15px;">I have reviewed this pre-flight briefing and accept responsibility for the safe conduct of this UAS operation.</div>
@@ -12559,17 +13301,17 @@ async function loadFAAChart(input) {
 
   try {
     const collarMargin = parseFloat(document.getElementById('chartCollarMargin')?.value || '3') / 100;
+    // Re-importing the same chart: remove the old version BEFORE writing the
+    // new tiles. Both share one URL namespace, so removing afterwards (as this
+    // used to) deleted the tiles just written and left a blank chart.
+    const preId = sanitizeChartName(file.name);
+    if (S.faaCharts[preId]) await removeChart(preId);
     const result = await processVFRChart(file, (msg, pct) => {
       if (bar) bar.style.width = pct + '%';
       if (text) text.textContent = msg;
-    }, { collarMargin });
+    }, { collarMargin, chartId: preId });
 
     const chartId = result.chartId;
-
-    // If re-importing same chart, remove old version first
-    if (S.faaCharts[chartId]) {
-      await removeChart(chartId);
-    }
 
     // Create chart-specific tile layer
     const layer = new L.TileLayer.FAAChart({
@@ -12679,7 +13421,7 @@ async function restoreFAACharts() {
   const keys = await cache.keys();
 
   for (const info of charts) {
-    const prefix = 'local-tiles.sar-preflight/faa-sectional-' + info.chartId;
+    const prefix = 'local-tiles.sar-preflight/faa-sectional-' + info.chartId + '/'; // '/' — 'los-angeles' must not match 'los-angeles-tac'
     const hasTiles = keys.some(r => r.url.includes(prefix));
     if (!hasTiles) continue;
 
@@ -12700,6 +13442,7 @@ async function restoreFAACharts() {
   }
 
   updateChartList();
+  if (S.map) buildLayerControl(); // restored charts must appear under Map Layers
 }
 
 // Remove a single imported chart and its cached tiles
@@ -12715,7 +13458,7 @@ async function removeChart(chartId) {
   if ('caches' in window) {
     const cache = await caches.open('sar-tiles-v1');
     const keys = await cache.keys();
-    const prefix = 'local-tiles.sar-preflight/faa-sectional-' + chartId;
+    const prefix = 'local-tiles.sar-preflight/faa-sectional-' + chartId + '/'; // '/' — never another chart's tiles
     for (const req of keys) {
       if (req.url.includes(prefix)) await cache.delete(req);
     }
@@ -12751,8 +13494,8 @@ function updateChartList() {
   el.innerHTML = ids.map(id => {
     const c = S.faaCharts[id];
     return '<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--text-secondary);padding:2px 0;">' +
-      '<span>' + c.chartName + '</span>' +
-      '<button class="btn btn-ghost" onclick="removeChart(\'' + id + '\')" style="padding:2px 6px;font-size:9px;">Remove</button>' +
+      '<span>' + _esc(c.chartName) + '</span>' +
+      '<button class="btn btn-ghost" data-chart-id="' + _esc(id) + '" onclick="removeChart(this.dataset.chartId)" style="padding:2px 6px;font-size:9px;">Remove</button>' +
       '</div>';
   }).join('');
 }
@@ -12980,12 +13723,12 @@ async function showMissionLogs() {
       const assessColor = log.assessment?.level === 'GO' ? 'var(--accent-green)' : log.assessment?.level === 'CAUTION' ? 'var(--accent-amber)' : 'var(--accent-red)';
       html += `<tr style="border-bottom:1px solid var(--border);">` +
         `<td style="padding:6px;color:var(--text-secondary);">${date}</td>` +
-        `<td style="padding:6px;">${log.rpic || '--'}</td>` +
-        `<td style="padding:6px;color:${assessColor};font-weight:600;">${assessmentLabelForLog(log.assessment)}</td>` +
+        `<td style="padding:6px;">${_esc(log.rpic || '--')}</td>` +
+        `<td style="padding:6px;color:${assessColor};font-weight:600;">${_esc(assessmentLabelForLog(log.assessment))}</td>` +
         `<td style="padding:6px;color:var(--text-secondary);">${loc}</td>` +
-        `<td style="padding:6px;">${log.aircraft || '--'}</td>` +
-        `<td style="padding:6px;color:var(--text-muted);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${(log.notes || '').replace(/"/g, '&quot;')}">${log.notes || '--'}</td>` +
-        `<td style="padding:6px;"><button class="btn btn-ghost" style="padding:2px 6px;font-size:9px;color:var(--accent-red);" onclick="deleteMissionLogEntry(${log.id || log.timestamp})">DEL</button></td></tr>`;
+        `<td style="padding:6px;">${_esc(log.aircraft || '--')}</td>` +
+        `<td style="padding:6px;color:var(--text-muted);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${_esc(log.notes || '')}">${_esc(log.notes || '--')}</td>` +
+        `<td style="padding:6px;"><button class="btn btn-ghost" style="padding:2px 6px;font-size:9px;color:var(--accent-red);" onclick="deleteMissionLogEntry(${Number(log.id || log.timestamp)})">DEL</button></td></tr>`;
     });
     html += '</table>';
     list.innerHTML = html;
@@ -13010,20 +13753,18 @@ async function exportMissionLogsAsCSV() {
   const logs = await getMissionLogs();
   if (!logs || logs.length === 0) return alert('No logs to export.');
   const headers = ['Date', 'RPIC', 'Aircraft', 'Assessment', 'Lat', 'Lng', 'Area Type', 'Wind (mph)', 'Visibility', 'Temp (F)', 'SOP Profile', 'NWS Alerts', 'Wire Hazards', 'Notes'];
+  // `??` not `||`: a logged 0 mph / 0 °F / 0 mi is a real reading, not a blank.
   const rows = logs.map(l => [
     l.timestamp ? new Date(l.timestamp).toISOString() : '',
-    l.rpic || '', l.aircraft || '', assessmentLabelForLog(l.assessment),
-    l.areaCenter?.lat?.toFixed(5) || '', l.areaCenter?.lng?.toFixed(5) || '',
-    l.areaType || '', l.wx?.windSpeed || '', l.wx?.visibility || '',
-    l.wx?.temp || '', l.sopProfile || '', l.nwsAlerts || 0, l.wireHazards || 0,
-    (l.notes || '').replace(/"/g, '""'),
+    l.rpic, l.aircraft, assessmentLabelForLog(l.assessment),
+    l.areaCenter?.lat?.toFixed(5), l.areaCenter?.lng?.toFixed(5),
+    l.areaType, l.wx?.windSpeed, l.wx?.visibility,
+    l.wx?.temp, l.sopProfile, l.nwsAlerts ?? 0, l.wireHazards ?? 0,
+    l.notes,
   ]);
   let csv = headers.join(',') + '\n';
-  rows.forEach(r => { csv += r.map(v => `"${v}"`).join(',') + '\n'; });
-  const blob = new Blob([csv], { type: 'text/csv' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url; a.download = `SAR_Mission_Logs_${new Date().toISOString().split('T')[0]}.csv`; a.click();
-  URL.revokeObjectURL(url);
+  rows.forEach(r => { csv += r.map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',') + '\n'; });
+  downloadBlob(new Blob([csv], { type: 'text/csv' }), `SAR_Mission_Logs_${new Date().toISOString().split('T')[0]}.csv`);
 }
 
 // ============================================================
@@ -13103,7 +13844,13 @@ function setCanopySource(v) {
   if (sel && sel.value !== val) sel.value = val;
   _updateCanopyCaption();
   if (S._canopyEditing) return; // the edit canvas owns the grid until SAVE/cancel
-  const wanted = S._overlayWanted && S._overlayWanted.canopy;
+  // A first load still in flight counts as wanted (renderRasterOverlay only
+  // sets the flag when it lands); either way the old-dataset load is dropped.
+  const wanted = (S._overlayWanted && S._overlayWanted.canopy) || S._canopyLoading;
+  S._canopyLoadGen = (S._canopyLoadGen || 0) + 1;
+  S._canopyLoading = false;
+  // The previous dataset's failure must not linger in the data-source list.
+  if (S.dataSourceErrors) clearDataSourceError('Canopy (NAIP-CHM)');
   S.canopy = null;
   if (wanted && typeof loadCanopyForView === 'function') loadCanopyForView();
   else if (S.map && typeof buildLayerControl === 'function') buildLayerControl();
@@ -13443,7 +14190,9 @@ async function _fetchChmv2Raster(base, grid) {
     try {
       const res = await _fetchCanopyFromProxy(base, grid);
       if (res && res.canopy) {
-        if (typeof cacheRaster === 'function') cacheRaster('canopy', cacheKey, Object.assign({ canopyArr: res.canopy, cloudFrac: res.cloudFrac || 0 }, _rasterGridRef(grid)));
+        // A PARTIAL grid (some tiles failed) is not cached: read back later it
+        // would serve the missing tiles as bare earth labeled CACHED.
+        if (!(res.tilesFailed > 0) && typeof cacheRaster === 'function') cacheRaster('canopy', cacheKey, Object.assign({ canopyArr: res.canopy, cloudFrac: res.cloudFrac || 0 }, _rasterGridRef(grid)));
         if (res.tilesFailed > 0) recordDataSourceError('Canopy', new Error(`${res.tilesFailed} of ${res.tilesTotal} canopy tiles failed to load (proxy/data-service errors)`));
         else clearDataSourceError('Canopy');
         const ed = await _applyCanopyEdits(grid, res.canopy);
@@ -13474,7 +14223,8 @@ async function _fetchNaipChmRaster(base, grid) {
     try {
       const res = await _fetchNaipChmFromProxy(base, grid);
       if (res && res.canopy) {
-        if (typeof cacheRaster === 'function') cacheRaster('canopy', cacheKey, Object.assign({ canopyArr: res.canopy, structures: true }, _rasterGridRef(grid)));
+        // Partial grids (a quarter-quad failed / absent) are not cached as complete.
+        if (!(res.tilesFailed > 0) && typeof cacheRaster === 'function') cacheRaster('canopy', cacheKey, Object.assign({ canopyArr: res.canopy, structures: true }, _rasterGridRef(grid)));
         if (res.tilesFailed > 0) recordDataSourceError('Canopy', new Error(`${res.tilesFailed} of ${res.tilesTotal} NAIP-CHM quarter-quads did not load (${S._canopyTileError || 'no coverage / proxy error'})`));
         else clearDataSourceError('Canopy');
         const ed = await _applyCanopyEdits(grid, res.canopy);
@@ -13701,8 +14451,10 @@ async function _fetchCanopyFromProxy(base, grid) {
         // blockSize: see CANOPY_COG_BLOCK_BYTES — MUST stay explicit.
         const tiff = await GeoTIFF.fromUrl(url, { blockSize: CANOPY_COG_BLOCK_BYTES });
         tileGrid = await _cogTileToGrid(tiff, grid);
+        if (tileGrid === null) { lastErr = null; break; } // no pixel overlap (quadkey seam) — not an error, nothing to retry
       } catch (e) { tileGrid = null; lastErr = e; } // missing tile / CORS / transient
     }
+    if (!tileGrid && !lastErr) { loaded++; continue; } // read fine, just none of our cells
     if (!tileGrid) {
       failed++;
       // Record WHY. This catch used to swallow the error entirely, so every
@@ -13943,6 +14695,11 @@ function _syncOpacitySliders(v, ...ids) {
     if (el && el.value !== String(v)) el.value = v;
   }
 }
+// Read an opacity slider: 0 is a legitimate value (`|| default` snapped it back).
+function _sliderOpacity(id, dflt) {
+  const v = parseFloat((document.getElementById(id) || {}).value);
+  return Number.isFinite(v) ? v : dflt;
+}
 function setCanopyOpacity(v) {
   const o = parseFloat(v);
   if (S.mapLayers.canopy && S.mapLayers.canopy.setOpacity) S.mapLayers.canopy.setOpacity(o);
@@ -13969,6 +14726,9 @@ async function toggleCanopyOverlay(on) {
   if (!on) {
     if (S._overlayWanted) S._overlayWanted.canopy = false;
     if (S.mapLayers.canopy && S.map.hasLayer(S.mapLayers.canopy)) S.map.removeLayer(S.mapLayers.canopy);
+    // A load still in flight must not re-attach the overlay the user just unchecked.
+    if (S._canopyLoading) { S._canopyLoading = false; setStatus('canopyStatus', '', ''); }
+    S._canopyLoadGen = (S._canopyLoadGen || 0) + 1;
     if (S.is3D && typeof sync3d === 'function') sync3d();
     buildLayerControl();
     return;
@@ -13986,9 +14746,11 @@ async function toggleCanopyOverlay(on) {
     const b = S.canopy.grid.bounds;
     const c2 = S.map.getCenter();
     if (c2.lat <= b.north && c2.lat >= b.south && c2.lng >= b.west && c2.lng <= b.east) {
-      if (!S.map.hasLayer(S.mapLayers.canopy)) S.map.addLayer(S.mapLayers.canopy);
       if (!S._overlayWanted) S._overlayWanted = {};
       S._overlayWanted.canopy = true;
+      // Attach through the mobile display-size cap (a deep-zoomed re-show
+      // must not create the giant stretched element the cap exists to avoid).
+      _applyOverlayZoomCap();
       buildLayerControl();
       if (S.is3D && typeof sync3d === 'function') sync3d();
       return;
@@ -14000,6 +14762,10 @@ async function toggleCanopyOverlay(on) {
 async function loadCanopyForView() {
   if (!S.map) return;
   if (S._canopyEditing) return; // grid must not change mid-edit
+  // Generation: a newer load, toggling the overlay off, or a source switch
+  // supersedes this one — its late result must not re-attach the overlay.
+  const gen = S._canopyLoadGen = (S._canopyLoadGen || 0) + 1;
+  S._canopyLoading = true;
   trackFetchStart('Canopy');
   setStatus('canopyStatus', 'loading', 'Fetching...');
   try {
@@ -14027,6 +14793,7 @@ async function loadCanopyForView() {
     const grid = makeGrid(center.lat, center.lng, halfWidthM, resM);
     try { Diag.note('canopy.start', { z: S.map.getZoom(), cols: grid.cols, rows: grid.rows, halfKm: Math.round(halfWidthM / 100) / 10 }); } catch (_) {}
     const { canopyFlat, source, tilesFailed, tilesLoaded, tilesTotal, cloudFrac } = await fetchCanopyRaster(grid);
+    if (gen !== S._canopyLoadGen) return; // superseded / unchecked / source switched
     if (S._canopyEditing) return; // user entered edit mode while this load was in flight — don't fight the edit canvas
     if (!canopyFlat) {
       setStatus('canopyStatus', 'error', source === 'no proxy' ? 'NO PROXY' : 'NO DATA');
@@ -14044,7 +14811,7 @@ async function loadCanopyForView() {
       buildLayerControl(); // revert the row the user just checked
       return;
     }
-    const op = parseFloat((document.getElementById('canopyOpacity') || {}).value) || CANOPY_OVERLAY_OPACITY;
+    const op = _sliderOpacity('canopyOpacity', CANOPY_OVERLAY_OPACITY);
     renderRasterOverlay('canopy', canopyGridToRGBA(grid, canopyFlat), grid, op);
     try { if (S.canopy && S.canopy.canopyFlat && S.canopy.canopyFlat.byteLength) Diag.free('canopyFlat', S.canopy.canopyFlat.byteLength); } catch (_) {}
     S.canopy = { grid, source, canopyFlat, cloudFrac: cloudFrac || 0 }; // retain pixels for GeoTIFF export
@@ -14066,6 +14833,7 @@ async function loadCanopyForView() {
     markSection('canopy', { status: 'live', updatedAt: Date.now(), error: null });
     buildLayerControl();
   } catch (e) {
+    if (gen !== S._canopyLoadGen) return; // a newer load / toggle-off owns the state now
     console.error('Canopy overlay error:', e);
     recordDataSourceError('Canopy', e);
     setStatus('canopyStatus', 'error', 'ERROR');
@@ -14073,6 +14841,7 @@ async function loadCanopyForView() {
     if (S._overlayWanted) S._overlayWanted.canopy = false;
     buildLayerControl(); // revert the row the user just checked
   } finally {
+    if (gen === S._canopyLoadGen) S._canopyLoading = false;
     trackFetchEnd('Canopy');
   }
 }
@@ -14163,7 +14932,7 @@ function exitCanopyEdit(force) {
   _canopyEditBarSync(); // hides the toolbar
   // Restore the normal canopy overlay from app state (reflects edits iff saved).
   if (S.canopy && S.canopy.canopyFlat) {
-    const op = parseFloat((document.getElementById('canopyOpacity') || {}).value) || CANOPY_OVERLAY_OPACITY;
+    const op = _sliderOpacity('canopyOpacity', CANOPY_OVERLAY_OPACITY);
     renderRasterOverlay('canopy', canopyGridToRGBA(S.canopy.grid, S.canopy.canopyFlat), S.canopy.grid, op);
   }
   buildLayerControl();
@@ -14329,6 +15098,7 @@ async function canopyEditSave() {
     const n = ce.sessionOps.length;
     ce.sessionOps = [];
     ce.undoStack = [];
+    ce._undoBytes = 0; // the byte budget tracks undoStack — reset with it
     const masks = ops.filter(o => o && o.t === 'mask').length;
     try { Diag.note('canopyEdit.save', { ops: n, total: ops.length, bytes, masks }); } catch (_) {}
     setStatus('canopyStatus', 'cached', 'EDITED');
@@ -14375,12 +15145,20 @@ function _canopyEditCanvasCreate() {
   const canvas = document.createElement('canvas');
   canvas.id = 'canopyEditCanvas';
   canvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;';
-  canvas.style.opacity = parseFloat((document.getElementById('canopyOpacity') || {}).value) || CANOPY_OVERLAY_OPACITY;
+  canvas.style.opacity = _sliderOpacity('canopyOpacity', CANOPY_OVERLAY_OPACITY);
   (pane || S.map.getContainer()).appendChild(canvas);
   ce.canvas = canvas;
   ce._onMapMove = () => _canopyEditRedraw();
-  ce._onZoomStart = () => { if (ce.canvas) ce.canvas.style.visibility = 'hidden'; };
-  ce._onZoomEnd = () => { if (ce.canvas) { ce.canvas.style.visibility = ''; _canopyEditRedraw(); } };
+  // The VEG preview canvas (created later, same pane) is container-anchored
+  // too: hide it with the edit canvas or it smears during the zoom animation.
+  ce._onZoomStart = () => {
+    if (ce.canvas) ce.canvas.style.visibility = 'hidden';
+    if (ce.vegCanvas) ce.vegCanvas.style.visibility = 'hidden';
+  };
+  ce._onZoomEnd = () => {
+    if (ce.vegCanvas) ce.vegCanvas.style.visibility = '';
+    if (ce.canvas) { ce.canvas.style.visibility = ''; _canopyEditRedraw(); }
+  };
   S.map.on('move resize', ce._onMapMove);
   S.map.on('zoomstart', ce._onZoomStart);
   S.map.on('zoomend', ce._onZoomEnd);
@@ -14694,13 +15472,15 @@ function _uiYield() {
 }
 
 // Completed VEG polygon (routed from onCanopyEditPolygon). Keep it on the map
-// with draggable vertices while the preview is live, then sample.
+// as a FIXED outline while the preview is live, then sample. No vertex
+// handles: the imagery mosaic, the preview and the baked op all come from the
+// ring as drawn, so a dragged vertex would show one area and apply another —
+// CANCEL and redraw to change it.
 function onCanopyVegPolygon(layer) {
   const ce = S.canopyEdit;
   if (!ce) return;
   layer.setStyle({ color: '#22c55e', weight: 2, fillColor: '#22c55e', fillOpacity: 0.08, dashArray: '6,4' });
   layer.addTo(S.map);
-  if (layer.editing && layer.editing.enable) layer.editing.enable();
   ce.polyLayer = layer;
   S.map.getContainer().style.cursor = '';
   const ring = (layer.getLatLngs()[0] || []).map(p => [p.lat, p.lng]);
@@ -15031,6 +15811,10 @@ async function toggleShadowOverlay(on) {
   if (!on) {
     if (S._overlayWanted) S._overlayWanted.shadow = false;
     if (S.mapLayers.shadow && S.map.hasLayer(S.mapLayers.shadow)) S.map.removeLayer(S.mapLayers.shadow);
+    // Neither an in-flight DEM load nor a pending scrub re-render may re-attach it.
+    clearTimeout(S._shadowTimeTimer);
+    if (S._shadowLoading) { S._shadowLoading = false; setStatus('shadowStatus', '', ''); }
+    S._shadowLoadGen = (S._shadowLoadGen || 0) + 1;
     if (S.is3D && typeof sync3d === 'function') sync3d();
     buildLayerControl();
     return;
@@ -15051,6 +15835,8 @@ async function toggleShadowOverlay(on) {
 
 async function loadShadowForView() {
   if (!S.map) return;
+  const gen = S._shadowLoadGen = (S._shadowLoadGen || 0) + 1; // newer load / toggle-off supersedes
+  S._shadowLoading = true;
   trackFetchStart('Sun shadow');
   setStatus('shadowStatus', 'loading', 'Fetching...');
   try {
@@ -15065,6 +15851,7 @@ async function loadShadowForView() {
     const resM = Math.max(WORK_RES_M, (2 * halfWidthM) / MAX_GRID);
     const grid = makeGrid(center.lat, center.lng, halfWidthM, resM);
     const dem = await fetch3DEPDEM(grid);
+    if (gen !== S._shadowLoadGen) return; // unchecked or superseded while fetching
     if (!dem.demFlat) {
       setStatus('shadowStatus', 'error', 'NO DEM');
       if (S._overlayWanted) S._overlayWanted.shadow = false;
@@ -15075,12 +15862,14 @@ async function loadShadowForView() {
     _renderShadowForTime();
     buildLayerControl();
   } catch (e) {
+    if (gen !== S._shadowLoadGen) return;
     console.error('Sun shadow overlay error:', e);
     recordDataSourceError('Sun shadow', e);
     setStatus('shadowStatus', 'error', 'ERROR');
     if (S._overlayWanted) S._overlayWanted.shadow = false;
     buildLayerControl(); // revert the row the user just checked
   } finally {
+    if (gen === S._shadowLoadGen) S._shadowLoading = false;
     trackFetchEnd('Sun shadow');
   }
 }
@@ -15096,7 +15885,7 @@ function _renderShadowForTime() {
   S.shadow.mask = mask;
   S.shadow.sun = sun;
   S.shadow.timeMs = t.getTime();
-  const op = parseFloat((document.getElementById('shadowOpacity') || {}).value) || SHADOW_OVERLAY_OPACITY;
+  const op = _sliderOpacity('shadowOpacity', SHADOW_OVERLAY_OPACITY);
   renderRasterOverlay('shadow', shadowMaskToRGBA(grid, mask), grid, op);
   const night = !(sun.elevation > 0);
   setStatus('shadowStatus', 'live', night ? 'NIGHT' : `SUN ${Math.round(sun.azimuth)}° ↑${Math.round(sun.elevation)}°`);
@@ -15118,7 +15907,10 @@ function _renderShadowForTime() {
 function _updateShadowForTime() {
   if (!S.shadow || !S._overlayWanted || !S._overlayWanted.shadow) return;
   clearTimeout(S._shadowTimeTimer);
-  S._shadowTimeTimer = setTimeout(_renderShadowForTime, 120);
+  S._shadowTimeTimer = setTimeout(() => {
+    // Re-check: the overlay may have been unchecked during the debounce.
+    if (S.shadow && S._overlayWanted && S._overlayWanted.shadow) _renderShadowForTime();
+  }, 120);
 }
 
 // ============================================================
@@ -15511,7 +16303,7 @@ function _renderVisibleViewsheds() {
     return;
   }
   const comp = compositeViewsheds(computed, undefined, { activeId: S.activeViewshedId });
-  const op = parseFloat((document.getElementById('vsOpacity') || {}).value) || VIEWSHED_OVERLAY_OPACITY;
+  const op = _sliderOpacity('vsOpacity', VIEWSHED_OVERLAY_OPACITY);
   renderRasterOverlay('viewshed', viewshedMaskToRGBA(comp.grid, comp.mask), comp.grid, op);
   if (r) {
     const rec = computed.find(x => x.id === S.activeViewshedId) || computed[computed.length - 1];
@@ -15607,7 +16399,17 @@ function clearAllViewsheds() {
   if (S.observerView) exitObserverView();
   if (S.mapLayers.observers) S.mapLayers.observers.clearLayers();
   if (S.mapLayers.viewshed && S.map && S.map.hasLayer(S.mapLayers.viewshed)) S.map.removeLayer(S.mapLayers.viewshed);
-  if (typeof clearViewsheds === 'function') clearViewsheds(_currentAreaKey());
+  // Drop the overlay for good: with _overlayWanted.viewshed still true the next
+  // zoomend (_applyOverlayZoomCap) re-added it and 3D kept draping it.
+  if (S._overlayWanted) S._overlayWanted.viewshed = false;
+  S.mapLayers.viewshed = null;
+  if (S._raster3d) delete S._raster3d.viewshed;
+  if (S.is3D && typeof sync3d === 'function') sync3d();
+  // Only THIS area's stored records. clearViewsheds(null) wipes every area, so
+  // with no area drawn delete the listed records one by one instead.
+  const ak = _currentAreaKey();
+  if (ak != null && typeof clearViewsheds === 'function') clearViewsheds(ak);
+  if (typeof deleteViewshed === 'function') (S.viewsheds || []).forEach(r => { if (r && r.id != null) deleteViewshed(r.id); });
   (S.viewsheds || []).forEach(r => { r._deleted = true; r._pendingRecompute = false; });
   S._vsRestoreSeq = (S._vsRestoreSeq || 0) + 1; // a pending restore must not re-add them
   S.viewsheds = [];
@@ -16133,7 +16935,25 @@ function _vert3dMakeLayer() {
     id: VERT3D_LAYER_ID,
     type: 'custom',
     renderingMode: '3d',
+    // Every setStyle(…, {diff:true}) in _sync3dNow drops this custom layer
+    // (build3dStyle doesn't list it) and _ensureVert3dLayer re-adds it, so
+    // onAdd runs again: free what the previous onAdd created first, or each
+    // sync leaks 8 buffers + 3 programs on the GPU.
+    _freeGl(gl) {
+      if (!gl || this._gl !== gl) { this._gl = null; return; } // other/lost context: nothing ours to free
+      for (const k of ['lineBuffer', 'quadBuffer', 'trailBuffer', 'planeTriBuffer', 'planeLineBuffer',
+        'triOpaqueBuffer', 'triCanopyBuffer', 'triCanopyIndexBuffer']) {
+        if (this[k]) { try { gl.deleteBuffer(this[k]); } catch (_) {} this[k] = null; }
+      }
+      for (const k of ['lineProg', 'quadProg', 'triProg']) {
+        if (this[k]) { try { gl.deleteProgram(this[k]); } catch (_) {} this[k] = null; }
+      }
+      this._gl = null;
+    },
+    onRemove(map, gl) { this._freeGl(gl); },
     onAdd(map, gl) {
+      this._freeGl(gl);
+      this._gl = gl;
       const compile = (type, src) => {
         const sh = gl.createShader(type);
         gl.shaderSource(sh, src);
@@ -16142,9 +16962,14 @@ function _vert3dMakeLayer() {
       };
       const link = (vs, fs) => {
         const p = gl.createProgram();
-        gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
-        gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+        const v = compile(gl.VERTEX_SHADER, vs);
+        const f = compile(gl.FRAGMENT_SHADER, fs);
+        gl.attachShader(p, v);
+        gl.attachShader(p, f);
         gl.linkProgram(p);
+        // Shaders are only needed until link: release them now.
+        gl.detachShader(p, v); gl.detachShader(p, f);
+        gl.deleteShader(v); gl.deleteShader(f);
         return p;
       };
       const fs = 'precision mediump float;varying vec3 v_color;void main(){gl_FragColor=vec4(v_color,1.0);}';
@@ -16637,8 +17462,8 @@ function _startCanopy3dBuild(src) {
     () => build.cancelled || !S.map3d)
     .then(result => {
       if (S._canopy3dBuild === build) S._canopy3dBuild = null;
-      _canopy3dProgressHide();
-      if (!result) return; // cancelled
+      if (!S._canopy3dBuild) _canopy3dProgressHide(); // don't hide a newer build's bar
+      if (!result || build.cancelled) return; // cancelled
       S._canopy3dCache = { src, verts: result.verts, indices: result.indices, missing: result.missing, anchor: result.anchor };
       if (S.is3D) _updateVert3dVerts();
       // Some vertices sampled not-yet-loaded terrain: show the mesh now, but
@@ -16659,7 +17484,7 @@ function _startCanopy3dBuild(src) {
     })
     .catch(err => {
       if (S._canopy3dBuild === build) S._canopy3dBuild = null;
-      _canopy3dProgressHide();
+      if (!S._canopy3dBuild) _canopy3dProgressHide();
       console.warn('3D canopy build failed:', err);
     });
 }
@@ -16679,6 +17504,9 @@ function _abortCanopy3dBuild() {
   const b = S._canopy3dBuild;
   if (!b) return;
   b.cancelled = true;
+  // Release the single-flight slot now: the cancelled build only notices at
+  // its next chunk, and a quick 3D re-entry must be able to start a new one.
+  S._canopy3dBuild = null;
   _canopy3dProgressHide();
 }
 
@@ -16916,21 +17744,25 @@ function _attachObserverInput() {
   let last = null;
   const down = (e) => {
     if (!S.observerView) return;
-    last = { x: e.clientX, y: e.clientY };
+    // One pointer drives the look: a second finger / palm touch must not
+    // interleave its positions with the first (it whipped the camera). A new
+    // PRIMARY pointer still takes over, so a lost pointerup can't lock input.
+    if (last && last.id !== e.pointerId && e.isPrimary !== true) return;
+    last = { x: e.clientX, y: e.clientY, id: e.pointerId };
     S.observerView.dragPx = 0;
     try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* mouse w/o capture */ }
   };
   const move = (e) => {
-    if (!last || !S.observerView) return;
+    if (!last || !S.observerView || e.pointerId !== last.id) return;
     const dx = e.clientX - last.x, dy = e.clientY - last.y;
-    last = { x: e.clientX, y: e.clientY };
+    last = { x: e.clientX, y: e.clientY, id: last.id };
     S.observerView.dragPx += Math.abs(dx) + Math.abs(dy);
     const look = applyLookDrag(S.observerView.pitch, S.observerView.bearing, dx, dy);
     S.observerView.pitch = look.pitch;
     S.observerView.bearing = look.bearing;
     _applyObserverLook();
   };
-  const up = () => { last = null; };
+  const up = (e) => { if (last && e && e.pointerId !== last.id) return; last = null; };
   const wheel = (e) => {
     if (!S.observerView) return;
     e.preventDefault();
@@ -17281,8 +18113,12 @@ function _finishDrive(d, target) {
 // never faster) and the drive is marked surfaceDetail:false.
 async function _routeDrive(start, target, signal) {
   const key = responseRouteKey('auto', start, target);
+  // A COPY of the memo entry: the condition loaders write per-run results
+  // (haz, mvum) onto the drive, and the memo's object is also held by the
+  // estimate on screen — mutating it in place wiped that estimate's chain
+  // controls and closures whenever a refresh was aborted or failed.
   const memo = _responseMemo().get(key);
-  if (memo) return memo;
+  if (memo) return Object.assign({}, memo);
   try {
     const rj = await _valhallaPost('/route', {
       locations: [{ lat: start.lat, lon: start.lng }, { lat: target.lat, lon: target.lng }],
@@ -17307,7 +18143,7 @@ async function _routeDrive(start, target, signal) {
     if (typeof cacheApiResponse === 'function') {
       cacheApiResponse('response_route', key, { coords, km: leg.km, sec: leg.sec, segments, surfaceDetail, at: drive.at });
     }
-    return drive;
+    return Object.assign({}, drive);
   } catch (e) {
     if (e && e.name === 'AbortError') throw e;
     const info = e && e.valhalla;
@@ -17441,6 +18277,27 @@ function _responseHasData(r) {
 
 // --- Conditions along the route(s) ---
 
+// Runs one condition request (fetch + body read) with a time limit. Without
+// one a stalled connection held the whole estimate on "Checking conditions…"
+// after routing had already answered. Running out of time is an ordinary
+// Error (the loader's failure path); the caller's own abort stays AbortError.
+function _responseTimed(run, outer, ms) {
+  ms = ms || RESPONSE_REQ_TIMEOUT_MS;
+  const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+  if (ctl && outer) {
+    if (outer.aborted) ctl.abort();
+    else if (outer.addEventListener) outer.addEventListener('abort', () => ctl.abort(), { once: true });
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (ctl) ctl.abort();
+      reject(new Error(`no answer within ${Math.round(ms / 1000)} s`));
+    }, ms);
+    Promise.resolve().then(() => run(ctl ? ctl.signal : outer))
+      .then(v => { clearTimeout(timer); resolve(v); }, e => { clearTimeout(timer); reject(e); });
+  });
+}
+
 async function _loadRouteWeather(resp, drives, signal) {
   if (!drives.length) return;
   const lists = drives.map(d => samplePolyline(d.coords, RESPONSE_WX_STEP_KM, RESPONSE_WX_MAX_POINTS));
@@ -17450,14 +18307,17 @@ async function _loadRouteWeather(resp, drives, signal) {
       + '&longitude=' + merged.points.map(p => p.lng.toFixed(4)).join(',')
       + '&hourly=rain,showers,snowfall,snow_depth,weather_code'
       + `&forecast_hours=${RESPONSE_WX_HOURS}&timeformat=unixtime&timezone=GMT`;
-    const res = await fetch(url, { signal });
-    if (!res.ok) {
-      let reason = '';
-      try { const b = await res.json(); if (b && b.reason) reason = ': ' + b.reason; } catch (_) { /* non-JSON */ }
-      throw new Error('HTTP ' + res.status + reason);
-    }
-    let j;
-    try { j = await res.json(); } catch (_) { throw new Error('response is not valid JSON'); }
+    const { res, j } = await _responseTimed(async sig => {
+      const res = await fetch(url, { signal: sig });
+      if (!res.ok) {
+        let reason = '';
+        try { const b = await res.json(); if (b && b.reason) reason = ': ' + b.reason; } catch (_) { /* non-JSON */ }
+        throw new Error('HTTP ' + res.status + reason);
+      }
+      let j;
+      try { j = await res.json(); } catch (_) { throw new Error('response is not valid JSON'); }
+      return { res, j };
+    }, signal);
     if (j && !Array.isArray(j) && j.error) throw new Error(j.reason || 'API error');
     const parsed = parseRouteWeather(j, merged.points.length);
     if (!parsed) throw new Error('response malformed');
@@ -17484,8 +18344,8 @@ async function _loadRouteCaltrans(resp, drives, signal) {
   try {
     const base = getCanopyProxyBase();
     if (!base) throw new Error('no data proxy configured');
-    const get = async file => {
-      const res = await _proxyFetch(base + '/caltrans/' + file, { signal });
+    const get = file => _responseTimed(async sig => {
+      const res = await _proxyFetch(base + '/caltrans/' + file, { signal: sig });
       // A Worker without the /caltrans/ route sends the path to its default
       // upstream, which answers 403 / 404.
       if (res.status === 403 || res.status === 404) throw new Error(`HTTP ${res.status} — the data proxy has no /caltrans/ route yet`);
@@ -17493,7 +18353,7 @@ async function _loadRouteCaltrans(resp, drives, signal) {
       const recs = parseQuickmapKml(await res.text());
       if (!recs) throw new Error('answer was not a Caltrans KML (data proxy needs the /caltrans/ route)');
       return recs;
-    };
+    }, signal);
     const [cc, chin] = await Promise.allSettled([get('v2_cc.kml'), get('v2_chin.kml')]);
     if (cc.status !== 'fulfilled') throw cc.reason;
     const records = cc.value.concat(chin.status === 'fulfilled' ? chin.value : []);
@@ -17519,16 +18379,24 @@ async function _loadRouteAlerts(resp, drives, signal) {
   const step = Math.min(RESPONSE_ALERT_STEP_KM, Math.max(0.5, main.km / 2));
   const lists = [samplePolyline(main.coords, step, RESPONSE_ALERT_MAX_POINTS)]
     .concat(drives.filter(d => d !== main).map(d => [{ lat: d.roadEnd.lat, lng: d.roadEnd.lng }]));
-  const pts = mergeSamplePoints(lists, 5, RESPONSE_ALERT_MAX_POINTS + 2).points;
-  const nMain = lists[0].length;
-  const results = await Promise.allSettled(pts.map(async p => {
-    const res = await fetch(`https://api.weather.gov/alerts/active?point=${p.lat.toFixed(4)},${p.lng.toFixed(4)}`, { signal });
+  const merged = mergeSamplePoints(lists, 5, RESPONSE_ALERT_MAX_POINTS + 2);
+  const pts = merged.points;
+  // Positions are judged in MERGED-point indices: merging points within 5 km
+  // renumbers them, so the main list's own indices (and its length) say
+  // nothing about which merged point is the start or a destination.
+  const mainMap = merged.maps[0] || [];
+  const startIdx = mainMap.length ? mainMap[0] : -1;
+  const destIdx = new Set();
+  if (mainMap.length) destIdx.add(mainMap[mainMap.length - 1]);
+  merged.maps.slice(1).forEach(m => { if (m.length) destIdx.add(m[m.length - 1]); });
+  const results = await Promise.allSettled(pts.map(p => _responseTimed(async sig => {
+    const res = await fetch(`https://api.weather.gov/alerts/active?point=${p.lat.toFixed(4)},${p.lng.toFixed(4)}`, { signal: sig });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const sw = _swCacheStamp(res);
     const data = await res.json();
     if (!data || !Array.isArray(data.features)) throw new Error('malformed');
     return { alerts: _mapNwsAlertFeatures(data.features), sw };
-  }));
+  }, signal)));
   if (signal && signal.aborted) return;
   const byId = new Map();
   let live = 0, cached = 0;
@@ -17545,9 +18413,9 @@ async function _loadRouteAlerts(resp, drives, signal) {
     const set = new Set(a.points);
     if (set.size >= pts.length) return 'entire route';
     const parts = [];
-    if (set.has(0)) parts.push('at start');
-    if ([...set].some(i => i > 0 && i < nMain - 1)) parts.push('en route');
-    if ([...set].some(i => i >= nMain - 1)) parts.push('at destination');
+    if (set.has(startIdx)) parts.push('at start');
+    if ([...set].some(i => i !== startIdx && !destIdx.has(i))) parts.push('en route');
+    if ([...set].some(i => destIdx.has(i))) parts.push('at destination');
     return parts.join(', ');
   };
   const alerts = [...byId.values()].map(a => Object.assign(a, { where: where(a) }));
@@ -17589,7 +18457,8 @@ async function _loadRouteMvum(resp, drives, signal) {
     const feats = (okR ? roads.features : [])
       .concat(okT ? trails.features.map(f => Object.assign({}, f, { __mvumTrail: true })) : []);
     const now = new Date();
-    withForest.forEach(d => { d.mvum = matchMvumRoads(feats, d.coords, d.segments, now); });
+    const tz = (S.wx && S.wx.missionTz) || undefined; // season day in the mission zone, not the device's
+    withForest.forEach(d => { d.mvum = matchMvumRoads(feats, d.coords, d.segments, now, tz); });
     const cached = (okR && roads.fromCache) || (okT && trails.fromCache);
     resp.mvum = { status: cached ? 'cached' : 'ok', at: Date.now(),
       // One layer missing, or a capped answer: the list may be short.
@@ -18139,9 +19008,13 @@ function renderResponse() {
   } else if (drive && drive.status === 'noroad') {
     setText('respTotal', `NO ROAD FOUND for ${p.name} — ${drive.error}`); setColor('respTotal', 'red');
     ['respRoad', 'respForest', 'respHike', 'respChains', 'respWx', 'respAccess'].forEach(id => { setText(id, '--'); setColor(id, null); });
-  } else if (S.sectionMeta.response && S.sectionMeta.response.partial) {
-    // This destination's route failed while others answered: its cells are
-    // unknown here (a section-wide failure is handled by markSection).
+  } else if (p && !p.skipped) {
+    // This destination's route failed: its cells are unknown here. Decided
+    // from the destination itself, not S.sectionMeta.response.partial — this
+    // render runs BEFORE _markResponseSection sets that flag, and markSection
+    // skips its own blanking for a partial patch, so the previous values
+    // stayed on screen. (A same-signature total failure keeps the earlier
+    // answer and never reaches here.)
     markCellsUnknown(cellIds.filter(id => id !== 'respStart'));
   }
 
@@ -18478,9 +19351,14 @@ if (typeof module !== 'undefined' && module.exports) {
     importKML, handleKMLFile, parseKML,
     copyBriefing, buildBriefingText,
     generatePDFBriefing, shareBriefingEmail, openInSARTopo,
+    _captureBriefingMap, _capture3dMap, _compositeMapCapture, briefingPdfSlices, _buildAndExportPDF, _openEmailBriefingWindow,
+    clearAllCaches, _updateTimeBar, resolveSectionalEdition, CACHE_VIEW_JOBS, _cacheViewJobOutcome,
     recordDataSourceError, clearDataSourceError, retryFailedSource, retryAllFailed, showDataSourceStatus,
     setAutoRefresh, loadFAAChart, removeChart, clearAllCharts, updateChartList, restoreFAACharts,
     fetchFireDanger, renderFirePerimeters, renderFireDangerCard,
+    _nfdrsPercentile, avalancheWarningActive, _avalanchePopup, fetchWireHazards, _renderOsmWireElements, restoreConfig,
+    trackFetchStart, trackFetchEnd, _nwsAlertCardHtml, _fetchGeoJsonLayer, _fetchCanopyFromProxy, _fetchChmv2Raster,
+    _commitAqi, ADSB_FETCH_TIMEOUT_MS,
     fetchNearbyAirports,
     initTimeBar, hideTimeBar,
     renderTerrainFeatures, renderLZMarkers,

@@ -90,6 +90,17 @@ function openDB() {
   });
 }
 
+// Settle a write/delete transaction: resolve on complete, REJECT on error or
+// abort (a quota abort fires only onabort). A promise waiting on oncomplete
+// alone never settled when the transaction failed.
+function _txDone(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'));
+    tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
+  });
+}
+
 function areaKey(lat, lng) {
   return `${lat.toFixed(3)}_${lng.toFixed(3)}`;
 }
@@ -105,10 +116,7 @@ async function cacheApiResponse(endpoint, key, data) {
       data,
       timestamp: Date.now(),
     });
-    return new Promise((resolve, reject) => {
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error);
-    });
+    return _txDone(tx);
   } catch (e) {
     console.warn('IndexedDB cache write failed:', e);
   }
@@ -179,7 +187,7 @@ async function clearApiCache(endpoint) {
     } else {
       store.clear();
     }
-    return new Promise(resolve => { tx.oncomplete = resolve; });
+    return _txDone(tx);
   } catch (e) {
     console.warn('IndexedDB cache clear failed:', e);
   }
@@ -192,7 +200,7 @@ async function saveAppState(key, value) {
     const db = await openDB();
     const tx = db.transaction('appState', 'readwrite');
     tx.objectStore('appState').put({ key, value, timestamp: Date.now() });
-    return new Promise(resolve => { tx.oncomplete = resolve; });
+    return _txDone(tx);
   } catch (e) {
     console.warn('AppState save failed:', e);
   }
@@ -219,7 +227,7 @@ async function saveTileRegion(regionId, metadata) {
     const db = await openDB();
     const tx = db.transaction('tileRegions', 'readwrite');
     tx.objectStore('tileRegions').put({ regionId, ...metadata, timestamp: Date.now() });
-    return new Promise(resolve => { tx.oncomplete = resolve; });
+    return _txDone(tx);
   } catch (e) {
     console.warn('Tile region save failed:', e);
   }
@@ -244,7 +252,7 @@ async function deleteTileRegion(regionId) {
     const db = await openDB();
     const tx = db.transaction('tileRegions', 'readwrite');
     tx.objectStore('tileRegions').delete(regionId);
-    return new Promise(resolve => { tx.oncomplete = resolve; });
+    return _txDone(tx);
   } catch (e) {
     console.warn('Tile region delete failed:', e);
   }
@@ -340,29 +348,34 @@ async function requestNotificationPermission() {
   return Notification.requestPermission();
 }
 
+// Called at the end of every computeAssessment with S.assessment
+// ({ limits, advisories, label, ... } — the assessmentDisplay shape; legacy
+// `issues` is read too). Notifies only on a TRANSITION into "limits exceeded"
+// (recomputes run on every fetch and time-bar scrub, so a standing limit must
+// not re-notify), only when the user enabled notifications, and only while the
+// app is backgrounded. Never shows a GO / CAUTION / NO-GO verdict word.
+let _notifyHadLimits = false;
 function checkAndNotify(assessResult) {
-  if (!('Notification' in window) || Notification.permission !== 'granted') return;
-  if (document.visibilityState === 'visible') return; // only notify when backgrounded
+  if (typeof window === 'undefined' || !('Notification' in window) || Notification.permission !== 'granted') return;
+  const a = assessResult || {};
+  const limits = [...new Set(Array.isArray(a.limits) ? a.limits : (Array.isArray(a.issues) ? a.issues : []))];
+  const had = _notifyHadLimits;
+  _notifyHadLimits = limits.length > 0;
+  if (!limits.length || had) return;                     // not a transition into limits
+  if (typeof document !== 'undefined' && document.visibilityState === 'visible') return; // only when backgrounded
   if (Date.now() - _lastNotifyTime < NOTIFY_COOLDOWN) return;
 
-  const conditions = [];
-  if (assessResult.level === 'NO-GO') {
-    assessResult.issues.forEach(issue => {
-      if (!_notifiedConditions[issue] || Date.now() - _notifiedConditions[issue] > 15 * 60 * 1000) {
-        conditions.push(issue);
-        _notifiedConditions[issue] = Date.now();
-      }
-    });
-  }
-
-  if (conditions.length > 0) {
-    _lastNotifyTime = Date.now();
-    new Notification('SAR Preflight: NO-GO', {
-      body: conditions.join(', '),
-      icon: './icons/icon-192.svg',
-      tag: 'sar-threshold',
-    });
-  }
+  const conditions = limits.filter(issue =>
+    !_notifiedConditions[issue] || Date.now() - _notifiedConditions[issue] > 15 * 60 * 1000);
+  if (!conditions.length) return;
+  conditions.forEach(issue => { _notifiedConditions[issue] = Date.now(); });
+  _lastNotifyTime = Date.now();
+  const n = limits.length;
+  new Notification(`SAR Preflight: ${n} LIMIT${n > 1 ? 'S' : ''} EXCEEDED`, {
+    body: conditions.join(', '),
+    icon: './icons/icon-192.svg',
+    tag: 'sar-threshold',
+  });
 }
 
 // --- SOP Profile CRUD ---
@@ -372,10 +385,7 @@ async function saveSopProfile(profile) {
     const db = await openDB();
     const tx = db.transaction('sopProfiles', 'readwrite');
     tx.objectStore('sopProfiles').put(profile);
-    return new Promise((resolve, reject) => {
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error);
-    });
+    return _txDone(tx);
   } catch (e) {
     console.warn('SOP profile save failed:', e);
   }
@@ -416,7 +426,7 @@ async function deleteSopProfile(name) {
     const db = await openDB();
     const tx = db.transaction('sopProfiles', 'readwrite');
     tx.objectStore('sopProfiles').delete(name);
-    return new Promise(resolve => { tx.oncomplete = resolve; });
+    return _txDone(tx);
   } catch (e) {
     console.warn('SOP profile delete failed:', e);
   }
@@ -477,7 +487,7 @@ async function deleteMissionLog(id) {
     const db = await openDB();
     const tx = db.transaction('missionLogs', 'readwrite');
     tx.objectStore('missionLogs').delete(id);
-    return new Promise(resolve => { tx.oncomplete = resolve; });
+    return _txDone(tx);
   } catch (e) {
     console.warn('Mission log delete failed:', e);
   }
@@ -490,10 +500,7 @@ async function saveViewshed(record) {
     const db = await openDB();
     const tx = db.transaction('viewsheds', 'readwrite');
     tx.objectStore('viewsheds').put(record);
-    return new Promise((resolve, reject) => {
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error);
-    });
+    return _txDone(tx);
   } catch (e) {
     console.warn('Viewshed save failed:', e);
   }
@@ -540,24 +547,29 @@ async function deleteViewshed(id) {
     const db = await openDB();
     const tx = db.transaction('viewsheds', 'readwrite');
     tx.objectStore('viewsheds').delete(id);
-    return new Promise(resolve => { tx.oncomplete = resolve; });
+    return _txDone(tx);
   } catch (e) {
     console.warn('Viewshed delete failed:', e);
   }
 }
 
-async function clearViewsheds(areaKeyFilter) {
+// Deletes ONE area's records. A null/undefined key is a no-op — it used to
+// clear the whole store, so "Clear all" with no area drawn erased every other
+// area's saved viewsheds. Wiping everything takes an explicit { all: true }.
+async function clearViewsheds(areaKeyFilter, opts) {
+  const all = !!(opts && opts.all === true);
+  if (areaKeyFilter == null && !all) return;
   try {
     const db = await openDB();
     const tx = db.transaction('viewsheds', 'readwrite');
     const store = tx.objectStore('viewsheds');
-    if (areaKeyFilter == null) {
+    if (areaKeyFilter == null) {   // only reachable with { all: true }
       store.clear();
     } else {
       const cur = store.index('areaKey').openKeyCursor(IDBKeyRange.only(areaKeyFilter));
       cur.onsuccess = e => { const c = e.target.result; if (c) { store.delete(c.primaryKey); c.continue(); } };
     }
-    return new Promise(resolve => { tx.oncomplete = resolve; });
+    return _txDone(tx);
   } catch (e) {
     console.warn('Viewsheds clear failed:', e);
   }
@@ -567,7 +579,7 @@ async function clearViewsheds(areaKeyFilter) {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     SAR_DB_NAME, SAR_DB_VERSION, ENDPOINT_TTL,
-    openDB, areaKey, cacheApiResponse, getCachedApiResponse, clearApiCache,
+    openDB, _txDone, areaKey, cacheApiResponse, getCachedApiResponse, clearApiCache,
     getCachedApiResponsesByPrefix,
     cacheRaster, getCachedRaster,
     saveAppState, getAppState,

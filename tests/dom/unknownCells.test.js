@@ -192,11 +192,14 @@ describe('fire danger failure', () => {
     expect(card).not.toContain('No wildland fire perimeters detected');
   });
 
-  it('a failed perimeter fetch with no prior data shows the UNKNOWN card and blanks wxFire', async () => {
+  // wxFire is derived from relative humidity by renderWeather (a weather cell):
+  // a failed perimeter fetch must not blank it.
+  it('a failed perimeter fetch with no prior data shows the UNKNOWN card and leaves the RH-derived wxFire alone', async () => {
+    document.getElementById('wxFire').textContent = 'Moderate';
     globalThis.fetch = () => Promise.resolve({ ok: false, status: 503 });
     await fetchFireDanger(38.68, -120.99, bounds);
     expect(document.getElementById('fireDangerCards').textContent).toContain(UNKNOWN_CELL_TEXT);
-    expect(text('wxFire')).toBe(UNKNOWN_CELL_TEXT);
+    expect(text('wxFire')).toBe('Moderate');
   });
 
   it('a failed refresh keeps this area\'s earlier card but leads with an amber stale line', async () => {

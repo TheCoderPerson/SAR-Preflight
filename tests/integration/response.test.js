@@ -1086,3 +1086,73 @@ describe('briefing and export', () => {
     expect(groups.some(g => /Response/.test(g.label))).toBe(false);
   });
 });
+
+describe('bug review Nov 2026 — response estimate robustness', () => {
+  const alert = (id, event) => ({ id, properties: { id, event, severity: 'Severe', headline: event + ' issued', description: 'Heavy snow.', onset: '2026-11-17T22:00:00-08:00', expires: '2026-11-18T16:15:00-08:00', senderName: 'NWS Sacramento CA' }, geometry: null });
+
+  it('a superseded refresh never wipes the chain controls of the estimate on screen (memo is copied)', async () => {
+    seed();
+    mockServices({ cc: res(CC_KML), chin: res(CHIN_KML) });
+    await fetchResponseEstimate({});
+    const shown = S.response;
+    const key = shown.dests[0].driveKey;
+    expect(shown.drives[key].haz.chainOn.length).toBe(1);
+    // A second run hits the session memo, then is superseded while its
+    // condition checks are on their way.
+    mockServices({ cc: () => { invalidateAreaRequests(); return res(EMPTY_KML); } });
+    await fetchResponseEstimate({});
+    expect(S.response).toBe(shown);
+    expect(shown.drives[key].haz.chainOn.length).toBe(1);
+    recomputeResponseForHour();
+    expect(text('respChains')).toMatch(/^Chain control on route/);
+  });
+
+  it('a warning only at the route end reads "at destination"', async () => {
+    seed();
+    let n = 0;
+    mockServices({ alerts: () => {
+      const me = n++;
+      return { ok: true, status: 200, headers: { get: () => null },
+        json: async () => { await new Promise(r => setTimeout(r, 0)); return { features: me === n - 1 ? [alert('urn:end', 'Winter Storm Warning')] : [] }; } };
+    } });
+    await fetchResponseEstimate({});
+    const a = S.response.alerts.alerts;
+    expect(a.length).toBe(1);
+    expect(a[0].where).toBe('at destination');
+  });
+
+  it('the selected destination whose route failed reads UNKNOWN while the other one answered', async () => {
+    const o1 = observer('o1', 'North', OBSERVER);
+    const o2 = observer('o2', 'South', { lat: 38.80, lng: -120.30 });
+    seed({ observers: [o1, o2] });
+    mockServices();
+    await fetchResponseEstimate({});
+    expect(text('respTotal')).not.toBe(UNKNOWN_CELL_TEXT);
+    S._responseMemo = null;
+    mockServices({ route: (url, opts) => {
+      const locs = JSON.parse(opts.body).locations;
+      const to = locs[locs.length - 1];
+      return Math.abs(to.lat - OBSERVER.lat) < 1e-6 ? res({}, { status: 500 }) : res(ROUTE);
+    } });
+    await fetchResponseEstimate({});
+    expect(S.sectionMeta.response.partial).toBe(true);
+    expect(text('respTotal')).toBe(UNKNOWN_CELL_TEXT);
+    expect(text('respRoad')).toBe(UNKNOWN_CELL_TEXT);
+  });
+
+  it('a condition check that never answers gives up instead of holding the estimate', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      seed();
+      mockServices({ cc: () => new Promise(() => {}), chin: () => new Promise(() => {}) });
+      const p = fetchResponseEstimate({});
+      await vi.advanceTimersByTimeAsync(60000);
+      await p;
+      expect(S.response && S.response.caltrans.status).toBe('error');
+      expect(S.response.caltrans.error).toMatch(/no answer within 25 s/);
+      expect(text('respChains')).toMatch(/^UNVERIFIED/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

@@ -4,6 +4,24 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.11.20-d — 2026-11-20
+
+- Observed ceiling: fog, snow or smoke reported as an obscured sky (vertical visibility) is now a ceiling and can trip the cloud-clearance limit. It used to read "Unlimited / VFR". A station that does not report sky condition or visibility now reads "Not reported" / "UNKNOWN (incomplete obs)" with an advisory, never "Unlimited" or VFR, and an invalid future-dated report can no longer replace a valid one.
+- Moon phase and illumination were about 13 days off (a new moon showed as nearly full). Density altitude read 600 to 1,800 ft low at mountain elevations. Both are now correct.
+- Avalanche zones no longer raise a false "Avalanche warning in effect" in the banner and popups: the forecast service marks every zone with an empty warning field, which the app read as a warning.
+- KML and CalTopo exports now contain the GeoJSON-based layers (class airspace, SUA, TFR areas, LAANC, fire perimeters, NWS alerts, wilderness, USFS/BLM roads, water, smoke, avalanche). They exported 0 features even though the export list showed counts.
+- More honest data labels: an offline copy of wildfire perimeters is shown dated and amber, a fire list too long to load is marked INCOMPLETE, a capped NOTAM search or a malformed TFR answer is a failed check, going offline mid-check is reported as a failure, cached airspace reads "(cached)", and a failed LAANC or airport lookup reads UNKNOWN. None of these show as "none" or LIVE any more.
+- Refreshing the same area no longer blanks good values to UNKNOWN when one source fails: they stay, marked "(stale: Verify)". Cached TFRs/NOTAMs can no longer land on another area, and airspace cells no longer flash green "Class G" while loading.
+- Class E surface areas now say LAANC authorization is required. NSFR restrictions are named by facility, "DATA STALE" counts as an advisory, and an area inside a TFR that touches its border is now detected as overlapping it.
+- Land ownership now counts private inholdings inside public land; no ownership data reads "verify ownership" instead of "No private land detected". Bird-risk water reads Unknown when the data is missing.
+- ADS-B: a refusing provider no longer shows "0 aircraft · LIVE", the lists say waiting / UNKNOWN instead of an all-clear, a hung provider no longer stalls updates, and PLANS mode keeps traffic hidden.
+- Viewshed: a drone flying inside taller trees or a building is no longer shown as visible, exported polygons no longer form figure-8 rings, and "Clear all observers" no longer erases other areas' saved viewsheds or comes back on zoom.
+- PDF and email briefings: the map now includes vector overlays, canopy/viewshed/shadow rasters and markers, works in 3D, is captured fresh each time (never the previous area's map), and multi-page PDFs no longer repeat content at page breaks.
+- Offline: basemap, topo, sectional, hillshade and street tiles are now cached as you browse, pre-downloaded topo tiles match what the map asks for, and the download includes the current sectional edition and the light basemap.
+- Re-importing an FAA chart no longer leaves it blank, and imported charts are placed more accurately. Threshold notifications now fire once on entering limits. The default 10-minute auto-refresh now runs on first launch, and the ADS-B on/off setting survives a reload.
+- Response Time Estimate: an aborted or failed refresh no longer erases chain controls and closures from the estimate on screen, a destination whose route failed reads UNKNOWN, condition checks give up after 25 s instead of hanging, active chain controls are never shown green, and missing elevation samples no longer add phantom climb.
+- Sun shadow no longer darkens sunlit ridge crests, the map wind arrow points downwind like the KML export, opacity sliders can be set to 0 %, the 3D view no longer leaks GPU memory on every refresh, and text from outside feeds is escaped everywhere it is displayed.
+
 ## v2026.11.20-c — 2026-11-20
 
 - The red DATA SOURCE ERRORS list under the banner now updates as each source answers. It used to wait until every check for the area had finished, so a failed weather check could show UNKNOWN on the Weather tab for minutes before the list named it, while the slowest source (often an overloaded OpenStreetMap server) was still trying. An opened [details] list now stays open while the list updates.
