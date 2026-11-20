@@ -7173,11 +7173,11 @@ async function fetchRadar() {
     const frames = (data.radar && data.radar.past) ? data.radar.past : [];
     if (frames.length === 0) return;
 
-    // Color scheme 6 = NEXRAD Level III (traditional NWS look: green->yellow->
-    // orange->red->magenta, blue reserved for snow). Trailing 1_1 = smoothing on,
-    // snow on (appropriate for mountain SAR).
+    // RainViewer serves only its Universal Blue scheme (blue light rain, pale
+    // blue snow); _makeRadarTileLayer repaints each tile in the palette chosen
+    // in Config (default: green rain, blue snow). See rainViewerTileUrl.
     const layers = frames.map(frame =>
-      L.tileLayer(`https://tilecache.rainviewer.com${frame.path}/256/{z}/{x}/{y}/6/1_1.png`, {
+      _makeRadarTileLayer(rainViewerTileUrl(frame.path), {
         opacity: 0, maxNativeZoom: 7, maxZoom: 18, zIndex: 500,
       })
     );
@@ -7193,6 +7193,7 @@ async function fetchRadar() {
     const controls = document.getElementById('radarControls');
     if (controls) controls.style.display = 'flex';
     updateRadarTime();
+    updateRadarLegend();
     clearDataSourceError('Radar');
 
     buildLayerControl();
@@ -7202,6 +7203,154 @@ async function fetchRadar() {
   } finally {
     trackFetchEnd('Radar');
   }
+}
+
+// --- Radar palette (Config → Weather radar colors) ---
+const RADAR_PALETTE_KEY = 'sar_radar_palette';
+let _radarLutCache = null;
+
+function getRadarPalette() {
+  let v = null;
+  try { v = localStorage.getItem(RADAR_PALETTE_KEY); } catch (e) { /* private mode */ }
+  return normalizeRadarPalette(v);
+}
+
+// The recolor table for a palette (default: the saved one), built once per
+// palette; null when the palette is drawn as served.
+function _radarLut(palette) {
+  const pal = normalizeRadarPalette(palette || getRadarPalette());
+  if (!_radarLutCache || _radarLutCache.palette !== pal) {
+    _radarLutCache = { palette: pal, lut: buildRadarRecolorLut(pal) };
+  }
+  return _radarLutCache.lut;
+}
+
+// Persist the choice and repaint every loaded frame (2D tiles are rebuilt from
+// the browser cache; the 3D source URL carries the palette so it reloads too).
+function setRadarPalette(v) {
+  const pal = normalizeRadarPalette(v);
+  try { localStorage.setItem(RADAR_PALETTE_KEY, pal); } catch (e) { /* private mode */ }
+  const sel = document.getElementById('cfgRadarPalette');
+  if (sel && sel.value !== pal) sel.value = pal;
+  updateRadarLegend();
+  if (S.radarAnim && S.radarAnim.layers) {
+    S.radarAnim.layers.forEach(l => { if (l && typeof l.redraw === 'function') l.redraw(); });
+  }
+  if (S.is3D && typeof sync3d === 'function') sync3d();
+}
+
+// Repaint a drawn RainViewer tile in place. Returns false (tile left as
+// served) when the pixels can't be read or aren't RainViewer colors.
+function _recolorRadarCtx(ctx, w, h, lut) {
+  if (!lut) return false;
+  let img;
+  try { img = ctx.getImageData(0, 0, w, h); } catch (e) { return false; } // tainted (no CORS)
+  const st = recolorRadarPixels(img.data, lut);
+  if (!st.recolored) {
+    if (st.unknown) { try { Diag.noteThrottled('radar.palette', 60000, { unknown: st.unknown, colored: st.colored }); } catch (_) {} }
+    return false;
+  }
+  ctx.putImageData(img, 0, 0);
+  return true;
+}
+
+// Leaflet tile layer that draws each RainViewer tile onto a canvas and
+// repaints it in the current palette. Built lazily (Leaflet may be absent in
+// tests). Falls back to the tile as served if CORS or decoding fails.
+let _RadarTileLayer = null;
+function _radarTileLayerClass() {
+  if (_RadarTileLayer) return _RadarTileLayer;
+  if (typeof L === 'undefined' || !L.TileLayer || typeof L.TileLayer.extend !== 'function') return null;
+  _RadarTileLayer = L.TileLayer.extend({
+    createTile(coords, done) {
+      const size = this.getTileSize();
+      const canvas = document.createElement('canvas');
+      canvas.width = size.x; canvas.height = size.y;
+      canvas.setAttribute('role', 'presentation');
+      // Leaflet's _abortLoading drops tiles whose element isn't `complete`.
+      canvas.complete = false;
+      const url = this.getTileUrl(coords);
+      const finish = err => { canvas.complete = true; done(err, canvas); };
+      const draw = (img, recolor) => {
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        if (recolor) _recolorRadarCtx(ctx, canvas.width, canvas.height, _radarLut());
+      };
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => { try { draw(img, true); finish(null); } catch (e) { finish(e); } };
+      img.onerror = () => {
+        // CORS refused or a network blip: try once more without CORS so the
+        // radar still shows (in RainViewer's own colors) rather than a hole.
+        const raw = new Image();
+        raw.onload = () => { try { draw(raw, false); finish(null); } catch (e) { finish(e); } };
+        raw.onerror = () => finish(new Error('radar tile failed'));
+        raw.src = url;
+      };
+      img.src = url;
+      return canvas;
+    },
+  });
+  return _RadarTileLayer;
+}
+
+function _makeRadarTileLayer(url, opts) {
+  const Cls = _radarTileLayerClass();
+  return Cls ? new Cls(url, opts) : L.tileLayer(url, opts);
+}
+
+// 3D: MapLibre fetches radar tiles through the 'sarradar' protocol, which
+// repaints them like the 2D layer. URL: sarradar://<palette>/<host+path>.
+let _radarProtocolRegistered = false;
+function _registerRadarProtocol() {
+  if (_radarProtocolRegistered) return true;
+  if (typeof maplibregl === 'undefined' || typeof maplibregl.addProtocol !== 'function') return false;
+  if (typeof createImageBitmap !== 'function') return false;
+  maplibregl.addProtocol('sarradar', async (params, abortController) => {
+    const m = /^sarradar:\/\/([a-z]+)\/(.+)$/.exec(params.url);
+    if (!m) throw new Error('bad radar url');
+    const res = await fetch('https://' + m[2], { mode: 'cors', signal: abortController && abortController.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const lut = _radarLut(m[1]);
+    if (!lut) return { data: await blob.arrayBuffer() };
+    const bmp = await createImageBitmap(blob);
+    const w = bmp.width, h = bmp.height;
+    let canvas;
+    if (typeof OffscreenCanvas !== 'undefined') canvas = new OffscreenCanvas(w, h);
+    else { canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h; }
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bmp, 0, 0);
+    if (typeof bmp.close === 'function') bmp.close();
+    if (!_recolorRadarCtx(ctx, w, h, lut)) return { data: await blob.arrayBuffer() };
+    const out = canvas.convertToBlob
+      ? await canvas.convertToBlob({ type: 'image/png' })
+      : await new Promise((ok, bad) => canvas.toBlob(b => (b ? ok(b) : bad(new Error('encode failed'))), 'image/png'));
+    return { data: await out.arrayBuffer() };
+  });
+  _radarProtocolRegistered = true;
+  return true;
+}
+
+// 3D tile URL for a 2D radar frame URL: routed through the repaint protocol
+// unless the palette is drawn as served (or the protocol is unavailable).
+function _radar3dUrl(url) {
+  if (!url) return url;
+  const pal = getRadarPalette();
+  if (radarPaletteIsIdentity(pal) || !_registerRadarProtocol()) return url;
+  return url.replace(/^https:\/\//, `sarradar://${pal}/`);
+}
+
+// Two small color bars under the radar playback buttons: rain and snow,
+// light → heavy, in the current palette.
+function updateRadarLegend() {
+  const el = document.getElementById('radarLegend');
+  if (!el) return;
+  const pal = getRadarPalette();
+  const rain = el.querySelector('[data-kind="rain"]');
+  const snow = el.querySelector('[data-kind="snow"]');
+  if (rain) rain.style.background = radarLegendGradient(pal, 'rain');
+  if (snow) snow.style.background = radarLegendGradient(pal, 'snow');
 }
 
 function radarToggle() {
@@ -11123,6 +11272,10 @@ async function restoreConfig() {
   // Canopy / structure height source (localStorage) + the Terrain-tab caption.
   const canSrcEl = document.getElementById('cfgCanopySource');
   if (canSrcEl) canSrcEl.value = getCanopySourceSetting();
+  // Weather radar palette (localStorage).
+  const radarPalEl = document.getElementById('cfgRadarPalette');
+  if (radarPalEl) radarPalEl.value = getRadarPalette();
+  updateRadarLegend();
   if (typeof _updateCanopyCaption === 'function') _updateCanopyCaption();
   // Restore custom proxy URL (localStorage) + hint. Field stays empty when the
   // built-in default proxy is in use.
@@ -15268,7 +15421,7 @@ function collect3dState() {
   if (S.radarAnim && S.radarAnim.layers && S.radarAnim.layers.length) {
     const frame = S.radarAnim.layers[S.radarAnim.index];
     if (frame && S.map.hasLayer(frame) && frame.options && frame.options.opacity > 0 && frame._url) {
-      radarUrl = frame._url;
+      radarUrl = _radar3dUrl(frame._url);
     }
   }
   // Terrain hillshade tracks the scene light (sun/moon) direction.
@@ -16342,6 +16495,8 @@ if (typeof module !== 'undefined' && module.exports) {
     fetchFaaObstacles, renderObstacleLayer, updateObstacleDisplay,
     renderAirportMarkers, fetchNWSAlerts, renderNWSAlertCards, renderNWSAlertPolygons,
     renderForecastChart, fetchRadar,
+    RADAR_PALETTE_KEY, getRadarPalette, setRadarPalette, _radarLut, _recolorRadarCtx, _radarTileLayerClass,
+    _makeRadarTileLayer, _radar3dUrl, updateRadarLegend,
     radarToggle, radarStep, updateRadarTime,
     openExport, closeExport, doExport, doExportGeoJson, getKMLCoords, populateExportModal,
     downloadBlob, exportRasterGeoTiff, exportRasterKmz, gatherVisibleLayerFolders, buildSunWindFolders,

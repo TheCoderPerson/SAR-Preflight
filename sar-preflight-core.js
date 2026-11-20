@@ -24,6 +24,15 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.11.20-a',
+    date: '2026-11-20',
+    changes: [
+      'Weather radar now shows light rain in green and snow in blue, so the rain/snow line stands out. Since January 2026 RainViewer has served its radar in a single color scheme ("Universal Blue") that draws light rain and snow in near-identical blues. The traditional color scale set up in June never took effect, because RainViewer ignored the request. The app now repaints each radar tile on your device: rain green → yellow → orange → red → magenta, snow light → dark blue. This works in both the 2D and 3D views.',
+      'New Config → Weather radar colors setting: Classic (green rain, blue snow, the default) or RainViewer Universal Blue as served.',
+      'A small RAIN / SNOW color key now sits under the radar playback buttons. The rain/snow split is RainViewer\'s estimate and can be off near the snow line; sleet and freezing rain are not shown separately.',
+    ],
+  },
+  {
     version: '2026.10.09-c',
     date: '2026-10-09',
     changes: [
@@ -5423,12 +5432,252 @@ function geojsonLineLatLngs(geometry) {
   return null;
 }
 
+// ============================================================
+// WEATHER RADAR PALETTE (RainViewer tile recolor)
+// ============================================================
+// Since 2026-01-01 the public RainViewer API serves ONE color scheme,
+// "Universal Blue" (ID 2): the {color} field of the tile URL is ignored and
+// every request comes back in scheme 2. That scheme draws light rain in blue
+// (#88ddee at 15 dBZ) and light snow in near-identical pale blue (#9fdfff), so
+// the rain/snow line is hard to see. Every pixel of a tile is an exact entry of
+// RainViewer's published table (rainviewer.com/files/rainviewer_api_colors_table.csv),
+// smoothing included, so a tile decodes back to (rain|snow, dBZ) without loss
+// and can be repainted in any palette. The tables below are that CSV's
+// Universal Blue rain and snow columns for -10..95 dBZ (all lower values are
+// transparent), as RRGGBBAA hex.
+const RV_UB_RAIN = (
+  '63615914 66635a19 69665c1e 6c685d24 6f6b5f29 726e612e 75706234 78736439 7c75653e 7f786744 ' +
+  '827b6949 857d6a4e 88806c54 8b826d59 8e856f5e 92887164 9e93756e aa9e7978 b6a97e82 c2b4828c ' +
+  'cec08796 d2c48ba0 d6c88faa dacc93b4 ded097be 88ddeeff 6cd1ebff 51c5e8ff 36bae5ff 1baee2ff ' +
+  '00a3e0ff 009ad5ff 0091caff 0088bfff 007fb4ff 0077aaff 0070a3ff 00699cff 006295ff 005b8eff ' +
+  '005588ff 005180ff 004e78ff 004a70ff 004768ff ffee00ff ffe000ff ffd200ff ffc500ff ffb700ff ' +
+  'ffaa00ff ff9f00ff ff9500ff ff8b00ff ff8100ff ff4400ff f23600ff e62800ff d91b00ff cd0d00ff ' +
+  'c10000ff a80000ff 8f0000ff 760000ff 5d0000ff ffaaffff ff9fffff ff95ffff ff8bffff ff81ffff ' +
+  'ff77ffff ff6cffff ff62ffff ff58ffff ff4effff ffffffff ffffffff ffffffff ffffffff ffffffff ' +
+  'ffffffff ffffffff ffffffff ffffffff ffffffff 00ff00ff 00ff00ff 00ff00ff 00ff00ff 00ff00ff ' +
+  '00ff00ff 00ff00ff 00ff00ff 00ff00ff 00ff00ff 00ff00ff 00ff00ff 00ff00ff 00ff00ff 00ff00ff ' +
+  '00ff00ff 00ff00ff 00ff00ff 00ff00ff 00ff00ff 00ff00ff'
+).split(' ');
+const RV_UB_SNOW = (
+  'cfffff00 ceffff0c cdffff19 ccffff26 cbffff33 cbffff3f caffff4c c9ffff59 c8ffff66 c7ffff72 ' +
+  'c7ffff7f c6ffff8c c5ffff99 c4ffffa5 c3ffffb2 c3ffffbf c2ffffcc c1ffffd8 c0ffffe5 bffffff2 ' +
+  'bfffffff b8f8ffff b2f2ffff abebffff a5e5ffff 9fdfffff 98d8ffff 92d2ffff 8bcbffff 85c5ffff ' +
+  '7fbfffff 78b8ffff 72b2ffff 6babffff 65a5ffff 5f9fffff 5b9bffff 5898ffff 5595ffff 5292ffff ' +
+  '4f8fffff 4b8bffff 4888ffff 4585ffff 4282ffff 3f7fffff 3b7bffff 3878ffff 3575ffff 3272ffff ' +
+  '2f6fffff 2b6bffff 2868ffff 2565ffff 2262ffff 1f5fffff 1b5bffff 1858ffff 1555ffff 1252ffff ' +
+  '0f4fffff 0c4bffff 0948ffff 0645ffff 0242ffff 003fffff 003bffff 0038ffff 0035ffff 0032ffff ' +
+  '002fffff 002bffff 0028ffff 0025ffff 0022ffff 001fffff 001bffff 0018ffff 0015ffff 0012ffff ' +
+  '000fffff 000cffff 0009ffff 0006ffff 0002ffff 0000ffff 0000ffff 0000ffff 0000ffff 0000ffff ' +
+  '0000ffff 0000ffff 0000ffff 0000ffff 0000ffff 0000ffff 0000ffff 0000ffff 0000ffff 0000ffff ' +
+  '0000ffff 0000ffff 0000ffff 0000ffff 0000ffff 0000ffff'
+).split(' ');
+const RV_UB_MIN_DBZ = -10;
+
+// Tile URL template for one RainViewer frame path ("/v2/radar/<id>"). 256 px
+// tiles, color scheme 2 (the only one served), smoothing on, snow on (the
+// rain/snow split is what the recolor keys off).
+function rainViewerTileUrl(path) {
+  return `https://tilecache.rainviewer.com${path}/256/{z}/{x}/{y}/2/1_1.png`;
+}
+
+// Classic palette, rain: green for light rain (as on most TV and consumer
+// radar), NWS reflectivity colors from yellow up. Stops are [dBZ, RRGGBB],
+// interpolated linearly; adjacent dBZ stops make a hard step. Below 15 dBZ the
+// returns (drizzle, virga, clutter) keep RainViewer's fade-in transparency.
+const RADAR_CLASSIC_RAIN = [
+  [-10, '9be89b'], [14, '9be89b'],
+  [15, '8fef8f'], [20, '00e000'], [25, '00c000'], [30, '009000'], [34, '007000'],
+  [35, 'ffff00'], [40, 'e7c000'], [45, 'ff9000'],
+  [50, 'ff0000'], [55, 'd60000'], [60, 'c00000'],
+  [65, 'ff00ff'], [70, '9955c9'], [75, 'ffffff'], [95, 'ffffff'],
+];
+
+// Palettes offered in Config. rain/snow: stop list, or null to keep
+// RainViewer's own color for that kind. A palette with both null is drawn as
+// served (no pixel work).
+const RADAR_PALETTES = {
+  classic: { label: 'Classic: green rain, blue snow', rain: RADAR_CLASSIC_RAIN, snow: null },
+  universal: { label: 'RainViewer Universal Blue (as served)', rain: null, snow: null },
+};
+const RADAR_PALETTE_DEFAULT = 'classic';
+
+function normalizeRadarPalette(name) {
+  return Object.prototype.hasOwnProperty.call(RADAR_PALETTES, name) ? name : RADAR_PALETTE_DEFAULT;
+}
+
+function radarPaletteIsIdentity(name) {
+  const p = RADAR_PALETTES[normalizeRadarPalette(name)];
+  return !p.rain && !p.snow;
+}
+
+function _rvHexRgba(h) {
+  const n = parseInt(h, 16);
+  return h.length === 8
+    ? [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]
+    : [(n >>> 16) & 255, (n >>> 8) & 255, n & 255, 255];
+}
+
+function _rvPack(c) { return ((c[0] << 24) | (c[1] << 16) | (c[2] << 8) | c[3]) >>> 0; }
+
+// RainViewer's own Universal Blue color for (kind, dBZ) as [r,g,b,a];
+// transparent outside -10..95.
+function rainViewerSourceRgba(kind, dbz) {
+  const t = kind === 'snow' ? RV_UB_SNOW : RV_UB_RAIN;
+  const i = Math.round(dbz) - RV_UB_MIN_DBZ;
+  return (i >= 0 && i < t.length) ? _rvHexRgba(t[i]) : [0, 0, 0, 0];
+}
+
+// Every table color → { kind, dbz }. Colors repeat across dBZ (white 65-74,
+// etc.): the lowest dBZ wins. No color appears in both the rain and snow
+// columns (checked by the unit tests).
+let _rvDecodeMap = null;
+let _rvEntries = null;
+function _rvDecodeTable() {
+  if (_rvDecodeMap) return _rvDecodeMap;
+  const map = new Map();
+  const entries = [];
+  [['rain', RV_UB_RAIN], ['snow', RV_UB_SNOW]].forEach(([kind, t]) => {
+    t.forEach((h, i) => {
+      const c = _rvHexRgba(h);
+      if (c[3] === 0) return;
+      const key = _rvPack(c);
+      if (!map.has(key)) map.set(key, { kind, dbz: i + RV_UB_MIN_DBZ });
+      entries.push({ c, kind, dbz: i + RV_UB_MIN_DBZ });
+    });
+  });
+  _rvDecodeMap = map;
+  _rvEntries = entries;
+  return map;
+}
+
+// Decode one tile pixel to { kind: 'rain'|'snow', dbz } or null (transparent,
+// or not a RainViewer color). Opaque pixels must match exactly. A canvas stores
+// colors premultiplied by alpha, so the color channels of a translucent pixel
+// read back through getImageData can be off by about 255/alpha; alpha itself
+// is exact. Translucent pixels therefore match the nearest table color with the
+// same alpha, within that rounding error.
+function decodeRainViewerColor(r, g, b, a) {
+  if (!a) return null;
+  const map = _rvDecodeTable();
+  const exact = map.get(_rvPack([r, g, b, a]));
+  if (exact) return exact;
+  if (a === 255) return null;
+  const tol = Math.max(2, Math.ceil(255 / a));
+  let best = null, bestD = Infinity;
+  for (const e of _rvEntries) {
+    if (Math.abs(e.c[3] - a) > 1) continue;
+    const dr = Math.abs(e.c[0] - r), dg = Math.abs(e.c[1] - g), db = Math.abs(e.c[2] - b);
+    if (dr > tol || dg > tol || db > tol) continue;
+    const d = dr * dr + dg * dg + db * db;
+    if (d < bestD) { bestD = d; best = e; }
+  }
+  return best ? { kind: best.kind, dbz: best.dbz } : null;
+}
+
+// Palette color for (kind, dBZ) as [r,g,b,a].
+function radarPaletteRgba(name, kind, dbz) {
+  const p = RADAR_PALETTES[normalizeRadarPalette(name)];
+  const stops = kind === 'snow' ? p.snow : p.rain;
+  const src = rainViewerSourceRgba(kind, dbz);
+  if (!stops) return src;
+  if (src[3] === 0) return src;
+  let rgb;
+  if (dbz <= stops[0][0]) rgb = _rvHexRgba(stops[0][1]);
+  else if (dbz >= stops[stops.length - 1][0]) rgb = _rvHexRgba(stops[stops.length - 1][1]);
+  else {
+    let k = 0;
+    while (stops[k + 1][0] < dbz) k++;
+    const [d0, h0] = stops[k], [d1, h1] = stops[k + 1];
+    const t = (dbz - d0) / (d1 - d0);
+    const c0 = _rvHexRgba(h0), c1 = _rvHexRgba(h1);
+    rgb = [0, 1, 2].map(j => Math.round(c0[j] + (c1[j] - c0[j]) * t));
+  }
+  // Faint returns keep RainViewer's fade-in alpha; everything else is opaque.
+  return [rgb[0], rgb[1], rgb[2], dbz < 15 ? src[3] : 255];
+}
+
+// Lookup table that repaints RainViewer pixels in palette `name`, or null when
+// the palette is drawn as served. Built from the exact table colors; the
+// translucent near-misses (see decodeRainViewerColor) are resolved on first
+// sight and memoized in `map`.
+function buildRadarRecolorLut(name) {
+  const pal = normalizeRadarPalette(name);
+  if (radarPaletteIsIdentity(pal)) return null;
+  const map = new Map();
+  _rvDecodeTable().forEach((v, key) => map.set(key, _rvPack(radarPaletteRgba(pal, v.kind, v.dbz))));
+  return { palette: pal, map };
+}
+
+const RADAR_LUT_MEMO_MAX = 20000;
+// A tile with more unknown (non-RainViewer) colored pixels than this share is
+// left exactly as served: RainViewer has changed its palette and a part-recolored
+// tile would mislead more than an unrecolored one.
+const RADAR_UNKNOWN_MAX_FRAC = 0.02;
+
+// Repaint RGBA pixel data (a getImageData buffer) in place with `lut`.
+// Returns { colored, unknown, recolored } — colored = non-transparent pixels,
+// unknown = those that are not RainViewer colors, recolored = whether the
+// buffer was changed.
+function recolorRadarPixels(data, lut) {
+  const out = { colored: 0, unknown: 0, recolored: false };
+  if (!data || !lut) return out;
+  const map = lut.map;
+  const len = data.length;
+  const resolved = new Uint32Array(len >> 2);
+  const isSet = new Uint8Array(len >> 2);
+  let lastKey = -1, lastVal;
+  for (let i = 0, p = 0; i < len; i += 4, p++) {
+    const a = data[i + 3];
+    if (a === 0) continue;
+    out.colored++;
+    const key = ((data[i] << 24) | (data[i + 1] << 16) | (data[i + 2] << 8) | a) >>> 0;
+    let val;
+    if (key === lastKey) val = lastVal;
+    else {
+      val = map.get(key);
+      if (val === undefined) {
+        const dec = decodeRainViewerColor(data[i], data[i + 1], data[i + 2], a);
+        val = dec ? _rvPack(radarPaletteRgba(lut.palette, dec.kind, dec.dbz)) : null;
+        if (map.size < RADAR_LUT_MEMO_MAX) map.set(key, val);
+      }
+      lastKey = key; lastVal = val;
+    }
+    if (val == null) { out.unknown++; continue; }
+    resolved[p] = val; isSet[p] = 1;
+  }
+  if (out.colored === 0 || out.unknown > out.colored * RADAR_UNKNOWN_MAX_FRAC) return out;
+  for (let i = 0, p = 0; i < len; i += 4, p++) {
+    if (!isSet[p]) continue;
+    const v = resolved[p];
+    data[i] = v >>> 24; data[i + 1] = (v >>> 16) & 255; data[i + 2] = (v >>> 8) & 255; data[i + 3] = v & 255;
+  }
+  out.recolored = true;
+  return out;
+}
+
+// CSS linear-gradient for the radar legend: kind 'rain' runs 15-75 dBZ, 'snow'
+// 10-50 dBZ (light → heavy, left to right).
+function radarLegendGradient(name, kind) {
+  const [lo, hi] = kind === 'snow' ? [10, 50] : [15, 75];
+  const steps = 12;
+  const parts = [];
+  for (let s = 0; s <= steps; s++) {
+    const dbz = Math.round(lo + (hi - lo) * s / steps);
+    const c = radarPaletteRgba(name, kind, dbz);
+    parts.push(`rgb(${c[0]},${c[1]},${c[2]}) ${Math.round(100 * s / steps)}%`);
+  }
+  return `linear-gradient(to right, ${parts.join(', ')})`;
+}
+
 // --- CJS export for Node/Vitest ---
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     assessmentDisplay, assessmentLabelForLog, limitsProfileInfo,
     WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, lerpBearing, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,
+    RV_UB_RAIN, RV_UB_SNOW, RADAR_PALETTES, RADAR_PALETTE_DEFAULT, rainViewerTileUrl, normalizeRadarPalette,
+    radarPaletteIsIdentity, rainViewerSourceRgba, decodeRainViewerColor, radarPaletteRgba, buildRadarRecolorLut,
+    recolorRadarPixels, radarLegendGradient,
     calcSunPosition, calcMoonPhase, calcMoonPosition, lightVecENU, lightForTime, hillshadeParams,
     wireHazardName, parseHeightToMeters, osmTowerHeightFt,
     parseChangelogMd,
