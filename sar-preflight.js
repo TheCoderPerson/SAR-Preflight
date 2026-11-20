@@ -7155,54 +7155,154 @@ function updateWireDisplay(counts, towerCount) {
 }
 
 // ============================================================
-// API: RAINVIEWER Weather Radar Animation
+// WEATHER RADAR — NWS (NOAA MRMS) in the US, RainViewer elsewhere and as
+// the fallback whenever NWS fails. Frames: { source, time (unix s), … } —
+// RainViewer { path }, NWS { region, brefTime, typeTime }.
 // ============================================================
-async function fetchRadar() {
+const RADAR_SOURCE_KEY = 'sar_radar_source';
+const RADAR_NWS_MAX_ZOOM = 9;           // 1 km data: z9 (~240 m pixels at 39°N) is plenty; Leaflet upscales past it
+const RADAR_RV_MAX_ZOOM = 7;            // RainViewer's free tier stops at z7
+const RADAR_REFRESH_MS = 5 * 60 * 1000; // background check for a newer frame
+const NWS_RADAR_DOWN_MS = 15 * 60 * 1000;
+const NWS_TILE_FAIL_LIMIT = 6;          // consecutive failed NWS tiles → NWS treated as down
+const NWS_CAPS_TIMEOUT_MS = 15000;
+
+function getRadarSourceSetting() {
+  let v = null;
+  try { v = localStorage.getItem(RADAR_SOURCE_KEY); } catch (e) { /* private mode */ }
+  return v === 'rainviewer' ? 'rainviewer' : 'auto';
+}
+
+// Config → Weather radar source. Re-fetches right away, keeping the radar
+// shown or hidden as it is.
+function setRadarSource(v) {
+  const val = v === 'rainviewer' ? 'rainviewer' : 'auto';
+  try { localStorage.setItem(RADAR_SOURCE_KEY, val); } catch (e) { /* private mode */ }
+  const sel = document.getElementById('cfgRadarSource');
+  if (sel && sel.value !== val) sel.value = val;
+  S._nwsRadarDownUntil = 0;
+  if (S.radarAnim) return fetchRadar({ background: true, force: true });
+}
+
+function _radarCenter() {
+  if (S.areaCenter) return S.areaCenter;
+  try { return S.map && typeof S.map.getCenter === 'function' ? S.map.getCenter() : null; } catch (e) { return null; }
+}
+
+async function _fetchNwsRadarFrames(region) {
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), NWS_CAPS_TIMEOUT_MS) : null;
+  let xml;
+  try {
+    const res = await fetch(nwsRadarCapabilitiesUrl(region), ctrl ? { signal: ctrl.signal } : undefined);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    xml = await res.text();
+  } catch (e) {
+    throw new Error(e && e.name === 'AbortError' ? 'timed out' : (e && e.message) || 'fetch failed');
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  const frames = selectNwsRadarFrames(
+    parseWmsTimeDimension(xml, `${region}_bref_qcd`), parseWmsTimeDimension(xml, `${region}_pcpn_typ`));
+  if (!frames.length) throw new Error('no radar times listed');
+  const ageMin = (Date.now() / 1000 - frames[frames.length - 1].time) / 60;
+  if (ageMin > NWS_RADAR_MAX_AGE_MIN) throw new Error(`newest image is ${Math.round(ageMin)} min old`);
+  return frames.map(f => Object.assign({ source: 'nws', region }, f));
+}
+
+async function _fetchRainViewerFrames() {
+  const res = await fetch('https://api.rainviewer.com/public/weather-maps.json');
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  const past = (data && data.radar && data.radar.past) ? data.radar.past : [];
+  return past.map(f => ({ source: 'rainviewer', time: f.time, path: f.path }));
+}
+
+// Load the radar frames and drape the newest. opts.background (the 5-minute
+// refresh, a source change): leave the map alone when nothing newer exists
+// (unless opts.force), and keep the radar hidden if the user had hidden it.
+async function fetchRadar(opts) {
+  const o = opts || {};
   trackFetchStart('Radar');
   try {
-    const res = await fetch('https://api.rainviewer.com/public/weather-maps.json');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-
-    // Clean up old radar layers
-    if (S.radarAnim && S.radarAnim.layers) {
-      S.radarAnim.layers.forEach(l => { if (S.map.hasLayer(l)) S.map.removeLayer(l); });
+    const prev = S.radarAnim;
+    const wasVisible = !!(prev && prev.layers && prev.layers.some(l => S.map.hasLayer(l) && l.options.opacity > 0));
+    let frames = null, fallback = null;
+    if (getRadarSourceSetting() === 'auto') {
+      const c = _radarCenter();
+      const region = c ? nwsRadarRegionFor(c.lat, c.lng) : null;
+      if (!region) fallback = c ? 'outside NWS radar coverage' : null;
+      else if (S._nwsRadarDownUntil && Date.now() < S._nwsRadarDownUntil) fallback = 'NWS radar tiles were failing';
+      else {
+        try { frames = await _fetchNwsRadarFrames(region); } catch (e) {
+          fallback = `NWS radar unavailable (${e.message})`;
+          try { Diag.note('radar.nws.fail', { m: String(e.message).slice(0, 120) }); } catch (_) {}
+        }
+      }
     }
-    if (S.radarAnim && S.radarAnim.interval) clearInterval(S.radarAnim.interval);
-
-    const frames = (data.radar && data.radar.past) ? data.radar.past : [];
+    if (!frames) frames = await _fetchRainViewerFrames();
     if (frames.length === 0) return;
 
-    // RainViewer serves only its Universal Blue scheme (blue light rain, pale
-    // blue snow); _makeRadarTileLayer repaints each tile in the palette chosen
-    // in Config (default: green rain, blue snow). See rainViewerTileUrl.
-    const layers = frames.map(frame =>
-      _makeRadarTileLayer(rainViewerTileUrl(frame.path), {
-        opacity: 0, maxNativeZoom: 7, maxZoom: 18, zIndex: 500,
-      })
-    );
+    if (o.background && !o.force && prev && prev.frames && prev.frames.length) {
+      const a = prev.frames[prev.frames.length - 1], b = frames[frames.length - 1];
+      if (a.source === b.source && a.time === b.time && a.region === b.region) {
+        prev.fallback = fallback;
+        updateRadarSourceLabel();
+        return;
+      }
+    }
 
-    S.radarAnim = { playing: false, index: layers.length - 1, layers: layers, interval: null, frames: frames };
+    // Clean up old radar layers
+    if (prev && prev.layers) prev.layers.forEach(l => { if (S.map.hasLayer(l)) S.map.removeLayer(l); });
+    if (prev && prev.interval) clearInterval(prev.interval);
 
-    // Show most recent frame at 0.5 opacity
-    const last = layers[layers.length - 1];
-    last.setOpacity(0.5);
-    last.addTo(S.map);
+    const layers = frames.map(f => _makeRadarTileLayer(f, { opacity: 0, maxZoom: 18, zIndex: 500 }));
+    S.radarAnim = { playing: false, index: layers.length - 1, layers, interval: null, frames, source: frames[0].source, fallback };
+    S._nwsTileFails = 0;
 
-    // Show radar controls
-    const controls = document.getElementById('radarControls');
-    if (controls) controls.style.display = 'flex';
+    // Show the most recent frame at 0.5 opacity (a background refresh keeps
+    // a radar the user had hidden, hidden).
+    const show = !(o.background && prev && !wasVisible);
+    if (show) {
+      const last = layers[layers.length - 1];
+      last.setOpacity(0.5);
+      last.addTo(S.map);
+      const controls = document.getElementById('radarControls');
+      if (controls) controls.style.display = 'flex';
+    }
+    const btn = document.getElementById('radarPlayBtn');
+    if (btn && prev && prev.playing) btn.innerHTML = '&#9654;';
     updateRadarTime();
     updateRadarLegend();
+    updateRadarSourceLabel();
     clearDataSourceError('Radar');
+    _scheduleRadarRefresh();
 
     buildLayerControl();
+    if (S.is3D && typeof sync3d === 'function') sync3d();
   } catch (err) {
     console.error('Radar fetch error:', err);
     recordDataSourceError('Radar', err);
   } finally {
     trackFetchEnd('Radar');
   }
+}
+
+// Every RADAR_REFRESH_MS, pick up a newer frame — NWS publishes every ~2 min,
+// far more often than the area auto-refresh. Skipped while the animation runs,
+// while the user is looking at an older frame, and while the page is hidden.
+function _scheduleRadarRefresh() {
+  if (S._radarRefreshTimer || typeof setInterval === 'undefined') return;
+  S._radarRefreshTimer = setInterval(_radarBackgroundRefresh, RADAR_REFRESH_MS);
+  if (S._radarRefreshTimer && typeof S._radarRefreshTimer.unref === 'function') S._radarRefreshTimer.unref();
+}
+
+function _radarBackgroundRefresh() {
+  const a = S.radarAnim;
+  if (!a || !a.layers || !a.layers.length) return;
+  if (typeof document !== 'undefined' && document.hidden) return;
+  if (a.playing || a.index !== a.layers.length - 1) return;
+  return fetchRadar({ background: true });
 }
 
 // --- Radar palette (Config → Weather radar colors) ---
@@ -7215,8 +7315,8 @@ function getRadarPalette() {
   return normalizeRadarPalette(v);
 }
 
-// The recolor table for a palette (default: the saved one), built once per
-// palette; null when the palette is drawn as served.
+// The RainViewer recolor table for a palette (default: the saved one), built
+// once per palette; null when the palette is drawn as served.
 function _radarLut(palette) {
   const pal = normalizeRadarPalette(palette || getRadarPalette());
   if (!_radarLutCache || _radarLutCache.palette !== pal) {
@@ -7254,9 +7354,87 @@ function _recolorRadarCtx(ctx, w, h, lut) {
   return true;
 }
 
-// Leaflet tile layer that draws each RainViewer tile onto a canvas and
-// repaints it in the current palette. Built lazily (Leaflet may be absent in
-// tests). Falls back to the tile as served if CORS or decoding fails.
+function _loadRadarImage(url, cors) {
+  return new Promise((ok, bad) => {
+    const img = new Image();
+    if (cors) img.crossOrigin = 'anonymous';
+    img.onload = () => ok(img);
+    img.onerror = () => bad(new Error('radar image failed'));
+    img.src = url;
+  });
+}
+
+// Draw one radar tile (frame at z/x/y) into `canvas`, repainted in palette
+// `pal`. Shared by the 2D layer and the 3D protocol. Anything that can't be
+// repainted (no CORS, foreign colors, missing precip type) is drawn as
+// served; rejects only when nothing could be drawn.
+async function _renderRadarTile(frame, z, x, y, canvas, pal) {
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (frame && frame.source === 'nws') return _renderNwsTile(frame, z, x, y, ctx, w, h, pal);
+  const url = rainViewerTileUrl(frame.path).replace('{z}', z).replace('{x}', x).replace('{y}', y);
+  let img, cors = true;
+  try { img = await _loadRadarImage(url, true); } catch (e) {
+    // CORS refused or a network blip: try once more without CORS so the radar
+    // still shows (in RainViewer's own colors) rather than a hole.
+    img = await _loadRadarImage(url, false); cors = false;
+  }
+  ctx.drawImage(img, 0, 0, w, h);
+  if (cors) _recolorRadarCtx(ctx, w, h, _radarLut(pal));
+}
+
+// NWS tile: reflectivity, plus (for a repainted palette) the precip-type image
+// of the same area with a margin, so echoes MRMS left untyped near a tile
+// edge can borrow the type next door (see recolorNwsPixels).
+async function _renderNwsTile(frame, z, x, y, ctx, w, h, pal) {
+  const bbox = tileBbox3857(z, x, y);
+  const brefUrl = nwsRadarGetMapUrl(frame.region, 'bref_qcd', frame.brefTime, bbox, w, h);
+  const wantType = !radarPaletteIsIdentity(pal) && !!frame.typeTime;
+  const buf = wantType ? nwsTypeBufferPx(z, y, w) : 0;
+  const per = (bbox[2] - bbox[0]) / w;
+  const typeP = wantType
+    ? _loadRadarImage(nwsRadarGetMapUrl(frame.region, 'pcpn_typ', frame.typeTime,
+        [bbox[0] - buf * per, bbox[1] - buf * per, bbox[2] + buf * per, bbox[3] + buf * per], w + 2 * buf, h + 2 * buf), true)
+        .catch(() => null)
+    : Promise.resolve(null);
+  let bref, cors = true;
+  try { bref = await _loadRadarImage(brefUrl, true); } catch (e) {
+    bref = await _loadRadarImage(brefUrl, false); cors = false; // throws if NWS is down
+  }
+  ctx.drawImage(bref, 0, 0, w, h);
+  const typeImg = await typeP;
+  if (!cors || !typeImg) return;
+  let bd, td;
+  try {
+    bd = ctx.getImageData(0, 0, w, h);
+    const tc = document.createElement('canvas');
+    tc.width = w + 2 * buf; tc.height = h + 2 * buf;
+    const tctx = tc.getContext('2d', { willReadFrequently: true });
+    tctx.drawImage(typeImg, 0, 0, tc.width, tc.height);
+    td = tctx.getImageData(0, 0, tc.width, tc.height);
+  } catch (e) { return; }
+  const st = recolorNwsPixels(bd.data, w, h, td.data, buf, pal);
+  if (st.recolored) ctx.putImageData(bd, 0, 0);
+  else if (st.unknown || st.typeUnknown) {
+    try { Diag.noteThrottled('radar.nws.palette', 60000, st); } catch (_) {}
+  }
+}
+
+// A run of failed NWS tiles means NWS is down even though its time list
+// loaded: switch to RainViewer for NWS_RADAR_DOWN_MS.
+function _noteRadarTile(frame, ok) {
+  if (!frame || frame.source !== 'nws') return;
+  if (ok) { S._nwsTileFails = 0; return; }
+  S._nwsTileFails = (S._nwsTileFails || 0) + 1;
+  if (S._nwsTileFails === NWS_TILE_FAIL_LIMIT) {
+    S._nwsRadarDownUntil = Date.now() + NWS_RADAR_DOWN_MS;
+    try { Diag.note('radar.nws.tiles.down', {}); } catch (_) {}
+    fetchRadar({ background: true, force: true });
+  }
+}
+
+// Leaflet tile layer that renders each radar tile onto a canvas via
+// _renderRadarTile. Built lazily (Leaflet may be absent in tests).
 let _RadarTileLayer = null;
 function _radarTileLayerClass() {
   if (_RadarTileLayer) return _RadarTileLayer;
@@ -7269,88 +7447,115 @@ function _radarTileLayerClass() {
       canvas.setAttribute('role', 'presentation');
       // Leaflet's _abortLoading drops tiles whose element isn't `complete`.
       canvas.complete = false;
-      const url = this.getTileUrl(coords);
-      const finish = err => { canvas.complete = true; done(err, canvas); };
-      const draw = (img, recolor) => {
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        if (recolor) _recolorRadarCtx(ctx, canvas.width, canvas.height, _radarLut());
-      };
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.onload = () => { try { draw(img, true); finish(null); } catch (e) { finish(e); } };
-      img.onerror = () => {
-        // CORS refused or a network blip: try once more without CORS so the
-        // radar still shows (in RainViewer's own colors) rather than a hole.
-        const raw = new Image();
-        raw.onload = () => { try { draw(raw, false); finish(null); } catch (e) { finish(e); } };
-        raw.onerror = () => finish(new Error('radar tile failed'));
-        raw.src = url;
-      };
-      img.src = url;
+      const frame = this.options.radarFrame;
+      _renderRadarTile(frame, coords.z, coords.x, coords.y, canvas, getRadarPalette()).then(
+        () => { canvas.complete = true; _noteRadarTile(frame, true); done(null, canvas); },
+        err => { canvas.complete = true; _noteRadarTile(frame, false); done(err || new Error('radar tile failed'), canvas); });
       return canvas;
     },
   });
   return _RadarTileLayer;
 }
 
-function _makeRadarTileLayer(url, opts) {
+function _makeRadarTileLayer(frame, opts) {
+  const nws = frame && frame.source === 'nws';
+  const url = nws ? `nws:${frame.region}:${frame.brefTime}` : rainViewerTileUrl(frame.path);
+  const o = Object.assign({ maxNativeZoom: nws ? RADAR_NWS_MAX_ZOOM : RADAR_RV_MAX_ZOOM }, opts, { radarFrame: frame });
   const Cls = _radarTileLayerClass();
-  return Cls ? new Cls(url, opts) : L.tileLayer(url, opts);
+  return Cls ? new Cls(url, o) : L.tileLayer(url, o);
 }
 
-// 3D: MapLibre fetches radar tiles through the 'sarradar' protocol, which
-// repaints them like the 2D layer. URL: sarradar://<palette>/<host+path>.
+// 3D: MapLibre loads repainted radar tiles through the 'sarradar' protocol:
+//   sarradar://<palette>/rv/<path>/{z}/{x}/{y}
+//   sarradar://<palette>/nws/<region>/<brefTime>/<typeTime|->/{z}/{x}/{y}
+// (each segment URI-encoded). The handler renders with _renderRadarTile.
+function _radarFrameKey(frame) {
+  if (frame.source === 'nws') {
+    return `nws/${frame.region}/${encodeURIComponent(frame.brefTime)}/${encodeURIComponent(frame.typeTime || '-')}`;
+  }
+  return `rv/${encodeURIComponent(frame.path)}`;
+}
+
+function _parseRadar3dUrl(url) {
+  const m = /^sarradar:\/\/([a-z]+)\/(rv|nws)\/(.+)\/(\d+)\/(\d+)\/(\d+)$/.exec(url || '');
+  if (!m) return null;
+  const parts = m[3].split('/').map(decodeURIComponent);
+  let frame;
+  if (m[2] === 'rv' && parts.length === 1) frame = { source: 'rainviewer', path: parts[0] };
+  else if (m[2] === 'nws' && parts.length === 3) {
+    frame = { source: 'nws', region: parts[0], brefTime: parts[1], typeTime: parts[2] === '-' ? null : parts[2] };
+  } else return null;
+  return { palette: normalizeRadarPalette(m[1]), frame, z: +m[4], x: +m[5], y: +m[6] };
+}
+
 let _radarProtocolRegistered = false;
 function _registerRadarProtocol() {
   if (_radarProtocolRegistered) return true;
   if (typeof maplibregl === 'undefined' || typeof maplibregl.addProtocol !== 'function') return false;
-  if (typeof createImageBitmap !== 'function') return false;
-  maplibregl.addProtocol('sarradar', async (params, abortController) => {
-    const m = /^sarradar:\/\/([a-z]+)\/(.+)$/.exec(params.url);
-    if (!m) throw new Error('bad radar url');
-    const res = await fetch('https://' + m[2], { mode: 'cors', signal: abortController && abortController.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const blob = await res.blob();
-    const lut = _radarLut(m[1]);
-    if (!lut) return { data: await blob.arrayBuffer() };
-    const bmp = await createImageBitmap(blob);
-    const w = bmp.width, h = bmp.height;
-    let canvas;
-    if (typeof OffscreenCanvas !== 'undefined') canvas = new OffscreenCanvas(w, h);
-    else { canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h; }
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(bmp, 0, 0);
-    if (typeof bmp.close === 'function') bmp.close();
-    if (!_recolorRadarCtx(ctx, w, h, lut)) return { data: await blob.arrayBuffer() };
-    const out = canvas.convertToBlob
-      ? await canvas.convertToBlob({ type: 'image/png' })
-      : await new Promise((ok, bad) => canvas.toBlob(b => (b ? ok(b) : bad(new Error('encode failed'))), 'image/png'));
-    return { data: await out.arrayBuffer() };
+  if (typeof document === 'undefined') return false;
+  maplibregl.addProtocol('sarradar', async (params) => {
+    const t = _parseRadar3dUrl(params.url);
+    if (!t) throw new Error('bad radar url');
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 256;
+    await _renderRadarTile(t.frame, t.z, t.x, t.y, canvas, t.palette);
+    const blob = await new Promise((ok, bad) => canvas.toBlob(b => (b ? ok(b) : bad(new Error('encode failed'))), 'image/png'));
+    return { data: await blob.arrayBuffer() };
   });
   _radarProtocolRegistered = true;
   return true;
 }
 
-// 3D tile URL for a 2D radar frame URL: routed through the repaint protocol
-// unless the palette is drawn as served (or the protocol is unavailable).
-function _radar3dUrl(url) {
-  if (!url) return url;
+// 3D raster source for a radar frame layer: { url, maxzoom }. Repainted
+// palettes go through the protocol; as-served (or no protocol) use the plain
+// tile URL — for NWS a WMS template MapLibre fills with {bbox-epsg-3857}.
+function _radar3dSource(layer) {
+  const frame = layer && layer.options && layer.options.radarFrame;
+  if (!frame) return null;
   const pal = getRadarPalette();
-  if (radarPaletteIsIdentity(pal) || !_registerRadarProtocol()) return url;
-  return url.replace(/^https:\/\//, `sarradar://${pal}/`);
+  const nws = frame.source === 'nws';
+  const maxzoom = nws ? RADAR_NWS_MAX_ZOOM : RADAR_RV_MAX_ZOOM;
+  if (!radarPaletteIsIdentity(pal) && _registerRadarProtocol()) {
+    return { url: `sarradar://${pal}/${_radarFrameKey(frame)}/{z}/{x}/{y}`, maxzoom };
+  }
+  return {
+    url: nws ? nwsRadarGetMapUrl(frame.region, 'bref_qcd', frame.brefTime, '{bbox-epsg-3857}', 256, 256)
+      : rainViewerTileUrl(frame.path),
+    maxzoom,
+  };
 }
 
-// Two small color bars under the radar playback buttons: rain and snow,
-// light → heavy, in the current palette.
+// Color key under the radar playback buttons: rain and snow, light → heavy,
+// in the current palette. NWS's own colors have no rain/snow split, so that
+// combination shows one RADAR bar.
 function updateRadarLegend() {
   const el = document.getElementById('radarLegend');
   if (!el) return;
   const pal = getRadarPalette();
+  const src = S.radarAnim && S.radarAnim.source;
+  const oneBar = src === 'nws' && radarPaletteIsIdentity(pal);
   const rain = el.querySelector('[data-kind="rain"]');
   const snow = el.querySelector('[data-kind="snow"]');
-  if (rain) rain.style.background = radarLegendGradient(pal, 'rain');
-  if (snow) snow.style.background = radarLegendGradient(pal, 'snow');
+  const rainLbl = el.querySelector('[data-label="rain"]');
+  const snowLbl = el.querySelector('[data-label="snow"]');
+  if (rain) rain.style.background = radarLegendGradient(pal, 'rain', src);
+  if (snow) { snow.style.background = radarLegendGradient(pal, 'snow', src); snow.style.display = oneBar ? 'none' : ''; }
+  if (snowLbl) snowLbl.style.display = oneBar ? 'none' : '';
+  if (rainLbl) rainLbl.textContent = oneBar ? 'RADAR' : 'RAIN';
+}
+
+// Source tag next to the frame time: NWS, or RAINVIEWER (amber when it is
+// standing in for a failed NWS source). The tooltip says why.
+function updateRadarSourceLabel() {
+  const el = document.getElementById('radarSource');
+  if (!el) return;
+  const a = S.radarAnim;
+  if (!a || !a.source) { el.textContent = ''; el.title = ''; el.classList.remove('fallback'); return; }
+  const nws = a.source === 'nws';
+  el.textContent = nws ? 'NWS' : 'RAINVIEWER';
+  el.title = nws ? 'NOAA/NWS MRMS radar (new image about every 2 min; animation frames 10 min apart)'
+    : `RainViewer radar${a.fallback ? ` (${a.fallback})` : ''}`;
+  el.classList.toggle('fallback', !nws && !!a.fallback && a.fallback !== 'outside NWS radar coverage');
 }
 
 function radarToggle() {
@@ -11275,6 +11480,8 @@ async function restoreConfig() {
   // Weather radar palette (localStorage).
   const radarPalEl = document.getElementById('cfgRadarPalette');
   if (radarPalEl) radarPalEl.value = getRadarPalette();
+  const radarSrcEl = document.getElementById('cfgRadarSource');
+  if (radarSrcEl) radarSrcEl.value = getRadarSourceSetting();
   updateRadarLegend();
   if (typeof _updateCanopyCaption === 'function') _updateCanopyCaption();
   // Restore custom proxy URL (localStorage) + hint. Field stays empty when the
@@ -15417,11 +15624,12 @@ function collect3dState() {
     rasters.push({ id, url: info.url, bounds: info.bounds, opacity: op });
   });
   // Current radar frame (if the radar layer is toggled on in 2D).
-  let radarUrl = null;
+  let radarUrl = null, radarMaxZoom;
   if (S.radarAnim && S.radarAnim.layers && S.radarAnim.layers.length) {
     const frame = S.radarAnim.layers[S.radarAnim.index];
-    if (frame && S.map.hasLayer(frame) && frame.options && frame.options.opacity > 0 && frame._url) {
-      radarUrl = _radar3dUrl(frame._url);
+    if (frame && S.map.hasLayer(frame) && frame.options && frame.options.opacity > 0) {
+      const src = _radar3dSource(frame);
+      if (src) { radarUrl = src.url; radarMaxZoom = src.maxzoom; }
     }
   }
   // Terrain hillshade tracks the scene light (sun/moon) direction.
@@ -15436,6 +15644,7 @@ function collect3dState() {
     overlays: { slope: active('slope'), streets: active('streets') },
     rasters,
     radarUrl,
+    radarMaxZoom,
     vectors: collect3dVectorGroups(),
     exaggeration: TERRAIN_EXAGGERATION,
     lightAzimuth: shade ? shade.azimuth : undefined,
@@ -16496,7 +16705,9 @@ if (typeof module !== 'undefined' && module.exports) {
     renderAirportMarkers, fetchNWSAlerts, renderNWSAlertCards, renderNWSAlertPolygons,
     renderForecastChart, fetchRadar,
     RADAR_PALETTE_KEY, getRadarPalette, setRadarPalette, _radarLut, _recolorRadarCtx, _radarTileLayerClass,
-    _makeRadarTileLayer, _radar3dUrl, updateRadarLegend,
+    _makeRadarTileLayer, _radar3dSource, _parseRadar3dUrl, _radarFrameKey, updateRadarLegend, updateRadarSourceLabel,
+    RADAR_SOURCE_KEY, getRadarSourceSetting, setRadarSource, _renderRadarTile, _noteRadarTile, _radarBackgroundRefresh,
+    NWS_TILE_FAIL_LIMIT, RADAR_REFRESH_MS,
     radarToggle, radarStep, updateRadarTime,
     openExport, closeExport, doExport, doExportGeoJson, getKMLCoords, populateExportModal,
     downloadBlob, exportRasterGeoTiff, exportRasterKmz, gatherVisibleLayerFolders, buildSunWindFolders,

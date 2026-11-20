@@ -24,6 +24,15 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.11.20-b',
+    date: '2026-11-20',
+    changes: [
+      'Weather radar in the US now comes from the National Weather Service: NOAA\'s MRMS radar mosaic, the data behind radar.weather.gov. A new image arrives about every 2 minutes (RainViewer: every 10), and rain vs. snow now comes from NOAA\'s own precipitation-type analysis. The animation still steps through the last 2 hours, 10 minutes apart, and the radar checks for a newer image every 5 minutes while you are on the latest frame.',
+      'RainViewer remains the radar outside NWS coverage (the lower 48, Alaska, Hawaii, Puerto Rico/Caribbean and Guam) and takes over automatically when NWS radar can\'t be reached, is more than 30 minutes old, or its images stop loading. A tag next to the radar time says which source is showing. It turns amber when RainViewer is standing in for NWS, and its tooltip says why.',
+      'New Config → Weather radar source setting: Auto (the default) or RainViewer only. The "RainViewer Universal Blue" colors option is now "As served by the radar source", which shows NWS\'s or RainViewer\'s own colors.',
+    ],
+  },
+  {
     version: '2026.11.20-a',
     date: '2026-11-20',
     changes: [
@@ -4043,9 +4052,9 @@ function build3dStyle(opts) {
     });
   });
   // Live weather radar (current frame only) drapes above imagery, below the
-  // analysis rasters and vectors. RainViewer tiles are native z7.
+  // analysis rasters and vectors.
   if (o.radarUrl) {
-    sources.radar = _raster3dSource(o.radarUrl, 7);
+    sources.radar = _raster3dSource(o.radarUrl, o.radarMaxZoom || 7); // RainViewer z7, NWS z9
     layers.push({ id: 'radar', type: 'raster', source: 'radar', paint: { 'raster-opacity': 0.5 } });
   }
   // Vector overlay groups (Phase 2) draw on top of every raster. Less-important
@@ -5494,14 +5503,16 @@ const RADAR_CLASSIC_RAIN = [
 
 // Palettes offered in Config. rain/snow: stop list, or null to keep
 // RainViewer's own color for that kind. A palette with both null is drawn as
-// served (no pixel work).
+// served by the source (no pixel work): RainViewer's Universal Blue, or NWS's
+// standard reflectivity colors.
 const RADAR_PALETTES = {
   classic: { label: 'Classic: green rain, blue snow', rain: RADAR_CLASSIC_RAIN, snow: null },
-  universal: { label: 'RainViewer Universal Blue (as served)', rain: null, snow: null },
+  served: { label: 'As served by the radar source', rain: null, snow: null },
 };
 const RADAR_PALETTE_DEFAULT = 'classic';
 
 function normalizeRadarPalette(name) {
+  if (name === 'universal') return 'served'; // saved by 2026.11.20-a
   return Object.prototype.hasOwnProperty.call(RADAR_PALETTES, name) ? name : RADAR_PALETTE_DEFAULT;
 }
 
@@ -5656,17 +5667,289 @@ function recolorRadarPixels(data, lut) {
 }
 
 // CSS linear-gradient for the radar legend: kind 'rain' runs 15-75 dBZ, 'snow'
-// 10-50 dBZ (light → heavy, left to right).
-function radarLegendGradient(name, kind) {
+// 10-50 dBZ (light → heavy, left to right). source 'nws' with the as-served
+// palette shows NWS's reflectivity colors (it has no separate snow colors).
+function radarLegendGradient(name, kind, source) {
   const [lo, hi] = kind === 'snow' ? [10, 50] : [15, 75];
+  const nwsServed = source === 'nws' && radarPaletteIsIdentity(name);
   const steps = 12;
   const parts = [];
   for (let s = 0; s <= steps; s++) {
     const dbz = Math.round(lo + (hi - lo) * s / steps);
-    const c = radarPaletteRgba(name, kind, dbz);
+    const c = nwsServed ? nwsReflectivityRgb(dbz) : radarPaletteRgba(name, kind, dbz);
     parts.push(`rgb(${c[0]},${c[1]},${c[2]}) ${Math.round(100 * s / steps)}%`);
   }
   return `linear-gradient(to right, ${parts.join(', ')})`;
+}
+
+// ============================================================
+// NWS RADAR (NOAA MRMS, via the NWS GeoServer behind radar.weather.gov)
+// ============================================================
+// US radar comes from NOAA's Multi-Radar/Multi-Sensor (MRMS) mosaic, served
+// as time-enabled WMS layers per region: <region>_bref_qcd (quality-controlled
+// base reflectivity, 1 km, new image every ~2 min) and <region>_pcpn_typ
+// (MRMS surface precipitation type). Public domain, no key, CORS open.
+// RainViewer stays the source outside these regions and whenever NWS fails.
+//
+// Both layers are served as pre-colored RGB images (no raw dBZ). The
+// reflectivity colors up to ~37 dBZ follow NWS's published legend exactly, so
+// they decode back to dBZ; above that (yellow → red → magenta) the legend is
+// only approximate, and those pixels are recognised by hue and kept as served.
+const NWS_RADAR_WMS = 'https://opengeo.ncep.noaa.gov/geoserver';
+
+// Each region's layer extent (EX_GeographicBoundingBox from GetCapabilities).
+// CONUS is listed first: it overlaps the Caribbean box over Florida/the Gulf.
+const NWS_RADAR_REGIONS = [
+  { id: 'conus', west: -130, east: -60, south: 20, north: 55 },
+  { id: 'alaska', west: -176, east: -126, south: 50, north: 72 },
+  { id: 'hawaii', west: -164, east: -151, south: 15, north: 26 },
+  { id: 'carib', west: -90, east: -60, south: 10, north: 25 },
+  { id: 'guam', west: 140, east: 150, south: 9, north: 18 },
+];
+
+// NWS region whose radar covers (lat, lng), or null (→ RainViewer).
+function nwsRadarRegionFor(lat, lng) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const r = NWS_RADAR_REGIONS.find(g => lng >= g.west && lng <= g.east && lat >= g.south && lat <= g.north);
+  return r ? r.id : null;
+}
+
+function nwsRadarCapabilitiesUrl(region) {
+  return `${NWS_RADAR_WMS}/${region}/ows?service=WMS&version=1.3.0&request=GetCapabilities`;
+}
+
+// WMS GetMap for one layer ('bref_qcd' | 'pcpn_typ') at one time, EPSG:3857.
+// bbox: [minX, minY, maxX, maxY], or a template token such as MapLibre's
+// '{bbox-epsg-3857}'.
+function nwsRadarGetMapUrl(region, layer, timeIso, bbox, width, height) {
+  const name = `${region}_${layer}`;
+  const bb = typeof bbox === 'string' ? bbox : bbox.map(v => v.toFixed(1)).join(',');
+  return `${NWS_RADAR_WMS}/${region}/${name}/ows?service=WMS&version=1.1.1&request=GetMap` +
+    `&layers=${name}&styles=&format=image/png&transparent=true&srs=EPSG:3857` +
+    `&bbox=${bb}&width=${width}&height=${height}` +
+    `&time=${encodeURIComponent(timeIso)}`;
+}
+
+// The time values a WMS GetCapabilities document lists for one layer (ISO
+// strings, as served). Regex-based so it runs the same in the browser and Node.
+function parseWmsTimeDimension(xml, layerName) {
+  if (typeof xml !== 'string') return [];
+  const at = xml.indexOf(`<Name>${layerName}</Name>`);
+  if (at < 0) return [];
+  const rest = xml.slice(at);
+  const next = rest.indexOf('<Layer', 1);
+  const scope = next > 0 ? rest.slice(0, next) : rest;
+  const m = /<Dimension[^>]*name="time"[^>]*>([^<]*)<\/Dimension>/.exec(scope);
+  if (!m) return [];
+  return m[1].split(',').map(s => s.trim()).filter(s => Number.isFinite(Date.parse(s)));
+}
+
+const NWS_RADAR_FRAME_STEP_MIN = 10;   // animation spacing (RainViewer's cadence)
+const NWS_RADAR_FRAME_COUNT = 13;      // → the last 2 hours
+const NWS_RADAR_PAIR_TOL_S = 180;      // reflectivity ↔ precip type / step target
+const NWS_RADAR_MAX_AGE_MIN = 30;      // newer than this or it's treated as down
+
+// Pick animation frames from the reflectivity times: the newest image, then
+// one per NWS_RADAR_FRAME_STEP_MIN back, each paired with the precip-type
+// image nearest in time (typeTime null when none is within tolerance).
+// Returns oldest → newest: [{ time (unix s), brefTime, typeTime }].
+function selectNwsRadarFrames(brefTimes, typeTimes, opts) {
+  const o = Object.assign({ step: NWS_RADAR_FRAME_STEP_MIN, count: NWS_RADAR_FRAME_COUNT, tol: NWS_RADAR_PAIR_TOL_S }, opts || {});
+  const sec = s => Date.parse(s) / 1000;
+  const bref = (brefTimes || []).map(s => ({ s, t: sec(s) })).filter(x => Number.isFinite(x.t)).sort((a, b) => a.t - b.t);
+  const types = (typeTimes || []).map(s => ({ s, t: sec(s) })).filter(x => Number.isFinite(x.t));
+  if (!bref.length) return [];
+  const nearest = (list, t) => {
+    let best = null;
+    for (const x of list) if (!best || Math.abs(x.t - t) < Math.abs(best.t - t)) best = x;
+    return best && Math.abs(best.t - t) <= o.tol ? best : null;
+  };
+  const newest = bref[bref.length - 1].t;
+  const out = [], used = new Set();
+  for (let k = 0; k < o.count; k++) {
+    const b = k === 0 ? bref[bref.length - 1] : nearest(bref, newest - k * o.step * 60);
+    if (!b || used.has(b.s)) continue;
+    used.add(b.s);
+    const ty = nearest(types, b.t);
+    out.push({ time: Math.round(b.t), brefTime: b.s, typeTime: ty ? ty.s : null });
+  }
+  return out.reverse();
+}
+
+// Web-Mercator (EPSG:3857) bounds of XYZ tile z/x/y: [minX, minY, maxX, maxY].
+function tileBbox3857(z, x, y) {
+  const R = 20037508.342789244, size = 2 * R / Math.pow(2, z);
+  return [-R + x * size, R - (y + 1) * size, -R + (x + 1) * size, R - y * size];
+}
+
+// Pixels of precip-type context to fetch around a tile so type can be filled
+// in from up to NWS_TYPE_FILL_M away (see recolorNwsPixels), across tile edges.
+const NWS_TYPE_FILL_M = 5000;
+function nwsTypeBufferPx(z, y, tileSize) {
+  const R = 20037508.342789244;
+  const lat = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 0.5) / Math.pow(2, z)))) * 180 / Math.PI;
+  const groundPx = (2 * R / Math.pow(2, z) / (tileSize || 256)) * Math.cos(lat * Math.PI / 180);
+  return Math.max(1, Math.min(32, Math.ceil(NWS_TYPE_FILL_M / groundPx)));
+}
+
+// NWS precip-type legend colors (MRMS PrecipFlag classes). S is snow; every
+// other class is liquid (WS warm stratiform, CS cool stratiform, C convective,
+// H hail, ST/CT tropical mixes). No class for sleet or freezing rain.
+const NWS_PTYPE_COLORS = {
+  '0450a4': 'WS', 'c8c8c8': 'S', 'ff3232': 'C', '960096': 'H', '6effff': 'CS', '00f900': 'ST', '009700': 'CT',
+};
+const _nwsPtypeByKey = new Map(Object.entries(NWS_PTYPE_COLORS).map(([h, c]) => [parseInt(h, 16), c]));
+
+function decodeNwsPrecipType(r, g, b, a) {
+  if (!a) return null;
+  return _nwsPtypeByKey.get((r << 16) | (g << 8) | b) || null;
+}
+
+// NWS reflectivity legend, one color per 0.2 dBZ from -27.4 to 36.6 dBZ
+// (sampled from the layer's GetLegendGraphic; dBZ = i * 0.2 - 27.4).
+const NWS_BREF_RAMP = (
+  '8d817f 8d827d 8e827b 8e837a 8e8478 8f8476 8f8574 908672 908670 90876f 91876d 91886b 918969 928a68 ' +
+  '928a66 938b64 938b62 938c60 938d5e 948d5d 948e5b 958f59 958f57 959056 959054 969254 979356 999458 ' +
+  '9a9559 9b975c 9c985d 9d9a5f 9e9b61 9f9c63 a09d65 a29f67 a3a069 a4a16b a5a36d a6a46f a7a570 a8a773 ' +
+  'a9a874 aba976 acaa78 adac7a aead7c afaf7e b0b080 b1b182 b2b284 b4b486 b5b588 b6b78a b7b88c b9b98e ' +
+  'babb8f bcbc92 bdbd93 bebf96 bfc097 c1c299 c2c39b c3c49d c4c59f c6c7a1 c7c8a3 c8caa5 c9cba7 cbcca9 ' +
+  'ccceab cecfad ced0af d0d2b1 d1d3b3 d1d3b4 d0d2b4 cfd1b4 cdd0b4 cccfb4 cacdb4 c9ccb4 c8cbb4 c6cab4 ' +
+  'c5c8b4 c4c7b4 c2c6b4 c1c5b4 bfc3b4 bec3b4 bdc1b4 bcc0b4 babfb4 b9beb4 b7bcb4 b6bbb4 b4bab4 b3b9b4 ' +
+  'b2b8b4 b1b7b4 afb5b4 aeb4b4 adb3b4 acb2b4 abb1b4 aab0b4 a8afb4 a8aeb4 a6acb4 a5acb4 a4aab4 a3aab4 ' +
+  'a2a8b4 a1a7b4 9fa6b4 9fa5b5 9da4b4 9ca3b5 9ba2b4 9aa1b5 99a0b4 989fb5 979db5 969db5 949bb5 939ab5 ' +
+  '9199b4 8f97b4 8d95b3 8b94b3 8993b2 8791b2 8590b1 838eb1 818db0 7f8bb0 7d8aaf 7b88ae 7987ae 7886ad ' +
+  '7584ad 7483ac 7181ac 7080ab 6d7eab 6c7daa 6a7baa 687aa9 6678a8 6477a8 6275a8 6175a7 5f73a7 5e73a7 ' +
+  '5d71a6 5c71a6 5a6fa5 596fa5 586ea5 576da5 556ca4 546ba4 536aa3 5269a3 5068a2 4f67a2 4e66a2 4d65a2 ' +
+  '4b64a1 4a63a1 4862a0 4761a0 4660a0 455f9f 435e9f 4460a0 4462a2 4666a4 4769a5 486ca8 496fa9 4a72ab ' +
+  '4b75ad 4c79af 4d7cb1 4e7fb3 4f82b5 5085b7 5188b9 538cbb 538fbd 5592bf 5695c0 5798c2 589bc4 599fc6 ' +
+  '5aa2c8 5ba5ca 5ca8cc 5dabce 5dadce 5dafcc 5db1ca 5cb3c9 5cb4c7 5bb6c5 5bb7c3 5ab9c1 5abbbf 59bcbe ' +
+  '59bebc 58c0ba 58c1b8 57c3b7 57c5b5 57c6b3 56c8b1 56caaf 55cbad 55cdac 54ceaa 54d0a8 53d2a6 53d4a5 ' +
+  '52d5a3 51d69f 4ed699 4bd694 48d68e 46d688 43d682 40d67d 3dd677 3bd672 38d66c 35d666 32d660 30d65b ' +
+  '2dd655 2bd650 28d64a 25d644 22d63e 20d639 1dd633 1ad62d 17d628 15d622 12d61c 0fd617 0ed414 0ed114 ' +
+  '0dce13 0ecb13 0dc813 0dc513 0dc112 0dbf12 0dbb12 0db812 0cb512 0db212 0caf11 0cac11 0ca811 0ca611 ' +
+  '0ca210 0c9f10 0b9c10 0c9910 0b9610 0b9310 0b8f0f 0b8d0f 0b890f 0b870f 0b850e 0b840e 0a820e 0b800e ' +
+  '0a7e0d 0a7d0d 0a7b0d 0a7a0d 0a780c 0a760c 0a740c 0a730c 0a710b 0a700b 096e0b 0a6c0b 096a0a 09690a ' +
+  '09670a 09660a 09640a 09620a 096009 095f09 0e6008 186608 216b08 2b7008 357507 3f7b07 498006 538606 ' +
+  '5c8b06 669006 709505 7a9b05 84a004 8ea504 97aa04 a1b003 abb503 b5ba03 bfbf02 c9c502 d2ca01'
+).split(' ');
+const NWS_BREF_RAMP_MIN = -27.4, NWS_BREF_RAMP_STEP = 0.2;
+const NWS_DBZ_HIGH = Infinity;   // ≥ ~37 dBZ: yellow/orange/red/magenta, kept as served
+
+let _nwsRampRgb = null;
+const _nwsBrefCache = new Map();
+// Decode an NWS reflectivity pixel: dBZ (number) for the gray→blue→green part
+// of the scale, NWS_DBZ_HIGH for the warm/magenta part, NaN for a color that
+// is not on NWS's scale, null when transparent.
+function decodeNwsReflectivity(r, g, b, a) {
+  if (!a) return null;
+  const key = (r << 16) | (g << 8) | b;
+  const hit = _nwsBrefCache.get(key);
+  if (hit !== undefined) return hit;
+  if (!_nwsRampRgb) _nwsRampRgb = NWS_BREF_RAMP.map(h => _rvHexRgba(h));
+  let best = -1, bestD = Infinity;
+  for (let i = 0; i < _nwsRampRgb.length; i++) {
+    const c = _nwsRampRgb[i];
+    const d = (c[0] - r) * (c[0] - r) + (c[1] - g) * (c[1] - g) + (c[2] - b) * (c[2] - b);
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  let v;
+  if (bestD <= 36) v = Math.round((NWS_BREF_RAMP_MIN + best * NWS_BREF_RAMP_STEP) * 10) / 10;
+  else if ((r >= 0xa0 && b <= 0x40 && g <= 0xe5) ||          // yellow → orange → red
+           (b >= 0xc0 && g <= 0x80 && r >= 0x50) ||          // magenta → purple
+           (r >= 0xe0 && b >= 0xf0)) v = NWS_DBZ_HIGH;      // pale pink
+  else v = NaN;
+  if (_nwsBrefCache.size < 4096) _nwsBrefCache.set(key, v);
+  return v;
+}
+
+// Nearest precip type for every pixel of a (pw × ph) RGBA type image:
+// chessboard-distance transform carrying the label (0 none, 1 liquid, 2 snow).
+// Returns { lab, dist, unknown, colored }.
+function _nwsTypeField(ptype, pw, ph) {
+  const n = pw * ph, lab = new Uint8Array(n), dist = new Uint16Array(n).fill(65535);
+  let unknown = 0, colored = 0;
+  for (let p = 0, i = 0; p < n; p++, i += 4) {
+    if (!ptype[i + 3]) continue;
+    colored++;
+    const c = decodeNwsPrecipType(ptype[i], ptype[i + 1], ptype[i + 2], ptype[i + 3]);
+    if (!c) { unknown++; continue; }
+    lab[p] = c === 'S' ? 2 : 1; dist[p] = 0;
+  }
+  const relax = (p, q) => { if (dist[q] + 1 < dist[p]) { dist[p] = dist[q] + 1; lab[p] = lab[q]; } };
+  for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++) {
+    const p = y * pw + x;
+    if (!dist[p]) continue;
+    if (x > 0) relax(p, p - 1);
+    if (y > 0) { relax(p, p - pw); if (x > 0) relax(p, p - pw - 1); if (x < pw - 1) relax(p, p - pw + 1); }
+  }
+  for (let y = ph - 1; y >= 0; y--) for (let x = pw - 1; x >= 0; x--) {
+    const p = y * pw + x;
+    if (!dist[p]) continue;
+    if (x < pw - 1) relax(p, p + 1);
+    if (y < ph - 1) { relax(p, p + pw); if (x < pw - 1) relax(p, p + pw + 1); if (x > 0) relax(p, p + pw - 1); }
+  }
+  return { lab, dist, unknown, colored };
+}
+
+// Repaint an NWS reflectivity tile (w × h RGBA, in place) in palette `name`,
+// taking rain/snow from the precip-type image `ptype` ((w+2·buf)² RGBA, the
+// same area plus `buf` pixels on every side). Echoes MRMS left untyped take
+// the nearest type within `buf` pixels; weak (<15 dBZ) echoes with no type
+// nearby are dropped (MRMS doesn't treat them as precipitation), stronger ones
+// are drawn as rain. Above ~37 dBZ rain keeps NWS's own warm colors.
+// Returns { colored, unknown, recolored, typeUnknown }; the tile is left as
+// served when either image is not in NWS's colors.
+function recolorNwsPixels(bref, w, h, ptype, buf, name) {
+  const out = { colored: 0, unknown: 0, recolored: false, typeUnknown: 0 };
+  const pal = normalizeRadarPalette(name);
+  if (!bref || !ptype || radarPaletteIsIdentity(pal)) return out;
+  const pw = w + 2 * buf, ph = h + 2 * buf;
+  if (ptype.length !== pw * ph * 4 || bref.length !== w * h * 4) return out;
+  const field = _nwsTypeField(ptype, pw, ph);
+  out.typeUnknown = field.unknown;
+  if (field.colored && field.unknown > field.colored * RADAR_UNKNOWN_MAX_FRAC) return out;
+  const res = new Uint8ClampedArray(bref.length);
+  for (let y = 0, i = 0; y < h; y++) {
+    for (let x = 0; x < w; x++, i += 4) {
+      const a = bref[i + 3];
+      if (!a) continue;
+      out.colored++;
+      const v = decodeNwsReflectivity(bref[i], bref[i + 1], bref[i + 2], a);
+      if (Number.isNaN(v)) { out.unknown++; continue; }
+      const p = (y + buf) * pw + (x + buf);
+      const kind = field.dist[p] <= buf ? field.lab[p] : 0;
+      let c;
+      if (kind === 0 && v < 15) continue;                       // untyped weak echo: not drawn
+      if (v === NWS_DBZ_HIGH) {
+        c = kind === 2 ? radarPaletteRgba(pal, 'snow', 45) : [bref[i], bref[i + 1], bref[i + 2], 255];
+      } else {
+        c = radarPaletteRgba(pal, kind === 2 ? 'snow' : 'rain', Math.round(v));
+      }
+      res[i] = c[0]; res[i + 1] = c[1]; res[i + 2] = c[2]; res[i + 3] = c[3];
+    }
+  }
+  if (out.colored && out.unknown > out.colored * RADAR_UNKNOWN_MAX_FRAC) return out;
+  bref.set(res);
+  out.recolored = true;
+  return out;
+}
+
+// NWS's own colors at the warm end of the scale, for the legend only (the
+// map keeps whatever NWS draws there). From the layer's legend graphic.
+const NWS_BREF_LEGEND_HIGH = [
+  [40, 'f3c819'], [45, 'f4b217'], [48, 'f90101'], [52, 'a70f10'], [57, 'af0101'],
+  [58, 'fdf6ff'], [62, 'e47cfc'], [67, 'fc75fe'], [68, 'a700f9'], [72, '5e00d4'],
+];
+
+// NWS reflectivity color at dBZ as drawn by NWS (legend only).
+function nwsReflectivityRgb(dbz) {
+  if (dbz <= 36.6) {
+    const i = Math.max(0, Math.min(NWS_BREF_RAMP.length - 1, Math.round((dbz - NWS_BREF_RAMP_MIN) / NWS_BREF_RAMP_STEP)));
+    return _rvHexRgba(NWS_BREF_RAMP[i]).slice(0, 3);
+  }
+  let s = NWS_BREF_LEGEND_HIGH[0];
+  for (const st of NWS_BREF_LEGEND_HIGH) if (st[0] <= dbz) s = st;
+  return _rvHexRgba(s[1]).slice(0, 3);
 }
 
 // --- CJS export for Node/Vitest ---
@@ -5678,6 +5961,9 @@ if (typeof module !== 'undefined' && module.exports) {
     RV_UB_RAIN, RV_UB_SNOW, RADAR_PALETTES, RADAR_PALETTE_DEFAULT, rainViewerTileUrl, normalizeRadarPalette,
     radarPaletteIsIdentity, rainViewerSourceRgba, decodeRainViewerColor, radarPaletteRgba, buildRadarRecolorLut,
     recolorRadarPixels, radarLegendGradient,
+    NWS_RADAR_WMS, NWS_RADAR_REGIONS, nwsRadarRegionFor, nwsRadarCapabilitiesUrl, nwsRadarGetMapUrl, parseWmsTimeDimension,
+    NWS_RADAR_MAX_AGE_MIN, selectNwsRadarFrames, tileBbox3857, nwsTypeBufferPx, NWS_PTYPE_COLORS, decodeNwsPrecipType,
+    NWS_BREF_RAMP, NWS_DBZ_HIGH, decodeNwsReflectivity, recolorNwsPixels, nwsReflectivityRgb,
     calcSunPosition, calcMoonPhase, calcMoonPosition, lightVecENU, lightForTime, hillshadeParams,
     wireHazardName, parseHeightToMeters, osmTowerHeightFt,
     parseChangelogMd,
