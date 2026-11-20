@@ -1438,9 +1438,12 @@ function _areaKeyOf(lat, lng) {
 const AREA_BLANK_SECTIONS = ['weather', 'airQuality', 'airspace', 'elevation', 'obstacles', 'solar', 'fireDanger',
   'groundAccess', 'publicLands', 'water', 'hospitals', 'trails'];
 
+// Cells of sections whose fetch is about to start for a different area: they
+// read UPDATING… until that fetch answers (values), or its last source fails
+// (UNKNOWN: NEEDS UPDATE). Never the previous area's numbers.
 function _blankSectionCells(keys) {
   if (typeof document === 'undefined') return;
-  keys.forEach(k => sectionCellsFor(k).forEach(id => { setText(id, '--'); setColor(id, null); }));
+  keys.forEach(k => sectionCellsFor(k).forEach(id => { setText(id, UPDATING_CELL_TEXT); setColor(id, 'cyan'); }));
 }
 
 // Derived cells (Ops tab) — computed from the weather and the terrain, so they
@@ -1644,6 +1647,9 @@ async function processArea(layer, type) {
     if (typeof buildLayerControl === 'function' && document.getElementById('layerList')) buildLayerControl();
   }
   S._processedAreaKey = _newAreaKey;
+  // A refresh of the same area: cells left "--" or UNKNOWN by an earlier
+  // failure say UPDATING… while their fetch runs (a new area's were reset above).
+  if (!isNewArea) AREA_BLANK_SECTIONS.forEach(k => markCellsUpdating(sectionCellsFor(k)));
   // Each awaited check reports in as it settles (unless a newer area took over).
   const answered = (name, p) => Promise.resolve(p).then(() => {}, () => {})
     .then(() => { if (S._areaGen === areaGen) _areaAnswered(name); });
@@ -1696,6 +1702,8 @@ async function processArea(layer, type) {
   // A newer area (or a clear) took over while these were loading: its own
   // processArea computes the derived data — don't overwrite it with ours.
   if (S._areaGen !== areaGen) return;
+  // Every fetch has settled: nothing may still claim to be updating.
+  AREA_BLANK_SECTIONS.forEach(_settleSectionUpdating);
 
   // Start ADS-B polling (needs elevation data for AGL). A new area already
   // restarted it when its elevation answered.
@@ -1717,10 +1725,30 @@ function recordDataSourceError(source, error) {
     timestamp: Date.now(),
     status: error?.status || null,
   };
+  _queueDataSourceStatus();
 }
 
 function clearDataSourceError(source) {
+  if (!(source in S.dataSourceErrors)) return;
   delete S.dataSourceErrors[source];
+  _queueDataSourceStatus();
+}
+
+// The red DATA SOURCE ERRORS panel follows S.dataSourceErrors as each source
+// answers. It used to be redrawn only once every fetch for the area had
+// settled, so a source that failed in seconds (weather, already showing
+// UNKNOWN in its section) stayed off the panel for as long as the slowest
+// source took to give up — minutes, when every Overpass mirror times out.
+// One redraw per tick however many sources change together; none while no
+// area is drawn (the panel sits beside the hidden assessment banner).
+let _dsStatusQueued = false;
+function _queueDataSourceStatus() {
+  if (_dsStatusQueued || typeof document === 'undefined') return;
+  _dsStatusQueued = true;
+  Promise.resolve().then(() => {
+    _dsStatusQueued = false;
+    if (S.areaCenter) showDataSourceStatus();
+  });
 }
 
 async function retryFailedSource(source) {
@@ -1752,12 +1780,25 @@ async function retryFailedSource(source) {
   };
   const fn = retryMap[source];
   if (fn) {
+    const cells = DATA_SOURCE_SECTION[source];
+    if (cells) markCellsUpdating(sectionCellsFor(cells[0], cells[1]));
     await fn();
+    if (cells) _settleSectionUpdating(cells[0]);
     computeOpsData();
     computeAssessment();
     showDataSourceStatus();
   }
 }
+
+// Which panel cells (section, optional sub-source) each DATA SOURCE ERRORS
+// entry fills — so its RETRY shows UPDATING… there while it runs.
+const DATA_SOURCE_SECTION = {
+  'Weather': ['weather'], 'Air Quality': ['airQuality'], 'Elevation': ['elevation'], 'Sun/Moon': ['solar'],
+  'Wire Hazards': ['obstacles', 'wire'], 'Utility Circuits': ['obstacles', 'utility'],
+  'FAA Obstacles': ['obstacles', 'dof'], 'Protected Areas': ['obstacles', 'protected'],
+  'FAA Airspace': ['airspace', 'faa'], 'Airports': ['airspace', 'airports'],
+  'Fire Danger': ['fireDanger'], 'ADS-B': ['adsb'],
+};
 
 async function retryAllFailed() {
   const sources = Object.keys(S.dataSourceErrors);
@@ -1770,6 +1811,9 @@ function showDataSourceStatus() {
   const banner = document.getElementById('assessmentBanner');
   if (!banner) return;
   const existing = document.getElementById('dataSourceWarning');
+  // Redrawn whenever a source fails or recovers: keep [details] as the user left it.
+  const prevDetails = existing && existing.querySelector('.ds-details');
+  const detailsOpen = !!(prevDetails && prevDetails.style.display === 'block');
   if (existing) existing.remove();
 
   const errors = Object.entries(S.dataSourceErrors);
@@ -1787,7 +1831,8 @@ function showDataSourceStatus() {
   div.appendChild(summary);
 
   const details = document.createElement('div');
-  details.style.cssText = 'display:none;margin-top:6px;padding-top:6px;border-top:1px solid var(--border);';
+  details.className = 'ds-details';
+  details.style.cssText = `display:${detailsOpen ? 'block' : 'none'};margin-top:6px;padding-top:6px;border-top:1px solid var(--border);`;
   errors.forEach(([name, err]) => {
     const row = document.createElement('div');
     row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:3px 0;';
@@ -1864,6 +1909,68 @@ function markCellsUnknown(ids) {
   (ids || []).forEach(id => { setText(id, UNKNOWN_CELL_TEXT); setColor(id, 'red'); });
 }
 
+// While a source is still being fetched — including every mirror or fallback
+// it tries — its cells that have nothing current to show say so, instead of
+// "--" or a red UNKNOWN left from an earlier failure. Only the last source
+// failing turns them UNKNOWN (markSection). Cells holding this area's values
+// (fresh, or flagged stale) keep them during a refresh.
+const UPDATING_CELL_TEXT = 'UPDATING…';
+function _cellHasNoValue(t) {
+  t = (t || '').trim();
+  return !t || t === '--' || t === UPDATING_CELL_TEXT || t.startsWith(UNKNOWN_CELL_TEXT);
+}
+function markCellsUpdating(ids) {
+  if (typeof document === 'undefined') return;
+  (ids || []).forEach(id => {
+    const el = document.getElementById(id); if (!el) return;
+    if (!_cellHasNoValue(el.textContent)) return;
+    setText(id, UPDATING_CELL_TEXT); setColor(id, 'cyan');
+  });
+}
+
+// A source has answered: any of its cells still reading UPDATING… (ones the
+// render had nothing for) become UNKNOWN if it failed, "--" otherwise.
+function _settleUpdatingCells(ids, failed) {
+  if (typeof document === 'undefined') return;
+  (ids || []).forEach(id => {
+    const el = document.getElementById(id);
+    if (!el || el.textContent !== UPDATING_CELL_TEXT) return;
+    if (failed) { setText(id, UNKNOWN_CELL_TEXT); setColor(id, 'red'); }
+    else { setText(id, '--'); setColor(id, null); }
+  });
+}
+
+// Has THIS area's own lookup `name` answered yet? Some cells are redrawn when a
+// different source answers (the wire summary when the utility circuits arrive,
+// the nearest airport when FAA airspace does), from whatever is held at that
+// moment. Without this they read "None mapped" / "None found" — a finding —
+// while their own lookup was still on its way, or after it had failed.
+// Returns null (not yet, for the current area) or { ok }.
+function _sourceAnswered(name) {
+  const st = S._srcAnswer && S._srcAnswer[name];
+  return st && st.area === S.currentArea ? st : null;
+}
+function _noteSourceAnswer(name, ok) {
+  (S._srcAnswer || (S._srcAnswer = {}))[name] = { area: S.currentArea, ok: !!ok };
+}
+// The text a "nothing found" cell may show for lookup `name`: UPDATING… while
+// it is on its way, UNKNOWN after it failed with nothing held, else `none`.
+function _noneCell(id, name, none, color) {
+  const st = S.currentArea ? _sourceAnswered(name) : { ok: true };
+  if (!st) { setText(id, UPDATING_CELL_TEXT); setColor(id, 'cyan'); }
+  else if (!st.ok) { setText(id, UNKNOWN_CELL_TEXT); setColor(id, 'red'); }
+  else { setText(id, none); setColor(id, color || null); }
+}
+
+// Settle a whole section (each sub-source of a rollup by its own outcome).
+function _settleSectionUpdating(key) {
+  const c = SECTION_CELLS[key]; if (!c) return;
+  const meta = S.sectionMeta[key];
+  const failed = m => !!(m && m.status === 'error');
+  if (Array.isArray(c)) _settleUpdatingCells(c, failed(meta));
+  else Object.keys(c).forEach(src => _settleUpdatingCells(c[src], failed(meta && meta.sources ? meta.sources[src] : meta)));
+}
+
 // An UPDATE that fails while this area's earlier data is still on screen: the
 // values stay (they are real, just not current) but every one of them turns
 // amber with this suffix so nobody reads them as fresh.
@@ -1872,6 +1979,7 @@ function markCellsStale(ids) {
   (ids || []).forEach(id => {
     const el = document.getElementById(id); if (!el) return;
     const t = el.textContent || '';
+    if (t === UPDATING_CELL_TEXT) { setText(id, UNKNOWN_CELL_TEXT); setColor(id, 'red'); return; } // never filled
     if (!t || t === '--' || t === UNKNOWN_CELL_TEXT) return;   // nothing real to flag
     if (!t.endsWith(STALE_CELL_SUFFIX)) el.textContent = t + STALE_CELL_SUFFIX;
     setColor(id, 'amber');
@@ -2046,6 +2154,8 @@ function markSection(key, patch) {
     if (patch.status === 'error' && !patch.partial) {
       if (_sectionHasPriorData(prior)) markCellsStale(sectionCellsFor(key, patch.source));
       else markCellsUnknown(sectionCellsFor(key, patch.source));
+    } else if (patch.status === 'live' || patch.status === 'cached') {
+      _settleUpdatingCells(sectionCellsFor(key, patch.source), false);
     }
     renderSectionMeta(key);
   }
@@ -2097,6 +2207,7 @@ async function updateSection(key) {
   if (meta.loading) return; // re-entrancy guard
   meta.loading = true;
   renderSectionMeta(key);
+  markCellsUpdating(sectionCellsFor(key));
   try {
     await def.fetch(S.areaCenter, S.areaBounds); // fetch's own branches mark live/cached/error
     if (def.computes === 'ops' || def.computes === 'both') { if (typeof computeOpsData === 'function') computeOpsData(); }
@@ -2105,6 +2216,7 @@ async function updateSection(key) {
     markSection(key, { status: 'error', error: e && e.message ? e.message : String(e) });
   } finally {
     if (S.sectionMeta[key]) S.sectionMeta[key].loading = false;
+    _settleSectionUpdating(key);
     renderSectionMeta(key);
     if (typeof showDataSourceStatus === 'function') showDataSourceStatus();
   }
@@ -4613,9 +4725,14 @@ function computeAirspace(lat, lng) {
   const nearDist = nearest ? nearest.distKm : Infinity;
   const nearNm = (nearDist * 0.539957).toFixed(1);
 
-  setText('airNearAirport', nearest ? `${nearest.icao} \u2014 ${nearest.name}` : 'None found');
-  setText('airNearDist', nearest ? `${nearNm} nm` : '--');
-  setColor('airNearDist', nearDist < 9.26 ? 'red' : nearDist < 18.52 ? 'amber' : 'green');
+  if (nearest) {
+    setText('airNearAirport', `${nearest.icao} \u2014 ${nearest.name}`);
+    setText('airNearDist', `${nearNm} nm`);
+    setColor('airNearDist', nearDist < 9.26 ? 'red' : nearDist < 18.52 ? 'amber' : 'green');
+  } else {
+    _noneCell('airNearAirport', 'airports', 'None found');
+    _noneCell('airNearDist', 'airports', '--', 'green');
+  }
 
   // Count nearby heliports
   const heliports = nearby.filter(a => a.type === 'heliport');
@@ -4624,8 +4741,7 @@ function computeAirspace(lat, lng) {
     setText('airHeliports', `${heliports.length} nearby: ${hList}`);
     setColor('airHeliports', 'amber');
   } else {
-    setText('airHeliports', 'None within range');
-    setColor('airHeliports', 'green');
+    _noneCell('airHeliports', 'airports', 'None within range', 'green');
   }
 
   // One FAA layer's state for the cells it feeds: 'unknown' (fetch failed, no
@@ -4769,6 +4885,7 @@ async function fetchNearbyAirports(center, bounds) {
   const cacheKey = typeof areaKey === 'function' ? areaKey(center.lat, center.lng) : `${center.lat.toFixed(3)}_${center.lng.toFixed(3)}`;
   const commit = elements => {
     S.nearbyAirports = _parseOverpassAirports(elements);
+    _noteSourceAnswer('airports', true);
     _setDataArea('airports', cacheKey);
     renderAirportMarkers(center.lat, center.lng);
     computeAirspace(center.lat, center.lng);
@@ -4827,6 +4944,7 @@ async function fetchNearbyAirports(center, bounds) {
       _setDataArea('airports', cacheKey);
       renderAirportMarkers(center.lat, center.lng);
     }
+    if (!(S.nearbyAirports && S.nearbyAirports.length)) _noteSourceAnswer('airports', false);
     markSection('airspace', { source: 'airports', status: 'error', error: msg });
   } finally {
     trackFetchEnd('Airports');
@@ -7112,6 +7230,7 @@ async function fetchWireHazards(bounds) {
 
     S.wireHazardCounts = counts;
     _setDataArea('wireHazards', wireKey);
+    _noteSourceAnswer('wire', true);
     const total = Object.values(counts).reduce((a, b) => a + b, 0);
     updateWireDisplay(counts, towerCount);
     buildLayerControl();
@@ -7137,6 +7256,7 @@ async function fetchWireHazards(bounds) {
     console.error('Wire hazard fetch error:', err);
     recordDataSourceError('Wire Hazards', err);
     const _wireErrMsg = err && err.message ? err.message : String(err);
+    if (!_dataIsForArea('wireHazards', wireKey)) _noteSourceAnswer('wire', false);
     markSection('obstacles', { source: 'wire', status: 'error', error: _wireErrMsg });
     // Try cached overpass data
     if (typeof getCachedApiResponse === 'function') {
@@ -7164,6 +7284,7 @@ async function fetchWireHazards(bounds) {
           });
           S.wireHazardCounts = counts;
           _setDataArea('wireHazards', wireKey);
+          _noteSourceAnswer('wire', true);
           const total = Object.values(counts).reduce((a, b) => a + b, 0);
           updateWireDisplay(counts, 0);
           const age = Date.now() - cached.timestamp;
@@ -7415,9 +7536,8 @@ function updateWireDisplay(counts, towerCount) {
     setText('terrTowers', `${towers} towers, ${telecomCount} telecom, ${aerialCount} aerialway`);
     setColor('terrTowers', (towers + telecomCount + aerialCount) > 0 ? 'amber' : 'green');
   } else {
-    setText('terrPower', 'None mapped (verify imagery)');
-    setColor('terrPower', 'amber');
-    setText('terrTowers', 'None mapped');
+    _noneCell('terrPower', 'wire', 'None mapped (verify imagery)', 'amber');
+    _noneCell('terrTowers', 'wire', 'None mapped');
   }
 }
 
@@ -18266,6 +18386,8 @@ if (typeof module !== 'undefined' && module.exports) {
     notifyProxyRateLimited, _proxyFetch, _swCacheStamp, _freshPatch, invalidateAreaRequests, _beginRequest, _requestCurrent, _setDataArea, _dataIsForArea, _readArcgisGeoJson, PROTECTED_LAYER_LABELS, _assessBadgeColor, renderAssessProfile, openLimitsProfileConfig, toggleAssessmentCollapsed, _setAssessCollapsed, restoreAssessCollapsed, ASSESS_COLLAPSED_KEY, sendFeedback, openFeedback, closeFeedback,
     fetchFAAairspace, faaAirspaceUnavailableLayers, FAA_AIRSPACE_LAYER_LABELS, fetchFireDanger,
     UNKNOWN_CELL_TEXT, SECTION_CELLS, sectionCellsFor, markCellsUnknown, renderFireDangerUnknown,
+    UPDATING_CELL_TEXT, markCellsUpdating, _settleUpdatingCells, _settleSectionUpdating, DATA_SOURCE_SECTION,
+    _sourceAnswered, _noteSourceAnswer, _noneCell,
     AREA_BLANK_SECTIONS, _areaKeyOf, _blankSectionCells, _resetPanelForNewArea, _dropWeatherState, _refreshDerivedForTerrain,
     AREA_DERIVED_CELLS, AREA_DATA_LAYERS, AREA_AWAIT_LABELS, _dropAreaData, _renderAssessmentLoading,
     _areaAwaits, _areaAwaitingLabels, _areaAnswered, _fetchTimed, WX_TIMEOUT_MS, ELEV_TIMEOUT_MS,

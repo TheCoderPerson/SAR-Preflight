@@ -92,7 +92,7 @@ afterEach(() => {
 });
 
 describe('weather: another area\'s values go when a request for this area begins', () => {
-  it('shows nothing, not the previous area\'s temperature, while the answer is on its way', async () => {
+  it('shows UPDATING…, not the previous area\'s temperature, while the answer is on its way', async () => {
     await loadArea(BASS, 46, 376);
     expect(text('wxTemp')).toBe('46°F');
     expect(S.wxAreaKey).toBe(_areaKeyOf(BASS.lat, BASS.lng));
@@ -102,9 +102,9 @@ describe('weather: another area\'s values go when a request for this area begins
     const p = fetchWeather(LOON.lat, LOON.lng);
     await Promise.resolve();
     // Request in flight: the panel and the state hold no other area's weather.
-    expect(text('wxTemp')).toBe('--');
-    expect(text('wxVis')).toBe('--');
-    expect(text('windMax')).toBe('--');
+    expect(text('wxTemp')).toBe('UPDATING…');
+    expect(text('wxVis')).toBe('UPDATING…');
+    expect(text('windMax')).toBe('UPDATING…');
     expect(S.wx).toEqual({});
     expect(S.wind).toEqual({});
     expect(S.wxAreaKey).toBeNull();
@@ -136,12 +136,12 @@ describe('weather: another area\'s values go when a request for this area begins
     fetchWeather(LOON.lat, LOON.lng);
     await Promise.resolve();
     expect(S.aqi).toBeNull();
-    expect(text('wxAQI')).toBe('--');
+    expect(text('wxAQI')).toBe('UPDATING…');
   });
 });
 
 describe('terrain: another area\'s values go when a request for this area begins', () => {
-  it('shows nothing, not the previous area\'s launch elevation, while the answer is on its way', async () => {
+  it('shows UPDATING…, not the previous area\'s launch elevation, while the answer is on its way', async () => {
     await loadArea(BASS, 46, 376);
     expect(text('terrLaunch')).toBe('1,234 ft AMSL');
     expect(S.elev.center).toBe(1234);
@@ -150,9 +150,9 @@ describe('terrain: another area\'s values go when a request for this area begins
     S.areaCenter = LOON;
     const p = fetchElevation(LOON, boundsOf(LOON));
     await Promise.resolve();
-    expect(text('terrLaunch')).toBe('--');
-    expect(text('terrMin')).toBe('--');
-    expect(text('terrCell')).toBe('--');
+    expect(text('terrLaunch')).toBe('UPDATING…');
+    expect(text('terrMin')).toBe('UPDATING…');
+    expect(text('terrCell')).toBe('UPDATING…');
     expect(S.elev).toEqual({});
     expect(S.cellStatus).toBeNull();
     expect(text('elevStatus')).toBe('Fetching...');
@@ -207,7 +207,7 @@ describe('terrain arriving after the weather refreshes what depends on both', ()
 });
 
 describe('_resetPanelForNewArea', () => {
-  it('blanks every cell an area fetch writes and puts the banner in a loading state', async () => {
+  it('sets every cell an area fetch writes to UPDATING… and puts the banner in a loading state', async () => {
     await loadArea(BASS, 46, 376);
     document.getElementById('airClass').textContent = 'Class G';
     document.getElementById('astSunrise').textContent = '06:47 AM';
@@ -220,7 +220,7 @@ describe('_resetPanelForNewArea', () => {
     _resetPanelForNewArea();
     AREA_BLANK_SECTIONS.forEach(k => sectionCellsFor(k).forEach(id => {
       expect(document.getElementById(id), id).not.toBeNull();
-      expect(text(id), id).toBe('--');
+      expect(text(id), id).toBe('UPDATING…');
     }));
     expect(text('assessBadge')).toBe('LOADING');
     expect(document.getElementById('assessBadge').className).toBe('assessment-badge');

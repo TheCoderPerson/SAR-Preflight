@@ -4,6 +4,12 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.11.20-c — 2026-11-20
+
+- The red DATA SOURCE ERRORS list under the banner now updates as each source answers. It used to wait until every check for the area had finished, so a failed weather check could show UNKNOWN on the Weather tab for minutes before the list named it, while the slowest source (often an overloaded OpenStreetMap server) was still trying. An opened [details] list now stays open while the list updates.
+- Fields now read UPDATING… while their source is still being checked, including while it works through backup servers or a second source, and switch to UNKNOWN: NEEDS UPDATE only once the last one has failed. A newly drawn area used to show "--", and UPDATE or RETRY left the red UNKNOWN on screen until the answer came back. Fields that already show this area's values keep them while a refresh runs.
+- Wire hazards and the nearest airport no longer read "None mapped" or "None found" while their OpenStreetMap lookup is still running, or after it failed. Those fields were redrawn whenever another source answered first (the utility circuits, FAA airspace) and showed "none" before their own lookup had replied.
+
 ## v2026.11.20-b — 2026-11-20
 
 - Weather radar in the US now comes from the National Weather Service: NOAA's MRMS radar mosaic, the data behind radar.weather.gov. A new image arrives about every 2 minutes (RainViewer: every 10), and rain vs. snow now comes from NOAA's own precipitation-type analysis. The animation still steps through the last 2 hours, 10 minutes apart, and the radar checks for a newer image every 5 minutes while you are on the latest frame.

@@ -24,6 +24,15 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.11.20-c',
+    date: '2026-11-20',
+    changes: [
+      'The red DATA SOURCE ERRORS list under the banner now updates as each source answers. It used to wait until every check for the area had finished, so a failed weather check could show UNKNOWN on the Weather tab for minutes before the list named it, while the slowest source (often an overloaded OpenStreetMap server) was still trying. An opened [details] list now stays open while the list updates.',
+      'Fields now read UPDATING… while their source is still being checked, including while it works through backup servers or a second source, and switch to UNKNOWN: NEEDS UPDATE only once the last one has failed. A newly drawn area used to show "--", and UPDATE or RETRY left the red UNKNOWN on screen until the answer came back. Fields that already show this area\'s values keep them while a refresh runs.',
+      'Wire hazards and the nearest airport no longer read "None mapped" or "None found" while their OpenStreetMap lookup is still running, or after it failed. Those fields were redrawn whenever another source answered first (the utility circuits, FAA airspace) and showed "none" before their own lookup had replied.',
+    ],
+  },
+  {
     version: '2026.11.20-b',
     date: '2026-11-20',
     changes: [

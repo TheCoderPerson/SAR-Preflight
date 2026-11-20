@@ -350,8 +350,8 @@ describe('processArea — a different area starts from nothing', () => {
     expect(S.elev).toEqual({});
     expect(S.wx).toEqual({});
     expect(S.tfrs.map(t => t.id)).toEqual(['MANUAL-TFR']);
-    expect(text('wxTemp')).toBe('--');
-    expect(text('terrLaunch')).toBe('--');
+    expect(text('wxTemp')).toBe('UPDATING…');
+    expect(text('terrLaunch')).toBe('UPDATING…');
     AREA_DERIVED_CELLS.forEach(id => expect(text(id), id).toBe('--'));
     // The weather has not answered: the banner says so and nothing else.
     expect(text('assessBadge')).toBe('LOADING');
@@ -412,7 +412,7 @@ describe('processArea — a different area starts from nothing', () => {
     const bigger = app.processArea(areaLayer(B.lat, B.lng, 0.08), 'polygon').catch(() => {});
     await flush();
     expect(text('assessBadge')).toBe('LOADING');
-    expect(text('wxTemp')).toBe('--');
+    expect(text('wxTemp')).toBe('UPDATING…');
     wx.release(resp(wxBody(31)));
     await bigger;
   });
@@ -495,5 +495,155 @@ describe('requests that never answer give up', () => {
     await p;
     expect(S.elev.center).toBe(6408);
     expect(text('elevStatus')).toMatch(/COPERNICUS/);
+  });
+});
+
+// ============================================================================
+// While a source is still trying (any mirror or fallback), its fields say
+// UPDATING…; only when its last source has failed do they say UNKNOWN, and at
+// that moment — not when the slowest other source gives up — it is listed in
+// the red DATA SOURCE ERRORS panel.
+describe('fields say UPDATING… until the last source has answered', () => {
+  const base = extra => Object.assign({
+    'air-quality-api': resp(aqiBody), 'swpc': resp(kpBody), 'alerts/active': resp({ features: [] }),
+    'getSamples': resp(demBody(1953.2)),
+  }, extra);
+  // Like held(), but once opened every later request answers at once too — the
+  // app queues OpenStreetMap lookups two at a time, so some arrive after release.
+  const gate = () => {
+    let open = null;
+    const h = held();
+    const g = () => (open ? Promise.resolve(open) : h());
+    g.release = r => { open = r; h.release(r); };
+    g.count = () => h.count();
+    return g;
+  };
+  const panelSources = () => {
+    const p = document.getElementById('dataSourceWarning');
+    return p ? [...p.querySelectorAll('.ds-details b')].map(b => b.textContent) : [];
+  };
+
+  it('a failed weather check shows UNKNOWN and joins the error panel while slow sources are still pending', async () => {
+    S._processedAreaKey = 'the-previous-area';
+    const wx = held(), overpass = gate();
+    route(base({ 'api.open-meteo.com/v1/forecast': wx, 'interpreter': overpass }));
+    let finished = false;
+    const done = app.processArea(areaLayer(B.lat, B.lng), 'polygon').catch(() => {}).then(() => { finished = true; });
+    await flush();
+    expect(text('wxTemp')).toBe(app.UPDATING_CELL_TEXT);
+    expect(text('windMax')).toBe(app.UPDATING_CELL_TEXT);
+    expect(panelSources()).not.toContain('Weather');
+
+    wx.release(resp({}, { status: 503 }));
+    await flush();
+    expect(text('wxTemp')).toBe('UNKNOWN: NEEDS UPDATE');
+    expect(panelSources()).toContain('Weather');
+    expect(finished).toBe(false);                       // OpenStreetMap lookups still out
+    expect(overpass.count()).toBeGreaterThan(0);
+    expect(text('terrTrails')).toBe(app.UPDATING_CELL_TEXT); // …and their fields still say so
+    // Redrawn when OTHER sources answered (utility circuits, FAA airspace), but
+    // their own OpenStreetMap lookups have not: not "None mapped" / "None found".
+    expect(text('terrPower')).toBe(app.UPDATING_CELL_TEXT);
+    expect(text('airNearAirport')).toBe(app.UPDATING_CELL_TEXT);
+
+    overpass.release(resp({ elements: [] }));
+    await done;
+    await flush();
+    expect(text('terrTrails')).not.toBe(app.UPDATING_CELL_TEXT);
+    expect(text('terrPower')).toBe('None mapped (verify imagery)');   // now it is a finding
+    expect(text('airNearAirport')).toBe('None found');
+  });
+
+  it('wire / airport "none" texts follow their own lookup: UPDATING…, then UNKNOWN or None', () => {
+    const area = areaLayer(B.lat, B.lng);
+    S.currentArea = area;
+    S._srcAnswer = {};
+    S.utilityWireCounts = {};
+    app.updateWireDisplay({}, 0);                      // e.g. the utility circuits answered first
+    expect(text('terrPower')).toBe(app.UPDATING_CELL_TEXT);
+    expect(text('terrTowers')).toBe(app.UPDATING_CELL_TEXT);
+    app._noteSourceAnswer('wire', false);              // every Overpass mirror failed, nothing held
+    app.updateWireDisplay({}, 0);
+    expect(text('terrPower')).toBe('UNKNOWN: NEEDS UPDATE');
+    app._noteSourceAnswer('wire', true);
+    app.updateWireDisplay({}, 0);
+    expect(text('terrPower')).toBe('None mapped (verify imagery)');
+    app.updateWireDisplay({ power_line: 2 }, 1);
+    expect(text('terrPower')).toBe('2 lines mapped \u2014 see map');
+    // A different area: that answer no longer counts.
+    S.currentArea = areaLayer(A.lat, A.lng);
+    app.updateWireDisplay({}, 0);
+    expect(text('terrPower')).toBe(app.UPDATING_CELL_TEXT);
+  });
+
+  it('a refresh of the same area: UNKNOWN fields say UPDATING… while it runs, real values stay', async () => {
+    route(base({ 'api.open-meteo.com/v1/forecast': resp({}, { status: 503 }), 'interpreter': resp({ elements: [] }) }));
+    const layer = areaLayer(B.lat, B.lng);
+    await app.processArea(layer, 'polygon').catch(() => {});
+    await flush();
+    expect(text('wxTemp')).toBe('UNKNOWN: NEEDS UPDATE');
+    expect(text('terrLaunch')).toBe('6,408 ft AMSL');
+
+    const wx = held();
+    route(base({ 'api.open-meteo.com/v1/forecast': wx, 'interpreter': resp({ elements: [] }) }));
+    const again = app.processArea(layer, 'polygon').catch(() => {});
+    await flush();
+    expect(text('wxTemp')).toBe(app.UPDATING_CELL_TEXT);
+    expect(text('terrLaunch')).toBe('6,408 ft AMSL');
+    wx.release(resp(wxBody(31)));
+    await again;
+    await flush();
+    expect(text('wxTemp')).toBe('31°F');
+  });
+
+  it('UPDATE and RETRY show UPDATING… during the re-check, then the answer', async () => {
+    route(base({ 'api.open-meteo.com/v1/forecast': resp({}, { status: 503 }), 'interpreter': resp({ elements: [] }) }));
+    await app.processArea(areaLayer(B.lat, B.lng), 'polygon').catch(() => {});
+    await flush();
+    expect(text('wxTemp')).toBe('UNKNOWN: NEEDS UPDATE');
+
+    // Section UPDATE button: still failing → back to UNKNOWN.
+    let wx = held();
+    route(base({ 'api.open-meteo.com/v1/forecast': wx }));
+    let p = app.updateSection('weather');
+    await flush();
+    expect(text('wxTemp')).toBe(app.UPDATING_CELL_TEXT);
+    wx.release(resp({}, { status: 503 }));
+    await p;
+    expect(text('wxTemp')).toBe('UNKNOWN: NEEDS UPDATE');
+
+    // Error panel RETRY: answers this time.
+    wx = held();
+    route(base({ 'api.open-meteo.com/v1/forecast': wx }));
+    p = app.retryFailedSource('Weather');
+    await flush();
+    expect(text('wxTemp')).toBe(app.UPDATING_CELL_TEXT);
+    wx.release(resp(wxBody(29)));
+    await p;
+    expect(text('wxTemp')).toBe('29°F');
+  });
+
+  it('a source that answers without filling a field does not leave it UPDATING…', () => {
+    app.markCellsUpdating(['wxTemp', 'wxUV']);
+    document.getElementById('wxTemp').textContent = '40°F';          // the render filled this one
+    app.markSection('weather', { status: 'live', updatedAt: Date.now(), error: null });
+    expect(text('wxTemp')).toBe('40°F');
+    expect(text('wxUV')).toBe('--');
+
+    // A failure on top of earlier data flags real values stale — never "UPDATING… (stale)".
+    app.markCellsUpdating(['wxUV']);
+    app.markSection('weather', { status: 'error', error: 'x' });
+    expect(text('wxTemp')).toBe('40°F (stale: Verify)');
+    expect(text('wxUV')).toBe('UNKNOWN: NEEDS UPDATE');
+  });
+
+  it('markCellsUpdating leaves fields that hold values alone', () => {
+    document.getElementById('wxTemp').textContent = '40°F';
+    document.getElementById('wxDew').textContent = '--';
+    document.getElementById('wxVis').textContent = 'UNKNOWN: NEEDS UPDATE';
+    app.markCellsUpdating(['wxTemp', 'wxDew', 'wxVis']);
+    expect(text('wxTemp')).toBe('40°F');
+    expect(text('wxDew')).toBe(app.UPDATING_CELL_TEXT);
+    expect(text('wxVis')).toBe(app.UPDATING_CELL_TEXT);
   });
 });
