@@ -295,7 +295,14 @@ body {
   background: rgba(10,14,20,0.9); border: 1px solid var(--border);
   border-radius: 6px; padding: 4px 8px; backdrop-filter: blur(8px);
   transform: scale(0.75); transform-origin: bottom left;
+  flex-wrap: wrap; max-width: 250px;
 }
+.radar-legend {
+  flex-basis: 100%; display: flex; align-items: center; gap: 4px; padding: 2px 0 1px;
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.5px; color: var(--text-muted);
+}
+.radar-legend .rl-bar { flex: 1; min-width: 40px; height: 7px; border-radius: 2px; }
+.radar-legend .rl-lbl + .rl-bar + .rl-lbl { margin-left: 6px; }
 
 /* Canopy edit mode — bottom-center toolbar over the map */
 .canopy-edit-bar {
@@ -968,6 +975,10 @@ select.api-input { cursor: pointer; }
       <button class="draw-btn" id="radarPlayBtn" onclick="radarToggle()" title="Play/Pause">&#9654;</button>
       <button class="draw-btn" onclick="radarStep(1)" title="Next">&raquo;</button>
       <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);" id="radarTime">--</span>
+      <span class="radar-legend" id="radarLegend" title="Light → heavy. The rain/snow split is RainViewer's estimate and can be off near the snow line; mixed precipitation is not shown separately. Colors: Config → Weather radar colors.">
+        <span class="rl-lbl">RAIN</span><span class="rl-bar" data-kind="rain"></span>
+        <span class="rl-lbl">SNOW</span><span class="rl-bar" data-kind="snow"></span>
+      </span>
     </div>
     <div class="timebar" id="timeBar">
       <div class="timebar-info">
@@ -1584,6 +1595,14 @@ select.api-input { cursor: pointer; }
               </select>
               <span id="adsbPollStatus" style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);">Idle</span>
             </div>
+          </div>
+          <div class="api-config">
+            <div class="data-label">Weather radar colors</div>
+            <select class="api-input" id="cfgRadarPalette" onchange="setRadarPalette(this.value)">
+              <option value="classic" selected>Classic: green rain, blue snow (default)</option>
+              <option value="universal">RainViewer Universal Blue, as served (blue rain, pale blue snow)</option>
+            </select>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">RainViewer now serves its radar in a single color scheme that draws light rain and snow in similar blues. <b>Classic</b> repaints each tile on this device: rain green → yellow → red → magenta, snow light → dark blue, so the rain/snow line stands out. The rain/snow split is RainViewer's estimate and can be off near the snow line; mixed precipitation (sleet, freezing rain) is not shown separately.</div>
           </div>
           <div class="api-config">
             <div class="data-label">Buildings in 3D view</div>

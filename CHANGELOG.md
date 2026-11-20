@@ -4,6 +4,12 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.11.20-a — 2026-11-20
+
+- Weather radar now shows light rain in green and snow in blue, so the rain/snow line stands out. Since January 2026 RainViewer has served its radar in a single color scheme ("Universal Blue") that draws light rain and snow in near-identical blues. The traditional color scale set up in June never took effect, because RainViewer ignored the request. The app now repaints each radar tile on your device: rain green → yellow → orange → red → magenta, snow light → dark blue. This works in both the 2D and 3D views.
+- New Config → Weather radar colors setting: Classic (green rain, blue snow, the default) or RainViewer Universal Blue as served.
+- A small RAIN / SNOW color key now sits under the radar playback buttons. The rain/snow split is RainViewer's estimate and can be off near the snow line; sleet and freezing rain are not shown separately.
+
 ## v2026.11.19-a — 2026-11-19
 
 - A newly drawn area now starts completely clean. Everything fetched for the previous area is dropped as soon as a different area is drawn: weather alerts, FAA airspace, airports, obstacles, protected areas, wildfire data, smoke, avalanche danger, land ownership, wire hazards, the observed ceiling, live TFRs and NOTAMs, and live traffic. Before, each of these stayed until its own check for the new area answered, so a slow check left the previous area's warnings in the banner and its layers on the map.
