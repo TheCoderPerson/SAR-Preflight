@@ -81,17 +81,18 @@ describe('radar palettes', () => {
     expect(RADAR_PALETTE_DEFAULT).toBe('classic');
     expect(normalizeRadarPalette('bogus')).toBe('classic');
     expect(normalizeRadarPalette(null)).toBe('classic');
-    expect(normalizeRadarPalette('universal')).toBe('universal');
+    expect(normalizeRadarPalette('served')).toBe('served');
+    expect(normalizeRadarPalette('universal')).toBe('served'); // name used by 2026.11.20-a
     expect(normalizeRadarPalette('__proto__')).toBe('classic');
     Object.values(RADAR_PALETTES).forEach(p => expect(typeof p.label).toBe('string'));
   });
 
-  it('universal is drawn as served', () => {
-    expect(radarPaletteIsIdentity('universal')).toBe(true);
+  it('served is drawn as served', () => {
+    expect(radarPaletteIsIdentity('served')).toBe(true);
     expect(radarPaletteIsIdentity('classic')).toBe(false);
-    expect(buildRadarRecolorLut('universal')).toBeNull();
+    expect(buildRadarRecolorLut('served')).toBeNull();
     for (let dbz = -10; dbz <= 95; dbz += 5) {
-      expect(radarPaletteRgba('universal', 'rain', dbz)).toEqual(rainViewerSourceRgba('rain', dbz));
+      expect(radarPaletteRgba('served', 'rain', dbz)).toEqual(rainViewerSourceRgba('rain', dbz));
     }
   });
 
@@ -175,6 +176,6 @@ describe('radarLegendGradient', () => {
     expect(g.match(/rgb\(/g)).toHaveLength(13);
     const [r, gg, b] = radarPaletteRgba('classic', 'rain', 15);
     expect(g).toContain(`rgb(${r},${gg},${b}) 0%`);
-    expect(radarLegendGradient('universal', 'rain')).toContain('rgb(136,221,238) 0%'); // #88ddee
+    expect(radarLegendGradient('served', 'rain')).toContain('rgb(136,221,238) 0%'); // #88ddee
   });
 });

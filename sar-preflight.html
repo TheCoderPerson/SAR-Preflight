@@ -303,6 +303,8 @@ body {
 }
 .radar-legend .rl-bar { flex: 1; min-width: 40px; height: 7px; border-radius: 2px; }
 .radar-legend .rl-lbl + .rl-bar + .rl-lbl { margin-left: 6px; }
+.radar-src { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.5px; color: var(--accent-cyan); margin-left: 4px; }
+.radar-src.fallback { color: var(--accent-amber); }
 
 /* Canopy edit mode — bottom-center toolbar over the map */
 .canopy-edit-bar {
@@ -975,9 +977,10 @@ select.api-input { cursor: pointer; }
       <button class="draw-btn" id="radarPlayBtn" onclick="radarToggle()" title="Play/Pause">&#9654;</button>
       <button class="draw-btn" onclick="radarStep(1)" title="Next">&raquo;</button>
       <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);" id="radarTime">--</span>
-      <span class="radar-legend" id="radarLegend" title="Light → heavy. The rain/snow split is RainViewer's estimate and can be off near the snow line; mixed precipitation is not shown separately. Colors: Config → Weather radar colors.">
-        <span class="rl-lbl">RAIN</span><span class="rl-bar" data-kind="rain"></span>
-        <span class="rl-lbl">SNOW</span><span class="rl-bar" data-kind="snow"></span>
+      <span class="radar-src" id="radarSource"></span>
+      <span class="radar-legend" id="radarLegend" title="Light → heavy. The rain/snow split is an estimate (NWS: MRMS precipitation type; RainViewer: its own) and can be off near the snow line; sleet and freezing rain are not shown separately. Source and colors: Config → Weather radar.">
+        <span class="rl-lbl" data-label="rain">RAIN</span><span class="rl-bar" data-kind="rain"></span>
+        <span class="rl-lbl" data-label="snow">SNOW</span><span class="rl-bar" data-kind="snow"></span>
       </span>
     </div>
     <div class="timebar" id="timeBar">
@@ -1597,12 +1600,20 @@ select.api-input { cursor: pointer; }
             </div>
           </div>
           <div class="api-config">
+            <div class="data-label">Weather radar source</div>
+            <select class="api-input" id="cfgRadarSource" onchange="setRadarSource(this.value)">
+              <option value="auto" selected>Auto: NWS (NOAA MRMS) in the US, RainViewer elsewhere or if NWS is down (default)</option>
+              <option value="rainviewer">RainViewer only</option>
+            </select>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;"><b>NWS</b> radar is NOAA's Multi-Radar/Multi-Sensor (MRMS) mosaic, the data behind radar.weather.gov: a new image about every 2 minutes and NOAA's own precipitation type (rain, snow, hail). It covers the lower 48, Alaska, Hawaii, Puerto Rico/Caribbean and Guam, chosen by the operational area (or the map center). Outside those, or whenever NWS fails, the app uses <b>RainViewer</b> (worldwide, 10-minute frames) and the radar panel's source tag turns amber. The radar checks for a newer image every 5 minutes while you are viewing the latest frame.</div>
+          </div>
+          <div class="api-config">
             <div class="data-label">Weather radar colors</div>
             <select class="api-input" id="cfgRadarPalette" onchange="setRadarPalette(this.value)">
               <option value="classic" selected>Classic: green rain, blue snow (default)</option>
-              <option value="universal">RainViewer Universal Blue, as served (blue rain, pale blue snow)</option>
+              <option value="served">As served by the radar source (NWS standard colors / RainViewer Universal Blue)</option>
             </select>
-            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;">RainViewer now serves its radar in a single color scheme that draws light rain and snow in similar blues. <b>Classic</b> repaints each tile on this device: rain green → yellow → red → magenta, snow light → dark blue, so the rain/snow line stands out. The rain/snow split is RainViewer's estimate and can be off near the snow line; mixed precipitation (sleet, freezing rain) is not shown separately.</div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;line-height:1.4;"><b>Classic</b> repaints each radar image on this device: rain green → yellow → red → magenta, snow light → dark blue, so the rain/snow line stands out. On NWS radar the snow comes from MRMS precipitation type; on RainViewer, from RainViewer's own rain/snow split. Both are estimates and can be off near the snow line; sleet and freezing rain are not shown separately. <b>As served</b> shows the source's own colors: NWS draws rain and snow alike (blue/gray for very light echoes), RainViewer draws light rain and snow in similar blues.</div>
           </div>
           <div class="api-config">
             <div class="data-label">Buildings in 3D view</div>

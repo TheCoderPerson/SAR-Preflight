@@ -4,6 +4,12 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.11.20-b — 2026-11-20
+
+- Weather radar in the US now comes from the National Weather Service: NOAA's MRMS radar mosaic, the data behind radar.weather.gov. A new image arrives about every 2 minutes (RainViewer: every 10), and rain vs. snow now comes from NOAA's own precipitation-type analysis. The animation still steps through the last 2 hours, 10 minutes apart, and the radar checks for a newer image every 5 minutes while you are on the latest frame.
+- RainViewer remains the radar outside NWS coverage (the lower 48, Alaska, Hawaii, Puerto Rico/Caribbean and Guam) and takes over automatically when NWS radar can't be reached, is more than 30 minutes old, or its images stop loading. A tag next to the radar time says which source is showing. It turns amber when RainViewer is standing in for NWS, and its tooltip says why.
+- New Config → Weather radar source setting: Auto (the default) or RainViewer only. The "RainViewer Universal Blue" colors option is now "As served by the radar source", which shows NWS's or RainViewer's own colors.
+
 ## v2026.11.20-a — 2026-11-20
 
 - Weather radar now shows light rain in green and snow in blue, so the rain/snow line stands out. Since January 2026 RainViewer has served its radar in a single color scheme ("Universal Blue") that draws light rain and snow in near-identical blues. The traditional color scale set up in June never took effect, because RainViewer ignored the request. The app now repaints each radar tile on your device: rain green → yellow → orange → red → magenta, snow light → dark blue. This works in both the 2D and 3D views.

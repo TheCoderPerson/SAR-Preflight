@@ -83,7 +83,8 @@ All data is fetched from free, public APIs. No API keys are required.
 | Moon phase and illumination | Calculated (lunar phase algorithm) | Computed on demand |
 | Geomagnetic Kp index (GNSS accuracy) | [NOAA SWPC](https://www.swpc.noaa.gov/) | ~1 hr |
 | NWS severe weather alerts | [NWS Weather API](https://www.weather.gov/documentation/services-web-api) | ~15 min |
-| Weather radar animation (repainted on-device: green rain, blue snow; Config → Weather radar colors) | [RainViewer](https://www.rainviewer.com/) | ~10 min |
+| Weather radar animation, US (lower 48, Alaska, Hawaii, Puerto Rico/Caribbean, Guam): reflectivity + precipitation type, repainted on-device (green rain, blue snow) | [NOAA/NWS MRMS](https://opengeo.ncep.noaa.gov/) via the NWS GeoServer (WMS) | ~2 min (animation frames 10 min apart) |
+| Weather radar animation elsewhere, and automatic fallback when NWS radar fails (Config → Weather radar source) | [RainViewer](https://www.rainviewer.com/) | ~10 min |
 | GOES-East GeoColor cloud imagery (Weather Imagery layer) | [NASA GIBS](https://nasa-gibs.github.io/gibs-api-docs/) / NOAA GOES-East | ~10 min |
 | Lightning strike density (Weather Imagery layer) | [NOAA nowCOAST](https://nowcoast.noaa.gov/) via WMS | ~15 min |
 | Class B/C/D/E airspace boundaries | [FAA UDDS](https://udds.faa.gov/) via ArcGIS | Static |

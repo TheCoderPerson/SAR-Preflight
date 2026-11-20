@@ -196,8 +196,11 @@ function routeStrategy(url) {
       url.includes('fonts.googleapis.com') ||
       url.includes('fonts.gstatic.com'))       return 'cache-first';
 
-  // Radar tiles — network-only (time-sensitive)
-  if (url.includes('tilecache.rainviewer.com')) return 'network-only';
+  // Radar tiles — network-only (time-sensitive). NWS radar (NOAA GeoServer):
+  // its GetCapabilities URL never changes, so the cache-first default would
+  // pin the first time list (and with it, frozen radar) forever.
+  if (url.includes('tilecache.rainviewer.com') ||
+      url.includes('opengeo.ncep.noaa.gov'))    return 'network-only';
 
   // Place/address search — network-only. This layer does its OWN IndexedDB
   // caching, with its own TTL and its own explicit "cached · N ago" status

@@ -31,6 +31,8 @@ describe('routeStrategy(url)', () => {
 
   it('routes radar tiles to network-only', () => {
     expect(routeStrategy('https://tilecache.rainviewer.com/v2/radar/123/256/11/335/785/2/1_1.png')).toBe('network-only');
+    expect(routeStrategy('https://opengeo.ncep.noaa.gov/geoserver/conus/ows?service=WMS&version=1.3.0&request=GetCapabilities')).toBe('network-only');
+    expect(routeStrategy('https://opengeo.ncep.noaa.gov/geoserver/conus/conus_bref_qcd/ows?service=WMS&request=GetMap&time=2026-11-20T15%3A39%3A55.000Z')).toBe('network-only');
   });
 
   // Deliberately network-only, NOT network-first: the search layer keeps its own
