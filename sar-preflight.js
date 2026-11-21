@@ -10835,7 +10835,7 @@ function doExport() {
   // 4. Hourly sun + wind bearing lines
   folders += buildSunWindFolders();
 
-  const kml = kmlDocument(`SAR Preflight Intel \u2014 ${ts}`, kmlStyles(), folders, EXPORT_DISCLAIMER);
+  const kml = kmlDocument(`UAS Preflight Demo \u2014 ${ts}`, kmlStyles(), folders, EXPORT_DISCLAIMER);
   downloadBlob(new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' }), `SAR_Preflight_${ts}.kml`);
 
   // 5. Canopy raster + one raster per observer viewshed (GeoTIFF for CalTopo, KMZ for Google Earth)
@@ -11964,11 +11964,49 @@ function showDisclaimer() {
   document.getElementById('disclaimerModal')?.classList.add('active');
 }
 
+// Re-acknowledgment: 30 minutes after the last acceptance, the disclaimer
+// comes back — when the app is brought back from the background (phone app
+// switch, desktop tab or window switch) and, on a page left open in front, at
+// the next minute check. An acceptance in another tab of this app counts.
+const DISCLAIMER_REPROMPT_MS = 30 * 60 * 1000;
+function _disclaimerLastAcceptedMs() {
+  let t = S._disclaimerAckedAt || 0;
+  try {
+    const v = Date.parse(localStorage.getItem('sar_disclaimer_accepted_at') || '');
+    if (Number.isFinite(v) && v > t) t = v;
+  } catch (_) { /* storage blocked: this session's time only */ }
+  return t;
+}
+function disclaimerRepromptDue(now) {
+  const modal = document.getElementById('disclaimerModal');
+  if (!modal || modal.classList.contains('active')) return false; // already showing
+  if (!S._disclaimerAcked) return false;                            // the launch prompt handles it
+  return (now == null ? Date.now() : now) - _disclaimerLastAcceptedMs() >= DISCLAIMER_REPROMPT_MS;
+}
+function maybeRepromptDisclaimer(now) {
+  if (typeof document === 'undefined') return false;
+  if (document.visibilityState === 'hidden') return false; // checked again on return
+  if (!disclaimerRepromptDue(now)) return false;
+  S._disclaimerAcked = false;
+  checkDisclaimer();
+  return true;
+}
+function initDisclaimerReprompt() {
+  if (S._disclaimerRepromptInit || typeof document === 'undefined') return;
+  S._disclaimerRepromptInit = true;
+  const check = () => { try { maybeRepromptDisclaimer(); } catch (_) {} };
+  document.addEventListener('visibilitychange', check);
+  window.addEventListener('focus', check);
+  window.addEventListener('pageshow', check); // restored from the back/forward cache
+  if (typeof setInterval !== 'undefined') setInterval(check, 60 * 1000);
+}
+
 function acceptDisclaimer() {
   // No acknowledgment, no entry (the button is disabled; this guards other callers).
   const box = _disclaimerAckBox();
   if (box && !box.checked) { onDisclaimerAckChange(); return; }
   S._disclaimerAcked = true;
+  S._disclaimerAckedAt = Date.now();
   try {
     localStorage.setItem('sar_disclaimer_version', DISCLAIMER_VERSION);
     localStorage.setItem('sar_disclaimer_accepted_at', new Date().toISOString());
@@ -11990,6 +12028,7 @@ function startApp() {
   // session exit cleanly?" check sees the prior flag before anything resets it.
   try { Diag.init(); Diag.bindTrigger(); } catch (_) {}
   checkDisclaimer();
+  initDisclaimerReprompt();
   initMap();
   resolveSectionalEdition();
   updateClock();
@@ -13011,7 +13050,7 @@ function buildBriefingText() {
   ];
 
   const lines = [];
-  lines.push('=== SAR UAS PRE-FLIGHT BRIEFING ===');
+  lines.push('=== UAS PREFLIGHT DEMO BRIEFING ===');
   _briefingTimeLines().forEach(l => lines.push(l));
   lines.push('');
 
@@ -13343,7 +13382,7 @@ function _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic
   container.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #111;padding-bottom:10px;margin-bottom:15px;">
       <div>
-        <h1 style="margin:0;font-size:20px;letter-spacing:2px;">SAR UAS PRE-FLIGHT BRIEFING</h1>
+        <h1 style="margin:0;font-size:20px;letter-spacing:2px;">UAS PREFLIGHT DEMO BRIEFING</h1>
         <div style="font-size:11px;color:#555;margin-top:4px;">SAR UAS Team</div>
       </div>
       <div style="text-align:right;">
@@ -13451,7 +13490,7 @@ function _openEmailBriefingWindow(mapDataUrl) {
     .sig-line{border-top:1px solid #333;padding-top:25px;width:45%;display:inline-block;margin-right:5%}
     @media print{body{margin:0;font-size:11px}}</style></head><body>
     <div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #111;padding-bottom:10px;margin-bottom:15px;">
-      <div><h1>SAR UAS PRE-FLIGHT BRIEFING</h1><div style="font-size:11px;color:#555;">SAR UAS Team</div></div>
+      <div><h1>UAS PREFLIGHT DEMO BRIEFING</h1><div style="font-size:11px;color:#555;">SAR UAS Team</div></div>
       <div><span class="badge" style="background:${badgeColor}">${_esc(assessBadge)}</span></div>
     </div>
     <table style="width:100%;font-size:12px;margin-bottom:10px;"><tr>
@@ -19458,6 +19497,7 @@ if (typeof module !== 'undefined' && module.exports) {
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
     showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer, onDisclaimerAckChange,
     checkDisclaimer, showDisclaimer, DISCLAIMER_VERSION, BRIEFING_DISCLAIMER,
+    DISCLAIMER_REPROMPT_MS, disclaimerRepromptDue, maybeRepromptDisclaimer, initDisclaimerReprompt,
     checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitActivated,
     showUpdateModalIfNewer, _updateApplyStatus, _updateBannerHtml, _cachedShellVersion, _verifyShellFresh,
     getCanopyProxyBase, getCustomProxy, saveCanopyProxy, DEFAULT_DATA_PROXY, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,

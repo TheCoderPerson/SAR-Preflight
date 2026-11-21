@@ -198,7 +198,7 @@ describe('H20 checkAndNotify', () => {
     expect(shown).toHaveLength(0);
     offline.checkAndNotify({ level: 'NO-GO', limits: ['Wind 30 mph exceeds 25 mph limit'], advisories: [] });
     expect(shown).toHaveLength(1);
-    expect(shown[0].title).toBe('SAR Preflight: 1 LIMIT EXCEEDED');
+    expect(shown[0].title).toBe('UAS Preflight Demo: 1 LIMIT EXCEEDED');
     expect(shown[0].title).not.toMatch(/NO-GO|CAUTION|\bGO\b/);
     expect(shown[0].body).toContain('Wind 30 mph');
     // A recompute that still has limits is not a transition — no repeat.

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>SAR UAS Pre-Flight Intelligence</title>
+<title>UAS Preflight Demo</title>
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#06b6d4">
 <link rel="icon" type="image/svg+xml" href="icons/icon-192.svg">
@@ -565,6 +565,9 @@ body {
 .assessment-badge { flex-shrink: 0; }
 .assess-body { flex: 1; min-width: 0; }
 .assess-profile { margin-top: 4px; font-size: 10px; color: var(--text-muted); }
+/* Always first in the advisories; not an advisory (never counted in the badge). */
+.assess-demo { margin-bottom: 4px; font-family: var(--font-mono); font-size: 10px; font-weight: 600; color: var(--accent-amber); cursor: pointer; }
+.assessment-banner.collapsed .assess-demo { display: none; } /* the footer carries the same line */
 .assess-profile .assess-profile-link {
   background: none; border: none; padding: 0; cursor: pointer; font: inherit;
   color: var(--text-primary); text-decoration: underline dotted; text-underline-offset: 2px;
@@ -842,7 +845,7 @@ select.api-input { cursor: pointer; }
 <body>
 
 <div class="header">
-  <div class="header-logo">SAR PREFLIGHT<span> // UAS INTEL</span><span id="appVersionLabel" style="font-size:9px;color:var(--text-muted);margin-left:6px;letter-spacing:0;">—</span></div>
+  <div class="header-logo">UAS PREFLIGHT<span> // DEMO</span><span id="appVersionLabel" style="font-size:9px;color:var(--text-muted);margin-left:6px;letter-spacing:0;">—</span></div>
   <button class="header-btn header-hamburger" onclick="toggleHeaderMenu()">&#9776;</button>
   <div class="header-actions" id="headerActions">
     <button class="header-btn" id="btnPanel" onclick="togglePanel()">DATA PANEL</button>
@@ -1007,6 +1010,7 @@ select.api-input { cursor: pointer; }
     <div class="assessment-banner" id="assessmentBanner" style="display:none;">
       <span class="assessment-badge go" id="assessBadge">NOMINAL</span>
       <div class="assess-body">
+        <div class="assess-demo" id="assessDemo" onclick="showDisclaimer()" title="Tap to read the full disclaimer">&#9888; Demonstration only &mdash; not for flight-safety decisions &mdash; use authorized sources</div>
         <span id="assessText">All conditions nominal</span>
         <div class="assess-profile" id="assessProfile"></div>
       </div>
@@ -1913,7 +1917,7 @@ select.api-input { cursor: pointer; }
   <div class="modal" style="width:500px;max-height:85vh;">
     <h3 style="color:var(--accent-amber);">Disclaimer &mdash; Read Before Each Use</h3>
     <div style="overflow-y:auto;max-height:52vh;font-size:12px;line-height:1.6;color:var(--text-secondary);">
-      <p><b style="color:var(--accent-amber);">SAR-Preflight is an experimental demonstration. It is not a flight-safety tool.</b></p>
+      <p><b style="color:var(--accent-amber);">UAS Preflight Demo is an experimental demonstration. It is not a flight-safety tool.</b></p>
       <p style="margin-top:10px;">It shows what is technically possible when public weather, airspace, terrain and other data are brought together in one place. It is not certified, approved or endorsed by the FAA or any other agency, and it is not an official preflight briefing.</p>
       <p style="margin-top:10px;"><b>Do not use this app to make flight-safety, go/no-go, or search decisions.</b> Any information shown here may be wrong, incomplete, out of date, or missing without warning &mdash; including TFRs, NOTAMs, airspace, obstacles, weather and terrain. A data source that failed or has no coverage may look like a clear result.</p>
       <p style="margin-top:10px;">For every actual flight, get the information you rely on from <b>authorized sources</b> &mdash; for example an official weather and NOTAM briefing (<b>1800wxbrief.com</b>), the FAA TFR list, B4UFLY or an FAA-approved LAANC provider, current FAA charts, and your agency&rsquo;s procedures.</p>

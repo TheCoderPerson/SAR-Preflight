@@ -1,6 +1,6 @@
 {
-  "name": "SAR UAS Pre-Flight Intelligence",
-  "short_name": "SAR Preflight",
+  "name": "UAS Preflight Demo",
+  "short_name": "Preflight Demo",
   "description": "Pre-flight weather, airspace, terrain, and risk assessment for UAS search and rescue operations",
   "start_url": "./sar-preflight.html",
   "display": "standalone",

@@ -1,8 +1,14 @@
 # Changelog
 
-All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
+All notable changes to UAS Preflight Demo, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
+
+## v2026.11.20-f — 2026-11-20
+
+- The disclaimer comes back 30 minutes after it was last accepted: when you return to the app (switching back from another app on a phone, or to the tab or window on a desktop), or within a minute on a page left open. It needs the acknowledgment box ticked again. Accepting in another tab of the app counts.
+- The advisories now start with "Demonstration only — not for flight-safety decisions — use authorized sources". It is not counted as an advisory, and tapping it opens the full disclaimer. When the advisories are collapsed, the same line stays in the footer.
+- The app is now called UAS Preflight Demo: header, browser tab, installed-app name, briefings, KML exports and notifications. The web address is unchanged, and an app already on your home screen may keep its old name until you reinstall it.
 
 ## v2026.11.20-e — 2026-11-20
 

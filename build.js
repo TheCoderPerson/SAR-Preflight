@@ -44,7 +44,7 @@ if (output === html) {
 // License + advisory banner: the single-file field build travels without the repo,
 // so the notice has to ride inside the HTML itself (Apache-2.0 §4).
 const licenseBanner = `<!--
-  SAR UAS Pre-Flight Intelligence Tool (SAR-Preflight)
+  UAS Preflight Demo (repository: SAR-Preflight)
   Copyright 2026 John O'Keefe (https://github.com/TheCoderPerson/SAR-Preflight)
   Licensed under the Apache License, Version 2.0 — see the LICENSE and NOTICE
   files in the repository, or http://www.apache.org/licenses/LICENSE-2.0
@@ -96,7 +96,7 @@ try {
   const { CHANGELOG_ENTRIES } = require('./sar-preflight-core.js');
   const md = [
     '# Changelog', '',
-    'All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.',
+    'All notable changes to UAS Preflight Demo, newest first.',
     '',
     '> Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.',
     '',

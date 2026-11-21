@@ -78,7 +78,7 @@ describe('buildBriefingText()', () => {
 
   it('includes the header line', () => {
     const text = buildBriefingText();
-    expect(text).toContain('=== SAR UAS PRE-FLIGHT BRIEFING ===');
+    expect(text).toContain('=== UAS PREFLIGHT DEMO BRIEFING ===');
   });
 
   it('includes a timestamp', () => {
@@ -211,7 +211,7 @@ describe('copyBriefing()', () => {
     copyBriefing();
     expect(navigator.clipboard.writeText).toHaveBeenCalledTimes(1);
     const text = navigator.clipboard.writeText.mock.calls[0][0];
-    expect(text).toContain('SAR UAS PRE-FLIGHT BRIEFING');
+    expect(text).toContain('UAS PREFLIGHT DEMO BRIEFING');
   });
 
   it('flashes button text to COPIED', async () => {

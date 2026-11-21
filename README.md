@@ -1,4 +1,6 @@
-# SAR UAS Pre-Flight Intelligence Tool
+# UAS Preflight Demo
+
+*(formerly "SAR UAS Pre-Flight Intelligence Tool"; the repository keeps the name SAR-Preflight)*
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 

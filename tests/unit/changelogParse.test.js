@@ -4,7 +4,7 @@ const { parseChangelogMd, CHANGELOG_ENTRIES } = require('../../sar-preflight-cor
 function generateMd(entries) {
   const md = [
     '# Changelog', '',
-    'All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.',
+    'All notable changes to UAS Preflight Demo, newest first.',
     '',
     '> Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.',
     '',

@@ -371,7 +371,7 @@ function checkAndNotify(assessResult) {
   conditions.forEach(issue => { _notifiedConditions[issue] = Date.now(); });
   _lastNotifyTime = Date.now();
   const n = limits.length;
-  new Notification(`SAR Preflight: ${n} LIMIT${n > 1 ? 'S' : ''} EXCEEDED`, {
+  new Notification(`UAS Preflight Demo: ${n} LIMIT${n > 1 ? 'S' : ''} EXCEEDED`, {
     body: conditions.join(', '),
     icon: './icons/icon-192.svg',
     tag: 'sar-threshold',
