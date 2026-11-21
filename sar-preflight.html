@@ -699,6 +699,7 @@ select.api-input { cursor: pointer; }
   font-weight: 500; cursor: pointer; border: 1px solid var(--border); transition: all 0.15s;
 }
 .btn-primary { background: var(--accent-blue); border-color: var(--accent-blue); color: #fff; }
+.btn:disabled, .btn[disabled] { opacity: 0.4; cursor: not-allowed; }
 .btn-primary:hover { background: #2d7bf0; }
 .btn-ghost { background: transparent; color: var(--text-secondary); }
 .btn-ghost:hover { color: var(--text-primary); border-color: var(--text-secondary); }
@@ -1550,7 +1551,7 @@ select.api-input { cursor: pointer; }
             <div id="appVersionDisplay" style="font-family:var(--font-mono);font-size:13px;color:var(--accent-cyan);margin-top:4px;">—</div>
             <button class="btn btn-ghost" onclick="showChangelog(false)" style="padding:4px 10px;font-size:10px;margin-top:6px;">What's New / Changelog</button>
             <button class="btn btn-ghost" onclick="showDisclaimer()" style="padding:4px 10px;font-size:10px;margin-top:6px;">View Disclaimer</button>
-            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:6px;">Advisory planning aid only &mdash; not an official FAA briefing. Licensed under <a href="https://github.com/TheCoderPerson/SAR-Preflight/blob/master/LICENSE" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Apache-2.0</a>; provided &ldquo;AS IS&rdquo;, without warranty of any kind.</div>
+            <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:6px;">Demonstration only &mdash; not an official FAA briefing and not for flight-safety decisions. Licensed under <a href="https://github.com/TheCoderPerson/SAR-Preflight/blob/master/LICENSE" target="_blank" rel="noopener" style="color:var(--accent-cyan);">Apache-2.0</a>; provided &ldquo;AS IS&rdquo;, without warranty of any kind.</div>
           </div>
           <div class="api-config">
             <button class="btn btn-primary" id="btnCheckUpdates" onclick="checkForUpdates()" style="padding:5px 12px;font-size:11px;">Check for Updates</button>
@@ -1844,7 +1845,7 @@ select.api-input { cursor: pointer; }
   </div>
 </div>
 
-<div class="app-footer" onclick="showDisclaimer()" title="Tap to read the full disclaimer">&#9888; Advisory only &mdash; not an official FAA briefing<span class="footer-verify"> &mdash; verify via official sources</span></div>
+<div class="app-footer" onclick="showDisclaimer()" title="Tap to read the full disclaimer">&#9888; Demonstration only &mdash; not for flight-safety decisions<span class="footer-verify"> &mdash; use authorized sources</span></div>
 
 <!-- Export Modal -->
 <div class="modal-overlay" id="exportModal">
@@ -1910,14 +1911,20 @@ select.api-input { cursor: pointer; }
 
 <div class="modal-overlay" id="disclaimerModal">
   <div class="modal" style="width:500px;max-height:85vh;">
-    <h3 style="color:var(--accent-amber);">Disclaimer</h3>
-    <div style="overflow-y:auto;max-height:55vh;font-size:12px;line-height:1.6;color:var(--text-secondary);">
-      <p><b>SAR-Preflight is an advisory planning aid only.</b></p>
-      <p style="margin-top:10px;">It is not certified, endorsed, or approved by the FAA and is not a substitute for an official preflight briefing. Weather, NOTAM, and TFR information shown here may be delayed, incomplete, or unavailable &mdash; always verify through official sources (e.g., <b>1800wxbrief.com</b>, the FAA TFR list) before flight. Terrain and coverage estimates are approximations.</p>
-      <p style="margin-top:10px;">This software is provided free of charge, &ldquo;AS IS,&rdquo; without warranty of any kind, under the Apache License 2.0. The authors and contributors accept no liability for any decision made or action taken in reliance on it. <b>Final responsibility for flight safety and search decisions rests with the remote pilot in command and the incident commander.</b></p>
+    <h3 style="color:var(--accent-amber);">Disclaimer &mdash; Read Before Each Use</h3>
+    <div style="overflow-y:auto;max-height:52vh;font-size:12px;line-height:1.6;color:var(--text-secondary);">
+      <p><b style="color:var(--accent-amber);">SAR-Preflight is an experimental demonstration. It is not a flight-safety tool.</b></p>
+      <p style="margin-top:10px;">It shows what is technically possible when public weather, airspace, terrain and other data are brought together in one place. It is not certified, approved or endorsed by the FAA or any other agency, and it is not an official preflight briefing.</p>
+      <p style="margin-top:10px;"><b>Do not use this app to make flight-safety, go/no-go, or search decisions.</b> Any information shown here may be wrong, incomplete, out of date, or missing without warning &mdash; including TFRs, NOTAMs, airspace, obstacles, weather and terrain. A data source that failed or has no coverage may look like a clear result.</p>
+      <p style="margin-top:10px;">For every actual flight, get the information you rely on from <b>authorized sources</b> &mdash; for example an official weather and NOTAM briefing (<b>1800wxbrief.com</b>), the FAA TFR list, B4UFLY or an FAA-approved LAANC provider, current FAA charts, and your agency&rsquo;s procedures.</p>
+      <p style="margin-top:10px;">This software is provided free of charge, &ldquo;AS IS,&rdquo; without warranty of any kind, under the Apache License 2.0. The authors and contributors accept no liability for any decision made or action taken based on it. <b>The remote pilot in command and the incident commander remain solely responsible for flight safety and operational decisions.</b></p>
     </div>
-    <div class="modal-actions" style="margin-top:16px;">
-      <button class="btn btn-primary" onclick="acceptDisclaimer()">I Understand &mdash; Continue</button>
+    <label for="disclaimerAck" style="display:flex;gap:10px;align-items:flex-start;margin-top:14px;padding:10px;border:1px solid var(--accent-amber);border-radius:4px;font-size:12px;line-height:1.5;color:var(--text-primary);cursor:pointer;">
+      <input type="checkbox" id="disclaimerAck" onchange="onDisclaimerAckChange()" style="margin-top:3px;width:18px;height:18px;flex-shrink:0;cursor:pointer;">
+      <span>I have read and understand this disclaimer, and I accept it. I understand this app is a demonstration only: I will not use it to make flight-safety decisions, and I will use authorized sources for actual flights.</span>
+    </label>
+    <div class="modal-actions" style="margin-top:14px;">
+      <button class="btn btn-primary" id="disclaimerAcceptBtn" onclick="acceptDisclaimer()" disabled>Accept &amp; Continue</button>
     </div>
   </div>
 </div>

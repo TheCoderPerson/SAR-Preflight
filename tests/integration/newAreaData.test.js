@@ -395,7 +395,9 @@ describe('processArea — a different area starts from nothing', () => {
     expect(text('wxTemp')).toBe('31°F');
     expect(text('terrLaunch')).toBe('6,408 ft AMSL');
     expect(text('assessBadge')).not.toBe('LOADING');
-    expect(text('assessText')).toBe(before);
+    // The same findings, led by the refresh now in flight (DATA SOURCES list).
+    expect(text('assessText')).toMatch(/Data sources updating: Weather, Air Quality, Elevation/);
+    expect(text('assessText').replace(/ • Data sources updating: [^•]*(?= •)/, '')).toBe(before);
     expect(_areaAwaitingLabels()).toEqual([]);
     wx.release(resp(wxBody(30))); dem.release(resp(demBody(1953.2)));
     await again;
@@ -520,7 +522,7 @@ describe('fields say UPDATING… until the last source has answered', () => {
   };
   const panelSources = () => {
     const p = document.getElementById('dataSourceWarning');
-    return p ? [...p.querySelectorAll('.ds-details b')].map(b => b.textContent) : [];
+    return p ? [...p.querySelectorAll('.ds-row.ds-error b')].map(b => b.textContent) : [];
   };
 
   it('a failed weather check shows UNKNOWN and joins the error panel while slow sources are still pending', async () => {

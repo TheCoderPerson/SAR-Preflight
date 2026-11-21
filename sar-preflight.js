@@ -451,6 +451,7 @@ function _localTZ() {
 function trackFetchStart(source) {
   S._activeFetches[source] = (Number(S._activeFetches[source]) || 0) + 1;
   _updateFetchActivity();
+  _queueDataSourceStatus();
 }
 
 function trackFetchEnd(source) {
@@ -458,6 +459,7 @@ function trackFetchEnd(source) {
   if (n > 0) S._activeFetches[source] = n;
   else delete S._activeFetches[source];
   _updateFetchActivity();
+  _queueDataSourceStatus();
 }
 
 function _updateFetchActivity() {
@@ -1070,6 +1072,8 @@ function clearArea() {
   const _vsRes = document.getElementById('vsResult'); if (_vsRes) _vsRes.textContent = '';
   S.nwsAlertsSource = null; // no area: nothing is being checked
   S.dataSourceErrors = {};
+  S.dataSourceOkAt = {};
+  S._dsAdvisorySig = '';
   const dsWarn = document.getElementById('dataSourceWarning');
   if (dsWarn) dsWarn.remove();
   document.getElementById('noAreaOverlay').style.display = '';
@@ -1596,6 +1600,10 @@ function _resetAreaSectionMeta() {
     if (!SECTION_DEFS[k].viewBased && AREA_GLOBAL_SECTIONS.indexOf(k) < 0) delete S.sectionMeta[k];
   });
   Object.keys(S.dataSourceErrors || {}).forEach(src => { if (!VIEW_ERROR_SOURCES.test(src)) delete S.dataSourceErrors[src]; });
+  // Answer times too: "OK · 2m ago" spoke for the previous area (Kp is global).
+  Object.keys(S.dataSourceOkAt || {}).forEach(src => {
+    if (!VIEW_ERROR_SOURCES.test(src) && src !== 'Kp Index') delete S.dataSourceOkAt[src];
+  });
 }
 
 // --- Checks a NEW area is still waiting for ---
@@ -1790,26 +1798,106 @@ function recordDataSourceError(source, error) {
   _queueDataSourceStatus();
 }
 
+// A source answered: its error (if any) goes, and the answer time is kept for
+// the DATA SOURCES list ("OK · 2m ago") — sources with a section freshness
+// record use that record instead, since it knows live from cached.
 function clearDataSourceError(source) {
-  if (!(source in S.dataSourceErrors)) return;
-  delete S.dataSourceErrors[source];
+  (S.dataSourceOkAt || (S.dataSourceOkAt = {}))[source] = Date.now();
+  if (source in S.dataSourceErrors) delete S.dataSourceErrors[source];
   _queueDataSourceStatus();
 }
 
-// The red DATA SOURCE ERRORS panel follows S.dataSourceErrors as each source
-// answers. It used to be redrawn only once every fetch for the area had
-// settled, so a source that failed in seconds (weather, already showing
-// UNKNOWN in its section) stayed off the panel for as long as the slowest
-// source took to give up — minutes, when every Overpass mirror times out.
-// One redraw per tick however many sources change together; none while no
-// area is drawn (the panel sits beside the hidden assessment banner).
+// Every source the app queries, in display order. `name` is the label used by
+// trackFetchStart / recordDataSourceError / clearDataSourceError; `meta` (+
+// `sub`) its S.sectionMeta record; `poll` = refreshes itself in the background;
+// `onDemand` = listed only once used (map-view / tool sources); `banner:false`
+// = never feeds the advisories (the response-time estimate is logistics only);
+// `activeWith` = fetched inside another source's request.
+const DATA_SOURCE_LIST = [
+  { name: 'Weather', meta: 'weather' },
+  { name: 'Air Quality', meta: 'airQuality', activeWith: 'Weather' },
+  { name: 'Aviation Wx', label: 'Aviation Wx (METAR)' },
+  { name: 'NWS Alerts', meta: 'alerts' },
+  { name: 'Kp Index', meta: 'spaceWx' },
+  { name: 'Radar', poll: true },
+  { name: 'Elevation', meta: 'elevation' },
+  { name: 'Sun/Moon', meta: 'solar' },
+  { name: 'TFR', meta: 'tfr' },
+  { name: 'NOTAM', meta: 'notam' },
+  { name: 'FAA Airspace', meta: 'airspace', sub: 'faa' },
+  { name: 'Airports', meta: 'airspace', sub: 'airports' },
+  { name: 'FAA Obstacles', meta: 'obstacles', sub: 'dof' },
+  { name: 'Wire Hazards', meta: 'obstacles', sub: 'wire' },
+  { name: 'Utility Circuits', meta: 'obstacles', sub: 'utility' },
+  { name: 'Protected Areas', meta: 'obstacles', sub: 'protected' },
+  { name: 'Fire Danger', meta: 'fireDanger' },
+  { name: 'Smoke' },
+  { name: 'Avalanche' },
+  { name: 'Public Lands', meta: 'publicLands' },
+  { name: 'Ground Access', meta: 'groundAccess' },
+  { name: 'Water (NHD)', meta: 'water' },
+  { name: 'Hospitals', meta: 'hospitals' },
+  { name: 'Trails', meta: 'trails' },
+  { name: 'ADS-B', meta: 'adsb', poll: true },
+  { name: 'Canopy', meta: 'canopy', onDemand: true },
+  { name: 'Canopy (NAIP-CHM)', onDemand: true },
+  { name: 'DEM (3DEP)', onDemand: true },
+  { name: 'Sun shadow', onDemand: true },
+  { name: 'Viewshed', onDemand: true },
+  { name: 'Response Time', meta: 'response', onDemand: true, banner: false },
+];
+
+function _dataSourceMeta(src) {
+  const m = src.meta && S.sectionMeta ? S.sectionMeta[src.meta] : null;
+  if (!m) return null;
+  return src.sub ? ((m.sources && m.sources[src.sub]) || null) : m;
+}
+
+// One row per source: { name, label, state, at, message, status, banner }.
+function dataSourceRows() {
+  const active = S._activeFetches || {};
+  const okAt = S.dataSourceOkAt || {};
+  const errs = S.dataSourceErrors || {};
+  const rows = [];
+  DATA_SOURCE_LIST.forEach(src => {
+    const meta = _dataSourceMeta(src);
+    const isActive = !!(active[src.name] || (src.activeWith && active[src.activeWith])
+      || (meta && meta.loading));
+    const st = dataSourceRowState({ active: isActive, error: errs[src.name], meta, okAt: okAt[src.name], poll: src.poll });
+    if (src.onDemand && st.state === 'waiting') return; // not used yet
+    if (!S.areaCenter && !src.onDemand && st.state === 'waiting') return;
+    rows.push(Object.assign({ name: src.name, label: src.label || src.name, banner: src.banner !== false }, st));
+  });
+  // Anything that reported an error under a name not in the list still shows.
+  Object.keys(errs).forEach(name => {
+    if (DATA_SOURCE_LIST.some(s => s.name === name)) return;
+    rows.push({ name, label: name, banner: true, state: 'error', at: errs[name].timestamp || null, message: errs[name].message, status: errs[name].status || null });
+  });
+  return rows;
+}
+
+// The DATA SOURCES list follows every source as it starts, answers or fails.
+// It used to be redrawn only once every fetch for the area had settled, so a
+// source that failed in seconds stayed off it for as long as the slowest
+// source took to give up. One redraw per tick however many sources change
+// together; none while no area is drawn (the panel sits beside the hidden
+// assessment banner). When the errors / updating set the banner lists has
+// changed, the assessment is recomputed so its first advisories follow.
 let _dsStatusQueued = false;
 function _queueDataSourceStatus() {
   if (_dsStatusQueued || typeof document === 'undefined') return;
   _dsStatusQueued = true;
   Promise.resolve().then(() => {
     _dsStatusQueued = false;
-    if (S.areaCenter) showDataSourceStatus();
+    if (!S.areaCenter) return;
+    showDataSourceStatus();
+    const sig = dataSourceAdvisories(dataSourceRows()).join('|');
+    // Only once this area's banner has been computed (before that it reads
+    // LOADING and the weather commit computes it).
+    if (sig !== (S._dsAdvisorySig || '') && S.currentArea && S.assessment && !_areaAwaits('weather')
+        && document.getElementById('assessBadge') && document.getElementById('assessText')) {
+      try { computeAssessment(); } catch (e) { console.warn('assessment refresh:', e); }
+    }
   });
 }
 
@@ -1841,7 +1929,19 @@ async function retryFailedSource(source) {
     'NOTAM': () => fetchLiveRestrictions(S.areaCenter, S.areaBounds),
   };
   const fn = retryMap[source];
-  if (fn) {
+  if (!fn) {
+    // Sources without their own retry: their section's UPDATE, or the tool
+    // that loads them.
+    const src = DATA_SOURCE_LIST.find(s => s.name === source);
+    if (src && src.meta && SECTION_DEFS[src.meta]) { await updateSection(src.meta); return; }
+    if (source === 'Canopy (NAIP-CHM)') { await updateSection('canopy'); return; }
+    if (source === 'Sun shadow' && typeof loadShadowForView === 'function') { await loadShadowForView(); return; }
+    if ((source === 'Viewshed' || source === 'DEM (3DEP)') && S.activeViewshedId && typeof recomputeViewshed === 'function') {
+      await recomputeViewshed(S.activeViewshedId); return;
+    }
+    return;
+  }
+  {
     const cells = DATA_SOURCE_SECTION[source];
     if (cells) markCellsUpdating(sectionCellsFor(cells[0], cells[1]));
     const gen = S._areaGen;
@@ -1865,49 +1965,120 @@ const DATA_SOURCE_SECTION = {
 };
 
 async function retryAllFailed() {
-  const sources = Object.keys(S.dataSourceErrors);
+  const sources = dataSourceRows().filter(r => r.state === 'error').map(r => r.name);
   for (const src of sources) {
     await retryFailedSource(src);
   }
 }
 
+// Collapsed to its summary line? Per viewer, remembered.
+const DS_LIST_COLLAPSED_KEY = 'sar_ds_list_collapsed';
+function _dsListCollapsed() {
+  if (S._dsListCollapsed == null) {
+    let v = false;
+    try { v = localStorage.getItem(DS_LIST_COLLAPSED_KEY) === '1'; } catch (_) {}
+    S._dsListCollapsed = v;
+  }
+  return S._dsListCollapsed;
+}
+function toggleDataSourceList() {
+  S._dsListCollapsed = !_dsListCollapsed();
+  try { localStorage.setItem(DS_LIST_COLLAPSED_KEY, S._dsListCollapsed ? '1' : '0'); } catch (_) {}
+  showDataSourceStatus();
+}
+
+// DATA SOURCES \u2014 every source the app queries, under the advisories:
+//   red    ERROR    + what went wrong in plain words, the server's answer, RETRY
+//   cyan   UPDATING (a request is in flight)
+//   green  OK / LIVE + how long ago it answered
+//   amber  CACHED   + the age of the copy shown
+//   grey   NOT CHECKED YET (this area's request has not started)
+const DS_STATE_STYLE = {
+  error: { color: 'var(--accent-red)', word: 'ERROR' },
+  updating: { color: 'var(--accent-cyan)', word: 'UPDATING' },
+  ok: { color: 'var(--accent-green)', word: 'OK' },
+  cached: { color: 'var(--accent-amber)', word: 'CACHED' },
+  waiting: { color: 'var(--text-muted)', word: 'NOT CHECKED YET' },
+};
 function showDataSourceStatus() {
   const banner = document.getElementById('assessmentBanner');
   if (!banner) return;
   const existing = document.getElementById('dataSourceWarning');
-  // Redrawn whenever a source fails or recovers: keep [details] as the user left it.
-  const prevDetails = existing && existing.querySelector('.ds-details');
-  const detailsOpen = !!(prevDetails && prevDetails.style.display === 'block');
   if (existing) existing.remove();
 
-  const errors = Object.entries(S.dataSourceErrors);
-  if (errors.length === 0) return;
+  const rows = dataSourceRows();
+  if (!rows.length || (!S.areaCenter && !rows.some(r => r.state === 'error'))) return;
+  const now = Date.now();
+  const n = s => rows.filter(r => r.state === s).length;
+  const nErr = n('error'), nUpd = n('updating');
+  const collapsed = _dsListCollapsed();
 
   const div = document.createElement('div');
   div.id = 'dataSourceWarning';
-  div.style.cssText = 'padding:8px 16px;background:rgba(239,68,68,0.1);border-bottom:1px solid var(--border);font-family:var(--font-mono);font-size:10px;color:var(--accent-red);';
+  div.className = 'ds-panel' + (nErr ? ' has-errors' : '');
+  div.style.cssText = 'padding:6px 16px;border-bottom:1px solid var(--border);font-family:var(--font-mono);font-size:10px;color:var(--text-secondary);'
+    + (nErr ? 'background:rgba(239,68,68,0.08);' : 'background:var(--bg-secondary, transparent);');
 
   const summary = document.createElement('div');
-  summary.style.cssText = 'display:flex;align-items:center;gap:8px;';
-  summary.innerHTML = `<span>\u26A0 DATA SOURCE ERRORS: ${_esc(errors.map(e => e[0]).join(', '))}</span>`
-    + `<button class="btn btn-ghost" style="padding:2px 8px;font-size:9px;color:var(--accent-red);border-color:var(--accent-red);" onclick="retryAllFailed()">RETRY ALL</button>`
-    + `<span style="color:var(--text-muted);cursor:pointer;font-size:9px;" onclick="this.parentElement.nextElementSibling.style.display=this.parentElement.nextElementSibling.style.display==='none'?'block':'none'">[details]</span>`;
+  summary.className = 'ds-summary';
+  summary.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;';
+  const counts = [
+    nErr ? `<span style="color:var(--accent-red);">${nErr} ERROR${nErr > 1 ? 'S' : ''}</span>` : '',
+    nUpd ? `<span style="color:var(--accent-cyan);">${nUpd} UPDATING</span>` : '',
+    n('ok') ? `<span style="color:var(--accent-green);">${n('ok')} OK</span>` : '',
+    n('cached') ? `<span style="color:var(--accent-amber);">${n('cached')} CACHED</span>` : '',
+    n('waiting') ? `<span style="color:var(--text-muted);">${n('waiting')} NOT CHECKED</span>` : '',
+  ].filter(Boolean).join(' \u00B7 ');
+  summary.innerHTML = `<span style="font-weight:600;color:${nErr ? 'var(--accent-red)' : 'var(--text-primary)'};">${nErr ? '\u26A0 ' : ''}DATA SOURCES</span>`
+    + `<span class="ds-counts">${counts}</span>`
+    + (nErr ? `<button type="button" class="btn btn-ghost ds-retry-all" style="padding:2px 8px;font-size:9px;color:var(--accent-red);border-color:var(--accent-red);">RETRY ALL</button>` : '')
+    + `<button type="button" class="ds-toggle" style="margin-left:auto;background:none;border:none;color:var(--text-muted);cursor:pointer;font-family:inherit;font-size:9px;" aria-expanded="${!collapsed}">${collapsed ? '[show list]' : '[hide list]'}</button>`;
   div.appendChild(summary);
+  const retryAll = summary.querySelector('.ds-retry-all');
+  if (retryAll) retryAll.addEventListener('click', () => retryAllFailed());
+  summary.querySelector('.ds-toggle').addEventListener('click', toggleDataSourceList);
 
   const details = document.createElement('div');
   details.className = 'ds-details';
-  details.style.cssText = `display:${detailsOpen ? 'block' : 'none'};margin-top:6px;padding-top:6px;border-top:1px solid var(--border);`;
-  errors.forEach(([name, err]) => {
+  details.style.cssText = `display:${collapsed ? 'none' : 'block'};margin-top:5px;padding-top:5px;border-top:1px solid var(--border);`;
+  // Errors first (full width, with the explanation and RETRY), then updating,
+  // then everything else in a compact grid.
+  const order = { error: 0, updating: 1, cached: 2, ok: 3, waiting: 4 };
+  const sorted = rows.slice().sort((a, b) => order[a.state] - order[b.state]);
+  const grid = document.createElement('div');
+  grid.className = 'ds-grid';
+  grid.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1px 12px;';
+  sorted.forEach(r => {
+    const sty = DS_STATE_STYLE[r.state] || DS_STATE_STYLE.waiting;
     const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:3px 0;';
-    const age = err.timestamp ? formatAge(Date.now() - err.timestamp) : '';
-    row.innerHTML = `<span style="min-width:90px;"><b>${_esc(name)}</b></span>`
-      + `<span style="color:var(--text-muted);flex:1;">${_esc(err.message)}${err.status ? ' (HTTP ' + _esc(err.status) + ')' : ''}${age ? ' \u2014 ' + age + ' ago' : ''}</span>`
-      + `<button class="btn btn-ghost" style="padding:1px 6px;font-size:9px;color:var(--accent-cyan);">RETRY</button>`;
-    // Listener, not an inline onclick: the source name must never be spliced into JS.
-    row.querySelector('button').addEventListener('click', () => retryFailedSource(name));
-    details.appendChild(row);
+    row.className = 'ds-row ds-' + r.state;
+    row.dataset.source = r.name;
+    if (r.state === 'error') {
+      const d = describeSourceError(r.message, r.status);
+      const age = r.at ? formatAge(now - r.at) : '';
+      row.style.cssText = 'display:flex;align-items:flex-start;gap:8px;padding:3px 0;';
+      row.innerHTML = `<span style="color:${sty.color};">\u25CF</span>`
+        + `<span style="min-width:96px;color:${sty.color};"><b>${_esc(r.label)}</b></span>`
+        + `<span style="flex:1;"><span style="color:${sty.color};font-weight:600;">ERROR \u2014 ${_esc(d.headline)}</span>`
+        + `<span style="display:block;color:var(--text-muted);">${_esc(d.detail)}${d.codes.length && !/HTTP\s*\d{3}/i.test(r.message || '') ? ' (HTTP ' + _esc(d.codes[0]) + ')' : ''}${age ? ' \u00B7 ' + age + ' ago' : ''}</span></span>`
+        + `<button type="button" class="btn btn-ghost ds-retry" style="padding:1px 6px;font-size:9px;color:var(--accent-cyan);">RETRY</button>`;
+      // Listener, not an inline onclick: the source name must never be spliced into JS.
+      row.querySelector('button').addEventListener('click', () => retryFailedSource(r.name));
+      details.appendChild(row);
+      return;
+    }
+    let tail = '';
+    if (r.state === 'ok' || r.state === 'cached') {
+      tail = r.at != null ? ' \u00B7 ' + formatAge(Math.max(0, now - r.at)) + (r.state === 'cached' ? ' old' : ' ago') : (r.state === 'cached' ? ' \u00B7 age unknown' : '');
+    }
+    const word = r.state === 'updating' ? 'UPDATING\u2026' : sty.word;
+    row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:1px 0;white-space:nowrap;overflow:hidden;';
+    row.innerHTML = `<span style="color:${sty.color};">\u25CF</span>`
+      + `<span style="overflow:hidden;text-overflow:ellipsis;"><b>${_esc(r.label)}</b></span>`
+      + `<span style="margin-left:auto;color:${sty.color};">${word}${_esc(tail)}</span>`;
+    grid.appendChild(row);
   });
+  if (grid.children.length) details.appendChild(grid);
   div.appendChild(details);
 
   banner.parentElement.insertBefore(div, banner.nextSibling);
@@ -2852,6 +3023,10 @@ async function fetchAviationWeather(center, bounds) {
   const c = center || S.areaCenter;
   if (!c) return;
   const tok = _beginRequest('metar');
+  trackFetchStart('Aviation Wx');
+  try { return await _fetchAviationWeatherInner(c, tok); } finally { trackFetchEnd('Aviation Wx'); }
+}
+async function _fetchAviationWeatherInner(c, tok) {
   const k = typeof areaKey === 'function' ? areaKey(c.lat, c.lng) : `${c.lat.toFixed(3)}_${c.lng.toFixed(3)}`;
   if (!_dataIsForArea('metar', k)) { S.metar = null; S.metarUnverified = false; S.metarUnverifiedReason = null; }
   const commit = (metar, unverified, reason) => {
@@ -6703,6 +6878,7 @@ async function fetchHMSSmoke(bounds) {
   // A late answer for another area must not replace (or clear) this area's plumes.
   const tok = _beginRequest('hmsSmoke');
   const cacheKey = _bboxCacheKey(b);
+  trackFetchStart('Smoke');
   try {
     const url = _arcgisGeoJsonUrl(HMS_SMOKE_BASE, '0', b, 'Density,Satellite,Start,End_', { pad: 0.5 });
     const r = await _fetchGeoJsonLayer('hms_smoke', cacheKey, url, { signal: tok.signal });
@@ -6726,6 +6902,8 @@ async function fetchHMSSmoke(bounds) {
   } catch (e) {
     if (!_requestCurrent(tok)) return;
     recordDataSourceError('Smoke', e);
+  } finally {
+    trackFetchEnd('Smoke');
   }
 }
 
@@ -6780,6 +6958,7 @@ async function fetchAvalanche(bounds) {
   // A late answer for another area must not replace (or clear) this area's zones.
   const tok = _beginRequest('avalanche');
   const areaK = _bboxCacheKey(b);
+  trackFetchStart('Avalanche');
   try {
     let fc = null, cacheErr = null;
     if (online) {
@@ -6823,6 +7002,8 @@ async function fetchAvalanche(bounds) {
       buildLayerControl();
       if (S.currentArea) computeAssessment();
     }
+  } finally {
+    trackFetchEnd('Avalanche');
   }
 }
 
@@ -9931,6 +10112,15 @@ function computeAssessment(snap) {
     }
   }
 
+  // Data-source errors and in-flight updates lead the advisories, so a glance
+  // at the banner shows which checks could not (yet) speak for this area.
+  const dsAdv = S.areaCenter ? dataSourceAdvisories(dataSourceRows()) : [];
+  S._dsAdvisorySig = dsAdv.join('|');
+  if (dsAdv.length) {
+    if (result.level === 'GO') result.level = 'CAUTION';
+    result.cautions = dsAdv.concat(result.cautions.filter(c => dsAdv.indexOf(c) < 0));
+  }
+
   // No verdict word: the banner names what was found and lists every item
   // (limits first, then advisories); the decision stays with the RPIC.
   const display = assessmentDisplay(result);
@@ -11741,30 +11931,48 @@ window.addEventListener('load', () => {
   }
   startApp();
 });
-// Bump ONLY when the disclaimer text materially changes — every device then
-// re-prompts exactly once. Deliberately NOT tied to SAR_VERSION: routine
-// releases must not re-interrupt, but a reworded disclaimer must reach
-// everyone, including devices that accepted years ago.
-const DISCLAIMER_VERSION = '2026.08.30';
+// The disclaimer is shown on EVERY launch (each page load) and must be
+// acknowledged with its checkbox before the app can be used — an earlier
+// acceptance never skips it. The version + time of the last acceptance are
+// still stored, as a record of what was accepted.
+const DISCLAIMER_VERSION = '2026.11.20';
 
-function checkDisclaimer() {
-  // Storage can throw (blocked site data, strict WebViews) — that must show the
-  // disclaimer, not abort startApp() before initMap().
-  let accepted = null;
-  try { accepted = localStorage.getItem('sar_disclaimer_version'); } catch (e) { /* storage blocked */ }
-  if (accepted !== DISCLAIMER_VERSION) {
-    document.getElementById('disclaimerModal')?.classList.add('active');
-  }
+function _disclaimerAckBox() { return document.getElementById('disclaimerAck'); }
+
+// The Accept button follows the checkbox.
+function onDisclaimerAckChange() {
+  const box = _disclaimerAckBox();
+  const btn = document.getElementById('disclaimerAcceptBtn');
+  if (btn) btn.disabled = !!(box && !box.checked);
 }
 
-// Re-read on demand (footer line, Config → View Disclaimer). Acceptance is
-// already stored; the I Understand button simply closes it again.
+function checkDisclaimer() {
+  // Every launch, whatever was accepted before. Unchecked each time: the
+  // acknowledgment is made for this use of the app.
+  const box = _disclaimerAckBox();
+  if (box) box.checked = false;
+  onDisclaimerAckChange();
+  document.getElementById('disclaimerModal')?.classList.add('active');
+}
+
+// Re-read on demand (footer line, Config → View Disclaimer). This session's
+// acknowledgment stands, so the box shows as checked and Accept just closes it.
 function showDisclaimer() {
+  const box = _disclaimerAckBox();
+  if (box) box.checked = !!S._disclaimerAcked;
+  onDisclaimerAckChange();
   document.getElementById('disclaimerModal')?.classList.add('active');
 }
 
 function acceptDisclaimer() {
-  try { localStorage.setItem('sar_disclaimer_version', DISCLAIMER_VERSION); } catch (e) { /* storage blocked — still close */ }
+  // No acknowledgment, no entry (the button is disabled; this guards other callers).
+  const box = _disclaimerAckBox();
+  if (box && !box.checked) { onDisclaimerAckChange(); return; }
+  S._disclaimerAcked = true;
+  try {
+    localStorage.setItem('sar_disclaimer_version', DISCLAIMER_VERSION);
+    localStorage.setItem('sar_disclaimer_accepted_at', new Date().toISOString());
+  } catch (e) { /* storage blocked — still close */ }
   document.getElementById('disclaimerModal')?.classList.remove('active');
   // A pending update supersedes What's New: the update modal shows the NEWER
   // version's notes, so showing last update's notes too would just stack modals.
@@ -12859,9 +13067,9 @@ function buildBriefingText() {
 
 // Rides on every briefing artifact that leaves the app (clipboard, email, PDF).
 const BRIEFING_DISCLAIMER =
-  'Advisory planning aid only - NOT an official FAA briefing. Data may be ' +
-  'incomplete or outdated; verify airspace, TFRs, NOTAMs and weather via ' +
-  'official sources (1800wxbrief.com) before flight.';
+  'Demonstration only - NOT an official FAA briefing and NOT for flight-safety ' +
+  'decisions. Data may be wrong, incomplete or outdated; get airspace, TFR, NOTAM ' +
+  'and weather information from authorized sources (1800wxbrief.com) before flight.';
 
 function copyBriefing() {
   if (!S.currentArea) return;
@@ -13165,7 +13373,7 @@ function _buildAndExportPDF(mapDataUrl, briefingText, sections, badgeColor, rpic
       return `<div style="margin-bottom:10px;"><div style="font-size:13px;font-weight:bold;border-bottom:1px solid #ccc;padding-bottom:2px;margin-bottom:4px;">${title}</div><div style="font-size:11px;color:#333;">${body}</div></div>`;
     }).join('')}
     <div style="margin-top:20px;border-top:2px solid #111;padding-top:10px;">
-      <div style="font-size:10px;color:#7a5d00;background:#fff8e1;border-left:4px solid #f59e0b;padding:6px 8px;margin-bottom:10px;"><b>Advisory planning aid only — NOT an official FAA briefing.</b> Verify airspace, TFRs, NOTAMs and weather via official sources (1800wxbrief.com) before flight.</div>
+      <div style="font-size:10px;color:#7a5d00;background:#fff8e1;border-left:4px solid #f59e0b;padding:6px 8px;margin-bottom:10px;"><b>Demonstration only — NOT an official FAA briefing and NOT for flight-safety decisions.</b> Get airspace, TFR, NOTAM and weather information from authorized sources (1800wxbrief.com) before flight.</div>
       <div style="font-size:11px;color:#555;margin-bottom:15px;">I have reviewed this pre-flight briefing and accept responsibility for the safe conduct of this UAS operation.</div>
       <table style="width:100%;font-size:11px;">
         <tr>
@@ -13255,7 +13463,7 @@ function _openEmailBriefingWindow(mapDataUrl) {
     ${mapHtml}
     ${sections.map(s => { const lines = s.split('\n'); return `<div class="section"><div class="section-title">${_esc(lines[0])}</div><div>${lines.slice(1).map(_esc).join('<br>')}</div></div>`; }).join('')}
     <div style="margin-top:20px;border-top:2px solid #111;padding-top:10px;">
-      <div style="font-size:10px;color:#7a5d00;background:#fff8e1;border-left:4px solid #f59e0b;padding:6px 8px;margin-bottom:10px;"><b>Advisory planning aid only — NOT an official FAA briefing.</b> Verify airspace, TFRs, NOTAMs and weather via official sources (1800wxbrief.com) before flight.</div>
+      <div style="font-size:10px;color:#7a5d00;background:#fff8e1;border-left:4px solid #f59e0b;padding:6px 8px;margin-bottom:10px;"><b>Demonstration only — NOT an official FAA briefing and NOT for flight-safety decisions.</b> Get airspace, TFR, NOTAM and weather information from authorized sources (1800wxbrief.com) before flight.</div>
       <div style="font-size:11px;color:#555;margin-bottom:15px;">I have reviewed this pre-flight briefing and accept responsibility for the safe conduct of this UAS operation.</div>
       <span class="sig-line">RPIC Signature</span><span class="sig-line">Date / Time</span>
     </div>
@@ -19248,7 +19456,7 @@ if (typeof module !== 'undefined' && module.exports) {
     startResponseStartPick, onResponseStartClick, clearResponseStart, onResponseMapPick, _responseManualStart,
     _briefingResponseLines, _exportResponseRecords, _mapNwsAlertFeatures, _nwsAlertCardHtml,
     S, Diag, setText, setColor, setStatus, switchTab, togglePanel,
-    showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer,
+    showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer, onDisclaimerAckChange,
     checkDisclaimer, showDisclaimer, DISCLAIMER_VERSION, BRIEFING_DISCLAIMER,
     checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitActivated,
     showUpdateModalIfNewer, _updateApplyStatus, _updateBannerHtml, _cachedShellVersion, _verifyShellFresh,
@@ -19354,6 +19562,7 @@ if (typeof module !== 'undefined' && module.exports) {
     _captureBriefingMap, _capture3dMap, _compositeMapCapture, briefingPdfSlices, _buildAndExportPDF, _openEmailBriefingWindow,
     clearAllCaches, _updateTimeBar, resolveSectionalEdition, CACHE_VIEW_JOBS, _cacheViewJobOutcome,
     recordDataSourceError, clearDataSourceError, retryFailedSource, retryAllFailed, showDataSourceStatus,
+    dataSourceRows, DATA_SOURCE_LIST, toggleDataSourceList,
     setAutoRefresh, loadFAAChart, removeChart, clearAllCharts, updateChartList, restoreFAACharts,
     fetchFireDanger, renderFirePerimeters, renderFireDangerCard,
     _nfdrsPercentile, avalancheWarningActive, _avalanchePopup, fetchWireHazards, _renderOsmWireElements, restoreConfig,

@@ -338,6 +338,7 @@ describe('NWS alerts integration with computeAssessment', () => {
     S.wind = { maxWind: 5, maxGust: 8 };
     S.elev = { center: 2000 };
     S.nwsAlerts = [];
+    S.dataSourceErrors = {}; S._activeFetches = {}; // earlier tests' fetch outcomes
   });
 
   afterEach(() => {

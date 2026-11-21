@@ -4,6 +4,14 @@ All notable changes to the SAR UAS Pre-Flight Intelligence Tool, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.11.20-e — 2026-11-20
+
+- The panel under the advisories is now DATA SOURCES: every source the app queries, with its status at all times. Green OK with how long ago it answered, cyan UPDATING… while a request is out, amber CACHED with the age of the copy shown, red ERROR with RETRY. Collapse it with [hide list]; the choice is remembered.
+- Errors are explained in plain words: "HTTP 503" now reads "Service unavailable", "HTTP 429" reads "Rate limited", and a request with no answer reads "Timed out". Every server code in the detail line is annotated the same way.
+- The first advisories in the banner are now "Data source errors: …" (each failed source with a short cause) and "Data sources updating: …", so a glance shows which checks have not spoken for this area. Background ADS-B and radar refreshes do not flash as updating, and the response-time estimate never feeds the banner.
+- Sources that failed without being listed before (water, trails, hospitals, ground access, land ownership, Kp, the response estimate) now show as errors with RETRY. METAR, smoke and avalanche checks now show while they are running.
+- The disclaimer now appears every time the app is opened, and Accept & Continue stays disabled until you check the box confirming you have read, understood and accepted it. The wording now says plainly that the app is a demonstration, not for flight-safety decisions, and that actual flights must use authorized sources. Briefings and the footer say the same.
+
 ## v2026.11.20-d — 2026-11-20
 
 - Observed ceiling: fog, snow or smoke reported as an obscured sky (vertical visibility) is now a ceiling and can trip the cloud-clearance limit. It used to read "Unlimited / VFR". A station that does not report sky condition or visibility now reads "Not reported" / "UNKNOWN (incomplete obs)" with an advisory, never "Unlimited" or VFR, and an invalid future-dated report can no longer replace a valid one.

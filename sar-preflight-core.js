@@ -24,6 +24,17 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.11.20-e',
+    date: '2026-11-20',
+    changes: [
+      'The panel under the advisories is now DATA SOURCES: every source the app queries, with its status at all times. Green OK with how long ago it answered, cyan UPDATING… while a request is out, amber CACHED with the age of the copy shown, red ERROR with RETRY. Collapse it with [hide list]; the choice is remembered.',
+      'Errors are explained in plain words: "HTTP 503" now reads "Service unavailable", "HTTP 429" reads "Rate limited", and a request with no answer reads "Timed out". Every server code in the detail line is annotated the same way.',
+      'The first advisories in the banner are now "Data source errors: …" (each failed source with a short cause) and "Data sources updating: …", so a glance shows which checks have not spoken for this area. Background ADS-B and radar refreshes do not flash as updating, and the response-time estimate never feeds the banner.',
+      'Sources that failed without being listed before (water, trails, hospitals, ground access, land ownership, Kp, the response estimate) now show as errors with RETRY. METAR, smoke and avalanche checks now show while they are running.',
+      'The disclaimer now appears every time the app is opened, and Accept & Continue stays disabled until you check the box confirming you have read, understood and accepted it. The wording now says plainly that the app is a demonstration, not for flight-safety decisions, and that actual flights must use authorized sources. Briefings and the footer say the same.',
+    ],
+  },
+  {
     version: '2026.11.20-d',
     date: '2026-11-20',
     changes: [
@@ -1329,6 +1340,127 @@ function assessmentDisplay(result) {
   else if (n && m) text = limits.join(' \u2022 ') + ' | Advisory: ' + advisories.join(' \u2022 ');
   else text = (n ? limits : advisories).join(' \u2022 ');
   return { label, cls, text, limits, advisories };
+}
+
+// --- Data-source status list (the DATA SOURCES panel under the advisories) ---
+// Plain words for an HTTP status, so "HTTP 503" reads as something a pilot can
+// act on. Unknown codes fall back to their class ("server error", …).
+const HTTP_STATUS_MEANINGS = {
+  400: 'bad request — the server rejected the query',
+  401: 'not authorized — sign-in or key required',
+  403: 'access refused — the server blocked the request',
+  404: 'not found — no data at that address',
+  405: 'request type not allowed',
+  408: 'timed out — the server waited too long',
+  409: 'conflict — try again',
+  410: 'gone — the data was removed',
+  413: 'request too large',
+  414: 'request address too long',
+  422: 'query not understood',
+  429: 'rate limited — too many requests, wait and retry',
+  451: 'blocked for legal reasons',
+  499: 'request cancelled / token required',
+  500: 'server error — the data service failed',
+  501: 'not supported by the server',
+  502: 'bad gateway — the upstream server failed',
+  503: 'service unavailable — server down or overloaded',
+  504: 'gateway timeout — the upstream server was too slow',
+  520: 'unknown upstream error',
+  521: 'upstream server is down',
+  522: 'upstream connection timed out',
+  524: 'upstream answer timed out',
+};
+function httpStatusMeaning(code) {
+  const n = Number(code);
+  if (!Number.isFinite(n)) return null;
+  if (HTTP_STATUS_MEANINGS[n]) return HTTP_STATUS_MEANINGS[n];
+  if (n >= 500 && n < 600) return 'server error';
+  if (n >= 400 && n < 500) return 'request refused';
+  if (n >= 300 && n < 400) return 'redirected — no data returned';
+  return null;
+}
+
+// Short headline + detail for a failed source. `message` is the recorded error
+// text (e.g. "3DEP HTTP 504; Open-Meteo elevation HTTP 502"), `status` an
+// optional numeric HTTP status. Every "HTTP nnn" in the detail is annotated
+// with its meaning; the headline names the FIRST cause found.
+// Returns { headline, detail, codes }.
+function describeSourceError(message, status) {
+  const msg = String(message == null ? '' : message);
+  const codes = [];
+  const seen = new Set();
+  const add = c => { const n = Number(c); if (Number.isFinite(n) && n >= 100 && n < 600 && !seen.has(n)) { seen.add(n); codes.push(n); } };
+  if (status != null) add(status);
+  const re = /\bHTTP\s*:?\s*(\d{3})\b/gi;
+  let m;
+  while ((m = re.exec(msg))) add(m[1]);
+  const detail = msg.replace(/\bHTTP\s*:?\s*(\d{3})\b(?!\s*\()/gi, (all, c, off, str) => {
+    const w = httpStatusMeaning(c);
+    if (!w) return all;
+    // Already inside parentheses ("…failed (HTTP 504)"): no nested pair.
+    return str.charAt(off + all.length) === ')' ? `${all} — ${w.split(' — ')[0]}` : `${all} (${w.split(' — ')[0]})`;
+  });
+  const low = msg.toLowerCase();
+  let headline = null;
+  if (codes.length) {
+    const w = httpStatusMeaning(codes[0]);
+    headline = w ? w.split(' — ')[0] : 'HTTP ' + codes[0];
+    headline = headline.charAt(0).toUpperCase() + headline.slice(1);
+  } else if (/no answer within|timed? ?out|timeout/.test(low)) headline = 'Timed out — no answer from the server';
+  else if (/failed to fetch|networkerror|network error|load failed|err_/.test(low)) headline = 'Network error — no connection, or the request was blocked';
+  else if (/offline/.test(low)) headline = 'Offline — no connection';
+  else if (/aborterror|aborted|cancel/.test(low)) headline = 'Cancelled before an answer arrived';
+  else if (/rate.?limit|too many/.test(low)) headline = 'Rate limited — wait and retry';
+  else if (/truncated|incomplete|partial/.test(low)) headline = 'Incomplete — only part of the data loaded';
+  else if (/unavailable/.test(low)) headline = 'Unavailable';
+  else if (/malformed|unexpected token|json|not kml|invalid|parse|no features|missing/.test(low)) headline = 'Bad answer — the server sent unusable data';
+  else if (/no proxy|proxy/.test(low)) headline = 'Data proxy problem';
+  else if (/no coverage|outside coverage/.test(low)) headline = 'No coverage here';
+  if (!headline) headline = 'Failed';
+  return { headline, detail, codes };
+}
+
+// The display state of one data source. Inputs (all optional):
+//   active — a request for it is in flight now
+//   error  — { message, status, timestamp } recorded for it (S.dataSourceErrors)
+//   meta   — its section freshness record { status, updatedAt, cachedAt, error, errorAt }
+//   okAt   — ms epoch it last answered successfully (sources without a section)
+//   poll   — it refreshes itself in the background (ADS-B, radar): a refresh of
+//            a source that already has a result keeps that result's state, so
+//            the list does not flash cyan every few seconds
+// Returns { state: 'error'|'updating'|'ok'|'cached'|'waiting', at, message, status }.
+function dataSourceRowState(inp) {
+  const o = inp || {};
+  const meta = o.meta || null;
+  const metaErr = !!(meta && meta.status === 'error');
+  const base = (() => {
+    if (o.error) return { state: 'error', at: o.error.timestamp || null, message: o.error.message || 'failed', status: o.error.status || null };
+    if (metaErr) return { state: 'error', at: meta.errorAt || null, message: meta.error || 'failed', status: null };
+    if (meta && meta.status === 'live' && meta.updatedAt != null) return { state: 'ok', at: meta.updatedAt };
+    if (meta && meta.status === 'cached') return { state: 'cached', at: meta.cachedAt != null ? meta.cachedAt : null };
+    if (o.okAt != null) return { state: 'ok', at: o.okAt };
+    return { state: 'waiting', at: null };
+  })();
+  if (o.active && !(o.poll && base.state !== 'waiting')) return { state: 'updating', at: null };
+  return base;
+}
+
+// The advisory lines the DATA SOURCES list contributes to the banner — always
+// the FIRST advisories. `rows` = [{ name, state, message, status, banner }];
+// rows with banner === false (logistics-only sources) are left out.
+function dataSourceAdvisories(rows) {
+  const list = (rows || []).filter(r => r && r.banner !== false);
+  const out = [];
+  const errs = list.filter(r => r.state === 'error');
+  const upd = list.filter(r => r.state === 'updating');
+  if (errs.length) {
+    out.push('Data source errors: ' + errs.map(r => {
+      const h = describeSourceError(r.message, r.status).headline;
+      return `${r.name} (${h.split(' — ')[0].toLowerCase()})`;
+    }).join(', '));
+  }
+  if (upd.length) out.push('Data sources updating: ' + upd.map(r => r.name).join(', '));
+  return out;
 }
 
 // Badge label for a stored mission-log entry: new entries carry `label`;
@@ -7040,6 +7172,7 @@ if (typeof module !== 'undefined' && module.exports) {
     ascentFromElevations, hikeTimeMin, chooseHikePlan,
     formatDurationMin, formatMilesKm, summarizeResponseDest, responseBreakdownText, responseRouteKey,
     assessmentDisplay, assessmentLabelForLog, limitsProfileInfo,
+    HTTP_STATUS_MEANINGS, httpStatusMeaning, describeSourceError, dataSourceRowState, dataSourceAdvisories,
     WIRE_CATEGORIES, CHANGELOG_ENTRIES, CHANGELOG_URL, lerp, lerpBearing, degToCompass, haversine, wmoCodeToText,
     parseSectionalEdition, currentSectionalCycle,
     RV_UB_RAIN, RV_UB_SNOW, RADAR_PALETTES, RADAR_PALETTE_DEFAULT, rainViewerTileUrl, normalizeRadarPalette,
