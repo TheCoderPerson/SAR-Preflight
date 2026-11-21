@@ -1495,7 +1495,7 @@ const AREA_DERIVED_CELLS = ['opsTempFactor', 'opsAltFactor', 'opsWindFactor', 'o
   'opsSwapTime', 'opsSwapRadius', 'opsSwapLZ'];
 // Observed ceiling / flight category (METAR): blanked for a new area, but not
 // in SECTION_CELLS.weather — a failed forecast must not blank a valid observation.
-const AREA_METAR_CELLS = ['wxCeiling', 'wxFlightCat'];
+const AREA_METAR_CELLS = ['wxCeiling', 'wxFlightCat', 'wxObsVis'];
 
 function _renderAssessmentLoading() {
   if (typeof document === 'undefined') return;
@@ -3046,33 +3046,45 @@ async function _fetchAviationWeatherInner(c, tok) {
     const sr = await fetch(stationsUrl, { signal: tok.signal });
     if (!sr.ok) throw new Error('NWS stations HTTP ' + sr.status);
     const sj = await sr.json();
-    // Stations arrive nearest-first, but the closest are often AUTO sites reporting
-    // no ceiling/visibility (e.g. 'KBQP ... PWINO') — walk the list until one is usable.
-    // Only a CURRENT observation ends the walk; an old one is remembered and
-    // the next station is tried.
-    let metar = null, partial = null;
-    for (const st of (sj.features || []).slice(0, 4)) {
-      if (!_requestCurrent(tok)) return;
-      const m = await _fetchStationObservation(st, c.lat, c.lng, tok.signal);
-      if (!m) continue;
-      if (metarAgeState(m) === 'current') {
-        // A current report missing sky condition or visibility is kept only
-        // as a last resort: a later station may report both.
-        if (!m.ceilingUnknown && m.visSm != null) { metar = m; break; }
-        if (!partial) partial = m;
-        continue;
-      }
-      if (_metarBetter(m, staleCandidate)) staleCandidate = m;
-    }
+    // Stations arrive nearest-first, but in the mountains the nearest are RAWS
+    // fire-weather / mesonet sites (BENC1, PLTC1 …) that never report sky
+    // condition or visibility, and the airport a few miles further down the
+    // list used to be never asked. Now: the NEAREST stations first (any kind,
+    // asked together), then airport stations nearest-first until both readings
+    // are in. Ceiling and visibility each come from the CLOSEST station with a
+    // current report of it (combineMetarReadings), with its distance. An old
+    // report is remembered; every skipped station's reason is kept.
+    const plan = metarStationPlan(sj.features || []);
+    let ceil = null, ceilPartial = null, vis = null;
+    const why = [];
+    const consider = m => {
+      if (!m) return;
+      if (metarAgeState(m) !== 'current') { if (_metarBetter(m, staleCandidate)) staleCandidate = m; return; }
+      if (!m.ceilingUnknown) { if (!ceil) ceil = m; }
+      else if (m.ceilingFt != null && !ceilPartial) ceilPartial = m; // "N ft or lower"
+      if (m.visSm != null && !vis) vis = m;
+    };
+    const near = await Promise.all(plan.nearest.map(st => _fetchStationObservation(st, c.lat, c.lng, tok.signal, why)));
     if (!_requestCurrent(tok)) return;
-    if (!metar && partial) metar = partial;
+    near.forEach(consider);
+    for (const st of plan.airports) {
+      if (ceil && vis) break;
+      consider(await _fetchStationObservation(st, c.lat, c.lng, tok.signal, why));
+      if (!_requestCurrent(tok)) return;
+    }
+    let metar = combineMetarReadings(ceil || ceilPartial, vis);
+    if (metar) metar.stationsChecked = plan.nearest.length + plan.airports.length;
     if (!metar && staleCandidate) {
       const age = metarObsAgeMs(staleCandidate);
       throw new Error((age == null || metarAgeState(staleCandidate) === 'unknown')
         ? `Latest ${staleCandidate.station} observation has no valid time`
         : `Latest ${staleCandidate.station} observation is ${_fmtAgeShort(Math.max(0, age))} old — no current METAR`);
     }
-    if (!metar) throw new Error('No nearby station reported a usable ceiling/visibility observation');
+    if (!metar) {
+      throw new Error((sj.features || []).length
+        ? 'No nearby station reported a usable ceiling/visibility observation' + (why.length ? ' (' + why.join('; ') + ')' : '')
+        : 'NWS lists no observation stations for this point');
+    }
     // A SW offline-fallback body is a snapshot, not a current check.
     const fromSw = metar.swCachedAt !== undefined;
     commit(metar, fromSw, fromSw ? 'observation served from offline cache' : null);
@@ -3098,15 +3110,94 @@ async function _fetchAviationWeatherInner(c, tok) {
   }
 }
 
+// One METAR check asks the METAR_NEAREST_STATIONS nearest stations (any
+// kind), then up to METAR_MAX_AIRPORTS airport stations beyond them.
+const METAR_NEAREST_STATIONS = 4;
+const METAR_MAX_AIRPORTS = 4;
+// US airport (ICAO) identifiers: 4 characters starting K (CONUS), P (Alaska /
+// Pacific) or T (Caribbean). RAWS and mesonet sites use 5 (BENC1, C1234).
+const METAR_ICAO_RE = /^[KPT][A-Z0-9]{3}$/;
+// { nearest: the first N stations as listed (nearest-first), airports: the
+// airport-style stations after them, nearest-first }.
+function metarStationPlan(features) {
+  const id = f => String((f && f.properties && f.properties.stationIdentifier) || '');
+  const list = (features || []).filter(f => id(f));
+  const nearest = list.slice(0, METAR_NEAREST_STATIONS);
+  const airports = list.slice(METAR_NEAREST_STATIONS).filter(f => METAR_ICAO_RE.test(id(f))).slice(0, METAR_MAX_AIRPORTS);
+  return { nearest, airports };
+}
+
+// Distance text for a station reading: "12 nm", "4.3 nm", "<1 nm".
+function _metarDistText(nm) {
+  if (nm == null || !Number.isFinite(nm)) return null;
+  return nm < 1 ? '<1 nm' : nm < 10 ? nm.toFixed(1) + ' nm' : Math.round(nm) + ' nm';
+}
+// "KAUN, 12 nm" for one reading's source.
+function metarSourceLabel(src) {
+  if (!src || !src.station) return '';
+  const d = _metarDistText(src.distNm);
+  return src.station + (d ? ', ' + d : '');
+}
+// Where the observation's readings come from: "KAUN, 12 nm" when one station
+// gave both, "ceiling KPVF, 3.2 nm; visibility KAUN, 12 nm" when two did.
+// Observations stored before per-reading sources fall back to the station.
+function metarSourcesText(m) {
+  if (!m) return '';
+  const c = m.ceilingSrc, v = m.visSrc;
+  if (c && v && c.station !== v.station) return 'ceiling ' + metarSourceLabel(c) + '; visibility ' + metarSourceLabel(v);
+  return metarSourceLabel(c || v || { station: m.station, distNm: m.distNm });
+}
+
+// One observation from the closest station reporting each reading. `ceil` is
+// the closest current report with a known sky condition (or, failing that, a
+// partial one — "N ft or lower"), `vis` the closest with a visibility. The
+// age is the OLDER of the two, so neither reading is ever passed off as newer.
+function combineMetarReadings(ceil, vis) {
+  if (!ceil && !vis) return null;
+  const src = m => m ? { station: m.station, name: m.name || '', distNm: m.distNm, obsTime: m.obsTime } : null;
+  const parts = [ceil, vis].filter(Boolean);
+  const times = parts.map(m => m.obsTime);
+  const obsTime = times.every(Number.isFinite) ? Math.min.apply(null, times) : null;
+  const ceilingUnknown = !ceil || !!ceil.ceilingUnknown;
+  const ceilingFt = ceil ? ceil.ceilingFt : null;
+  const visSm = vis ? vis.visSm : null;
+  const two = ceil && vis && ceil.station !== vis.station;
+  const primary = ceil || vis;
+  const sw = parts.filter(m => m.swCachedAt !== undefined);
+  const raws = [...new Set(parts.map(m => m.raw).filter(Boolean))];
+  return {
+    ok: true,
+    station: two ? ceil.station + '/' + vis.station : primary.station,
+    name: two ? '' : (primary.name || ''),
+    distNm: Math.max.apply(null, parts.map(m => (m.distNm == null ? -1 : m.distNm))) >= 0
+      ? Math.max.apply(null, parts.map(m => m.distNm || 0)) : null,
+    ceilingFt,
+    ...(ceilingUnknown ? { ceilingUnknown: true } : {}),
+    visSm,
+    fltCat: flightCategory(ceilingFt, visSm, ceilingUnknown),
+    obsTime,
+    raw: raws.join(' | '),
+    lat: primary.lat, lon: primary.lon,
+    ceilingSrc: ceil ? src(ceil) : null,
+    visSrc: vis ? src(vis) : null,
+    ...(sw.length ? { swCachedAt: sw.some(m => m.swCachedAt == null) ? null : Math.min.apply(null, sw.map(m => m.swCachedAt)) } : {}),
+  };
+}
+
 // Fetch one station's latest observation and normalize it to the S.metar shape.
-// Returns null when the station has nothing usable (offline, or no cloud/visibility
-// data at all), so the caller can try the next-nearest station.
-async function _fetchStationObservation(st, lat, lng, signal) {
+// Returns null when the station has nothing usable (offline, or neither a sky
+// condition nor a visibility), so the caller can try the next station; the
+// reason, with the station's distance, is appended to `why` (when given).
+async function _fetchStationObservation(st, lat, lng, signal, why) {
+  const id = st && st.properties && st.properties.stationIdentifier;
+  const co = st && st.geometry && st.geometry.coordinates; // [lon, lat]
+  const dKm = co ? haversine(lat, lng, co[1], co[0]) : null;
+  const dTxt = dKm != null ? _metarDistText(dKm * 0.539957) : null;
+  const skip = reason => { if (why && id) why.push(id + (dTxt ? ' (' + dTxt + ')' : '') + ': ' + reason); return null; };
   try {
-    const id = st && st.properties && st.properties.stationIdentifier;
     if (!id) return null;
     const r = await fetch(`https://api.weather.gov/stations/${id}/observations/latest`, signal ? { signal } : undefined);
-    if (!r.ok) return null;
+    if (!r.ok) return skip('HTTP ' + r.status);
     const sw = _swCacheStamp(r);
     const p = (await r.json()).properties || {};
     const layers = Array.isArray(p.cloudLayers) ? p.cloudLayers.filter(Boolean) : [];
@@ -3115,15 +3206,15 @@ async function _fetchStationObservation(st, lat, lng, signal) {
       .map(cl => ({ cover: cl.amount, base: Math.round(cl.base.value * 3.28084) })); // m \u2192 ft
     const visSm = (p.visibility && p.visibility.value != null)
       ? p.visibility.value / 1609.344 : null; // m \u2192 statute miles
-    if (!clouds.length && visSm == null) return null; // nothing usable \u2014 try next station
     // Clear sky arrives as a CLR/SKC layer; NO layer at all means the station
     // reported no sky condition (no ceilometer) \u2014 not "Unlimited". A ceiling
     // layer with no base (e.g. VV///) leaves the ceiling unknown too.
     const ceilingUnknown = !layers.length || layers.some(cl =>
       /^(BKN|OVC|OVX|VV)$/i.test(String(cl.amount || '')) && !(cl.base && cl.base.value != null));
     const ceilingFt = metarCeilingFt(clouds);
-    const co = st.geometry && st.geometry.coordinates; // [lon, lat]
-    const dKm = co ? haversine(lat, lng, co[1], co[0]) : null;
+    // Neither reading (a known sky condition \u2014 clear counts \u2014 or a partial
+    // ceiling, or a visibility): try the next station.
+    if (ceilingUnknown && ceilingFt == null && visSm == null) return skip('no sky condition or visibility reported');
     return {
       ok: true,
       station: id,
@@ -3139,7 +3230,10 @@ async function _fetchStationObservation(st, lat, lng, signal) {
       // Served from the SW offline fallback: when it was stored (null = unknown).
       ...(sw ? { swCachedAt: sw.cachedAt } : {}),
     };
-  } catch (e) { return null; }
+  } catch (e) {
+    if (e && e.name === 'AbortError') return null; // superseded: nobody reads this pass
+    return skip('request failed (' + ((e && e.message) || String(e)) + ')');
+  }
 }
 
 // Cloud ceiling — the observed METAR at NOW (authoritative), else a coarse estimate
@@ -3156,13 +3250,26 @@ function renderObservedCeiling(snap) {
       : '';
     const cf = m.ceilingFt;
     const tone = c => (stale && c === 'green') ? 'amber' : c;
+    // Each reading names the station it came from and its distance (they can
+    // be two different stations: the closest reporting each one).
+    const legacy = !m.ceilingSrc && !m.visSrc ? { station: m.station, distNm: m.distNm } : null;
+    const cSrc = m.ceilingSrc || legacy, vSrc = m.visSrc || legacy;
+    const at = s => s ? ` (${metarSourceLabel(s)})` : '';
     if (m.ceilingUnknown) {
       // No sky condition reported: never "Unlimited".
-      setText('wxCeiling', (cf == null ? 'Not reported' : `${cf.toLocaleString()} ft or lower`) + ` (${m.station})` + stale);
+      setText('wxCeiling', (cf == null ? 'Not reported by nearby stations' : `${cf.toLocaleString()} ft or lower` + at(cSrc)) + stale);
       setColor('wxCeiling', (cf != null && cf < 1000) ? 'red' : 'amber');
     } else {
-      setText('wxCeiling', (cf == null ? 'Unlimited' : `${cf.toLocaleString()} ft`) + ` (${m.station})` + stale);
+      setText('wxCeiling', (cf == null ? 'Unlimited' : `${cf.toLocaleString()} ft`) + at(cSrc) + stale);
       setColor('wxCeiling', tone((cf == null || cf >= 3000) ? 'green' : cf >= 1000 ? 'amber' : 'red'));
+    }
+    if (m.visSm == null) {
+      setText('wxObsVis', 'Not reported by nearby stations' + stale);
+      setColor('wxObsVis', 'amber');
+    } else {
+      const v = m.visSm >= 9.95 ? '10+' : (Math.round(m.visSm * 10) / 10).toString(); // METAR tops out at 10SM = "10 or more"
+      setText('wxObsVis', `${v} SM` + at(vSrc) + stale);
+      setColor('wxObsVis', tone(m.visSm >= 5 ? 'green' : m.visSm >= 3 ? 'amber' : 'red'));
     }
     const fc = m.fltCat !== undefined ? m.fltCat : flightCategory(cf, m.visSm, m.ceilingUnknown);
     if (fc == null) {
@@ -3186,6 +3293,9 @@ function renderObservedCeiling(snap) {
     } else {
       setText('wxCeiling', '--'); setColor('wxCeiling', null);
     }
+    // Observed visibility exists only at NOW, from a METAR.
+    if (metarFailed) { setText('wxObsVis', UNKNOWN_CELL_TEXT); setColor('wxObsVis', 'red'); }
+    else { setText('wxObsVis', snap._isNow ? '--' : '— (obs)'); setColor('wxObsVis', null); }
     if (snap._isNow && S.metarUnverified) {
       setText('wxFlightCat', UNKNOWN_CELL_TEXT); setColor('wxFlightCat', 'red');
     } else {
@@ -9842,10 +9952,12 @@ function computeAssessment(snap) {
   const metarAge = (S.metar && S.metar.ok) ? metarAgeState(S.metar) : null;
   if (S.metar && S.metar.ok && (metarAge === 'current' || metarAge === 'retained')) {
     const cc = assessCloudClearance(S.metar.ceilingFt, S.metar.visSm, thresholds.maxAltAGL, thresholds);
-    cc.issues.forEach(s => addLimit(`${s} (${S.metar.station})`));
-    cc.cautions.forEach(s => addAdvisory(`${s} (${S.metar.station})`));
+    const srcTxt = metarSourcesText(S.metar);
+    cc.issues.forEach(s => addLimit(`${s} (${srcTxt})`));
+    cc.cautions.forEach(s => addAdvisory(`${s} (${srcTxt})`));
     const missing = [S.metar.ceilingUnknown && 'sky condition/ceiling', S.metar.visSm == null && 'visibility'].filter(Boolean);
-    if (missing.length) addAdvisory(`Observed ${missing.join(' and ')} not reported by ${S.metar.station} — check current METAR before flight`);
+    const checked = S.metar.stationsChecked ? `any of the ${S.metar.stationsChecked} nearby stations checked` : S.metar.station;
+    if (missing.length) addAdvisory(`Observed ${missing.join(' and ')} not reported by ${checked} — check current METAR before flight`);
   }
   // A failed / empty METAR check is not "no ceiling or visibility limit".
   // Nor is an observation that is not CURRENT (fetched old, or aged since).
@@ -10211,7 +10323,7 @@ function _exportNeedsDisclaimer(key) {
 
 // Data-summary sections shown at the area centre (shared by KML + GeoJSON export).
 const EXPORT_SUMMARY_SECTIONS = [
-  { id: 'expWxData', name: 'Weather', fields: ['wxTemp','wxFeels','wxDew','wxHumidity','wxPressure','wxDensity','wxVis','wxCloud','wxCeiling','wxConditions','wxPrecip','wxLightning','wxUV','wxKp','wxIcing','wxFire','wxAQI'] },
+  { id: 'expWxData', name: 'Weather', fields: ['wxTemp','wxFeels','wxDew','wxHumidity','wxPressure','wxDensity','wxVis','wxCloud','wxCeiling','wxObsVis','wxConditions','wxPrecip','wxLightning','wxUV','wxKp','wxIcing','wxFire','wxAQI'] },
   { id: 'expWindData', name: 'Wind Profile', fields: ['windMax','windGustMax','windDir','windImpact'] },
   { id: 'expAirspace', name: 'Airspace', fields: ['airClass','airLAANC','airLAANCAlt','airNearAirport','airNearDist'] },
   { id: 'expTerrain', name: 'Terrain', fields: ['terrMin','terrMax','terrRange','terrLaunch','terrClass','terrSlope','terrVeg','terrCell'] },
@@ -13040,7 +13152,7 @@ function _briefingTimeLines() {
 
 function buildBriefingText() {
   const sections = [
-    { name: 'WEATHER', fields: ['wxTemp','wxFeels','wxDew','wxHumidity','wxPressure','wxDensity','wxVis','wxCloud','wxCeiling','wxConditions','wxPrecip','wxLightning','wxUV','wxKp','wxIcing','wxFire','wxAQI'] },
+    { name: 'WEATHER', fields: ['wxTemp','wxFeels','wxDew','wxHumidity','wxPressure','wxDensity','wxVis','wxCloud','wxCeiling','wxObsVis','wxConditions','wxPrecip','wxLightning','wxUV','wxKp','wxIcing','wxFire','wxAQI'] },
     { name: 'WIND', fields: ['windMax','windGustMax','windDir','windImpact'] },
     { name: 'AIRSPACE', fields: ['airClass','airLAANC','airLAANCAlt','airNearAirport','airNearDist'] },
     { name: 'TERRAIN', fields: ['terrMin','terrMax','terrRange','terrLaunch','terrClass','terrSlope','terrPower','terrTowers','terrVeg','terrCell'] },
@@ -19498,6 +19610,7 @@ if (typeof module !== 'undefined' && module.exports) {
     showUpdateModal, dismissUpdateModal, _changelogEntriesHtml, showChangelog, showUpdateBanner, acceptDisclaimer, onDisclaimerAckChange,
     checkDisclaimer, showDisclaimer, DISCLAIMER_VERSION, BRIEFING_DISCLAIMER,
     DISCLAIMER_REPROMPT_MS, disclaimerRepromptDue, maybeRepromptDisclaimer, initDisclaimerReprompt,
+    metarStationPlan, METAR_NEAREST_STATIONS, METAR_MAX_AIRPORTS, METAR_ICAO_RE, combineMetarReadings, metarSourcesText, metarSourceLabel,
     checkDeployedVersion, applyUpdate, fetchLatestVersion, _swRefreshShell, _swAwaitActivated,
     showUpdateModalIfNewer, _updateApplyStatus, _updateBannerHtml, _cachedShellVersion, _verifyShellFresh,
     getCanopyProxyBase, getCustomProxy, saveCanopyProxy, DEFAULT_DATA_PROXY, fetch3DEPDEM, fetchCanopyRaster, _cogTileToGrid,

@@ -24,6 +24,15 @@ const WIRE_CATEGORIES = {
 const CHANGELOG_URL = 'https://github.com/TheCoderPerson/SAR-Preflight/blob/master/CHANGELOG.md';
 const CHANGELOG_ENTRIES = [
   {
+    version: '2026.11.21-a',
+    date: '2026-11-21',
+    changes: [
+      'Observed ceiling/visibility (METAR) no longer fails with "No nearby station reported a usable ceiling/visibility observation" in mountain areas. The weather service lists fire-weather stations first, and they never report sky or visibility, so the app asked only those and never reached the airport a few miles further down the list. It now asks the 4 nearest stations, then the nearest airports (up to 4) until it has both readings.',
+      'Ceiling and visibility each come from the closest station that reports them, and each shows that station and its distance, for example "Unlimited (KAUN, 12 nm)". A new Observed Visibility cell sits next to Flight Category, and the banner advisories name the station(s) and distance too.',
+      'When the METAR check still finds nothing, the error lists each station with its distance and why it was skipped (for example "BENC1 (3.1 nm): no sky condition or visibility reported"), instead of one generic message.',
+    ],
+  },
+  {
     version: '2026.11.20-f',
     date: '2026-11-20',
     changes: [
@@ -1411,7 +1420,11 @@ function describeSourceError(message, status) {
   });
   const low = msg.toLowerCase();
   let headline = null;
-  if (codes.length) {
+  // Stations that answered without the needed fields (a per-station list may
+  // mix in an HTTP code from one of them — the overall cause is still this).
+  if (/^no nearby (airport )?station reported/i.test(msg)) headline = 'No usable report — nearby stations sent no ceiling/visibility';
+  else if (/observation is .* old/i.test(msg)) headline = 'Out of date — no current report';
+  else if (codes.length) {
     const w = httpStatusMeaning(codes[0]);
     headline = w ? w.split(' — ')[0] : 'HTTP ' + codes[0];
     headline = headline.charAt(0).toUpperCase() + headline.slice(1);

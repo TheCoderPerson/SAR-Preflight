@@ -365,6 +365,67 @@ describe('H6 / G02 — observed ceiling', () => {
     expect(S.metarUnverified).toBe(true);
   });
 
+  // Real station list for a foothill area (Nov 2026): seven RAWS / mesonet
+  // sites, which never report sky condition or visibility, sit ahead of the
+  // first airport. The walk used to stop after four and report "no station".
+  it('asks the 4 nearest stations, then the nearest airport, past fire-weather sites with no sky/visibility', async () => {
+    const raws = () => resp({ properties: { timestamp: new Date().toISOString(), rawMessage: '', cloudLayers: [], visibility: { value: null } } });
+    const ids = ['BDMC1', 'OWNC1', 'BENC1', 'HLLC1', 'PLTC1', 'FSHC1', 'MTZC1', 'KAUN'];
+    const byId = {}; ids.forEach(id => { byId[id] = id === 'KAUN' ? obs(Date.now() - 73 * 60e3) : raws(); });
+    route(stationsRoute(ids, byId));
+    await app.fetchAviationWeather(A, S.areaBounds);
+    expect(S.metar && S.metar.station).toBe('KAUN');
+    expect(S.metarUnverified).toBe(false);
+    expect(S.dataSourceErrors['Aviation Wx']).toBeUndefined();
+    // The four nearest first, then straight to the airport (not the RAWS between).
+    const asked = globalThis.fetch.mock.calls.map(c => String(c[0])).filter(u => u.includes('observations/latest'))
+      .map(u => u.match(/stations\/([^/]+)\//)[1]);
+    expect(asked).toEqual(['BDMC1', 'OWNC1', 'BENC1', 'HLLC1', 'KAUN']);
+    expect(text('wxCeiling')).toMatch(/\(KAUN, <1 nm\)/);
+    expect(text('wxObsVis')).toMatch(/^10\+ SM \(KAUN, <1 nm\)/);
+  });
+
+  it('each reading comes from the closest station reporting it, with its distance', async () => {
+    // B reports visibility only (no ceilometer); C, farther, reports both.
+    const at = (id, lat, lng) => ({ properties: { stationIdentifier: id, name: id }, geometry: { coordinates: [lng, lat] } });
+    const now = new Date(Date.now() - 20 * 60e3).toISOString();
+    route({
+      'api.weather.gov/points': resp({ properties: { observationStations: 'https://api.weather.gov/gridpoints/X/stations' } }),
+      'gridpoints/X/stations': resp({ features: [at('KVIS', A.lat + 0.05, A.lng), at('KBTH', A.lat + 0.3, A.lng)] }),
+      'stations/KVIS/observations/latest': resp({ properties: { timestamp: now, cloudLayers: [], visibility: { value: 4828 } } }),
+      'stations/KBTH/observations/latest': resp({ properties: { timestamp: now,
+        cloudLayers: [{ amount: 'OVC', base: { value: 300 } }], visibility: { value: 16093 } } }),
+    });
+    await app.fetchAviationWeather(A, S.areaBounds);
+    const m = S.metar;
+    expect(m.visSrc.station).toBe('KVIS');          // closest visibility: 3 SM
+    expect(m.visSm).toBeCloseTo(3, 1);
+    expect(m.ceilingSrc.station).toBe('KBTH');      // closest sky condition: OVC 984 ft
+    expect(m.ceilingFt).toBe(984);
+    expect(m.fltCat).toBe('IFR');
+    expect(text('wxCeiling')).toMatch(/^984 ft \(KBTH, 18 nm\)/);
+    expect(text('wxObsVis')).toMatch(/^3 SM \(KVIS, 3\.0 nm\)/);
+    expect(app.metarSourcesText(m)).toBe('ceiling KBTH, 18 nm; visibility KVIS, 3.0 nm');
+  });
+
+  it('when nothing usable comes back, the error names each station, its distance and why', async () => {
+    const empty = resp({ properties: { timestamp: new Date().toISOString(), cloudLayers: [], visibility: { value: null } } });
+    route(stationsRoute(['BENC1', 'KXYZ'], { BENC1: empty, KXYZ: resp({}, { status: 503 }) }));
+    await app.fetchAviationWeather(A, S.areaBounds);
+    const msg = S.dataSourceErrors['Aviation Wx'].message;
+    expect(msg).toMatch(/No nearby station reported/);
+    expect(msg).toContain('KXYZ (<1 nm): HTTP 503');
+    expect(msg).toContain('BENC1 (<1 nm): no sky condition or visibility reported');
+    expect(globalThis.describeSourceError(msg).headline).toMatch(/^No usable report/);
+  });
+
+  it('station plan: the 4 nearest of any kind, then up to 4 airports beyond them', () => {
+    const f = id => ({ properties: { stationIdentifier: id } });
+    const plan = app.metarStationPlan(['BENC1', 'KPVF', 'C1234', 'PLTC1', 'MTZC1', 'KAUN', 'D9999', 'PAJN', 'KMHR', 'KSAC', 'KLHM'].map(f));
+    expect(plan.nearest.map(x => x.properties.stationIdentifier)).toEqual(['BENC1', 'KPVF', 'C1234', 'PLTC1']);
+    expect(plan.airports.map(x => x.properties.stationIdentifier)).toEqual(['KAUN', 'PAJN', 'KMHR', 'KSAC']);
+  });
+
   it('a valid 2.5 h old report beats a future-dated one as the retained candidate', async () => {
     route(stationsRoute(['KFUT', 'KOLD'], { KFUT: obs(Date.now() + 12 * 3600e3), KOLD: obs(Date.now() - 2.5 * 3600e3) }));
     await app.fetchAviationWeather(A, S.areaBounds);

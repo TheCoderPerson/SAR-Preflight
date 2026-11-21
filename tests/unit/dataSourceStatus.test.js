@@ -27,6 +27,11 @@ describe('describeSourceError', () => {
     expect(describeSourceError('TFR response malformed').headline).toMatch(/^Bad answer/);
     expect(describeSourceError('').headline).toBe('Failed');
   });
+  it('METAR: stations that answered without the data, or only an old report', () => {
+    expect(describeSourceError('No nearby airport station reported a usable ceiling/visibility observation (KXYZ: HTTP 503; BENC1: no sky condition or visibility reported)').headline)
+      .toMatch(/^No usable report/);
+    expect(describeSourceError('Latest KAUN observation is 3.5 h old — no current METAR').headline).toMatch(/^Out of date/);
+  });
   it('inside parentheses uses a dash instead of nesting', () => {
     expect(describeSourceError('Overpass: all mirrors failed (HTTP 504)').detail)
       .toBe('Overpass: all mirrors failed (HTTP 504 — gateway timeout)');

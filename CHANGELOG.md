@@ -4,6 +4,12 @@ All notable changes to UAS Preflight Demo, newest first.
 
 > Generated from `CHANGELOG_ENTRIES` in `sar-preflight-core.js` by `build.js` — edit there, not here.
 
+## v2026.11.21-a — 2026-11-21
+
+- Observed ceiling/visibility (METAR) no longer fails with "No nearby station reported a usable ceiling/visibility observation" in mountain areas. The weather service lists fire-weather stations first, and they never report sky or visibility, so the app asked only those and never reached the airport a few miles further down the list. It now asks the 4 nearest stations, then the nearest airports (up to 4) until it has both readings.
+- Ceiling and visibility each come from the closest station that reports them, and each shows that station and its distance, for example "Unlimited (KAUN, 12 nm)". A new Observed Visibility cell sits next to Flight Category, and the banner advisories name the station(s) and distance too.
+- When the METAR check still finds nothing, the error lists each station with its distance and why it was skipped (for example "BENC1 (3.1 nm): no sky condition or visibility reported"), instead of one generic message.
+
 ## v2026.11.20-f — 2026-11-20
 
 - The disclaimer comes back 30 minutes after it was last accepted: when you return to the app (switching back from another app on a phone, or to the tab or window on a desktop), or within a minute on a page left open. It needs the acknowledgment box ticked again. Accepting in another tab of the app counts.
